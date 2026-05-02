@@ -156,6 +156,11 @@ class ParsedFile:
     referenced_tables: list[TableRef] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
+    @property
+    def path_str(self) -> str:
+        """Return the path as a string."""
+        return str(self.path)
+
 
 class SqlParser(ABC):
     """Abstract base class for SQL parsers.
