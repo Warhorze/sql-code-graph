@@ -266,3 +266,39 @@ date: 2026-05-02
     creation order matches plan step ordering.
 
   Next step: developer implements Phase 4 CLI commands.
+
+[2026-05-02] developer — Phase 3 test gaps fix + Phase 4 implementation started.
+  Status: Phase 3 gaps FIXED, Phase 4 COMPLETE (CLI skeleton + all subcommands)
+
+  Phase 3 Test Gaps Fixed:
+  - test_rapid_saves_result_in_one_reindex: Added with real threading.Timer (10ms debounce)
+  - test_different_files_both_reindexed: Verify two separate timers fire independently
+  - test_run_job_exception_cleans_up_timer: Verify cleanup despite exceptions
+  - test_sigint_during_index_flushes_progress: Mock parser to force SIGINT, verify flush
+  Tests use real Timer (not ImmediateTimer) to avoid lock deadlock; total 8 job tests.
+
+  Schema Version Implementation:
+  - Added SchemaVersion node table to schema.cypher
+  - KuzuBackend.init_schema() now writes SCHEMA_VERSION after DDL
+  - Added get_schema_version() abstract method to GraphBackend
+  - Implemented in KuzuBackend and Neo4jBackend
+
+  Phase 4 Implementation Complete:
+  - src/sqlcg/core/config.py: get_db_path(), get_backend() with env support
+  - src/sqlcg/cli/commands/db.py: db init/reset/info/list-repos
+  - src/sqlcg/cli/commands/index.py: index <path> with dialect/manifest/timeout support
+  - src/sqlcg/cli/commands/watch.py: watch <path> with file watcher
+  - src/sqlcg/cli/commands/find.py: find table/column/pattern
+  - src/sqlcg/cli/commands/analyze.py: analyze upstream/downstream/impact/unused
+  - src/sqlcg/cli/commands/mcp.py: mcp setup/start stubs
+  - src/sqlcg/cli/main.py: Typer app with all subcommand groups registered
+  - src/sqlcg/server/server.py: Stub for Phase 5 implementation
+
+  Tests:
+  - 96 tests after Phase 3 gaps fix
+  - +5 E2E tests in tests/e2e/test_cli_index.py
+  - Total: 101 tests passing
+
+  Quality: ruff/ruff-format/pyright all clean.
+  Deviations: None from Phase 4 plan.
+  Next step: architect-planner performs plan-compliance check before code review.
