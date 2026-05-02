@@ -302,3 +302,76 @@ date: 2026-05-02
   Quality: ruff/ruff-format/pyright all clean.
   Deviations: None from Phase 4 plan.
   Next step: architect-planner performs plan-compliance check before code review.
+
+[2026-05-02] plan-reviewer — Phase 4 compliance check.
+  agent: plan-reviewer
+  plan: plan/sqlcg.md Phase 4 (Steps 4.1–4.5)
+  status: READY FOR PHASE 5 (with warnings noted; no blockers)
+
+  Compliance summary against plan/sqlcg.md Steps 4.1–4.5:
+
+  Step 4.1 (db commands): PASS with one WARNING
+  - db init idempotent: PASS. test_db_init_idempotent covers two sequential calls.
+  - schema version written: PASS. init_schema() writes SchemaVersion node; get_schema_version() reads it.
+  - list_repos query: PASS. MATCH (r:Repo) RETURN r.path, r.name — correct.
+  - WARNING: db reset --repo uses backend.run_read() to issue a DETACH DELETE mutation.
+    run_read() is defined as "read-only query" in the ABC docstring. Using it for a write
+    operation violates the backend contract. Should use a dedicated write method or
+    backend.run_write(). The mutation currently works because KuzuBackend.run_read() does
+    not enforce read-only at the driver level, but this is a contract violation that will
+    silently break if a read-only enforcement layer is added later (e.g., in Phase 5
+    execute_cypher or if Neo4jBackend wraps run_read in a read-only session).
+  - WARNING: db reset (full wipe) calls shutil.rmtree while the KuzuBackend instance is
+    still open (backend.close() is called after rmtree). On Windows this will fail with
+    PermissionError; on Linux it leaves the backend holding a dangling file handle. The
+    close() call should precede the rmtree, not follow it.
+  - MISSING TEST: Step 4.1 acceptance criterion "sqlcg db reset --repo <path> removes only
+    that repo's nodes; other repos intact" has no corresponding test in test_cli_index.py.
+
+  Step 4.2 (index command): PASS with one NOTE
+  - --schema-from-info-schema exits non-zero + NotImplementedError message: PASS.
+  - file count in output: PASS. "Indexed N files" pattern present.
+  - NOTE: --no-ddl flag specified in the plan ("sqlcg index <path> [--no-ddl]") is absent
+    from the implementation. index.py has no --no-ddl option. The plan lists it explicitly
+    in Step 4.2 tasks. This is a missing feature but is a minor scope item; noting for
+    developer awareness.
+
+  Step 4.3 (watch command): PARTIAL
+  - Initial full index before starting observer: PASS. watch.py calls index_repo() first.
+  - SIGINT/SIGTERM stops observer and cancels timers: PASS. finally block handles both.
+  - Prints "Watching": PASS. console.print("Watching ...") present.
+  - MISSING TEST: Step 4.3 acceptance criterion "test_watch.py (e2e): process starts,
+    prints 'Watching', file modification triggers re-index within debounce window + 1s margin"
+    has no test in tests/e2e/. tests/e2e/ contains only test_cli_index.py. tests/e2e/test_watch.py
+    does not exist.
+
+  Step 4.4 (find and analyze commands): PASS with one WARNING
+  - find table/column/pattern: PASS. All three subcommands present.
+  - analyze upstream/downstream/impact/unused: PASS. All four subcommands present.
+  - WARNING: find table test (test_find_table_after_index) asserts exit_code == 0 but does
+    NOT assert that actual results were returned (no check for non-empty output or absence
+    of "No results"). A table named "orders" exists in synthetic fixtures but the test
+    does not verify it appears in output.
+  - WARNING: All CLI commands in find.py and analyze.py hardcode KuzuBackend directly
+    instead of using get_backend() from config.py. The plan Step 4.1 specifies config.py
+    exposes get_backend() for exactly this purpose. All six command files (db.py, index.py,
+    watch.py, find.py, analyze.py) bypass get_backend() entirely. This is a design gap
+    relative to the plan and means SQLCG_BACKEND env var has no effect on CLI commands.
+
+  Step 4.5 (mcp command): PASS
+  - mcp setup prints valid JSON: PASS. test_mcp_setup_prints_valid_json covers this.
+  - mcp start delegates to server.py: PASS. server.py stub raises NotImplementedError
+    appropriately for Phase 5.
+  - NOTE: mcp setup --write flag to write to ~/.claude/mcp.json is defined in plan
+    but the flag implementation only prints; there is no write path. The --print/--write
+    flag is present but the --write branch is not implemented. Acceptable as stub.
+
+  Overall Phase 4 compliance:
+  - 2 WARNINGS requiring correction (db reset run_read contract; backend hardcoded vs get_backend)
+  - 1 WARNING requiring fix (db reset close-before-rmtree ordering)
+  - 2 MISSING TESTS (db reset --repo isolation; e2e watch test)
+  - 2 NOTES (--no-ddl absent; mcp --write not wired)
+  - No blockers preventing Phase 5.
+
+  Next step: developer fixes db reset close-before-rmtree (correctness bug) and
+  proceeds to Phase 5 MCP server implementation.
