@@ -2,7 +2,7 @@
 
 agent: architect-planner
 task: Full phased implementation plan for sqlcg (sql-code-graph)
-status: in-progress
+status: idle — plan committed, available for developer Q&A and plan-compliance check
 date: 2026-05-02
 
 ---
@@ -14,9 +14,17 @@ date: 2026-05-02
   strengths, risks, gaps, and ranked improvements. Six open questions surfaced for user.
   Next step: architect-planner reads ARCHITECTURE_REVIEW.md and plans Phase 1 implementation.
 
-[2026-05-02] architect-planner — Started full implementation planning pass.
-  Inputs: ARCHITECTURE_REVIEW.md (all six open questions resolved), plan/blueprint.md (v1.2),
-  plan/WORKFLOW.md. No existing source tree — greenfield project.
-  Producing: plan/sqlcg.md — complete phased plan across five phases with tasks, acceptance
-  criteria, risk mitigations, and test strategy.
-  Next step: plan-reviewer reviews plan/sqlcg.md before developer starts Phase 1.
+[2026-05-02] architect-planner — Completed full implementation plan: plan/sqlcg.md.
+  Summary: Six-phase plan (Scaffold + Data Model, Parser Layer, Cross-File Indexer,
+  CLI, MCP Server, Benchmarks + CI). All four HIGH-risk findings addressed as mandatory
+  steps: transaction() rollback in both backends (Step 1.4/1.5), _extract_column_lineage
+  structured error recording (Step 2.2), resolve_pass2 error handling (Step 3.1),
+  SchemaResolver thread-safety via Lock + fresh-per-job pattern (Step 2.1 + 3.3).
+  Additional findings addressed: Column.id multi-catalog construction (Step 1.6),
+  delete_nodes_for_file Column cleanup (Step 1.4), JOINS deferred to v2 (schema DDL),
+  add_information_schema raises NotImplementedError (Step 2.1), BEGIN false-positive
+  heuristic replaced with token-aware check (Step 2.3), _EMBEDDED_DML regex fixed
+  (Step 2.3), execute_cypher read-only enforcement with string-literal stripping (Step 5.3),
+  acryl-datahub and sqlglot version bounds corrected (pyproject.toml).
+  Blocking questions: none — all six architecture open questions resolved before planning.
+  Next step: plan-reviewer reviews plan/sqlcg.md; then developer starts Phase 1.
