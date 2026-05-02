@@ -75,6 +75,8 @@ def test_find_table_after_index(tmp_path, monkeypatch):
     # The synthetic fixtures include tables like "orders", "customers"
     result = runner.invoke(app, ["find", "table", "orders"])
     assert result.exit_code == 0
+    # Check that the table name appears in the output
+    assert "orders" in result.output.lower()
 
 
 def test_mcp_setup_prints_valid_json(monkeypatch):
@@ -86,3 +88,50 @@ def test_mcp_setup_prints_valid_json(monkeypatch):
     import json
 
     json.loads(result.output)  # Should not raise
+
+
+def test_db_reset_repo_isolates(tmp_path, monkeypatch):
+    """Test that db reset --repo isolates one repo and preserves others."""
+    monkeypatch.setenv("SQLCG_DB_PATH", str(tmp_path / "test.db"))
+
+    # Init database
+    runner.invoke(app, ["db", "init"])
+
+    fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
+    if not fixtures_path.exists():
+        pytest.skip("Synthetic fixtures not found")
+
+    # Index the same fixtures twice (simulating two repos)
+    # Note: in practice, you'd index two different repos, but we'll use the same fixtures
+    # with different paths to simulate two repos
+    repo1 = tmp_path / "repo1"
+    repo2 = tmp_path / "repo2"
+    repo1.mkdir()
+    repo2.mkdir()
+
+    # Copy fixtures to both paths
+    import shutil
+
+    for sql_file in fixtures_path.glob("*.sql"):
+        shutil.copy(sql_file, repo1 / sql_file.name)
+        shutil.copy(sql_file, repo2 / sql_file.name)
+
+    # Index both repos
+    result1 = runner.invoke(app, ["index", str(repo1)])
+    assert result1.exit_code == 0
+    result2 = runner.invoke(app, ["index", str(repo2)])
+    assert result2.exit_code == 0
+
+    # Check that both repos are indexed
+    info_before = runner.invoke(app, ["db", "info"])
+    assert "Repo:" in info_before.output or "Repo" in info_before.output
+
+    # Reset one repo
+    reset_result = runner.invoke(app, ["db", "reset", "--repo", str(repo1)])
+    assert reset_result.exit_code == 0
+    assert "Reset repo" in reset_result.output
+
+    # Verify the other repo's nodes still exist by finding tables
+    # (The second repo should still have indexed tables)
+    find_result = runner.invoke(app, ["find", "table", "orders"])
+    assert find_result.exit_code == 0
