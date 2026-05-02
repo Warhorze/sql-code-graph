@@ -172,6 +172,14 @@ class KuzuBackend(GraphBackend):
             logger.error(f"run_read failed: {e}")
             raise
 
+    def run_write(self, query: str, params: dict[str, Any]) -> None:
+        """Execute a write query (mutation)."""
+        try:
+            self._conn.execute(query, params)
+        except Exception as e:
+            logger.error(f"run_write failed: {e}")
+            raise
+
     def delete_nodes_for_file(self, file_path: str) -> None:
         """Delete all nodes and relationships associated with a file.
 

@@ -76,6 +76,15 @@ class GraphBackend(ABC):
         """
 
     @abstractmethod
+    def run_write(self, query: str, params: dict[str, Any]) -> None:
+        """Execute a write query (mutation).
+
+        Args:
+            query: Query string (Cypher for KùzuDB/Neo4j)
+            params: Parameters to bind in the query
+        """
+
+    @abstractmethod
     def delete_nodes_for_file(self, file_path: str) -> None:
         """Delete all nodes associated with a file and its relationships.
 
@@ -102,6 +111,14 @@ class GraphBackend(ABC):
     @abstractmethod
     def close(self) -> None:
         """Close the database connection."""
+
+    def __enter__(self) -> "GraphBackend":
+        """Context manager entry point."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Context manager exit point — closes the database connection."""
+        self.close()
 
     @staticmethod
     def _pk_field(label: str) -> str:
