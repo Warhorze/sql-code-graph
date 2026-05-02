@@ -1,119 +1,45 @@
 """KùzuDB schema definition for sqlcg graph."""
 
-# Schema version for migration tracking
+from enum import StrEnum
+from importlib.resources import files
+
 SCHEMA_VERSION = "1"
 
-# Node table names (labels)
-NODE_REPO = "Repo"
-NODE_FILE = "File"
-NODE_TABLE = "SqlTable"
-NODE_COLUMN = "SqlColumn"
-NODE_QUERY = "SqlQuery"
 
-# Relationship names
-REL_DEFINED_IN = "DEFINED_IN"
-REL_HAS_COLUMN = "HAS_COLUMN"
-REL_SELECTS_FROM = "SELECTS_FROM"
-REL_INSERTS_INTO = "INSERTS_INTO"
-REL_DELETES_FROM = "DELETES_FROM"
-REL_UPDATES = "UPDATES"
-REL_COLUMN_LINEAGE = "COLUMN_LINEAGE"
-REL_DECLARES = "DECLARES"
+class NodeLabel(StrEnum):
+    REPO = "Repo"
+    FILE = "File"
+    TABLE = "SqlTable"
+    COLUMN = "SqlColumn"
+    QUERY = "SqlQuery"
 
-# Full DDL schema
-SCHEMA_DDL = """
--- Repo node: one per indexed repository
-CREATE NODE TABLE Repo (
-    path STRING PRIMARY KEY,
-    name STRING
-);
 
--- File node: one per .sql file
-CREATE NODE TABLE File (
-    path STRING PRIMARY KEY,
-    repo_path STRING,
-    sha STRING,
-    dialect STRING
-);
+class RelType(StrEnum):
+    DEFINED_IN = "DEFINED_IN"
+    QUERY_DEFINED_IN = "QUERY_DEFINED_IN"
+    HAS_COLUMN = "HAS_COLUMN"
+    SELECTS_FROM = "SELECTS_FROM"
+    INSERTS_INTO = "INSERTS_INTO"
+    DELETES_FROM = "DELETES_FROM"
+    UPDATES = "UPDATES"
+    COLUMN_LINEAGE = "COLUMN_LINEAGE"
+    DECLARES = "DECLARES"
 
--- Table node: one per unique table reference
-CREATE NODE TABLE SqlTable (
-    qualified STRING PRIMARY KEY,
-    catalog STRING,
-    db STRING,
-    name STRING,
-    kind STRING,
-    defined_in_file STRING
-);
 
--- Column node: one per unique column reference
-CREATE NODE TABLE SqlColumn (
-    id STRING PRIMARY KEY,
-    catalog STRING,
-    db STRING,
-    table_name STRING,
-    col_name STRING,
-    table_qualified STRING
-);
+# Backward-compatible aliases
+NODE_REPO = NodeLabel.REPO
+NODE_FILE = NodeLabel.FILE
+NODE_TABLE = NodeLabel.TABLE
+NODE_COLUMN = NodeLabel.COLUMN
+NODE_QUERY = NodeLabel.QUERY
 
--- Query node: one per SQL statement parsed
-CREATE NODE TABLE SqlQuery (
-    id STRING PRIMARY KEY,
-    file_path STRING,
-    statement_index INT64,
-    sql STRING,
-    kind STRING,
-    target_table STRING,
-    parse_failed BOOLEAN,
-    confidence FLOAT,
-    parsing_mode STRING
-);
+REL_DEFINED_IN = RelType.DEFINED_IN
+REL_HAS_COLUMN = RelType.HAS_COLUMN
+REL_SELECTS_FROM = RelType.SELECTS_FROM
+REL_INSERTS_INTO = RelType.INSERTS_INTO
+REL_DELETES_FROM = RelType.DELETES_FROM
+REL_UPDATES = RelType.UPDATES
+REL_COLUMN_LINEAGE = RelType.COLUMN_LINEAGE
+REL_DECLARES = RelType.DECLARES
 
--- File -> Table: table is defined in this file
-CREATE REL TABLE DEFINED_IN (
-    FROM SqlTable TO File
-);
-
--- Query -> File: query is defined in this file
-CREATE REL TABLE QUERY_DEFINED_IN (
-    FROM SqlQuery TO File
-);
-
--- Table -> Column: table has this column
-CREATE REL TABLE HAS_COLUMN (
-    FROM SqlTable TO SqlColumn
-);
-
--- Query -> Table: query selects from table
-CREATE REL TABLE SELECTS_FROM (
-    FROM SqlQuery TO SqlTable
-);
-
--- Query -> Table: query inserts into table
-CREATE REL TABLE INSERTS_INTO (
-    FROM SqlQuery TO SqlTable
-);
-
--- Query -> Table: query deletes from table
-CREATE REL TABLE DELETES_FROM (
-    FROM SqlQuery TO SqlTable
-);
-
--- Query -> Table: query updates table
-CREATE REL TABLE UPDATES (
-    FROM SqlQuery TO SqlTable
-);
-
--- Column -> Column: lineage relationship
-CREATE REL TABLE COLUMN_LINEAGE (
-    FROM SqlColumn TO SqlColumn,
-    transform STRING,
-    confidence FLOAT,
-    query_id STRING
-);
-
--- Query -> Table: query declares/creates this table
-CREATE REL TABLE DECLARES (
-    FROM SqlQuery TO SqlTable
-);
-"""
+SCHEMA_DDL: str = files("sqlcg.core").joinpath("schema.cypher").read_text(encoding="utf-8")

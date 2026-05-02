@@ -327,6 +327,36 @@ class SqlParser(ABC):
                 # Extract output columns
                 for col_expr in stmt.expressions:
                     col_name = col_expr.alias if col_expr.alias else str(col_expr)
+                    # Schema validation: if schema is loaded and column isn't in it,
+                    # emit a reduced-confidence edge rather than a full-confidence one.
+                    if schema:
+                        table_cols: list[str] | None = None
+                        for _scope_name, cols in schema.items():
+                            if isinstance(cols, list):
+                                table_cols = cols
+                                break
+                            elif isinstance(cols, dict):
+                                for _db, tables in cols.items():
+                                    if isinstance(tables, dict):
+                                        for _tbl, tcols in tables.items():
+                                            if col_name in tcols:
+                                                table_cols = tcols
+                                                break
+                        if table_cols is not None and col_name not in table_cols:
+                            self._log.warning(
+                                "column %s not found in schema, emitting low-confidence edge",
+                                col_name,
+                            )
+                            edges.append(
+                                LineageEdge(
+                                    src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                                    dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                                    transform="UNKNOWN",
+                                    confidence=0.5,
+                                )
+                            )
+                            continue
+
                     try:
                         root = sg_lineage(col_name, body, schema=schema, dialect=self.DIALECT)
                         if root:

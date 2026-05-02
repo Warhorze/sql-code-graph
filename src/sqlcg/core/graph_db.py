@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from sqlcg.core.schema import NodeLabel
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
@@ -105,9 +106,9 @@ class GraphBackend(ABC):
             Primary key field name for the label
         """
         match label:
-            case "Repo" | "File":
+            case NodeLabel.REPO | NodeLabel.FILE:
                 return "path"
-            case "SqlTable":
+            case NodeLabel.TABLE:
                 return "qualified"
             case _:
                 return "id"
