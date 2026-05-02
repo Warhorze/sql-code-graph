@@ -298,6 +298,9 @@ class SqlParser(ABC):
         On sqlglot.lineage failure: log WARNING, append to ParsedFile.errors,
         emit LineageEdge with confidence=0.0, continue (do NOT raise or skip silently).
 
+        For columns not found in the schema, emits edges with reduced confidence (0.5)
+        rather than skipping silently (only applies when schema is non-empty).
+
         Args:
             stmt: sqlglot AST node (Select/Insert/Create)
             path: Path to the source file

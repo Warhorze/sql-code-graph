@@ -64,18 +64,12 @@ class Neo4jBackend(GraphBackend):
             except Exception as e:
                 logger.warning(f"Index creation skipped: {e}")
 
-    # Maps each label to its primary key field — mirrors KuzuBackend (Deviation 1)
-    _PK_FIELD: dict[str, str] = {
-        NODE_REPO: "path",
-        NODE_FILE: "path",
-        NODE_TABLE: "qualified",
-        NODE_COLUMN: "id",
-        NODE_QUERY: "id",
-    }
-
     def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties."""
-        pk_field = self._PK_FIELD.get(label, "id")
+        # Validate property keys to prevent Cypher injection
+        self._validate_props(properties)
+
+        pk_field = self._pk_field(label)
         query = f"MERGE (n:{label} {{{pk_field}: $key}}) SET n += $props"
         try:
             self._session.run(query, {"key": key, "props": properties})
@@ -93,8 +87,11 @@ class Neo4jBackend(GraphBackend):
         properties: dict[str, Any],
     ) -> None:
         """Upsert a relationship between two nodes."""
-        src_pk = self._PK_FIELD.get(src_label, "id")
-        dst_pk = self._PK_FIELD.get(dst_label, "id")
+        # Validate property keys to prevent Cypher injection
+        self._validate_props(properties)
+
+        src_pk = self._pk_field(src_label)
+        dst_pk = self._pk_field(dst_label)
         query = (
             f"MATCH (src:{src_label} {{{src_pk}: $src_key}})"
             f" MATCH (dst:{dst_label} {{{dst_pk}: $dst_key}})"
@@ -166,7 +163,8 @@ class Neo4jBackend(GraphBackend):
     def transaction(self) -> Iterator["Neo4jBackend"]:
         """Context manager for Neo4j transactions.
 
-        Uses Neo4j's session.begin_transaction() API.
+        Creates a fresh session per transaction to avoid issues with shared
+        long-lived sessions that may be closed externally.
 
         Yields:
             self (the Neo4jBackend instance)
@@ -174,10 +172,13 @@ class Neo4jBackend(GraphBackend):
         Raises:
             Any exception raised in the context triggers ROLLBACK.
         """
-        tx = self._session.begin_transaction()
+        session = self._driver.session()
+        tx = session.begin_transaction()
         try:
             yield self
             tx.commit()
         except Exception:
             tx.rollback()
             raise
+        finally:
+            session.close()

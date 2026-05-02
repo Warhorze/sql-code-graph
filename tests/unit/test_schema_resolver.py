@@ -121,3 +121,31 @@ class TestSchemaResolver:
         assert len(resolver._view_bodies) == 2
         assert "view1" in resolver._view_bodies
         assert "view2" in resolver._view_bodies
+
+    def test_as_dict_returns_deep_copy_not_reference(self):
+        """Test that as_dict() returns a deep copy, not a reference to internal cache.
+
+        Ensures that mutations to the returned dict do not corrupt the internal state.
+        """
+        import sqlglot
+
+        resolver = SchemaResolver()
+
+        # Add a table
+        create_ast = sqlglot.parse("CREATE TABLE public.users (id INT);")[0]
+        resolver.add_create_table(create_ast)
+
+        # Get the dict
+        dict1 = resolver.as_dict()
+        assert "public" in dict1
+
+        # Mutate the returned dict
+        dict1["public"]["users"] = ["id", "corrupted"]
+        dict1["newkey"] = {"fake": "data"}
+
+        # Get it again
+        dict2 = resolver.as_dict()
+
+        # Verify the internal cache is unaffected
+        assert dict2["public"]["users"] == ["id"]
+        assert "newkey" not in dict2

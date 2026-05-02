@@ -108,8 +108,8 @@ class TestAnsiParser:
         result = parser.parse_file(Path("test.sql"), sql)
 
         assert len(result.statements) == 1
-        # At minimum, should extract either the CTE or the real table
-        assert len(result.statements[0].sources) >= 0
+        # CTE handling is complex; at minimum, verify parsing succeeded without crash
+        assert result.statements[0].kind == "SELECT"
 
     def test_parse_malformed_sql(self):
         """Test parsing malformed SQL doesn't crash."""

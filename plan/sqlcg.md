@@ -575,9 +575,15 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
 
 - Files affected: `src/sqlcg/indexer/dbt_adapter.py`
 - Tasks:
-  - `load_dbt_manifest(manifest_path, schema_resolver)`: calls `dbt-artifacts` to load
-    manifest, then `schema_resolver.add_dbt_manifest(manifest_path)` for each node
+  - `load_dbt_manifest(manifest_path, schema_resolver)`: loads dbt manifest via raw dict
+    access (Phase 3 Step 3.6 note: fragile against dbt manifest version changes; 
+    typed models via `dbt-artifacts` deferred to v2), then calls
+    `schema_resolver.add_dbt_manifest(manifest_path)`
   - Errors loading manifest are logged and do not abort indexing
+  - **Phase 3 Step 3.6 note**: The plan listed `dbt-artifacts>=1.0.0` as a core
+    dependency in the blueprint, but this package does not exist in public registries.
+    v1 uses raw JSON dict access instead (fragile but functional). For v2, introduce
+    `dbt-artifacts` typed models under the `dbt` optional extra.
 - Acceptance:
   - `test_indexer_to_graph.py`: indexing `tests/fixtures/jaffle_shop/` with manifest
     produces column-level edges where DDL-only indexing produces table-level only
@@ -763,6 +769,10 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     - `p95 < 500ms` per file
     - `>= 50 files/sec` throughput
     - `>= 90%` cross-file resolution rate
+  - **Note on p95 benchmark gate**: Adversarial files (`200_join.sql`, `500_union.sql`)
+    that hit the `--timeout-per-file` ceiling must be excluded from the p95 latency
+    distribution. Measure them in a separate "adversarial" bucket. Otherwise the gate
+    always fails because those files exceed the timeout.
   - `docs/BENCHMARKS.md`: publish precision/recall separately from coverage (blueprint §11)
 - Acceptance:
   - `pytest tests/benchmarks/ --benchmark-only` passes all threshold assertions

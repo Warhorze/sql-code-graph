@@ -5,6 +5,7 @@ within a single thread. Do not share a SchemaResolver instance across concurrent
 jobs — construct one per re-index job instead (see jobs.py).
 """
 
+import copy
 import threading
 from pathlib import Path
 from typing import Any
@@ -127,8 +128,8 @@ class SchemaResolver:
 
                 self._cache = None  # Invalidate cache
 
-        except Exception as exc:
-            logger.warning("Failed to load dbt manifest: %s", exc)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
+            logger.warning("Failed to load dbt manifest %s: %s", manifest_path, exc)
 
     def add_information_schema(self, csv_path: str | Path) -> None:
         """Load table schemas from an information_schema CSV.
@@ -145,12 +146,13 @@ class SchemaResolver:
         """Return the schema as a nested dict: {catalog: {db: {table: [cols]}}}.
 
         Returns:
-            Nested dictionary of table schemas, cached under lock.
+            A deep copy of the cached schema dict. Mutations by the caller
+            do not affect the internal cache.
         """
         with self._lock:
             if self._cache is None:
                 self._cache = self._build_dict()
-            return self._cache
+            return copy.deepcopy(self._cache)
 
     def _build_dict(self) -> dict:
         """Build the nested schema dictionary (called only under self._lock).

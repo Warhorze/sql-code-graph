@@ -1,5 +1,6 @@
 """Abstract base class for graph database backends."""
 
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,6 +9,9 @@ from typing import Any
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
+
+# Regex for validating property key names (identifiers)
+_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class GraphBackend(ABC):
@@ -89,6 +93,40 @@ class GraphBackend(ABC):
     @abstractmethod
     def close(self) -> None:
         """Close the database connection."""
+
+    @staticmethod
+    def _pk_field(label: str) -> str:
+        """Return the primary key field name for a node label.
+
+        Args:
+            label: Node label (e.g., "Repo", "File", "SqlTable", "SqlColumn", "SqlQuery")
+
+        Returns:
+            Primary key field name for the label
+        """
+        match label:
+            case "Repo" | "File":
+                return "path"
+            case "SqlTable":
+                return "qualified"
+            case _:
+                return "id"
+
+    @staticmethod
+    def _validate_props(properties: dict[str, Any]) -> None:
+        """Validate that all property keys are safe identifiers.
+
+        Guards against Cypher injection via property key interpolation.
+
+        Args:
+            properties: Dictionary of properties to validate
+
+        Raises:
+            ValueError: If any property key is not a valid identifier
+        """
+        for key in properties:
+            if not _IDENT_RE.match(key):
+                raise ValueError(f"Invalid property key: {key!r}")
 
     @contextmanager
     def transaction(self) -> Iterator["GraphBackend"]:

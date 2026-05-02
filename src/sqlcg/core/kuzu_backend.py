@@ -83,16 +83,10 @@ class KuzuBackend(GraphBackend):
 
         Note: Properties that match the primary key field are skipped in the SET clause.
         """
-        # Map label to its primary key field name
-        pk_field_map = {
-            NODE_REPO: "path",
-            NODE_FILE: "path",
-            NODE_TABLE: "qualified",
-            NODE_COLUMN: "id",
-            NODE_QUERY: "id",
-        }
+        # Validate property keys to prevent Cypher injection
+        self._validate_props(properties)
 
-        pk_field = pk_field_map.get(label, "id")
+        pk_field = self._pk_field(label)
 
         # Build the MERGE statement
         # Format: MERGE (n:Label {pk_field: $key}) SET n.field = $field, ...
@@ -125,17 +119,11 @@ class KuzuBackend(GraphBackend):
         properties: dict[str, Any],
     ) -> None:
         """Upsert a relationship between two nodes."""
-        # Map label to its primary key field name
-        pk_field_map = {
-            NODE_REPO: "path",
-            NODE_FILE: "path",
-            NODE_TABLE: "qualified",
-            NODE_COLUMN: "id",
-            NODE_QUERY: "id",
-        }
+        # Validate property keys to prevent Cypher injection
+        self._validate_props(properties)
 
-        src_pk_field = pk_field_map.get(src_label, "id")
-        dst_pk_field = pk_field_map.get(dst_label, "id")
+        src_pk_field = self._pk_field(src_label)
+        dst_pk_field = self._pk_field(dst_label)
 
         query = f"""
             MATCH (src:{src_label} {{{src_pk_field}: $src_key}})
@@ -254,9 +242,10 @@ class KuzuBackend(GraphBackend):
             self._conn.execute("COMMIT")
             self._in_transaction = False
         except Exception:
-            self._in_transaction = False
             try:
                 self._conn.execute("ROLLBACK")
+                self._in_transaction = False
             except Exception as rollback_err:
                 logger.error(f"Rollback failed: {rollback_err}")
+                self._in_transaction = False  # defensive reset
             raise

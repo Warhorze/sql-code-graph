@@ -18,7 +18,8 @@ logger = getLogger(__name__)
 # Used as fallback when tokenization fails
 _SCRIPTING_BLOCK = re.compile(r"\bBEGIN\b", re.IGNORECASE)
 
-# Regex for extracting DML statements from scripting blocks
+# Regex for extracting DML statements from scripting blocks.
+# Does not handle ';' inside string literals — tokenizer-based extraction deferred to v2.
 _EMBEDDED_DML = re.compile(
     r"(SELECT\s+.+?(?=;|\Z)|INSERT\s+INTO.+?(?=;|\Z)|UPDATE\s+.+?(?=;|\Z)|DELETE\s+.+?(?=;|\Z))",
     re.DOTALL | re.IGNORECASE | re.MULTILINE,
