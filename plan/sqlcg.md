@@ -127,13 +127,18 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
 **Step 1.1 — Project scaffold**
 
 - Files affected: `pyproject.toml`, `src/sqlcg/__init__.py`, `src/sqlcg/__main__.py`,
-  `src/sqlcg/utils/logging.py`, `.env.example`, `.sqlcgignore`, `README.md`
+  `src/sqlcg/utils/logging.py`, `src/sqlcg/utils/hashing.py`, `.env.example`,
+  `.sqlcgignore`, `README.md`
 - Tasks:
   - `uv init sql-code-graph && uv add "sqlglot[rs]" kuzu typer pydantic pytest`
   - Set `requires-python = ">=3.12"` in `pyproject.toml`
   - Add `[project.scripts] sqlcg = "sqlcg.cli.main:main"`
   - Create `src/sqlcg/utils/logging.py`: stderr-only logger factory (`getLogger` wrapper
     that always uses `stream=sys.stderr`); no `print()` anywhere in the package
+  - Create `src/sqlcg/utils/hashing.py`: `def hash_sql(sql: str) -> str` — returns a
+    SHA-256 hex digest of the normalized SQL bytes. Used to populate `File.sha` in the
+    graph (DDL §7 declares `sha STRING` on the `File` node). Normalization: strip leading
+    and trailing whitespace before hashing.
   - Add `.sqlcgignore` with sensible defaults (`*.bak`, `tmp/`, `node_modules/`)
 - Acceptance:
   - `python -m sqlcg --help` exits 0
@@ -171,11 +176,16 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
 - Tasks:
   - Implement all abstract methods: `upsert_node`, `upsert_edge`, `run_read`,
     `delete_nodes_for_file`, `close`
-  - Implement `transaction()` using KùzuDB's connection-level transaction API:
+  - Implement `transaction()` using KùzuDB's connection-level transaction API.
+    **Developer note**: before coding, verify the exact Python method names in KùzuDB
+    0.11.3 docs — the connection object exposes `begin_transaction()`, not `begin()`;
+    commit and rollback are `commit()` and `rollback()`. The pattern to implement is:
     ```python
     @contextmanager
     def transaction(self):
-        self._conn.begin()
+        # Verify against kuzu 0.11.3 Python API: conn.begin_transaction() /
+        # conn.commit() / conn.rollback(). Do not assume neo4j-style begin().
+        self._conn.begin_transaction()
         try:
             yield self
             self._conn.commit()
@@ -183,8 +193,14 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
             self._conn.rollback()
             raise
     ```
+    If `begin_transaction()` does not exist on the connection object in 0.11.3, check
+    whether KùzuDB 0.11.3 uses `set_auto_commit(False)` / `commit()` / `rollback()`
+    instead — document the actual API used in a code comment.
   - `delete_nodes_for_file` must delete BOTH `Query` nodes and orphaned `Column` nodes
-    linked to `Table` nodes `DEFINED_IN` the file (finding 5.5):
+    linked to `Table` nodes `DEFINED_IN` the file (finding 5.5).
+    **Implementation note**: KùzuDB does not support multiple statements in a single
+    `conn.execute()` call. Issue each of the four Cypher statements as a separate
+    `self._conn.execute(...)` call within the active transaction:
     ```cypher
     -- Step A: delete Column nodes for tables defined in this file
     MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)-[:HAS_COLUMN]->(c:Column)
@@ -251,21 +267,47 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
   - Add `threading.Lock` (`self._lock = threading.Lock()`) protecting all mutations and
     the `_invalidate_cache` call (finding 3.3):
     ```python
+    def __init__(self, dialect=None):
+        self.dialect = dialect
+        self._tables: dict = {}
+        self._view_bodies: dict = {}
+        self._lock = threading.Lock()
+        self._cache: dict | None = None  # manual cache; lru_cache is not usable on
+                                         # instance methods (self is unhashable)
+
     def add_create_table(self, ast):
         with self._lock:
             # ... mutation ...
-            self._invalidate_cache()
+            self._cache = None  # invalidate
 
-    def as_dict(self):
+    def as_dict(self) -> dict:
         with self._lock:
-            return self._as_dict_locked()
+            if self._cache is None:
+                self._cache = self._build_dict()
+            return self._cache
 
-    @functools.lru_cache(maxsize=1)
-    def _as_dict_locked(self):
-        # ... build dict ...
+    def _build_dict(self) -> dict:
+        # Called only under self._lock. Build the nested schema dict.
+        out = {}
+        for (cat, db, name), cols in self._tables.items():
+            cur = out
+            for k in [cat, db]:
+                if k:
+                    cur = cur.setdefault(k, {})
+            cur[name] = cols
+        return out
+
+    def _invalidate_cache(self):
+        # May be called while lock is held or without lock (depends on caller).
+        # Prefer calling via add_* methods which hold the lock.
+        self._cache = None
     ```
-    Note: `lru_cache` is applied to the private method; the public `as_dict` acquires
-    the lock first and then delegates. This makes the lock-then-read sequence atomic.
+    **Rationale**: `functools.lru_cache` on an instance method uses `self` as part of
+    the cache key. Plain class instances are not hashable by default, so calling
+    `lru_cache`-decorated instance methods raises `TypeError: unhashable type` at
+    runtime. Use a `_cache: dict | None` field with manual invalidation instead.
+    The `threading.Lock` guards both the mutation and the cache read/write, making
+    the lock-then-read sequence atomic.
   - `add_information_schema(self, csv_path)` body:
     `raise NotImplementedError("--schema-from-info-schema is not yet implemented (v2)")`
   - `add_view_sources`, `add_dbt_manifest` implemented as per blueprint
@@ -417,7 +459,17 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     3. Pass 2: `aggregator.resolve_pass2` for each file
     4. Upsert all nodes/edges via `db`
   - `reindex_file(file_path, db, dialect)`: dependency-aware incremental re-index
-    (finding 3.1 — use `db.transaction()`):
+    (finding 3.1 — use `db.transaction()`).
+    Define `STALE_VIEWS_QUERY` as a module-level constant in `indexer.py` (taken from
+    blueprint §7):
+    ```python
+    STALE_VIEWS_QUERY = """
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
+      <-[:SELECTS_FROM]-(q:Query)-[:DECLARES]->(v:Table {kind: 'VIEW'})
+    RETURN DISTINCT v.qualified AS view_name
+    """
+    ```
+    Implementation:
     ```python
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
         stale_views = db.run_read(STALE_VIEWS_QUERY, {"path": file_path})
@@ -488,9 +540,16 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     on failure, preventing stale entries
 - Acceptance:
   - `test_watch.py` (e2e): modify file A and file B within 1 s; assert both are
-    re-indexed within 5 s and the graph reflects both changes
+    re-indexed and the graph reflects both changes.
+    **Implementation note**: do not use wall-clock `time.sleep()` assertions in tests
+    — they are flaky under CI load. Use `threading.Event` (or replace
+    `threading.Timer` with a synchronous mock in unit tests):
+    - In unit tests: inject a fake timer factory that calls the callback synchronously
+      so the debounce fires immediately.
+    - In e2e tests: use an `Event` set inside the mocked `reindex_file` and
+      `Event.wait(timeout=10)` rather than a hard sleep.
   - `test_watch.py`: rapid saves to the same file within the 2 s debounce window result
-    in exactly one re-index call
+    in exactly one re-index call (verified via call-count mock on `reindex_file`)
 
 **Step 3.5 — Watcher (watchdog integration)**
 
@@ -620,7 +679,11 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
   Each tool docstring must include a `Raises` section documenting `NotIndexedError`
   when the graph has no indexed repos (finding 3.11). Docstrings stay under 2 KB.
 
-  Each tool returns a Pydantic model (auto-JSON by FastMCP).
+  Return types: all tools except `index_repo` return a Pydantic model (auto-JSON
+  by FastMCP). `index_repo` returns a plain `dict` (matching the blueprint §6.2
+  signature `-> dict` with keys `files_parsed`, `parse_errors`, `tables_found`,
+  `lineage_edges_created`). FastMCP serialises both to JSON; the distinction is that
+  the `dict` return does not produce a named schema in the tool's JSON schema output.
 
 - Acceptance:
   - `test_mcp_tools.py`: each tool called against a pre-indexed fixture graph returns
@@ -654,10 +717,16 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
 
 **Step 6.1 — Benchmark fixtures**
 
-- Files affected: `tests/benchmarks/tpch/`, `tests/benchmarks/golden_corpus/`,
-  `tests/benchmarks/adversarial/`, `tests/fixtures/synthetic/`, `tests/fixtures/jaffle_shop/`
+- Files affected: `tests/benchmarks/tpch/`, `tests/benchmarks/sqlmesh/`,
+  `tests/benchmarks/golden_corpus/`, `tests/benchmarks/adversarial/`,
+  `tests/fixtures/synthetic/`, `tests/fixtures/jaffle_shop/`
 - Tasks:
   - Download TPC-H 24 queries into `tests/benchmarks/tpch/`
+  - Copy or symlink the SQLMesh open test suite dialect fixtures into
+    `tests/benchmarks/sqlmesh/` (source: `tests/fixtures/` in the sqlmesh GitHub repo).
+    The blueprint §11 names this as a primary fixture source for cross-dialect coverage.
+    Select the ANSI, BigQuery, Snowflake, and T-SQL subdirectories; exclude dialects not
+    in scope for v1. Record the SQLMesh commit SHA in `tests/benchmarks/sqlmesh/SOURCE.txt`.
   - Populate `tests/benchmarks/golden_corpus/snowflake/` with the ten files from
     blueprint §11 (qualify, lateral_flatten, colon_extract, colon_reserved_word,
     scripting_block, identifier_dynamic, copy_into, three_part, create_procedure,
