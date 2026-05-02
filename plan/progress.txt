@@ -28,3 +28,24 @@ date: 2026-05-02
   acryl-datahub and sqlglot version bounds corrected (pyproject.toml).
   Blocking questions: none — all six architecture open questions resolved before planning.
   Next step: plan-reviewer reviews plan/sqlcg.md; then developer starts Phase 1.
+
+[2026-05-02] plan-reviewer — Reviewed plan/sqlcg.md.
+  Status: READY FOR IMPLEMENTATION (with corrections applied)
+  Issues found and resolved:
+  - BLOCKER fixed: lru_cache on instance method is unhashable — replaced with _cache
+    attribute pattern + threading.Lock in Step 2.1
+  - WARNING fixed: KuzuBackend transaction() method name unverified — added developer
+    note to check KùzuDB 0.11.3 Python API before coding (begin_transaction vs begin)
+    in Step 1.4
+  - WARNING fixed: delete_nodes_for_file must issue 4 separate conn.execute() calls —
+    KùzuDB does not support multi-statement execute() — clarified in Step 1.4
+  - WARNING fixed: STALE_VIEWS_QUERY referenced but never defined in plan — added
+    module-level constant with exact Cypher from blueprint §7 in Step 3.3
+  - WARNING fixed: test_watch.py wall-clock assertion (5s) is flaky under CI load —
+    replaced with Event-based + mock-timer approach in Step 3.4
+  - WARNING fixed: "each tool returns Pydantic model" was imprecise — index_repo
+    returns plain dict per blueprint §6.2; corrected in Step 5.2
+  - NOTE fixed: hashing.py missing from plan scope — added to Step 1.1; File.sha DDL
+    field requires it
+  - NOTE fixed: SQLMesh fixtures missing from Step 6.1 tasks — added as explicit task
+  Next step: developer starts implementation on Phase 1.
