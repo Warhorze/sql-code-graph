@@ -845,6 +845,37 @@ and confidence score documented in blueprint §8.2.
 
 ---
 
+## Deviations
+
+### Deviation 1: Node Label Naming (Cypher Reserved Words)
+
+- **Reason**: KùzuDB Cypher parser treats "Table", "Column", "Query" as reserved words,
+  causing parser exceptions when used as node labels in MERGE statements. To avoid
+  workaround complexity and maintain clean query syntax, we renamed labels.
+- **Change**: 
+  - `Table` → `SqlTable`
+  - `Column` → `SqlColumn`
+  - `Query` → `SqlQuery`
+- **Impact**: No functional impact — the renamed labels are purely internal implementation.
+  All Cypher queries and constants use the new names. Future cross-database support
+  (e.g., Neo4j) will see identical logic, just without this constraint.
+- **Date**: 2026-05-02
+
+### Deviation 2: Added QUERY_DEFINED_IN Relationship
+
+- **Reason**: The blueprint schema defines DEFINED_IN only from SqlTable to File, but
+  QueryNode needs to reference the File it's defined in (for delete_nodes_for_file).
+  Without a separate relationship type, we cannot distinguish Query→File from Table→File
+  in Cypher.
+- **Change**: Added `CREATE REL TABLE QUERY_DEFINED_IN (FROM SqlQuery TO File)` to
+  the schema DDL.
+- **Impact**: Minimal — Cypher queries for delete_nodes_for_file now use QUERY_DEFINED_IN
+  for queries and DEFINED_IN for tables. This provides clarity and prevents relationship
+  ambiguity.
+- **Date**: 2026-05-02
+
+---
+
 ## Rollout Notes
 
 This is a greenfield project with no existing users; no migration or rollback plan is
