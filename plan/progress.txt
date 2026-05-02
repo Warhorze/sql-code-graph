@@ -2,7 +2,7 @@
 
 agent: developer
 task: Phase 1 implementation (Scaffold, Data Model, Backend ABC)
-status: complete — all tests passing, ready for review
+status: complete — all tests passing, PR ready
 date: 2026-05-02
 
 ---
@@ -49,3 +49,29 @@ date: 2026-05-02
     field requires it
   - NOTE fixed: SQLMesh fixtures missing from Step 6.1 tasks — added as explicit task
   Next step: developer starts implementation on Phase 1.
+
+[2026-05-02] developer — Completed Phase 1 implementation.
+  Status: COMPLETE — All Phase 1 steps delivered with 29 unit tests passing
+  Implemented:
+  - Step 1.1: Project scaffold with uv, pyproject.toml, logging.py, hashing.py, .sqlcgignore
+  - Step 1.2: GraphBackend ABC with abstract interface and default transaction() (warning)
+  - Step 1.3: KùzuDB schema DDL with NODE_* and REL_* constants
+  - Step 1.4: KuzuBackend with MERGE-based upserts, BEGIN/COMMIT/ROLLBACK transactions,
+    4-statement delete_nodes_for_file, primary key field handling
+  - Step 1.5: Neo4jBackend stub (parallel implementation, matches KuzuBackend logic)
+  - Step 1.6: Frozen dataclasses (TableRef, ColumnRef, LineageEdge) and mutable
+    (QueryNode, ParsedFile) with multi-catalog collision prevention
+
+  Deviations from plan (2):
+  1. Node labels: Table→SqlTable, Column→SqlColumn, Query→SqlQuery (Cypher reserved words)
+  2. Added QUERY_DEFINED_IN rel type (Query→File edges required for delete_nodes_for_file)
+
+  Tests passing:
+  - test_kuzu_backend.py: 6 (upsert idempotency, transaction commit/rollback, delete)
+  - test_neo4j_backend.py: [setup for future]
+  - test_data_models.py: 17 (TableRef, ColumnRef, LineageEdge, QueryNode, ParsedFile)
+  - test_graph_backend.py: 3 (ABC enforcement, transaction warning)
+  - test_cli.py: 3 (help, import, no-stdout)
+
+  Acceptance criteria: all 8 Phase 1 criteria met
+  Next step: architect-planner performs plan-compliance check before code review.
