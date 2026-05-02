@@ -12,6 +12,7 @@ class NodeLabel(StrEnum):
     TABLE = "SqlTable"
     COLUMN = "SqlColumn"
     QUERY = "SqlQuery"
+    SCHEMA_VERSION = "SchemaVersion"
 
 
 class RelType(StrEnum):
@@ -32,6 +33,7 @@ NODE_FILE = NodeLabel.FILE
 NODE_TABLE = NodeLabel.TABLE
 NODE_COLUMN = NodeLabel.COLUMN
 NODE_QUERY = NodeLabel.QUERY
+NODE_SCHEMA_VERSION = NodeLabel.SCHEMA_VERSION
 
 REL_DEFINED_IN = RelType.DEFINED_IN
 REL_HAS_COLUMN = RelType.HAS_COLUMN

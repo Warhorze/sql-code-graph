@@ -92,3 +92,8 @@ CREATE REL TABLE COLUMN_LINEAGE (
 CREATE REL TABLE DECLARES (
     FROM SqlQuery TO SqlTable
 );
+
+-- Schema version tracking
+CREATE NODE TABLE SchemaVersion (
+    version STRING PRIMARY KEY
+);

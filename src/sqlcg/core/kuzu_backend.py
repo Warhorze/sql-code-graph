@@ -16,6 +16,7 @@ from sqlcg.core.queries import (
 from sqlcg.core.schema import (
     NODE_REPO,
     SCHEMA_DDL,
+    SCHEMA_VERSION,
 )
 from sqlcg.utils.logging import getLogger
 
@@ -73,6 +74,17 @@ class KuzuBackend(GraphBackend):
                 except Exception as e:
                     logger.error(f"DDL execution failed: {stmt[:50]}...: {e}")
                     raise
+
+        # Upsert the schema version
+        try:
+            self._conn.execute(
+                "MERGE (v:SchemaVersion {version: $v})",
+                {"v": SCHEMA_VERSION},
+            )
+            logger.debug(f"Wrote schema version: {SCHEMA_VERSION}")
+        except Exception as e:
+            logger.error(f"Failed to write schema version: {e}")
+            raise
 
     def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties.
@@ -192,6 +204,21 @@ class KuzuBackend(GraphBackend):
         except Exception as e:
             logger.error(f"delete_nodes_for_file failed for {file_path}: {e}")
             raise
+
+    def get_schema_version(self) -> str | None:
+        """Get the stored schema version from the database.
+
+        Returns:
+            The schema version string, or None if not set.
+        """
+        try:
+            result = self.run_read(
+                "MATCH (v:SchemaVersion) RETURN v.version AS version LIMIT 1", {}
+            )
+            return result[0]["version"] if result else None
+        except Exception as e:
+            logger.warning(f"Failed to read schema version: {e}")
+            return None
 
     def close(self) -> None:
         """Close the database connection."""

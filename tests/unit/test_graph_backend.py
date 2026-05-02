@@ -47,6 +47,9 @@ def test_transaction_default_warning(caplog):
         def delete_nodes_for_file(self, file_path):
             pass
 
+        def get_schema_version(self):
+            return None
+
         def close(self):
             pass
 

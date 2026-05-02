@@ -137,6 +137,21 @@ class Neo4jBackend(GraphBackend):
             logger.error(f"delete_nodes_for_file failed for {file_path}: {e}")
             raise
 
+    def get_schema_version(self) -> str | None:
+        """Get the stored schema version from the database.
+
+        Returns:
+            The schema version string, or None if not set.
+        """
+        try:
+            result = self.run_read(
+                "MATCH (v:SchemaVersion) RETURN v.version AS version LIMIT 1", {}
+            )
+            return result[0]["version"] if result else None
+        except Exception as e:
+            logger.warning(f"Failed to read schema version: {e}")
+            return None
+
     def close(self) -> None:
         """Close the database connection."""
         try:

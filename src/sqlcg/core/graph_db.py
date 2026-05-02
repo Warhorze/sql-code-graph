@@ -92,6 +92,14 @@ class GraphBackend(ABC):
         """
 
     @abstractmethod
+    def get_schema_version(self) -> str | None:
+        """Get the stored schema version from the database.
+
+        Returns:
+            The schema version string, or None if not set.
+        """
+
+    @abstractmethod
     def close(self) -> None:
         """Close the database connection."""
 
