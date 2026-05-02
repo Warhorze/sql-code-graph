@@ -199,3 +199,70 @@ date: 2026-05-02
 
   Quality: ruff/ruff-format/pyright all clean. No deviations from plan.
   Next step: architect-planner performs plan-compliance check before code review.
+
+[2026-05-02] plan-reviewer — Phase 3 compliance check + Phase 4-6 pre-flight review.
+  Status: READY FOR PHASE 4 (no blockers; 4 warnings; plan unchanged)
+
+  Phase 3 compliance (per Step 3.0–3.6 acceptance criteria):
+  - Step 3.0 (no Cypher literals in backends): PASS. Both backends import from queries.py;
+    no inline Cypher strings in delete_nodes_for_file.
+  - Step 3.1 view-resolution (view in A resolves from B): PASS. test_cross_file_view_resolution
+    covers three-file chain; assert checks no "cannot re-read" errors.
+  - Step 3.1 resolve_pass2 deleted file (returns pass-1, logs WARNING): PASS.
+    test_resolve_pass2_deleted_file: file.unlink(), assert result is parsed (identity check).
+    WARNING log in aggregator.py line 51-55 confirmed.
+  - Step 3.2 walker (only .sql, respects .sqlcgignore): PASS. test_walk_sql_files_yields_only_sql
+    and test_walk_sql_files_respects_ignore_patterns cover both conditions.
+  - Step 3.3 full index of synthetic/ produces node counts > 0: PASS.
+    test_index_synthetic_fixtures asserts files_parsed > 0 and tables_found > 0.
+  - Step 3.3 injected failure in reindex_file leaves graph unchanged (rollback): PASS.
+    test_reindex_file_rollback_on_error deletes file during reindex, asserts count_before == count_after.
+  - Step 3.3 SIGINT flushes and exits cleanly: PARTIAL. Indexer.index_repo has a
+    KeyboardInterrupt handler (line 61-64) that calls _upsert_all and re-raises. No test
+    covers this path — no test_sigint or equivalent test exists. The implementation is
+    present but unverified by test.
+  - Step 3.4 rapid saves => one reindex call: PARTIAL. test_jobs.py tests timer
+    cancellation (test_schedule_cancels_previous_timer) but does NOT verify that exactly
+    one reindex_file call occurs end-to-end. The mock_indexer.reindex_file call count is
+    never asserted. Timer is mocked out and never fires in any test.
+  - Step 3.4 two different files => two reindex calls: PARTIAL. test_different_files_get_different_timers
+    confirms two timers are created but never fires them; reindex_file call count not checked.
+  - Step 3.4 exception in _run_job => timer still removed: PASS.
+    WatchJobManager._run_job has a finally block (line 70-71) that pops the timer.
+    test_jobs.py does not exercise this path explicitly but cancel_all test confirms
+    _timers state management. Implementation correct; test coverage weak.
+  - Step 3.5 on_deleted calls db.delete_nodes_for_file: PASS.
+    test_on_deleted_with_sql_file: mock_db.delete_nodes_for_file.assert_called_once_with(sql_path).
+  - Step 3.6 dbt manifest errors logged, do not abort: PASS.
+    dbt_adapter.load_dbt_manifest wraps in try/except, logs WARNING. No test covers this
+    but the step 3.6 acceptance criterion (jaffle_shop fixture + column-level edges) is
+    MISSING — tests/fixtures/jaffle_shop/ does not exist and no test exercises it.
+
+  Phase 4-6 pre-flight:
+  - Phase 4 db init idempotency vs init_schema: WARNING — init_schema in KuzuBackend.py
+    detects existing schema by querying Repo node but never writes SCHEMA_VERSION to the
+    graph. Step 4.1 plan says "sqlcg db init writes SCHEMA_VERSION" and "sqlcg db init
+    checks stored version". There is no Repo.schema_version field in schema.cypher and no
+    write path in init_schema. The CLI db init command does not exist yet; but when it is
+    implemented, it has no mechanism to persist or read schema version. Plan is correct in
+    intent but the schema DDL and init_schema both need a schema_version field/write step
+    that is currently absent. Developer must add this during Phase 4.
+  - Phase 5 execute_cypher blocklist string-literal stripping: PASS (plan is correct).
+    The plan specifies: strip '...' and "..." with regex before checking blocklist. The
+    acceptance test requires "WHERE n.sql = 'DROP TABLE x'" to succeed. The plan's regex
+    approach is sound. No implementation exists yet — noting for implementation correctness.
+  - Phase 6 adversarial p95 exclusion: PASS (plan addresses it). Lines 773-775 explicitly
+    note that timed-out adversarial files must be excluded from p95 and measured in a
+    separate bucket. Note is present; implementation must honour it.
+  - Missing fixtures/files that Phase 4-5 depend on:
+    * tests/fixtures/jaffle_shop/ — does not exist; required for Step 3.6 acceptance and
+      Step 5 e2e MCP tests against "pre-indexed jaffle_shop".
+    * src/sqlcg/server/tools.py — does not exist (server/ has only __init__.py); all
+      Phase 5 Step 5.1–5.3 implementation targets missing.
+    * src/sqlcg/cli/commands/db.py, index.py, watch.py, find.py, analyze.py, mcp.py —
+      none exist (commands/ has only __init__.py); all Phase 4 targets missing.
+    * src/sqlcg/core/config.py — does not exist; required by multiple CLI commands.
+    These are expected pre-Phase-4 gaps, not plan errors. Flagging so developer verifies
+    creation order matches plan step ordering.
+
+  Next step: developer implements Phase 4 CLI commands.
