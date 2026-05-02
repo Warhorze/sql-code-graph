@@ -154,3 +154,48 @@ date: 2026-05-02
 
   Next step: developer adds 2 missing tests (sg_lineage failure, build_scope None->WARNING)
   then begins Phase 3 implementation.
+
+[2026-05-02] developer — Completed Phase 3 implementation (Cross-File Indexer).
+  Status: COMPLETE — All Phase 3 steps delivered with 92 total tests passing (24 new)
+  Implemented:
+  - Step 3.0: Centralize Cypher queries into queries.py (DELETE_*, STALE_VIEWS_QUERY)
+  - Step 3.1: CrossFileAggregator with two-pass resolution and hardened resolve_pass2
+    * register_pass1() builds view/table source map
+    * resolve_pass2() with file-not-found fallback + WARNING logging
+    * ParsedFile.path_str property for graph key construction
+    * Tests: cross-file view resolution, deleted file fallback
+  - Step 3.2: IndexerWalker with .sqlcgignore support
+    * walk_sql_files() generator yielding only .sql files
+    * load_ignore_spec() and is_ignored() from pathspec
+    * Tests: SQL-only filtering, pattern matching, directory traversal
+  - Step 3.3: Indexer orchestrator (main class)
+    * index_repo(): two-pass full indexing with SIGINT flush
+    * reindex_file(): transaction-aware with stale view detection
+    * _index_single_file(): timeout support via ThreadPoolExecutor
+    * _upsert_parsed_file(): full graph node/edge creation with all properties
+    * dbt_adapter.load_dbt_manifest(): stub with error handling
+    * Synthetic fixtures: base_tables.sql, views.sql, reports.sql
+    * Tests: synthetic fixture indexing, rollback verification
+  - Step 3.4: WatchJobManager for debounced file changes
+    * schedule(): per-file Timer with cancellation on reschedule
+    * _run_job(): fresh SchemaResolver per job (finding 3.3)
+    * cancel_all(): safe shutdown
+    * Tests: timer creation, cancellation, exception handling
+  - Step 3.5: SqlFileEventHandler (watchdog integration)
+    * on_modified/on_created/on_moved(): schedule reindex via job_manager
+    * on_deleted(): direct delete_nodes_for_file call
+    * _is_sql(): checks suffix + ignore patterns, handles bytes paths
+    * Tests: file type filtering, event routing, ignore pattern matching
+  - Step 3.6: dbt adapter stub (error-resilient)
+
+  Tests passing:
+  - test_cross_file_lineage.py: 2 (view resolution, deleted file fallback)
+  - test_indexer_to_graph.py: 3 (synthetic indexing, rollback, walker)
+  - test_walker.py: 4 (SQL-only, ignore patterns, traversal, empty)
+  - test_jobs.py: 5 (timer creation, cancellation, different files, exceptions)
+  - test_watcher.py: 10 (modified/created/moved/deleted, extensions, patterns)
+  - All Phase 1 & 2 tests still passing: 68 original tests
+  - Total: 92 unit + integration tests passing
+
+  Quality: ruff/ruff-format/pyright all clean. No deviations from plan.
+  Next step: architect-planner performs plan-compliance check before code review.
