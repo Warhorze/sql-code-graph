@@ -2,7 +2,7 @@
 
 agent: developer
 task: Phase 2 implementation (Parser Layer)
-status: in-progress
+status: complete — 28 new tests passing, PR ready
 date: 2026-05-02
 
 ---
@@ -49,6 +49,44 @@ date: 2026-05-02
     field requires it
   - NOTE fixed: SQLMesh fixtures missing from Step 6.1 tasks — added as explicit task
   Next step: developer starts implementation on Phase 1.
+
+[2026-05-02] developer — Completed Phase 2 implementation (Parser Layer).
+  Status: COMPLETE — All Phase 2 steps delivered with 57 total unit tests passing (28 new)
+  Implemented:
+  - Step 2.1: SchemaResolver with thread-safe Lock-based caching
+    * add_create_table extracts columns from CREATE statements
+    * add_view_sources registers view→source mappings
+    * add_dbt_manifest loads dbt project schemas
+    * add_information_schema raises NotImplementedError (v2)
+    * as_dict() returns nested {catalog: {db: {table: [cols]}}} structure
+
+  - Step 2.2: SqlParser ABC with dialect registry
+    * _classify() maps statements to kinds (SELECT/INSERT/UPDATE/DELETE/CREATE_TABLE/etc)
+    * _real_tables() extracts tables from sqlglot scopes
+    * _convert_table_expr_to_ref() handles Table/Identifier/Schema nodes
+    * _extract_column_lineage() with structured error recording (confidence=0.0 on failure)
+    * registry.py with @register(dialect) decorator and get_parser() factory
+
+  - Step 2.3: ANSI and Snowflake parsers
+    * AnsiParser: full parse_file() with scope-based table extraction
+    * Fallback table scan using find_all(Table) when scope fails
+    * SnowflakeParser: token-aware BEGIN detection (avoids comments/strings)
+    * Scripting block DML extraction with confidence=0.3 marking
+
+  - Step 2.4: BigQuery, Postgres, T-SQL parsers
+    * Each sets DIALECT and inherits AnsiParser behavior
+    * BigQueryParser: token-aware DECLARE/BEGIN detection
+    * PostgresParser: standard ANSI parsing for v1
+    * TsqlParser: standard ANSI parsing for v1
+
+  Tests passing:
+  - test_schema_resolver.py: 6 (cache, concurrency, NotImplementedError, nested structure)
+  - test_parser.py: 22 (10 ANSI + 4 Snowflake + 8 registry)
+  - All Phase 1 tests still passing: 29 original tests
+  - Total: 57 unit tests passing
+
+  Quality: ruff/pyright clean. No blocking issues.
+  Next step: architect-planner performs plan-compliance check before code review.
 
 [2026-05-02] developer — Completed Phase 1 implementation.
   Status: COMPLETE — All Phase 1 steps delivered with 29 unit tests passing
