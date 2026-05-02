@@ -8,49 +8,59 @@ Reviewer agent: architect-reviewer
 
 ## Open Questions
 
-The following questions require user input before implementation begins. They are
-blocking or near-blocking for specific design decisions.
+> **Status**: All six questions resolved — answers combine user input with patterns
+> cross-referenced from [CodeGraphContext](https://github.com/CodeGraphContext/CodeGraphContext)
+> v0.4.5, the upstream project sqlcg is modelled on.
 
-1. **Multi-dialect corpus**: When `sqlcg index` is run over a directory that
-   contains a mix of dialects (e.g. `.sql` files from both Snowflake and BigQuery),
-   what is the intended user experience? Options are: (a) require `--dialect` to
-   be a single value for the entire repo, (b) per-file dialect detection via
-   heuristics, (c) a sidecar `.sqlcgdialects` config file mapping paths to
-   dialects. The blueprint does not address this, and it directly affects the
-   `IndexerWalker` and `SchemaResolver` design.
+1. **Multi-dialect corpus** — **Resolved: single `--dialect` per invocation.**
+   `sqlcg index <dir> --dialect snowflake` applies one dialect to the whole directory.
+   Users with DDL and ETL in separate dirs can pass `--no-ddl` (or simply point only
+   at the ETL dir) to reduce surface area — DDL ingestion is opt-in, not required.
+   Mixed-dialect repos are handled by running `sqlcg index` twice against the two dirs.
+   Impact on design: `IndexerWalker` receives a single `dialect` enum; `SchemaResolver`
+   is instantiated once per run, not per file.
 
-2. **KùzuDB multi-repo isolation**: Is the graph database intended to hold a single
-   indexed repository per database file, or should one `.sqlcg/` directory hold
-   multiple repos as separate sub-graphs? The blueprint mentions `Repo` nodes but
-   does not specify whether `sqlcg index path-A` followed by `sqlcg index path-B`
-   accumulates into one graph or replaces it. This affects the `db init / reset`
-   semantics and `delete_nodes_for_file` scope.
+2. **KùzuDB multi-repo isolation** — **Resolved: additive accumulation, reuse
+   CodeGraphContext's MERGE-keyed-by-path pattern.**
+   CodeGraphContext uses `MERGE (r:Repository {path: $abs_path})` so each repo gets
+   its own node and all child nodes reference it. `sqlcg index path-A` then
+   `sqlcg index path-B` accumulates both. Selective wipe: `sqlcg db reset` clears
+   everything; `sqlcg db reset --repo <path>` removes only one repo's nodes.
+   Update the KùzuDB schema DDL to declare `path STRING PRIMARY KEY` on the `Repo`
+   node table.
 
-3. **`execute_cypher` long-term intent**: The blueprint explicitly omits
-   `execute_cypher` from v1, citing the footgun argument. However, a guarded version
-   is described in comments. Is this tool planned for v2, or permanently excluded?
-   The answer affects whether the `GraphBackend.run_read` interface needs to expose
-   parameter binding for arbitrary queries.
+3. **`execute_cypher` intent** — **Resolved: ship in v1 with read-only enforcement.**
+   User confirmed all planned features are v1, including type-safety features.
+   Reuse CodeGraphContext's blocklist pattern: strip quoted string literals first,
+   then reject queries containing any of `{CREATE, MERGE, DELETE, SET, REMOVE, DROP}`.
+   `GraphBackend.run_read` already provides the required interface; no new plumbing
+   needed. Remove the "excluded from v1" note from the blueprint.
 
-4. **Concurrency model for `sqlcg watch`**: The watcher fires `reindex_file` on each
-   file-change event. If multiple files change simultaneously (e.g. a `git pull`
-   touching 50 files), does the design intend serial re-indexing or parallel? The
-   `jobs.py` module is listed in the file tree but its contract is not specified in
-   the blueprint. Clarifying this now will determine whether `GraphBackend` needs
-   thread-safety guarantees.
+4. **Concurrency model for `sqlcg watch`** — **Resolved: per-file debounced timers,
+   same pattern as CodeGraphContext.**
+   CodeGraphContext uses one `threading.Timer` (2 s debounce) per file path in a
+   `self.timers` dict. Rapid saves cancel and restart the timer for that file;
+   different files are independent; concurrent timer expiry can overlap.
+   **This confirms finding 3.3 is real and mandatory to fix**: `SchemaResolver`
+   must not be shared across concurrent re-index calls — either use a `threading.Lock`
+   around cache mutation, or construct a fresh `SchemaResolver` per re-index job.
+   `jobs.py` contract: one `threading.Timer` per file, 2 s debounce, no global queue.
 
-5. **Target Python version**: The blueprint uses `str | None` union syntax (PEP 604)
-   throughout without specifying a minimum Python version. PEP 604 requires Python
-   3.10+. KùzuDB 0.11.3 and `sqlglot[rs]` have their own floor requirements.
-   Confirming the minimum version (recommended: 3.11+) locks `pyproject.toml`
-   `requires-python` and avoids silent CI failures on older interpreters.
+5. **Target Python version** — **Resolved: `requires-python = ">=3.12"`.**
+   User preference is latest stable. CodeGraphContext targets `>=3.10` with CI on
+   3.12; KùzuDB's own FalkorDB-lite extras require `>=3.12`. Set `>=3.12` in
+   `pyproject.toml`; CI matrix: 3.12 and 3.13 (verify KùzuDB 0.11.3 on 3.13 before
+   enabling). Drop any `sys.version_info` guards for 3.10/3.11 syntax.
 
-6. **Schema ingestion for non-dbt / non-DDL repos**: For users who have neither dbt
-   nor `CREATE TABLE` in their SQL files (e.g. a pure-DML warehouse with schema
-   stored in a data catalog), the blueprint offers `--schema-from-info-schema` via
-   CSV/Parquet but leaves `add_information_schema()` as `...`. Is this a v1
-   deliverable or deferred? If deferred, should the MCP tool responses include an
-   explicit `schema_missing` flag so Claude can prompt the user for DDL?
+6. **DDL requirement / `add_information_schema`** — **Resolved: DDL is not required
+   for the primary use case; defer `add_information_schema` to v2.**
+   For table-level lineage (the core use case), sqlglot resolves table references from
+   DML alone — DDL is not needed. Column-level lineage degrades gracefully when schema
+   is absent: `SELECT *` expands to `*` with `confidence=0.3` and `schema_required=true`
+   surfaced in the MCP response, which gives Claude enough signal to ask the user for
+   DDL if needed. `add_information_schema()` should raise `NotImplementedError` in v1
+   (finding 3.8); the `--schema-from-info-schema` CLI flag should error immediately.
+   Remove `add_information_schema` from the v1 deliverable list in the blueprint.
 
 ---
 
