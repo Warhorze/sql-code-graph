@@ -7,14 +7,14 @@ from typing import Any
 import kuzu
 
 from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.queries import (
+    DELETE_COLUMNS_FOR_FILE,
+    DELETE_FILE,
+    DELETE_QUERIES_FOR_FILE,
+    DELETE_TABLES_FOR_FILE,
+)
 from sqlcg.core.schema import (
-    NODE_COLUMN,
-    NODE_FILE,
-    NODE_QUERY,
     NODE_REPO,
-    NODE_TABLE,
-    REL_DEFINED_IN,
-    REL_HAS_COLUMN,
     SCHEMA_DDL,
 )
 from sqlcg.utils.logging import getLogger
@@ -174,37 +174,19 @@ class KuzuBackend(GraphBackend):
         """
         try:
             # Step A: Delete Column nodes for tables defined in this file
-            query_a = (
-                f"MATCH (f:{NODE_FILE} {{path: $path}})"
-                f"<-[:{REL_DEFINED_IN}]-(t:{NODE_TABLE})"
-                f"-[:{REL_HAS_COLUMN}]->(c:{NODE_COLUMN})"
-                " DETACH DELETE c"
-            )
-            self._conn.execute(query_a, {"path": file_path})
+            self._conn.execute(DELETE_COLUMNS_FOR_FILE, {"path": file_path})
             logger.debug(f"Deleted Column nodes for {file_path}")
 
             # Step B: Delete Query nodes and their edges
-            query_b = f"""
-                MATCH (f:{NODE_FILE} {{path: $path}})<-[:QUERY_DEFINED_IN]-(q:{NODE_QUERY})
-                DETACH DELETE q
-            """
-            self._conn.execute(query_b, {"path": file_path})
+            self._conn.execute(DELETE_QUERIES_FOR_FILE, {"path": file_path})
             logger.debug(f"Deleted Query nodes for {file_path}")
 
             # Step C: Delete Table nodes defined in this file
-            query_c = f"""
-                MATCH (f:{NODE_FILE} {{path: $path}})<-[:{REL_DEFINED_IN}]-(t:{NODE_TABLE})
-                DETACH DELETE t
-            """
-            self._conn.execute(query_c, {"path": file_path})
+            self._conn.execute(DELETE_TABLES_FOR_FILE, {"path": file_path})
             logger.debug(f"Deleted Table nodes for {file_path}")
 
             # Step D: Delete the File node itself
-            query_d = f"""
-                MATCH (f:{NODE_FILE} {{path: $path}})
-                DETACH DELETE f
-            """
-            self._conn.execute(query_d, {"path": file_path})
+            self._conn.execute(DELETE_FILE, {"path": file_path})
             logger.debug(f"Deleted File node for {file_path}")
 
         except Exception as e:

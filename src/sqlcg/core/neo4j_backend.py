@@ -5,6 +5,12 @@ from contextlib import contextmanager
 from typing import Any
 
 from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.queries import (
+    DELETE_COLUMNS_FOR_FILE,
+    DELETE_FILE,
+    DELETE_QUERIES_FOR_FILE,
+    DELETE_TABLES_FOR_FILE,
+)
 from sqlcg.core.schema import NODE_COLUMN, NODE_FILE, NODE_QUERY, NODE_REPO, NODE_TABLE
 from sqlcg.utils.logging import getLogger
 
@@ -119,31 +125,13 @@ class Neo4jBackend(GraphBackend):
         params = {"path": file_path}
         try:
             # Step A: Delete SqlColumn nodes for tables defined in this file
-            self._session.run(
-                f"MATCH (f:{NODE_FILE} {{path: $path}})"
-                f"<-[:DEFINED_IN]-(t:{NODE_TABLE})-[:HAS_COLUMN]->(c:{NODE_COLUMN})"
-                " DETACH DELETE c",
-                params,
-            )
-            # Step B: Delete SqlQuery nodes (Deviation 2: QUERY_DEFINED_IN not DEFINED_IN)
-            self._session.run(
-                f"MATCH (f:{NODE_FILE} {{path: $path}})"
-                f"<-[:QUERY_DEFINED_IN]-(q:{NODE_QUERY})"
-                " DETACH DELETE q",
-                params,
-            )
+            self._session.run(DELETE_COLUMNS_FOR_FILE, params)
+            # Step B: Delete SqlQuery nodes
+            self._session.run(DELETE_QUERIES_FOR_FILE, params)
             # Step C: Delete SqlTable nodes defined in this file
-            self._session.run(
-                f"MATCH (f:{NODE_FILE} {{path: $path}})"
-                f"<-[:DEFINED_IN]-(t:{NODE_TABLE})"
-                " DETACH DELETE t",
-                params,
-            )
+            self._session.run(DELETE_TABLES_FOR_FILE, params)
             # Step D: Delete the File node itself
-            self._session.run(
-                f"MATCH (f:{NODE_FILE} {{path: $path}}) DETACH DELETE f",
-                params,
-            )
+            self._session.run(DELETE_FILE, params)
             logger.debug(f"Deleted all nodes for {file_path}")
         except Exception as e:
             logger.error(f"delete_nodes_for_file failed for {file_path}: {e}")
