@@ -1,5 +1,6 @@
 """Unit tests for WatchJobManager."""
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -151,4 +152,64 @@ def test_cancel_all_clears_timers(mock_indexer, mock_db):
 
     manager.cancel_all()
 
+    assert len(manager._timers) == 0
+
+
+def test_rapid_saves_result_in_one_reindex(mock_indexer, mock_db):
+    """Test that rapid saves to same file result in exactly one reindex call."""
+    # Use real threading.Timer with very short delay (10ms)
+    # This tests the real debouncing behavior
+
+    manager = WatchJobManager(mock_indexer, mock_db, dialect=None, debounce_seconds=0.01)
+
+    # Schedule the same file twice rapidly
+    manager.schedule("test.sql")
+    manager.schedule("test.sql")
+
+    # Wait for timers to fire (should be ~10ms + some buffer)
+    time.sleep(0.05)
+
+    # Should have called reindex_file exactly once
+    # (second schedule cancelled first timer, only second fires)
+    assert mock_indexer.reindex_file.call_count == 1
+
+
+def test_different_files_both_reindexed(mock_indexer, mock_db):
+    """Test that scheduling different files results in two reindex calls."""
+    # Use real threading.Timer with very short delay
+    manager = WatchJobManager(mock_indexer, mock_db, dialect=None, debounce_seconds=0.01)
+
+    # Schedule two different files
+    manager.schedule("file_a.sql")
+    manager.schedule("file_b.sql")
+
+    # Wait for timers to fire
+    time.sleep(0.05)
+
+    # Both timers should fire, so reindex_file should be called twice
+    assert mock_indexer.reindex_file.call_count == 2
+
+    # Verify the calls were made with correct file paths
+    calls = mock_indexer.reindex_file.call_args_list
+    called_files = {str(call[0][0]) for call in calls}
+    assert called_files == {"file_a.sql", "file_b.sql"}
+
+
+def test_run_job_exception_cleans_up_timer(mock_indexer, mock_db):
+    """Test that exception in _run_job cleans up the timer entry."""
+    # Make reindex_file raise an exception
+    mock_indexer.reindex_file.side_effect = RuntimeError("Test error")
+
+    manager = WatchJobManager(mock_indexer, mock_db, dialect=None, debounce_seconds=0.01)
+
+    # Schedule a file
+    manager.schedule("test.sql")
+
+    # Timer should be in _timers before it fires
+    assert "test.sql" in manager._timers
+
+    # Wait for timer to fire (will call _run_job which raises and then cleans up)
+    time.sleep(0.05)
+
+    # Timer should have been cleaned up from _timers dict despite the exception
     assert len(manager._timers) == 0

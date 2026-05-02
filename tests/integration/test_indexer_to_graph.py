@@ -104,3 +104,41 @@ def test_walker_yields_only_sql_files(temp_db):
     assert all(f.suffix == ".sql" for f in files)
     # Should find at least the 3 synthetic files
     assert len(files) >= 3
+
+
+def test_sigint_during_index_flushes_progress(temp_db):
+    """Test that SIGINT during index flushes progress to DB."""
+    from unittest.mock import patch
+
+    fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
+    if not fixtures_path.exists():
+        pytest.skip("Synthetic fixtures not found")
+
+    indexer = Indexer()
+
+    # Mock parser.parse_file to raise KeyboardInterrupt after first file
+    call_count = [0]
+
+    def mock_parse_file(file_path, sql):
+        call_count[0] += 1
+        if call_count[0] > 1:
+            raise KeyboardInterrupt("User interrupted")
+        # Return a valid parsed file for the first call
+        from sqlcg.parsers.registry import get_parser
+
+        parser = get_parser(None, None)
+        return parser.parse_file(file_path, sql)
+
+    with patch("sqlcg.parsers.ansi_parser.SqlParser.parse_file", side_effect=mock_parse_file):
+        try:
+            indexer.index_repo(fixtures_path, dialect=None, db=temp_db, timeout_per_file=30)
+        except KeyboardInterrupt:
+            pass  # Expected
+
+    # Even with SIGINT, at least the first file should have been upserted
+    # Verify by checking node count > 0
+    result = temp_db.run_read("MATCH (n) RETURN COUNT(*) as count", {})
+    count = result[0]["count"]
+
+    # Should have at least created some nodes from the first file
+    assert count > 0
