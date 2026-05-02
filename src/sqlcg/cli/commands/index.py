@@ -5,8 +5,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from sqlcg.core.config import get_db_path
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.config import get_backend, get_db_path
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
@@ -23,6 +22,9 @@ def index_cmd(  # noqa: B008
     timeout_per_file: int = typer.Option(  # noqa: B008
         30, "--timeout-per-file", help="Timeout per file in seconds"
     ),
+    no_ddl: bool = typer.Option(  # noqa: B008
+        False, "--no-ddl", help="Skip DDL statements (not yet fully implemented)"
+    ),
     schema_from_info_schema: str | None = typer.Option(  # noqa: B008
         None, "--schema-from-info-schema", hidden=True, help="(Not yet implemented)"
     ),
@@ -32,16 +34,20 @@ def index_cmd(  # noqa: B008
         console.print("[red]--schema-from-info-schema is not yet implemented (v2)[/red]")
         raise typer.Exit(1)
 
+    # TODO: wire no_ddl through to the indexer once it supports the parameter
+    if no_ddl:
+        console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
+
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    backend = KuzuBackend(str(db_path))
-    backend.init_schema()
 
-    indexer = Indexer()
-    summary = indexer.index_repo(path, dialect, backend, dbt_manifest, timeout_per_file)
-    console.print(
-        f"[green]Indexed[/green] {summary['files_parsed']} files — "
-        f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
-        f"{summary['parse_errors']} errors"
-    )
-    backend.close()
+    with get_backend() as backend:
+        backend.init_schema()
+
+        indexer = Indexer()
+        summary = indexer.index_repo(path, dialect, backend, dbt_manifest, timeout_per_file)
+        console.print(
+            f"[green]Indexed[/green] {summary['files_parsed']} files — "
+            f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
+            f"{summary['parse_errors']} errors"
+        )

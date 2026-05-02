@@ -27,6 +27,14 @@ class GraphBackend(ABC):
     """
 
     @abstractmethod
+    def init_schema(self) -> None:
+        """Initialize the database schema if not already present.
+
+        Creates all node and relationship tables from the schema definition.
+        Idempotent: safe to call multiple times.
+        """
+
+    @abstractmethod
     def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties.
 

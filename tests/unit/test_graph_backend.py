@@ -35,6 +35,9 @@ def test_transaction_default_warning(caplog):
     class MinimalBackend(GraphBackend):
         """A minimal backend implementation."""
 
+        def init_schema(self):
+            pass
+
         def upsert_node(self, label, key, properties):
             pass
 
@@ -43,6 +46,9 @@ def test_transaction_default_warning(caplog):
 
         def run_read(self, query, params):
             return []
+
+        def run_write(self, query, params):
+            pass
 
         def delete_nodes_for_file(self, file_path):
             pass
