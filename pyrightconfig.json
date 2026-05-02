@@ -1,0 +1,6 @@
+{
+  "include": ["src"],
+  "exclude": ["src/sqlcg/core/neo4j_backend.py"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}

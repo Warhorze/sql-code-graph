@@ -19,6 +19,7 @@ def test_cli_help():
 def test_import_cli():
     """Test that we can import the CLI without errors."""
     from sqlcg.cli.main import app
+
     assert app is not None
 
 
@@ -31,6 +32,7 @@ def test_import_sqlcg():
     try:
         sys.stdout = io.StringIO()
         import sqlcg
+
         output = sys.stdout.getvalue()
         assert output == "", f"Expected no stdout output, got: {output}"
         assert hasattr(sqlcg, "__version__")

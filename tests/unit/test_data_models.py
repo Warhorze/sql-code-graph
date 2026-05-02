@@ -2,7 +2,7 @@
 
 import pytest
 
-from sqlcg.parsers import TableRef, ColumnRef, LineageEdge, QueryNode, ParsedFile
+from sqlcg.parsers import ColumnRef, LineageEdge, ParsedFile, QueryNode, TableRef
 
 
 class TestTableRef:

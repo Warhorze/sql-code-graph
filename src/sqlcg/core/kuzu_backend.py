@@ -1,28 +1,21 @@
 """KùzuDB implementation of GraphBackend."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import kuzu
 
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.schema import (
-    SCHEMA_DDL,
-    SCHEMA_VERSION,
-    NODE_FILE,
-    NODE_TABLE,
-    NODE_QUERY,
     NODE_COLUMN,
+    NODE_FILE,
+    NODE_QUERY,
     NODE_REPO,
+    NODE_TABLE,
     REL_DEFINED_IN,
     REL_HAS_COLUMN,
-    REL_SELECTS_FROM,
-    REL_INSERTS_INTO,
-    REL_DELETES_FROM,
-    REL_UPDATES,
-    REL_COLUMN_LINEAGE,
-    REL_DECLARES,
+    SCHEMA_DDL,
 )
 from sqlcg.utils.logging import getLogger
 
@@ -50,9 +43,7 @@ class KuzuBackend(GraphBackend):
         """
         # Check if Repo node table exists (first table in DDL)
         try:
-            self._conn.execute(
-                f"MATCH (n:{NODE_REPO}) RETURN COUNT(*) as count LIMIT 1"
-            )
+            self._conn.execute(f"MATCH (n:{NODE_REPO}) RETURN COUNT(*) as count LIMIT 1")
             # If we get here, the schema is already initialized
             logger.debug("Schema already initialized")
             return
@@ -83,9 +74,7 @@ class KuzuBackend(GraphBackend):
                     logger.error(f"DDL execution failed: {stmt[:50]}...: {e}")
                     raise
 
-    def upsert_node(
-        self, label: str, key: str, properties: dict[str, Any]
-    ) -> None:
+    def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties.
 
         Note: The key parameter is used for the primary key field. The actual
@@ -165,9 +154,7 @@ class KuzuBackend(GraphBackend):
         try:
             self._conn.execute(query, params)
         except Exception as e:
-            logger.error(
-                f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}"
-            )
+            logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -176,10 +163,10 @@ class KuzuBackend(GraphBackend):
             result = self._conn.execute(query, params)
             # KùzuDB returns a QueryResult that we need to convert to list of dicts
             rows = []
-            column_names = result.get_column_names()
+            column_names = result.get_column_names()  # type: ignore[union-attr]
             for row in result:
                 # Each row is a tuple-like object with column names
-                rows.append(dict(zip(column_names, row)))
+                rows.append(dict(zip(column_names, row, strict=True)))
             return rows
         except Exception as e:
             logger.error(f"run_read failed: {e}")
@@ -199,10 +186,12 @@ class KuzuBackend(GraphBackend):
         """
         try:
             # Step A: Delete Column nodes for tables defined in this file
-            query_a = f"""
-                MATCH (f:{NODE_FILE} {{path: $path}})<-[:{REL_DEFINED_IN}]-(t:{NODE_TABLE})-[:{REL_HAS_COLUMN}]->(c:{NODE_COLUMN})
-                DETACH DELETE c
-            """
+            query_a = (
+                f"MATCH (f:{NODE_FILE} {{path: $path}})"
+                f"<-[:{REL_DEFINED_IN}]-(t:{NODE_TABLE})"
+                f"-[:{REL_HAS_COLUMN}]->(c:{NODE_COLUMN})"
+                " DETACH DELETE c"
+            )
             self._conn.execute(query_a, {"path": file_path})
             logger.debug(f"Deleted Column nodes for {file_path}")
 
@@ -265,9 +254,9 @@ class KuzuBackend(GraphBackend):
             self._conn.execute("COMMIT")
             self._in_transaction = False
         except Exception:
+            self._in_transaction = False
             try:
                 self._conn.execute("ROLLBACK")
             except Exception as rollback_err:
                 logger.error(f"Rollback failed: {rollback_err}")
-            self._in_transaction = False
             raise

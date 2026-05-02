@@ -1,8 +1,9 @@
 """Abstract base class for graph database backends."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from sqlcg.utils.logging import getLogger
 
@@ -21,9 +22,7 @@ class GraphBackend(ABC):
     """
 
     @abstractmethod
-    def upsert_node(
-        self, label: str, key: str, properties: dict[str, Any]
-    ) -> None:
+    def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties.
 
         Idempotent MERGE: if the node exists, update its properties;
@@ -105,9 +104,7 @@ class GraphBackend(ABC):
             Any exception raised in the context is logged; the caller
             must decide whether to re-raise.
         """
-        logger.warning(
-            "transaction() not overridden — no rollback guarantee"
-        )
+        logger.warning("transaction() not overridden — no rollback guarantee")
         try:
             yield self
         except Exception:

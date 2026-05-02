@@ -1,17 +1,22 @@
 """Neo4j implementation of GraphBackend."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.schema import NODE_COLUMN, NODE_FILE, NODE_QUERY, NODE_REPO, NODE_TABLE
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
 
 try:
-    from neo4j import GraphDatabase
+    from neo4j import GraphDatabase as _GraphDatabase
+
+    GraphDatabase = _GraphDatabase
     NEO4J_AVAILABLE = True
 except ImportError:
+    GraphDatabase = None  # type: ignore[assignment,misc]
     NEO4J_AVAILABLE = False
 
 
@@ -43,13 +48,13 @@ class Neo4jBackend(GraphBackend):
 
         Creates indexes and constraints for efficient querying.
         """
-        # Create indexes on primary key fields
+        # Create indexes on primary key fields — uses renamed labels (Deviation 1)
         indexes = [
-            "CREATE INDEX idx_repo_path IF NOT EXISTS FOR (r:Repo) ON (r.path)",
-            "CREATE INDEX idx_file_path IF NOT EXISTS FOR (f:File) ON (f.path)",
-            "CREATE INDEX idx_table_qualified IF NOT EXISTS FOR (t:Table) ON (t.qualified)",
-            "CREATE INDEX idx_column_id IF NOT EXISTS FOR (c:Column) ON (c.id)",
-            "CREATE INDEX idx_query_id IF NOT EXISTS FOR (q:Query) ON (q.id)",
+            f"CREATE INDEX idx_repo_path IF NOT EXISTS FOR (r:{NODE_REPO}) ON (r.path)",
+            f"CREATE INDEX idx_file_path IF NOT EXISTS FOR (f:{NODE_FILE}) ON (f.path)",
+            f"CREATE INDEX idx_table_qualified IF NOT EXISTS FOR (t:{NODE_TABLE}) ON (t.qualified)",
+            f"CREATE INDEX idx_column_id IF NOT EXISTS FOR (c:{NODE_COLUMN}) ON (c.id)",
+            f"CREATE INDEX idx_query_id IF NOT EXISTS FOR (q:{NODE_QUERY}) ON (q.id)",
         ]
 
         for index_query in indexes:
@@ -59,29 +64,21 @@ class Neo4jBackend(GraphBackend):
             except Exception as e:
                 logger.warning(f"Index creation skipped: {e}")
 
-    def upsert_node(
-        self, label: str, key: str, properties: dict[str, Any]
-    ) -> None:
+    # Maps each label to its primary key field — mirrors KuzuBackend (Deviation 1)
+    _PK_FIELD: dict[str, str] = {
+        NODE_REPO: "path",
+        NODE_FILE: "path",
+        NODE_TABLE: "qualified",
+        NODE_COLUMN: "id",
+        NODE_QUERY: "id",
+    }
+
+    def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties."""
-        # Use MERGE for idempotent upsert
-        # Note: Neo4j uses {key: $key} where 'key' is the primary key field name
-        # For simplicity, we'll use 'id' as the key field
-        props_str = "{id: $key"
-        params = {"key": key}
-
-        for k, v in properties.items():
-            props_str += f", {k}: ${k}"
-            params[k] = v
-
-        props_str += "}"
-
-        query = f"MERGE (n:{label} {props_str})"
-        if properties:
-            set_parts = [f"n.{k} = ${k}" for k in properties.keys()]
-            query += f" SET {', '.join(set_parts)}"
-
+        pk_field = self._PK_FIELD.get(label, "id")
+        query = f"MERGE (n:{label} {{{pk_field}: $key}}) SET n += $props"
         try:
-            self._session.run(query, params)
+            self._session.run(query, {"key": key, "props": properties})
         except Exception as e:
             logger.error(f"upsert_node failed: {label} {key}: {e}")
             raise
@@ -96,26 +93,18 @@ class Neo4jBackend(GraphBackend):
         properties: dict[str, Any],
     ) -> None:
         """Upsert a relationship between two nodes."""
-        query = f"""
-            MATCH (src:{src_label} {{id: $src_key}})
-            MATCH (dst:{dst_label} {{id: $dst_key}})
-            MERGE (src)-[r:{rel_type}]->(dst)
-        """
-
-        params = {"src_key": src_key, "dst_key": dst_key}
-
-        if properties:
-            set_parts = [f"r.{k} = ${k}" for k in properties.keys()]
-            query += f" SET {', '.join(set_parts)}"
-            for k, v in properties.items():
-                params[k] = v
-
+        src_pk = self._PK_FIELD.get(src_label, "id")
+        dst_pk = self._PK_FIELD.get(dst_label, "id")
+        query = (
+            f"MATCH (src:{src_label} {{{src_pk}: $src_key}})"
+            f" MATCH (dst:{dst_label} {{{dst_pk}: $dst_key}})"
+            f" MERGE (src)-[r:{rel_type}]->(dst)"
+            " SET r += $props"
+        )
         try:
-            self._session.run(query, params)
+            self._session.run(query, {"src_key": src_key, "dst_key": dst_key, "props": properties})
         except Exception as e:
-            logger.error(
-                f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}"
-            )
+            logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -130,43 +119,34 @@ class Neo4jBackend(GraphBackend):
 
     def delete_nodes_for_file(self, file_path: str) -> None:
         """Delete all nodes and relationships associated with a file."""
+        params = {"path": file_path}
         try:
-            # Step A: Delete Column nodes
+            # Step A: Delete SqlColumn nodes for tables defined in this file
             self._session.run(
-                """
-                MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)-[:HAS_COLUMN]->(c:Column)
-                DETACH DELETE c
-                """,
-                {"path": file_path},
+                f"MATCH (f:{NODE_FILE} {{path: $path}})"
+                f"<-[:DEFINED_IN]-(t:{NODE_TABLE})-[:HAS_COLUMN]->(c:{NODE_COLUMN})"
+                " DETACH DELETE c",
+                params,
             )
-
-            # Step B: Delete Query nodes
+            # Step B: Delete SqlQuery nodes (Deviation 2: QUERY_DEFINED_IN not DEFINED_IN)
             self._session.run(
-                """
-                MATCH (f:File {path: $path})<-[:DEFINED_IN]-(q:Query)
-                DETACH DELETE q
-                """,
-                {"path": file_path},
+                f"MATCH (f:{NODE_FILE} {{path: $path}})"
+                f"<-[:QUERY_DEFINED_IN]-(q:{NODE_QUERY})"
+                " DETACH DELETE q",
+                params,
             )
-
-            # Step C: Delete Table nodes
+            # Step C: Delete SqlTable nodes defined in this file
             self._session.run(
-                """
-                MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
-                DETACH DELETE t
-                """,
-                {"path": file_path},
+                f"MATCH (f:{NODE_FILE} {{path: $path}})"
+                f"<-[:DEFINED_IN]-(t:{NODE_TABLE})"
+                " DETACH DELETE t",
+                params,
             )
-
-            # Step D: Delete File node
+            # Step D: Delete the File node itself
             self._session.run(
-                """
-                MATCH (f:File {path: $path})
-                DETACH DELETE f
-                """,
-                {"path": file_path},
+                f"MATCH (f:{NODE_FILE} {{path: $path}}) DETACH DELETE f",
+                params,
             )
-
             logger.debug(f"Deleted all nodes for {file_path}")
         except Exception as e:
             logger.error(f"delete_nodes_for_file failed for {file_path}: {e}")

@@ -3,7 +3,7 @@
 import pytest
 
 from sqlcg.core.kuzu_backend import KuzuBackend
-from sqlcg.core.schema import NODE_TABLE, NODE_QUERY, NODE_COLUMN, NODE_FILE, NODE_REPO
+from sqlcg.core.schema import NODE_COLUMN, NODE_FILE, NODE_QUERY, NODE_TABLE
 
 
 @pytest.fixture
@@ -59,13 +59,12 @@ class TestKuzuBackendUpsert:
         )
 
         # Query to verify the edge exists
-        result = backend.run_read(
-            f"""
-            MATCH (q:{NODE_QUERY} {{id: $src}})-[r:SELECTS_FROM]->(t:{NODE_TABLE} {{qualified: $dst}})
-            RETURN COUNT(*) as count
-            """,
-            {"src": "query1", "dst": "table1"},
+        _edge_q = (
+            f"MATCH (q:{NODE_QUERY} {{id: $src}})"
+            f"-[r:SELECTS_FROM]->(t:{NODE_TABLE} {{qualified: $dst}})"
+            " RETURN COUNT(*) as count"
         )
+        result = backend.run_read(_edge_q, {"src": "query1", "dst": "table1"})
         assert len(result) == 1
         assert result[0]["count"] == 1
 
@@ -80,13 +79,7 @@ class TestKuzuBackendUpsert:
         )
 
         # Query again to make sure still only one edge
-        result = backend.run_read(
-            f"""
-            MATCH (q:{NODE_QUERY} {{id: $src}})-[r:SELECTS_FROM]->(t:{NODE_TABLE} {{qualified: $dst}})
-            RETURN COUNT(*) as count
-            """,
-            {"src": "query1", "dst": "table1"},
-        )
+        result = backend.run_read(_edge_q, {"src": "query1", "dst": "table1"})
         assert len(result) == 1
         assert result[0]["count"] == 1
 
@@ -148,20 +141,19 @@ class TestKuzuBackendDeleteFile:
         backend.upsert_edge(NODE_QUERY, "query1", NODE_FILE, "/test.sql", "QUERY_DEFINED_IN", {})
 
         # Verify all nodes exist
-        result = backend.run_read(
-            f"MATCH (n) WHERE n.qualified = 'table1' OR n.id = 'table1.col1' OR n.id = 'query1' RETURN COUNT(*) as count",
-            {},
+        _q = (
+            "MATCH (n) WHERE n.qualified = 'table1'"
+            " OR n.id = 'table1.col1' OR n.id = 'query1'"
+            " RETURN COUNT(*) as count"
         )
+        result = backend.run_read(_q, {})
         assert result[0]["count"] == 3
 
         # Delete nodes for the file
         backend.delete_nodes_for_file("/test.sql")
 
         # Verify all nodes are gone
-        result = backend.run_read(
-            f"MATCH (n) WHERE n.qualified = 'table1' OR n.id = 'table1.col1' OR n.id = 'query1' RETURN COUNT(*) as count",
-            {},
-        )
+        result = backend.run_read(_q, {})
         assert result[0]["count"] == 0
 
     def test_delete_nodes_for_file_cleans_columns(self, backend):
@@ -179,16 +171,12 @@ class TestKuzuBackendDeleteFile:
         backend.upsert_edge(NODE_TABLE, "table1", NODE_COLUMN, "table1.col2", "HAS_COLUMN", {})
 
         # Verify columns exist
-        result = backend.run_read(
-            f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {}
-        )
+        result = backend.run_read(f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {})
         assert result[0]["count"] == 2
 
         # Delete the file
         backend.delete_nodes_for_file("/test.sql")
 
         # Verify columns are deleted
-        result = backend.run_read(
-            f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {}
-        )
+        result = backend.run_read(f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {})
         assert result[0]["count"] == 0

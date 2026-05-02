@@ -9,6 +9,7 @@ app = typer.Typer()
 def version() -> None:
     """Show version."""
     from sqlcg import __version__
+
     typer.echo(f"sqlcg version {__version__}")
 
 
