@@ -202,14 +202,14 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     `conn.execute()` call. Issue each of the four Cypher statements as a separate
     `self._conn.execute(...)` call within the active transaction:
     ```cypher
-    -- Step A: delete Column nodes for tables defined in this file
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)-[:HAS_COLUMN]->(c:Column)
+    -- Step A: delete SqlColumn nodes for tables defined in this file (Deviation 1: SqlTable/SqlColumn labels)
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn)
     DETACH DELETE c;
-    -- Step B: delete Query nodes and all their edges
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(q:Query)
+    -- Step B: delete SqlQuery nodes and their edges (Deviation 2: QUERY_DEFINED_IN relationship)
+    MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery)
     DETACH DELETE q;
-    -- Step C: delete Table nodes defined in this file (re-inserted on re-parse)
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
+    -- Step C: delete SqlTable nodes defined in this file (re-inserted on re-parse)
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
     DETACH DELETE t;
     -- Step D: delete the File node itself
     MATCH (f:File {path: $path})
@@ -354,6 +354,12 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
   - `test_parser.py`: failed `sg_lineage` call appends to `ParsedFile.errors` and emits
     a `confidence=0.0` edge (not a silent skip)
   - `test_parser.py`: `build_scope` returning `None` triggers fallback and logs a WARNING
+  - **COMPLIANCE NOTE (Phase 2)**: The `_extract_column_lineage` error-recording path and the
+    `build_scope None → WARNING` path are implemented in `base.py` but are NOT covered by
+    any test in the current 57-test suite. These two criteria must be added as explicit tests
+    before Phase 3 begins. Suggested test locations: `tests/unit/test_parser.py` (mock
+    `sg_lineage` to raise; mock `build_scope` to return None) or a dedicated
+    `tests/unit/test_lineage_extractor.py` as named in the Test Strategy section.
 
 **Step 2.3 — Snowflake parser**
 
@@ -464,10 +470,13 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     blueprint §7):
     ```python
     STALE_VIEWS_QUERY = """
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
-      <-[:SELECTS_FROM]-(q:Query)-[:DECLARES]->(v:Table {kind: 'VIEW'})
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
+      <-[:SELECTS_FROM]-(q:SqlQuery)-[:DECLARES]->(v:SqlTable {kind: 'VIEW'})
     RETURN DISTINCT v.qualified AS view_name
     """
+    # NOTE: Uses SqlTable/SqlQuery labels (Deviation 1). DEFINED_IN is Table→File;
+    # QUERY_DEFINED_IN is Query→File. This query traverses t→File (DEFINED_IN) and
+    # q→t (SELECTS_FROM), so it does NOT use QUERY_DEFINED_IN — correct as written.
     ```
     Implementation:
     ```python
