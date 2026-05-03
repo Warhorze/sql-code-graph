@@ -13,9 +13,6 @@ from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
 
-# Create FastMCP instance at module scope so tools.py can import and register with it
-mcp = FastMCP("SQL Code Graph")
-
 
 def _configure_mcp_logging() -> None:
     """Redirect sys.stdout to sys.stderr to protect MCP protocol.
@@ -25,6 +22,13 @@ def _configure_mcp_logging() -> None:
     mcp.run() and before any code that might print to stdout.
     """
     sys.stdout = sys.stderr
+
+
+# Protect stdout before importing FastMCP (which may emit output during import)
+_configure_mcp_logging()
+
+# Create FastMCP instance at module scope so tools.py can import and register with it
+mcp = FastMCP("SQL Code Graph")
 
 
 def main(db_path: str | None = None) -> None:
@@ -37,8 +41,6 @@ def main(db_path: str | None = None) -> None:
     Raises:
         RuntimeError: If tools fail to initialize or FastMCP server fails.
     """
-    _configure_mcp_logging()
-
     # Import tools module to trigger tool registration via @mcp.tool() decorators
     import sqlcg.server.tools
 
