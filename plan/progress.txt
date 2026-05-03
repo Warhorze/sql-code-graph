@@ -493,3 +493,68 @@ date: 2026-05-02
 
   Next step: developer implements Phase 5 (server.py, exceptions.py, tools.py) following
   the step ordering above. Fix db reset close-before-rmtree before starting Phase 5.
+
+[2026-05-03] developer — Completed Phase 5 implementation (MCP Server).
+  Status: COMPLETE — All Phase 5 steps delivered with 129 tests passing (27 new)
+  Implemented:
+  - Step 5.1: exceptions.py with NotIndexedError and InvalidColumnRefError
+    * Both exceptions properly documented and raised from tools
+    * server.py already complete with _configure_mcp_logging() and mcp instance
+    * sys.stdout redirection protection verified by test_server.py
+
+  - Step 5.2: tools.py with all 7 named MCP tools
+    * index_repo(): calls Indexer.index_repo, returns dict with metrics
+    * trace_column_lineage(): BFS traversal of COLUMN_LINEAGE edges (upstream)
+    * find_table_usages(): SELECTS_FROM relationship queries
+    * get_downstream_dependencies(): BFS traversal forward on COLUMN_LINEAGE
+    * get_upstream_dependencies(): BFS traversal backward on COLUMN_LINEAGE
+    * search_sql_pattern(): KùzuDB contains() function for substring matching
+    * list_dialects_and_repos(): joins Repo to File nodes, collects dialects
+    * All tools decorated with @mcp.tool() and use module-level _backend singleton
+    * NotIndexedError raised for unindexed graph (all tools except index_repo)
+    * Each tool has docstring with Args, Returns, Raises sections
+
+  - Step 5.2: models.py with all Pydantic return types
+    * LineageResult, LineageNode for trace_column_lineage
+    * TableUsageResult, TableUsage for find_table_usages
+    * DependencyResult, DependencyNode for dependency traversals
+    * SqlPatternResult, SqlPatternMatch for search_sql_pattern
+    * DialectRepoResult, DialectRepo for list_dialects_and_repos
+
+  - Step 5.3: execute_cypher tool
+    * Read-only enforcement: strips string literals, checks blocklist
+    * Blocklist: CREATE, MERGE, DELETE, SET, REMOVE, DROP, TRUNCATE
+    * Auto-LIMIT: appends "LIMIT 500" if missing
+    * String-literal stripping prevents false positives (e.g., 'DROP TABLE' in SQL)
+    * Handles existing LIMIT without duplication
+
+  Tests passing:
+  - test_server.py: 1 (stdout redirect verification)
+  - test_mcp_tools.py: 26 (index, lineage, usages, dependencies, patterns, dialects, execute)
+    * index_repo: path validation, summary dict return
+    * trace_column_lineage: NotIndexedError, InvalidColumnRefError, BFS result
+    * find_table_usages: NotIndexedError, result structure
+    * get_downstream_dependencies: NotIndexedError, BFS result
+    * get_upstream_dependencies: NotIndexedError, BFS result
+    * search_sql_pattern: NotIndexedError, pattern matching
+    * list_dialects_and_repos: NotIndexedError, dialect aggregation
+    * execute_cypher: blocklist (CREATE/MERGE/DELETE/SET/DROP/TRUNCATE),
+                      string-literal bypass, auto-LIMIT, existing LIMIT
+  - All 102 previous tests still passing
+  - Total: 129 tests passing (1 skipped)
+
+  Quality: ruff check/format/pyright all clean. No blocking issues.
+
+  Deviations from plan: None. All requirements met exactly as specified.
+
+  Implementation Notes:
+  - Module-level _backend singleton implements KùzuDB single-writer model
+  - init_backend() called from server.main() before mcp.run()
+  - _get_backend() raises RuntimeError if backend not initialized
+  - _assert_indexed() helper avoids code duplication across tools
+  - BFS implementation uses deque for efficiency (vs variable-length Cypher paths)
+  - Column reference parsing handles both "table.col" and "cat.db.table.col" formats
+  - Cypher uses contains() function for substring matching (not CONTAINS operator)
+  - File nodes joined to Repo nodes via BELONGS_TO relationships
+
+  Next step: architect-planner performs plan-compliance check before code review.
