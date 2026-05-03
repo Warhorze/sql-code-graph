@@ -913,7 +913,7 @@ Snowflake DWH with two SQL layers that Phase 7 targets:
 - Note: most DDL is in `.xml` Liquibase changelogs; only the handful of plain `.sql`
   files will be indexed (IndexerWalker filters by `.sql` suffix)
 
-**ETL layer** (`etl/`): **648 `.sql` files** — the interesting half of the corpus.
+**ETL layer** (`etl/`): **648 (more) `.sql` files** — the interesting half of the corpus.
 These are the actual data movement scripts: multi-step Snowflake scripting blocks,
 `CREATE OR REPLACE TEMP TABLE ... AS SELECT`, `INSERT INTO ... SELECT FROM temp`,
 variable assignments (`SET warehousename = ...`), `USE SCHEMA/WAREHOUSE` directives.
@@ -924,7 +924,9 @@ Subdirectories:
 - `etl/pdi/template/adobe_initial_load/`, `voorraad_initial_load/`: specialised loads
 - `etl/sql/`: comparison and authorisation SQL
 - `etl/sql/da/`: DA-layer transformation SQL
-- `etl/sql/ba/`: BA-layer transformation SQL
+- `etl/sql/dim/`: BA-layer transformation SQL
+- `etl/sql/fact/`: BA-layer transformation SQL
+-  `etl/sql/int/`: DA-BA interface layer transformation SQL
 All SQL in both layers uses the Snowflake dialect.
 
 ---

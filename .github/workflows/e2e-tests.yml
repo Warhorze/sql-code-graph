@@ -1,0 +1,12 @@
+name: E2E Tests
+on: [push, pull_request]
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install dependencies
+        run: uv sync --all-extras
+      - name: Run E2E tests
+        run: uv run pytest tests/e2e -v --tb=short --ignore=tests/e2e/test_dwh_e2e.py
