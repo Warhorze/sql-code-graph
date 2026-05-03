@@ -558,3 +558,23 @@ date: 2026-05-03
   - File nodes joined to Repo nodes via BELONGS_TO relationships
 
   Next step: architect-planner performs plan-compliance check before code review.
+
+
+[2026-05-03] architect-reviewer — ETL lineage gap analysis (Q&A response).
+  Summary: Answered why ETL is excluded from sqlcg scope. Key findings:
+  - ETL is not named in Non-Goals — it is excluded by omission, not deliberate design.
+  - INSERT INTO...SELECT and CTAS are fully in scope. COPY INTO has partial handling
+    (STAGE node, no column lineage). Stored procedures and scripting blocks fall back
+    to regex DML extraction with confidence=0.3, zero column lineage.
+  - Intra-file multi-step temp table chains are partially solvable via the existing
+    SchemaResolver DDL sniffer + DataHub SqlParsingAggregator session context, but
+    this path is unmeasured — no ETL fixture in the benchmark suite.
+  - Cross-session and COPY INTO column mapping are fundamental static-analysis limits.
+  - dbt adapter provides schema enrichment, not DAG lineage.
+  - Phase 7 DWH report will silently show zero lineage at the ETL-to-DDL boundary
+    unless explicitly noted in docs/DWH_PARSE_REPORT.md.
+  Added: Section 6 "ETL Lineage Gap" in ARCHITECTURE_REVIEW.md (previous section 6
+  renumbered to section 7).
+  Recommendation: add tests/fixtures/synthetic/etl_chain.sql to measure intra-file
+  temp table chain resolution before Phase 6 benchmarks are finalised.
+  Next step: idle, available for architect-planner Q&A.
