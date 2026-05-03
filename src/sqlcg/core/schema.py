@@ -16,6 +16,7 @@ class NodeLabel(StrEnum):
 
 
 class RelType(StrEnum):
+    BELONGS_TO = "BELONGS_TO"
     DEFINED_IN = "DEFINED_IN"
     QUERY_DEFINED_IN = "QUERY_DEFINED_IN"
     HAS_COLUMN = "HAS_COLUMN"

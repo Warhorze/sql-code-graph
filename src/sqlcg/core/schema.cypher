@@ -45,6 +45,11 @@ CREATE NODE TABLE SqlQuery (
     parsing_mode STRING
 );
 
+-- File -> Repo: file belongs to this repository
+CREATE REL TABLE BELONGS_TO (
+    FROM File TO Repo
+);
+
 -- File -> Table: table is defined in this file
 CREATE REL TABLE DEFINED_IN (
     FROM SqlTable TO File

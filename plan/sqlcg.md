@@ -895,6 +895,139 @@ and confidence score documented in blueprint §8.2.
 
 ---
 
+### Phase 7 — DWH End-to-End Validation (Days 31–33)
+
+**Context**
+
+The DWH repository lives at `/home/ignwrad/Projects/dwh`. It is a real production
+Snowflake DWH with:
+- `ddl/changelogs/BA-TABLES/`: ~121 Snowflake `CREATE TABLE` DDL files (primary table
+  definitions; naming convention `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
+- `ddl/changelogs/BA-VIEWS/`: view definitions (`WTDA_ARTIKEL.sql`,
+  `WTFV_TRANSACTIES_UURLIJKS.sql`, `WVFA_RFM_CLASSIFICATIE.sql`, etc.)
+- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views (`BA_WTDH_WERKNEMER.sql`,
+  `BA_WTFE_WERKNEMER_UREN.sql`, `BA_METADATA.sql`, etc.)
+- `ddl/semtex_views.sql`: top-level view bundle
+- `sqlmesh/`: directory present but empty as of Phase 7 authoring
+- `.sqlfluff` at repo root configuring Snowflake dialect
+
+All SQL in `ddl/` uses the Snowflake dialect. No SQLMesh model files are present
+in the scanned directories; Phase 7 targets `ddl/` only.
+
+---
+
+**Step 7.1 — Index the DWH DDL corpus**
+
+- Files affected: no source files; adds `tests/e2e/test_dwh_e2e.py`
+- Tasks:
+  - Run `sqlcg db init` against a temporary KùzuDB path (isolated from the default
+    `~/.sqlcg/graph.db`)
+  - Run `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake` against the
+    temporary database, capturing stdout/stderr
+  - Parse the summary output: `files_parsed`, `parse_errors`, `tables_found`,
+    `lineage_edges_created`
+  - Assert parse success rate: `(files_parsed - parse_errors) / files_parsed >= 0.80`
+  - Assert `tables_found > 0` and the process exits 0
+  - If parse success rate falls below 80%, log each error file path and error message
+    to a report file (`tests/e2e/dwh_parse_report.txt`) but do NOT fail the test —
+    fail only if success rate < 80%
+  - Note: the `ddl/changelogs/` directory contains both `.sql` files and `.xml`
+    changelog manifests; `IndexerWalker` must skip `.xml` files (it already filters
+    by `.sql` suffix — verify this in the test by asserting `files_parsed` matches
+    the count of `.sql` files under `ddl/`, not total files)
+- Acceptance:
+  - `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake` exits 0
+  - Parse success rate >= 80%
+  - `tables_found` includes at least: `WTDA_ARTIKEL`, `WTDH_KLANT`, `WTFA_KASSATRANSACTIE`,
+    `WTFE_BIJVERKOOP_MATRIX` (four tables known to have DDL files in BA-TABLES)
+
+**Step 7.2 — find and analyze against known DWH tables**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py` (continued from 7.1)
+- Tasks:
+  - Using the indexed DWH graph from Step 7.1 (same temporary database):
+  - `sqlcg find table WTDA_ARTIKEL`: assert exit 0 and output contains "WTDA_ARTIKEL"
+  - `sqlcg find table WTDH_KLANT`: assert exit 0 and output contains "WTDH_KLANT"
+  - `sqlcg find table WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 (view from BA-VIEWS)
+  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0 (may return empty if no
+    downstream edges exist — accept empty result, do not require non-empty)
+  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0; if the view
+    SELECT references WTFA_KASSATRANSACTIE or similar, assert non-empty result
+  - `sqlcg analyze unused`: assert exit 0 (may return tables with no inbound lineage)
+  - All assertions are exit-code + output-format checks, not specific row-count checks,
+    because the exact lineage extracted depends on Snowflake-dialect parse quality
+- Acceptance:
+  - All six commands exit 0
+  - `find table WTDA_ARTIKEL` returns at least one row
+  - `find table WTDH_KLANT` returns at least one row
+  - `analyze downstream WTDA_ARTIKEL` does not crash
+
+**Step 7.3 — MCP tools against the DWH index**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py` (continued), requires Phase 5 complete
+- Tasks:
+  - Using the indexed DWH graph from Step 7.1:
+  - Call `trace_column_lineage` MCP tool with table `WTDA_ARTIKEL` and any column
+    that appears in `WTDA_ARTIKEL.sql`; assert response is a valid Pydantic model
+    (no exception)
+  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is a list
+    (may be empty if no cross-file references resolved)
+  - Call `list_dialects_and_repos`; assert response includes dialect "snowflake" and
+    at least one repo entry pointing to the DWH `ddl/` path
+  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5")`; assert returns
+    a list of length <= 5 containing at least one of the known table names
+  - Call `mcp start` via subprocess in a subprocess, assert process starts without
+    immediately exiting with non-zero code (use a 2-second timeout: if the process is
+    still running after 2 seconds, it passes; terminate it after the check)
+- Acceptance:
+  - `trace_column_lineage` on a known DWH table does not raise an exception
+  - `find_table_usages("WTDH_KLANT")` returns without error
+  - `list_dialects_and_repos` includes snowflake dialect
+  - `execute_cypher` returns the correct result shape
+  - `mcp start` subprocess is alive after 2 seconds
+
+**Step 7.4 — Parse quality report**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py`, `docs/DWH_PARSE_REPORT.md`
+- Tasks:
+  - After running the full index in Step 7.1, emit a structured parse quality report
+    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored):
+    - Total files, parsed, errored, success rate
+    - List of errored files with error category (timeout, parse_failed, exception)
+    - Table count, view count, lineage edge count
+    - Distribution of `parsing_mode` values across all indexed queries
+  - This report is a diagnostic artifact, not a test gate. It is committed alongside
+    the Phase 7 e2e test run output.
+  - The report generation should be a pytest fixture with `autouse=False` and a
+    `--dwh-report` flag so it only runs when explicitly requested (not in CI by default,
+    as the DWH path is not available in CI)
+- Acceptance:
+  - `pytest tests/e2e/test_dwh_e2e.py --dwh-report` generates `docs/DWH_PARSE_REPORT.md`
+  - Report contains all four required sections (totals, errors, counts, parsing_mode dist.)
+
+---
+
+**Phase 7 pre-conditions**
+
+- Phase 5 (MCP Server) must be complete before Step 7.3 can run
+- Phase 4 db reset close-before-rmtree fix must be in place (temporary database setup
+  uses context manager pattern that depends on correct close() ordering)
+- The DWH repo at `/home/ignwrad/Projects/dwh` must be accessible from the test runner;
+  Phase 7 tests are explicitly local-only (not CI-runnable) and must be skipped
+  automatically when `SQLCG_DWH_PATH` env var is not set
+
+**Phase 7 known risks**
+
+| Risk | Mitigation |
+|---|---|
+| Snowflake-specific DDL syntax (CLONE, DYNAMIC TABLE, SECURE VIEW) causes parse failures | Accept in parse report; do not raise success rate gate above 80% for initial run |
+| `ddl/changelogs/*.xml` changelog manifests mixed with `.sql` files | IndexerWalker already filters by `.sql` suffix; assert in test that xml files are not counted |
+| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` only; sqlmesh validation deferred to a future phase if models are added |
+| DWH path not available in CI | Guard all Phase 7 tests with `pytest.mark.skipif(not Path(DWH_PATH).exists(), ...)` |
+| KùzuDB single-writer lock conflicts if tests run in parallel | Use a per-test-session tmp_path for the DWH index database; never share with other test sessions |
+
+---
+
 ## Rollout Notes
 
 This is a greenfield project with no existing users; no migration or rollback plan is

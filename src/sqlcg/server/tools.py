@@ -1,0 +1,517 @@
+"""MCP tools for SQL code graph queries and indexing."""
+
+import re
+from collections import deque
+from pathlib import Path
+
+from sqlcg.core.config import get_db_path
+from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.indexer.indexer import Indexer
+from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
+from sqlcg.server.models import (
+    DependencyNode,
+    DependencyResult,
+    DialectRepo,
+    DialectRepoResult,
+    LineageNode,
+    LineageResult,
+    SqlPatternMatch,
+    SqlPatternResult,
+    TableUsage,
+    TableUsageResult,
+)
+from sqlcg.server.server import mcp  # noqa: F401
+from sqlcg.utils.logging import getLogger
+
+logger = getLogger(__name__)
+
+# Module-level singleton backend (KùzuDB single-writer model)
+_backend: GraphBackend | None = None
+
+
+def init_backend(db_path: str | None = None) -> None:
+    """Initialize the module-level backend singleton.
+
+    Args:
+        db_path: Path to KùzuDB database. If None, uses get_db_path().
+    """
+    global _backend
+    path = db_path or str(get_db_path())
+    _backend = KuzuBackend(path)
+    _backend.init_schema()
+    logger.debug(f"Backend initialized: {path}")
+
+
+def _get_backend() -> GraphBackend:
+    """Get the initialized backend.
+
+    Raises:
+        RuntimeError: If backend not initialized via init_backend().
+    """
+    if _backend is None:
+        raise RuntimeError("Backend not initialized. Call init_backend() before using tools.")
+    return _backend
+
+
+def _assert_indexed(db: GraphBackend) -> None:
+    """Check that the graph has indexed repos.
+
+    Args:
+        db: GraphBackend instance
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
+    if not rows or rows[0]["n"] == 0:
+        raise NotIndexedError("No repos have been indexed. Run `sqlcg index <path>` first.")
+
+
+def _parse_column_ref(col_ref: str) -> tuple[str, str]:
+    """Parse column reference "table.column" or "catalog.db.table.column".
+
+    Args:
+        col_ref: Column reference string
+
+    Returns:
+        Tuple of (table_id, column_name)
+
+    Raises:
+        InvalidColumnRefError: If format is invalid
+    """
+    parts = col_ref.split(".")
+    if len(parts) < 2:
+        raise InvalidColumnRefError(
+            f"Invalid column reference: {col_ref} (expected 'table.column' or "
+            f"'catalog.db.table.column')"
+        )
+    # Last part is the column name, everything before is the table id
+    column_name = parts[-1]
+    table_id = ".".join(parts[:-1])
+    return table_id, column_name
+
+
+@mcp.tool()
+def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
+    """Index a repository of SQL files.
+
+    Parses SQL files, extracts table and column definitions, and builds
+    lineage edges. Results are persisted to the graph database.
+
+    Args:
+        repo_path: Root directory path to index
+        dialect: SQL dialect (ansi, snowflake, bigquery, postgres, tsql)
+
+    Returns:
+        Dict with keys: files_parsed, parse_errors, tables_found, lineage_edges_created
+    """
+    db = _get_backend()
+    indexer = Indexer()
+    path = Path(repo_path).resolve()
+    if not path.exists():
+        raise ValueError(f"Repository path does not exist: {repo_path}")
+    if not path.is_dir():
+        raise ValueError(f"Repository path is not a directory: {repo_path}")
+
+    # Ensure the Repo node exists for this repository
+    from sqlcg.core.schema import NodeLabel, RelType
+
+    abs_path = str(path)
+    db.upsert_node(
+        NodeLabel.REPO,
+        abs_path,
+        {
+            "path": abs_path,
+            "name": path.name,
+        },
+    )
+
+    # Index the repository (with absolute path)
+    result = indexer.index_repo(path, dialect, db)
+
+    # Create BELONGS_TO relationships from File nodes to Repo node
+    # Query for all File nodes in this repo and link them to the Repo
+    files_query = """
+    MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix
+    RETURN f.path AS path
+    """
+    repo_prefix = abs_path.rstrip("/") + "/"
+    file_rows = db.run_read(files_query, {"repo_prefix": repo_prefix})
+    for row in file_rows:
+        db.upsert_edge(
+            NodeLabel.FILE,
+            row["path"],
+            NodeLabel.REPO,
+            abs_path,
+            RelType.BELONGS_TO,
+            {},
+        )
+
+    logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
+    return result
+
+
+@mcp.tool()
+def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
+    """Trace upstream lineage of a column.
+
+    Traverses COLUMN_LINEAGE edges backward up to max_depth levels.
+
+    Args:
+        table_col: Column reference in format "table.column"
+                   or "catalog.db.table.column"
+        max_depth: Maximum number of hops to traverse
+
+    Returns:
+        LineageResult with list of upstream column nodes
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+        InvalidColumnRefError: If column reference format is invalid
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    try:
+        table_id, col_name = _parse_column_ref(table_col)
+    except InvalidColumnRefError:
+        raise
+
+    # Construct the full column id
+    col_id = f"{table_id}.{col_name}"
+
+    lineage: list[LineageNode] = []
+    visited: set[str] = set()
+    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+
+    while queue:
+        current_id, depth = queue.popleft()
+
+        if current_id in visited or depth > max_depth:
+            continue
+
+        visited.add(current_id)
+
+        # Query for upstream columns (reverse direction)
+        rows = db.run_read(
+            """
+            MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+            RETURN src.id AS id, src.col_name AS col_name
+            """,
+            {"id": current_id},
+        )
+
+        for row in rows:
+            node_id = row["id"]
+            if node_id not in visited:
+                lineage.append(
+                    LineageNode(
+                        name=row.get("col_name", ""),
+                        kind="column",
+                        file=None,
+                        confidence=None,
+                    )
+                )
+                queue.append((node_id, depth + 1))
+
+    return LineageResult(column=table_col, lineage=lineage)
+
+
+@mcp.tool()
+def find_table_usages(table_name: str) -> TableUsageResult:
+    """Find all queries that use a given table.
+
+    Searches for SELECTS_FROM relationships pointing to the table.
+
+    Args:
+        table_name: Table name to search for
+
+    Returns:
+        TableUsageResult with list of queries using this table
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    rows = db.run_read(
+        """
+        MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
+        RETURN f.path AS file, q.sql AS sql, q.kind AS kind
+        """,
+        {"name": table_name},
+    )
+
+    usages: list[TableUsage] = []
+    for row in rows:
+        usages.append(
+            TableUsage(
+                query_file=row["file"],
+                sql=row.get("sql"),
+                kind=row.get("kind"),
+            )
+        )
+
+    return TableUsageResult(table=table_name, usages=usages)
+
+
+@mcp.tool()
+def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+    """Find all downstream dependencies of a column.
+
+    Traverses COLUMN_LINEAGE edges forward to find columns that depend on this one.
+
+    Args:
+        table_col: Column reference in format "table.column"
+                   or "catalog.db.table.column"
+        max_depth: Maximum number of hops to traverse
+
+    Returns:
+        DependencyResult with list of downstream column nodes
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+        InvalidColumnRefError: If column reference format is invalid
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    try:
+        table_id, col_name = _parse_column_ref(table_col)
+    except InvalidColumnRefError:
+        raise
+
+    # Construct the full column id
+    col_id = f"{table_id}.{col_name}"
+
+    nodes: list[DependencyNode] = []
+    visited: set[str] = set()
+    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+
+    while queue:
+        current_id, depth = queue.popleft()
+
+        if current_id in visited or depth > max_depth:
+            continue
+
+        visited.add(current_id)
+
+        # Query for downstream columns (forward direction)
+        rows = db.run_read(
+            """
+            MATCH (src:SqlColumn {id: $id})-[:COLUMN_LINEAGE]->(dst:SqlColumn)
+            RETURN dst.id AS id, dst.col_name AS col_name
+            """,
+            {"id": current_id},
+        )
+
+        for row in rows:
+            node_id = row["id"]
+            if node_id not in visited:
+                nodes.append(
+                    DependencyNode(
+                        name=row.get("col_name", ""),
+                        kind="column",
+                    )
+                )
+                queue.append((node_id, depth + 1))
+
+    return DependencyResult(root=table_col, nodes=nodes)
+
+
+@mcp.tool()
+def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+    """Find all upstream dependencies of a column.
+
+    Traverses COLUMN_LINEAGE edges backward to find columns this one depends on.
+
+    Args:
+        table_col: Column reference in format "table.column"
+                   or "catalog.db.table.column"
+        max_depth: Maximum number of hops to traverse
+
+    Returns:
+        DependencyResult with list of upstream column nodes
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+        InvalidColumnRefError: If column reference format is invalid
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    try:
+        table_id, col_name = _parse_column_ref(table_col)
+    except InvalidColumnRefError:
+        raise
+
+    # Construct the full column id
+    col_id = f"{table_id}.{col_name}"
+
+    nodes: list[DependencyNode] = []
+    visited: set[str] = set()
+    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+
+    while queue:
+        current_id, depth = queue.popleft()
+
+        if current_id in visited or depth > max_depth:
+            continue
+
+        visited.add(current_id)
+
+        # Query for upstream columns (reverse direction)
+        rows = db.run_read(
+            """
+            MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+            RETURN src.id AS id, src.col_name AS col_name
+            """,
+            {"id": current_id},
+        )
+
+        for row in rows:
+            node_id = row["id"]
+            if node_id not in visited:
+                nodes.append(
+                    DependencyNode(
+                        name=row.get("col_name", ""),
+                        kind="column",
+                    )
+                )
+                queue.append((node_id, depth + 1))
+
+    return DependencyResult(root=table_col, nodes=nodes)
+
+
+@mcp.tool()
+def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
+    """Search for SQL patterns in indexed queries.
+
+    Uses substring matching on the query SQL text.
+
+    Args:
+        query: Pattern string to search for
+        limit: Maximum number of results (default 20)
+
+    Returns:
+        SqlPatternResult with list of matching queries
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    rows = db.run_read(
+        """
+        MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
+        WHERE contains(q.sql, $query)
+        RETURN f.path AS file, q.sql AS sql, q.kind AS kind
+        LIMIT $limit
+        """,
+        {"query": query, "limit": limit},
+    )
+
+    matches: list[SqlPatternMatch] = []
+    for row in rows:
+        matches.append(
+            SqlPatternMatch(
+                file=row["file"],
+                sql=row.get("sql", ""),
+                kind=row.get("kind"),
+            )
+        )
+
+    return SqlPatternResult(pattern=query, matches=matches)
+
+
+@mcp.tool()
+def list_dialects_and_repos() -> DialectRepoResult:
+    """List all indexed repositories and their SQL dialects.
+
+    Returns:
+        DialectRepoResult with list of repositories and their dialects
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    db = _get_backend()
+    _assert_indexed(db)
+
+    rows = db.run_read(
+        """
+        MATCH (r:Repo)<-[:BELONGS_TO]-(f:File)
+        RETURN r.path AS path, r.name AS name, collect(DISTINCT f.dialect) AS dialects
+        """,
+        {},
+    )
+
+    repos: list[DialectRepo] = []
+    for row in rows:
+        repos.append(
+            DialectRepo(
+                path=row["path"],
+                name=row.get("name"),
+                dialects=row.get("dialects", []),
+            )
+        )
+
+    return DialectRepoResult(repos=repos)
+
+
+@mcp.tool()
+def execute_cypher(query: str) -> list[dict]:
+    """Execute a read-only Cypher query against the graph.
+
+    This tool allows direct Cypher queries for advanced users. It enforces
+    read-only mode by stripping quoted literals and checking for write
+    operation keywords. A LIMIT clause is automatically appended if missing.
+
+    **Important Security Note**: This tool strips single and double-quoted
+    string literals before checking for write operations. String literals
+    containing mutation keywords (e.g., 'DROP TABLE') will NOT trigger the
+    write-operation blocker. This is by design to allow querying SQL text
+    that contains such keywords.
+
+    Args:
+        query: Cypher query string (read-only)
+
+    Returns:
+        List of result dictionaries from the query
+
+    Raises:
+        ValueError: If the query contains write operations (CREATE, MERGE,
+                   DELETE, SET, REMOVE, DROP, TRUNCATE)
+    """
+    db = _get_backend()
+
+    # Strip quoted string literals before blocklist check
+    # This prevents mutation commands hiding inside strings from triggering the blocker
+    stripped = re.sub(r"'[^']*'", "", query)
+    stripped = re.sub(r'"[^"]*"', "", stripped)
+
+    # Check for write operations (case-insensitive)
+    if re.search(
+        r"\b(CREATE|MERGE|DELETE|SET|REMOVE|DROP|TRUNCATE)\b",
+        stripped,
+        re.IGNORECASE,
+    ):
+        raise ValueError(
+            "Write operations are not permitted via execute_cypher. "
+            "Use the CLI or dedicated tools instead."
+        )
+
+    # Auto-append LIMIT if missing
+    q = query.rstrip()
+    if q.endswith(";"):
+        q = q[:-1].rstrip()
+    if "limit" not in q.lower():
+        q = q + " LIMIT 500"
+
+    try:
+        return db.run_read(q, {})
+    except Exception as e:
+        logger.error(f"Cypher execution failed: {e}")
+        raise

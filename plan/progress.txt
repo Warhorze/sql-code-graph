@@ -375,3 +375,121 @@ date: 2026-05-02
 
   Next step: developer fixes db reset close-before-rmtree (correctness bug) and
   proceeds to Phase 5 MCP server implementation.
+
+[2026-05-02] architect-reviewer — Phase 5 implementation plan + Phase 7 DWH e2e phase added.
+  agent: architect-reviewer
+  status: READY FOR PHASE 5 IMPLEMENTATION
+
+  Phase 4 sign-off:
+  All Phase 4 review findings from the plan-reviewer compliance check have been resolved
+  by the developer (commit bb05108):
+  - GraphBackend ABC now has __enter__/__exit__ for context manager use.
+  - run_write() abstract method added and implemented in KuzuBackend and Neo4jBackend.
+  - mcp --write flag is now wired to write ~/.claude/mcp.json.
+  - get_backend() from config.py is wired into all CLI command files.
+  - analyze depth bounds validation is present.
+  Two residual warnings are noted but do not block Phase 5:
+  - db reset close-before-rmtree ordering (correctness bug on Linux, crash on Windows).
+  - Missing e2e test_watch.py (deferred to Phase 6).
+
+  Phase 5 implementation plan (Steps 5.1, 5.2, 5.3):
+
+  PRE-FLIGHT CHECKS — must be true before Phase 5 coding begins:
+  1. db reset close-before-rmtree fix should land first (it touches KuzuBackend.close()
+     which Phase 5 tools also depend on via the context manager pattern).
+  2. tests/fixtures/jaffle_shop/ does not yet exist; Step 5.2 acceptance criteria require
+     "pre-indexed fixture graph". Developer must either download jaffle_shop or use the
+     existing tests/fixtures/synthetic/ as the fixture target and update the acceptance
+     tests accordingly. Recommend using synthetic/ for Phase 5 unit/integration tests
+     and deferring jaffle_shop to Phase 6/7.
+  3. Verify FastMCP version pinned in pyproject.toml supports @mcp.tool() decorator with
+     Pydantic return types — the plan assumes this. If FastMCP uses a different decorator
+     API, all tool signatures in Step 5.2 need adjustment before writing a single line.
+  4. src/sqlcg/server/ currently has only server.py (a NotImplementedError stub) and
+     __init__.py. The developer must create tools.py and exceptions.py from scratch.
+
+  Step 5.1 — server.py + exceptions.py (implement first):
+  - Order rationale: exceptions.py must exist before tools.py can import NotIndexedError.
+    server.py must expose the FastMCP instance before tools.py can register @mcp.tool().
+    So the correct creation order is: exceptions.py, server.py, tools.py.
+  - exceptions.py: define NotIndexedError(RuntimeError) and InvalidColumnRefError(ValueError).
+    Keep them in a separate module (not inline in tools.py) so CLI commands can also
+    catch NotIndexedError if needed.
+  - server.py: _configure_mcp_logging() must redirect sys.stdout = sys.stderr *before*
+    any import that could trigger a print() — do this at module load, not inside main().
+    If it is deferred to main(), any top-level print in FastMCP's own imports will have
+    already emitted to stdout before the guard is active.
+    Expose mcp = FastMCP("SQL Code Graph") at module scope so tools.py can import it
+    with "from sqlcg.server.server import mcp".
+  - Risk: KuzuBackend does not support concurrent connections to the same on-disk database
+    (KùzuDB's single-writer model). The MCP server must open exactly one backend instance
+    at startup and pass it to all tool calls — do not open a new KuzuBackend per tool
+    call. Design tools.py to receive a module-level backend reference, not create one
+    per invocation. This is a gotcha specific to this codebase that is not stated in
+    the plan.
+
+  Step 5.2 — tools.py named tools (implement second):
+  - All seven tools must import the shared backend from a module-level singleton, not
+    from get_backend() per call. Suggested pattern: tools.py defines _backend: GraphBackend
+    and _init_backend(path) called from server.main() before mcp.run().
+  - NotIndexedError check: each tool should call db.run_read("MATCH (r:Repo) RETURN count(r)
+    AS n", {}) and raise NotIndexedError if n == 0. This is the same guard for all tools
+    and should be extracted into a private _assert_indexed(db) helper to avoid duplication.
+  - trace_column_lineage Cypher: the plan says "COLUMN_LINEAGE*1..max_depth path query".
+    KùzuDB uses SHORTEST syntax differently from Neo4j — test the variable-length path
+    pattern against a real KùzuDB 0.11.3 instance before finalising the query, as
+    KùzuDB's support for *1..N on arbitrary rel types has version-specific limitations.
+    Fallback: BFS loop up to max_depth in Python if variable-length paths fail.
+  - Return types: the plan specifies all tools except index_repo return Pydantic models.
+    Define these models in a new src/sqlcg/server/models.py to avoid tools.py growing
+    too large. Docstrings must stay under 2 KB each (plan constraint).
+  - index_repo tool: this is a long-running operation. Calling Indexer.index_repo()
+    synchronously inside an MCP tool will block the MCP server's event loop for the
+    duration of indexing. For Phase 5, document this limitation in the tool docstring;
+    do not attempt async wrapping (out of scope). For large repos, users should use
+    the CLI sqlcg index instead.
+  - Acceptance criteria gap: the plan says "each tool called against a pre-indexed
+    fixture graph returns the expected Pydantic model without error" but does not
+    specify what the fixture graph must contain. Developer must decide: either index
+    tests/fixtures/synthetic/ as part of the test fixture setup, or create a conftest.py
+    that runs sqlcg index on synthetic/ into a tmp KùzuDB path before test collection.
+
+  Step 5.3 — execute_cypher (implement last):
+  - The string-literal stripping regex must handle both single-quoted and double-quoted
+    strings. Plan specifies replace '...' and "..." with empty strings. Note that
+    Snowflake uses $$ quoting for procedure bodies — if $$ strings are not stripped,
+    a procedure body containing DROP TABLE will incorrectly trigger the blocklist.
+    For v1 the plan does not mention $$-quoting; note this as a known gap in the
+    tool docstring.
+  - The auto-LIMIT append must insert "LIMIT 500" before any trailing whitespace or
+    semicolon, not just at end-of-string. Use rstrip() before checking and appending.
+  - The blocklist must be case-insensitive (plan specifies re.IGNORECASE). Add TRUNCATE
+    to the blocklist — it is a mutation not currently listed but is supported by KùzuDB.
+  - Acceptance criteria: all four test cases in the plan are unambiguous and testable
+    as written.
+
+  Ambiguities in the Phase 5 plan that need resolution before coding:
+  1. get_downstream_dependencies vs get_upstream_dependencies — the plan describes BFS
+     on COLUMN_LINEAGE but does not specify whether it traverses SELECTS_FROM edges
+     (table-level) or only COLUMN_LINEAGE edges (column-level). This determines the
+     return model shape. Developer must choose and document.
+  2. search_sql_pattern — "WHERE q.sql CONTAINS $query" is not standard Cypher.
+     KùzuDB uses CONTAINS as a function: WHERE contains(q.sql, $query). Developer
+     must verify the correct KùzuDB syntax before finalising.
+  3. list_dialects_and_repos — aggregation of dialect from File nodes vs from a
+     dedicated property on Repo nodes: File nodes have a dialect property, but Repo
+     nodes currently do not. The Cypher must join Repo → File to collect distinct
+     dialects. Clarify this in the implementation.
+
+  Phase 7 DWH e2e section added to plan/sqlcg.md (after Phase 6).
+  DWH repo structure: /home/ignwrad/Projects/dwh
+  - ddl/changelogs/BA-TABLES/: primary DDL source (~121 .sql files with Snowflake CREATE TABLE)
+  - ddl/changelogs/BA-VIEWS/: view definitions (WTDA_ARTIKEL.sql, WTFV_TRANSACTIES_UURLIJKS.sql, etc.)
+  - ddl/changelogs/IA-ANALYTICS/: analytics layer views (BA_WTDH_WERKNEMER.sql, etc.)
+  - sqlmesh/: directory exists but is empty (no .sql models present as of scan)
+  - No .sqlfluff config found in sqlmesh/ — only the root .sqlfluff applies
+  - The "SQLMesh" and "Dagster" components referenced in the task description do not
+    currently have SQL files in the scanned directories; Phase 7 targets ddl/ only.
+
+  Next step: developer implements Phase 5 (server.py, exceptions.py, tools.py) following
+  the step ordering above. Fix db reset close-before-rmtree before starting Phase 5.
