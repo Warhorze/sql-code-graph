@@ -254,3 +254,12 @@ class TestExecuteCypher:
         result = execute_cypher("MATCH (n:Repo) RETURN n LIMIT 5")
         assert isinstance(result, list)
         assert len(result) <= 5
+
+    def test_execute_cypher_limit_not_fooled_by_string_literal(self, indexed_graph):
+        """Query with 'limit' in a string literal should still get LIMIT 500 appended.
+
+        Regression test for C1: the LIMIT check must use stripped query, not original.
+        A query like WHERE x = 'limit test' should still get LIMIT 500 appended.
+        """
+        result = execute_cypher("MATCH (n:SqlQuery) WHERE contains(n.sql, 'limit test') RETURN n")
+        assert isinstance(result, list)

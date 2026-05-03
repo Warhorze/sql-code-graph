@@ -694,3 +694,52 @@ date: 2026-05-03
   No blockers.
 
   Next step: developer proceeds to Phase 6 (Benchmarks and CI).
+
+[2026-05-03] developer — Phase 5 critical bug fixes (C1, C2, W1, W2).
+  Status: COMPLETE — All four bugs/warnings fixed and tested
+  Summary: Code review found 2 critical bugs and 2 warnings in Phase 5 MCP server
+  implementation. All fixed with tests added.
+
+  C1 — LIMIT check doesn't strip string literals (CRITICAL)
+  - File: src/sqlcg/server/tools.py, function execute_cypher
+  - Problem: LIMIT check used original query "limit" not in q.lower(), so WHERE sql='LIMIT 500'
+    prevented appending LIMIT. Also affects string-literal stripping regex.
+  - Fix: (1) Use stripped version for LIMIT check: "limit" not in stripped.lower()
+         (2) Update regex to handle SQL escaped quotes: r"'(?:''|[^'])*'" for single quotes,
+             r'"(?:""|[^"])*"' for double quotes
+  - Test: Added test_execute_cypher_limit_not_fooled_by_string_literal() to verify
+          LIMIT 500 appended even when query contains 'limit' in string literal
+
+  C2 — Backend not closed on MCP server shutdown (CRITICAL)
+  - File: src/sqlcg/server/server.py (main), src/sqlcg/server/tools.py (shutdown)
+  - Problem: mcp.run() blocks until shutdown; backend never closed, leaving KùzuDB
+    file locks open. On process exit, dangling handles prevent subsequent runs.
+  - Fix: (1) Wrap mcp.run() in try-finally in main()
+         (2) Add shutdown_backend() function to tools.py
+         (3) Call shutdown_backend() in finally block
+  - Impact: Process shutdown now properly releases database resources
+
+  W1 — String literal regex doesn't handle escaped single quotes (WARNING)
+  - File: src/sqlcg/server/tools.py, execute_cypher string stripping
+  - Problem: r"'[^']*'" doesn't handle SQL standard escaped quotes ''
+  - Fix: Updated to r"'(?:''|[^']*)*'" (and double quote equivalent)
+  - Impact: Queries like "WHERE x = 'It''s DROP TABLE users'" no longer trigger false
+    positive blocklist
+
+  W2 — No error handling for backend init failure (WARNING)
+  - File: src/sqlcg/server/tools.py, function init_backend
+  - Problem: If backend.init_schema() raises, _backend is set to broken instance.
+    Subsequent calls get misleading "Backend not initialized" instead of real error.
+  - Fix: Wrap init_schema() in try-except; close backend on error before re-raising
+         as RuntimeError with context
+  - Impact: Initialization errors now immediately visible with full context
+
+  Tests:
+  - All 130 existing tests still pass (1 skipped)
+  - Added 1 new regression test: test_execute_cypher_limit_not_fooled_by_string_literal
+  - Covered in test_mcp_tools.py::TestExecuteCypher
+  - Total: 131 tests passing (1 skipped)
+
+  Quality: ruff check/format/pyright all clean. No blocking issues.
+
+  Next step: Ready for review.

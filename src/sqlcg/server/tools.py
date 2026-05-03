@@ -35,12 +35,33 @@ def init_backend(db_path: str | None = None) -> None:
 
     Args:
         db_path: Path to KùzuDB database. If None, uses get_db_path().
+
+    Raises:
+        RuntimeError: If backend initialization fails
     """
     global _backend
     path = db_path or str(get_db_path())
-    _backend = KuzuBackend(path)
-    _backend.init_schema()
+    backend = KuzuBackend(path)
+    try:
+        backend.init_schema()
+    except Exception as exc:
+        backend.close()
+        raise RuntimeError(f"Backend initialization failed: {exc}") from exc
+    _backend = backend
     logger.debug(f"Backend initialized: {path}")
+
+
+def shutdown_backend() -> None:
+    """Shutdown the module-level backend singleton.
+
+    Closes the database connection and clears the global reference.
+    Safe to call multiple times.
+    """
+    global _backend
+    if _backend is not None:
+        _backend.close()
+        _backend = None
+        logger.debug("Backend shut down")
 
 
 def _get_backend() -> GraphBackend:
@@ -489,8 +510,9 @@ def execute_cypher(query: str) -> list[dict]:
 
     # Strip quoted string literals before blocklist check
     # This prevents mutation commands hiding inside strings from triggering the blocker
-    stripped = re.sub(r"'[^']*'", "", query)
-    stripped = re.sub(r'"[^"]*"', "", stripped)
+    # Handle escaped quotes: '' in single quotes, "" in double quotes
+    stripped = re.sub(r"'(?:''|[^'])*'", "", query)
+    stripped = re.sub(r'"(?:""|[^"])*"', "", stripped)
 
     # Check for write operations (case-insensitive)
     if re.search(
@@ -507,7 +529,7 @@ def execute_cypher(query: str) -> list[dict]:
     q = query.rstrip()
     if q.endswith(";"):
         q = q[:-1].rstrip()
-    if "limit" not in q.lower():
+    if "limit" not in stripped.lower():  # use stripped, not q.lower()
         q = q + " LIMIT 500"
 
     try:

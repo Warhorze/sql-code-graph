@@ -900,90 +900,103 @@ and confidence score documented in blueprint §8.2.
 **Context**
 
 The DWH repository lives at `/home/ignwrad/Projects/dwh`. It is a real production
-Snowflake DWH with:
-- `ddl/changelogs/BA-TABLES/`: ~121 Snowflake `CREATE TABLE` DDL files (primary table
-  definitions; naming convention `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
+Snowflake DWH with two SQL layers that Phase 7 targets:
+
+**DDL layer** (`ddl/`):
+- `ddl/changelogs/BA-TABLES/`: Snowflake `CREATE TABLE` DDL files (naming convention
+  `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
 - `ddl/changelogs/BA-VIEWS/`: view definitions (`WTDA_ARTIKEL.sql`,
   `WTFV_TRANSACTIES_UURLIJKS.sql`, `WVFA_RFM_CLASSIFICATIE.sql`, etc.)
-- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views (`BA_WTDH_WERKNEMER.sql`,
-  `BA_WTFE_WERKNEMER_UREN.sql`, `BA_METADATA.sql`, etc.)
-- `ddl/semtex_views.sql`: top-level view bundle
-- `sqlmesh/`: directory present but empty as of Phase 7 authoring
-- `.sqlfluff` at repo root configuring Snowflake dialect
+- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views
+- `ddl/changelogs/MA-PROCEDURES/`: stored procedures with embedded DML
+- Other `ddl/changelogs/` subdirectories: dynamic tables, streams, tasks, masking, stages
+- Note: most DDL is in `.xml` Liquibase changelogs; only the handful of plain `.sql`
+  files will be indexed (IndexerWalker filters by `.sql` suffix)
 
-All SQL in `ddl/` uses the Snowflake dialect. No SQLMesh model files are present
-in the scanned directories; Phase 7 targets `ddl/` only.
+**ETL layer** (`etl/`): **648 `.sql` files** — the interesting half of the corpus.
+These are the actual data movement scripts: multi-step Snowflake scripting blocks,
+`CREATE OR REPLACE TEMP TABLE ... AS SELECT`, `INSERT INTO ... SELECT FROM temp`,
+variable assignments (`SET warehousename = ...`), `USE SCHEMA/WAREHOUSE` directives.
+This is where lineage becomes non-trivial and where the current parser is expected
+to produce only partial results (table-level at confidence=0.3 for scripting blocks).
+Subdirectories:
+- `etl/pdi/template/`: ~36 Snowflake ETL scripts (initial loads, incremental updates)
+- `etl/pdi/template/adobe_initial_load/`, `voorraad_initial_load/`: specialised loads
+- `etl/sql/`: comparison and authorisation SQL
+- `etl/sql/da/`: DA-layer transformation SQL
+- `etl/sql/ba/`: BA-layer transformation SQL
+All SQL in both layers uses the Snowflake dialect.
 
 ---
 
-**Step 7.1 — Index the DWH DDL corpus**
+**Step 7.1 — Index the full DWH corpus (DDL + ETL)**
 
 - Files affected: no source files; adds `tests/e2e/test_dwh_e2e.py`
 - Tasks:
   - Run `sqlcg db init` against a temporary KùzuDB path (isolated from the default
     `~/.sqlcg/graph.db`)
-  - Run `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake` against the
-    temporary database, capturing stdout/stderr
-  - Parse the summary output: `files_parsed`, `parse_errors`, `tables_found`,
-    `lineage_edges_created`
-  - Assert parse success rate: `(files_parsed - parse_errors) / files_parsed >= 0.80`
-  - Assert `tables_found > 0` and the process exits 0
-  - If parse success rate falls below 80%, log each error file path and error message
-    to a report file (`tests/e2e/dwh_parse_report.txt`) but do NOT fail the test —
-    fail only if success rate < 80%
-  - Note: the `ddl/changelogs/` directory contains both `.sql` files and `.xml`
-    changelog manifests; `IndexerWalker` must skip `.xml` files (it already filters
-    by `.sql` suffix — verify this in the test by asserting `files_parsed` matches
-    the count of `.sql` files under `ddl/`, not total files)
+  - Index DDL layer: `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake`
+  - Index ETL layer: `sqlcg index /home/ignwrad/Projects/dwh/etl --dialect snowflake`
+    (same database — additive MERGE; DDL tables must already exist so ETL `INSERT INTO`
+    statements resolve their targets)
+  - Parse the combined summary: `files_parsed`, `parse_errors`, `tables_found`,
+    `lineage_edges_created` — captured separately per run and summed
+  - Assert overall parse success rate >= 0.70 (lower threshold than DDL-only because
+    ETL scripting blocks are expected to partially degrade to confidence=0.3 fallback)
+  - Assert DDL-only parse success rate >= 0.80 (stricter — DDL is plain CREATE TABLE/VIEW)
+  - Log each error file and category to `tests/e2e/dwh_parse_report.txt`; do NOT fail
+    on rate below threshold — fail only if the process itself exits non-zero
+  - Note: `ddl/changelogs/*.xml` manifests are skipped automatically by `.sql` filter
 - Acceptance:
-  - `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake` exits 0
-  - Parse success rate >= 80%
-  - `tables_found` includes at least: `WTDA_ARTIKEL`, `WTDH_KLANT`, `WTFA_KASSATRANSACTIE`,
-    `WTFE_BIJVERKOOP_MATRIX` (four tables known to have DDL files in BA-TABLES)
+  - Both `sqlcg index` invocations exit 0
+  - `tables_found` (across both runs) > 0
+  - ETL files produce at least some `lineage_edges_created` (not all zero)
 
 **Step 7.2 — find and analyze against known DWH tables**
 
 - Files affected: `tests/e2e/test_dwh_e2e.py` (continued from 7.1)
 - Tasks:
-  - Using the indexed DWH graph from Step 7.1 (same temporary database):
+  - Using the combined DDL+ETL graph from Step 7.1:
   - `sqlcg find table WTDA_ARTIKEL`: assert exit 0 and output contains "WTDA_ARTIKEL"
   - `sqlcg find table WTDH_KLANT`: assert exit 0 and output contains "WTDH_KLANT"
   - `sqlcg find table WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 (view from BA-VIEWS)
-  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0 (may return empty if no
-    downstream edges exist — accept empty result, do not require non-empty)
-  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0; if the view
-    SELECT references WTFA_KASSATRANSACTIE or similar, assert non-empty result
-  - `sqlcg analyze unused`: assert exit 0 (may return tables with no inbound lineage)
-  - All assertions are exit-code + output-format checks, not specific row-count checks,
-    because the exact lineage extracted depends on Snowflake-dialect parse quality
+  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0; because ETL scripts INSERT
+    INTO tables downstream of DDL tables, this should now return non-empty lineage
+    (unlike DDL-only where this was always empty)
+  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 and non-empty
+    (view references base tables also present in the DDL index)
+  - `sqlcg analyze unused`: assert exit 0 — ETL-referenced tables should appear less
+    "unused" than DDL-only, since ETL inserts create inbound edges
+  - `sqlcg find pattern "CREATE OR REPLACE TEMP TABLE"`: assert exit 0; should return
+    results because ETL files use this pattern extensively
+  - All assertions are exit-code + output-format checks except where "non-empty" is noted
 - Acceptance:
-  - All six commands exit 0
+  - All seven commands exit 0
   - `find table WTDA_ARTIKEL` returns at least one row
-  - `find table WTDH_KLANT` returns at least one row
-  - `analyze downstream WTDA_ARTIKEL` does not crash
+  - `analyze downstream WTDA_ARTIKEL` returns at least one row (ETL → DDL edge)
+  - `find pattern "CREATE OR REPLACE TEMP TABLE"` returns results
 
-**Step 7.3 — MCP tools against the DWH index**
+**Step 7.3 — MCP tools against the combined DWH index**
 
 - Files affected: `tests/e2e/test_dwh_e2e.py` (continued), requires Phase 5 complete
 - Tasks:
-  - Using the indexed DWH graph from Step 7.1:
-  - Call `trace_column_lineage` MCP tool with table `WTDA_ARTIKEL` and any column
-    that appears in `WTDA_ARTIKEL.sql`; assert response is a valid Pydantic model
-    (no exception)
-  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is a list
-    (may be empty if no cross-file references resolved)
+  - Using the combined DDL+ETL graph from Step 7.1:
+  - Call `trace_column_lineage` MCP tool with a table+column known to have ETL lineage
+    (e.g. `WTDH_KLANT` which has an ETL update script); assert response is a valid
+    Pydantic model (no exception); lineage chain may be shallow if scripting block
+    parsing degraded to table-level only
+  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is non-empty
+    (ETL files reference this table in INSERT/UPDATE statements)
   - Call `list_dialects_and_repos`; assert response includes dialect "snowflake" and
-    at least one repo entry pointing to the DWH `ddl/` path
+    repo entries for both the `ddl/` and `etl/` paths
   - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5")`; assert returns
-    a list of length <= 5 containing at least one of the known table names
-  - Call `mcp start` via subprocess in a subprocess, assert process starts without
-    immediately exiting with non-zero code (use a 2-second timeout: if the process is
-    still running after 2 seconds, it passes; terminate it after the check)
+    a list of length <= 5 with at least one known table name
+  - Call `mcp start` via subprocess, assert alive after 2 seconds (terminate after check)
 - Acceptance:
   - `trace_column_lineage` on a known DWH table does not raise an exception
-  - `find_table_usages("WTDH_KLANT")` returns without error
-  - `list_dialects_and_repos` includes snowflake dialect
-  - `execute_cypher` returns the correct result shape
+  - `find_table_usages("WTDH_KLANT")` returns at least one row (ETL reference)
+  - `list_dialects_and_repos` includes snowflake dialect for both indexed paths
+  - `execute_cypher` returns correct result shape
   - `mcp start` subprocess is alive after 2 seconds
 
 **Step 7.4 — Parse quality report**
@@ -991,19 +1004,20 @@ in the scanned directories; Phase 7 targets `ddl/` only.
 - Files affected: `tests/e2e/test_dwh_e2e.py`, `docs/DWH_PARSE_REPORT.md`
 - Tasks:
   - After running the full index in Step 7.1, emit a structured parse quality report
-    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored):
-    - Total files, parsed, errored, success rate
+    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored) with:
+    - **Per-layer breakdown**: DDL layer totals and ETL layer totals separately, plus combined
+    - Total files, parsed, errored, success rate per layer
     - List of errored files with error category (timeout, parse_failed, exception)
     - Table count, view count, lineage edge count
     - Distribution of `parsing_mode` values across all indexed queries
-  - This report is a diagnostic artifact, not a test gate. It is committed alongside
-    the Phase 7 e2e test run output.
+    - ETL-specific section: how many ETL files fell back to scripting-block mode
+      (confidence=0.3) vs full parse (confidence=1.0); this is the key ETL quality signal
   - The report generation should be a pytest fixture with `autouse=False` and a
-    `--dwh-report` flag so it only runs when explicitly requested (not in CI by default,
-    as the DWH path is not available in CI)
+    `--dwh-report` flag so it only runs when explicitly requested
 - Acceptance:
   - `pytest tests/e2e/test_dwh_e2e.py --dwh-report` generates `docs/DWH_PARSE_REPORT.md`
-  - Report contains all four required sections (totals, errors, counts, parsing_mode dist.)
+  - Report contains all five required sections (DDL totals, ETL totals, combined, errors,
+    parsing_mode dist.)
 
 ---
 
@@ -1015,16 +1029,21 @@ in the scanned directories; Phase 7 targets `ddl/` only.
 - The DWH repo at `/home/ignwrad/Projects/dwh` must be accessible from the test runner;
   Phase 7 tests are explicitly local-only (not CI-runnable) and must be skipped
   automatically when `SQLCG_DWH_PATH` env var is not set
+- DDL must be indexed before ETL in Step 7.1 — ETL INSERT statements reference DDL
+  tables; indexing ETL first means `SchemaResolver` won't know the target table columns
 
 **Phase 7 known risks**
 
 | Risk | Mitigation |
 |---|---|
-| Snowflake-specific DDL syntax (CLONE, DYNAMIC TABLE, SECURE VIEW) causes parse failures | Accept in parse report; do not raise success rate gate above 80% for initial run |
+| ETL scripting blocks degrade to confidence=0.3 table-level only | Expected; report it in DWH_PARSE_REPORT.md; do not raise success rate gate above 70% for ETL layer |
+| Snowflake `SET`/`USE` statements cause parse noise | These produce `exp.Command` fallback nodes; they won't create false table edges but inflate parse_failed count |
+| Temp table chains: `CREATE TEMP TABLE x AS SELECT` → `INSERT INTO y SELECT FROM x` — x not in SchemaResolver | SchemaResolver's pass-1 DDL sniffer should register x; verify with a dedicated fixture before claiming ETL lineage works |
 | `ddl/changelogs/*.xml` changelog manifests mixed with `.sql` files | IndexerWalker already filters by `.sql` suffix; assert in test that xml files are not counted |
-| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` only; sqlmesh validation deferred to a future phase if models are added |
+| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` and `etl/` only |
 | DWH path not available in CI | Guard all Phase 7 tests with `pytest.mark.skipif(not Path(DWH_PATH).exists(), ...)` |
 | KùzuDB single-writer lock conflicts if tests run in parallel | Use a per-test-session tmp_path for the DWH index database; never share with other test sessions |
+| 648 ETL files may be slow to index | Use `--timeout-per-file 30` (default); expect full index to take 2–5 minutes locally |
 
 ---
 

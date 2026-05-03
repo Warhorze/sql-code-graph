@@ -45,5 +45,8 @@ def main(db_path: str | None = None) -> None:
     # Initialize the backend singleton used by all tools
     sqlcg.server.tools.init_backend(db_path)
 
-    # Run the MCP server event loop
-    mcp.run()
+    # Run the MCP server event loop, ensuring backend is closed on shutdown
+    try:
+        mcp.run()
+    finally:
+        sqlcg.server.tools.shutdown_backend()
