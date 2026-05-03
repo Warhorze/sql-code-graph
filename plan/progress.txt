@@ -1,10 +1,9 @@
 ## Current State
 
-agent: architect-reviewer
-task: ETL lineage gap analysis — Q&A response
-status: IDLE — ETL Lineage Gap section added to ARCHITECTURE_REVIEW.md
+agent: plan-reviewer
+task: Phase 5 MCP Server compliance review
+status: READY FOR PHASE 6
 date: 2026-05-03
-
 ---
 
 ## Handoff Log
@@ -578,3 +577,120 @@ date: 2026-05-03
   Recommendation: add tests/fixtures/synthetic/etl_chain.sql to measure intra-file
   temp table chain resolution before Phase 6 benchmarks are finalised.
   Next step: idle, available for architect-planner Q&A.
+
+[2026-05-03] plan-reviewer — Phase 5 compliance check (Steps 5.1–5.3).
+  agent: plan-reviewer
+  plan: plan/sqlcg.md Phase 5 (Steps 5.1–5.3)
+  status: READY FOR PHASE 6 (no blockers; 2 warnings; no plan changes required)
+
+  Pre-flight checks (from architect-reviewer Phase 5 notes):
+
+  1. db reset close-before-rmtree fix: PASS.
+     The full-reset branch in db.py does NOT open a backend at all before calling
+     shutil.rmtree. No dangling handle exists. The comment in the code confirms the
+     intent ("close backend first to release file handle") but the implementation is
+     correct: the backend is simply never opened in this path, so there is nothing to
+     close. The concern from the Phase 4 review is resolved.
+
+  2. server.py redirects stdout at module load (not inside main()): PARTIAL.
+     _configure_mcp_logging() is called inside main() at line 40, NOT at module load.
+     The architect-reviewer pre-flight note said it should happen at module load.
+     However: (a) the plan's Step 5.1 acceptance criterion only requires that calling
+     _configure_mcp_logging() makes sys.stdout is sys.stderr true — which the test
+     correctly verifies; (b) FastMCP import and instantiation at module load were
+     verified to emit nothing to stdout. The practical risk is low for v1.
+     WARNING: if a future FastMCP version prints to stdout during import or
+     mcp = FastMCP(...) construction, the guard will be too late. The fix is one line:
+     move _configure_mcp_logging() call to module level in server.py (before the
+     FastMCP import, or immediately after it). Noted for developer awareness.
+
+  3. KùzuDB single-writer constraint respected (one backend, not per-call): PASS.
+     tools.py defines a module-level _backend: GraphBackend | None = None singleton.
+     init_backend() creates it once; _get_backend() raises RuntimeError if not
+     initialized. No tool creates a new backend per invocation.
+
+  4. search_sql_pattern uses contains() function not CONTAINS operator: PASS.
+     tools.py line 410: WHERE contains(q.sql, $query) — correct KùzuDB syntax.
+
+  Step 5.1 acceptance criteria:
+
+  - _configure_mcp_logging() makes sys.stdout is sys.stderr true, tested in
+    test_server.py: PASS. test_configure_mcp_logging_redirects_stdout explicitly calls
+    the function and asserts sys.stdout is sys.stderr. Test passes.
+  - exceptions.py defines NotIndexedError(RuntimeError) and
+    InvalidColumnRefError(ValueError): PASS. Both present, documented, imported.
+  - mcp = FastMCP("SQL Code Graph") exposed at module scope: PASS.
+    server.py line 17.
+
+  Step 5.2 acceptance criteria:
+
+  - Each tool called against pre-indexed fixture graph returns expected Pydantic model:
+    PASS. indexed_graph fixture creates a real KuzuBackend and indexes
+    tests/fixtures/synthetic/ before each test. All six Pydantic-returning tools are
+    exercised via result attribute access (result.column, result.lineage, result.table,
+    result.usages, result.root, result.nodes, result.pattern, result.matches,
+    result.repos). Return types are correct Pydantic model instances.
+  - trace_column_lineage on non-indexed graph raises NotIndexedError: PASS.
+    test_trace_column_lineage_requires_indexed_graph at line 76-82.
+  - Tool docstrings include Raises section for NotIndexedError: PASS.
+    All 6 tools (trace_column_lineage, find_table_usages, get_downstream_dependencies,
+    get_upstream_dependencies, search_sql_pattern, list_dialects_and_repos) have a
+    Raises section. index_repo does not have one (correctly — it does not raise
+    NotIndexedError).
+  - index_repo returns plain dict (not Pydantic): PASS.
+    test_index_repo_returns_summary_dict asserts isinstance(result, dict) and checks
+    all four required keys (files_parsed, parse_errors, tables_found,
+    lineage_edges_created).
+  - Tools use module-level backend singleton: PASS.
+    All tools call _get_backend() which returns the module-level _backend.
+
+  Step 5.3 acceptance criteria:
+
+  - execute_cypher("MATCH (n) RETURN n LIMIT 10") succeeds: PARTIAL.
+    The test uses "MATCH (n:Repo) RETURN n.path AS path LIMIT 10" (labeled node, column
+    projection) rather than the exact query in the plan ("MATCH (n) RETURN n LIMIT 10").
+    The intent — read-only query with explicit LIMIT succeeds — is covered, but the
+    literal plan acceptance criterion is not tested. Low risk: the labelless scan would
+    also succeed. NOTE only.
+  - execute_cypher("MATCH (n) DELETE n") raises ValueError: PASS.
+    test_execute_cypher_blocklist_rejects_delete uses "MATCH (n:Test) DELETE n".
+    Blocklist correctly triggers on DELETE keyword.
+  - Query without LIMIT has LIMIT 500 appended: PASS.
+    test_execute_cypher_auto_limit_appended confirms result is a list and len <= 500.
+  - execute_cypher("MATCH (n) WHERE n.sql = 'DROP TABLE x' RETURN n") succeeds: PASS.
+    test_execute_cypher_string_literal_bypasses_blocklist uses
+    "MATCH (n:SqlQuery) WHERE contains(n.sql, 'DROP TABLE') RETURN n LIMIT 1".
+    String literal stripping removes 'DROP TABLE' before blocklist check; test passes.
+  - TRUNCATE in blocklist: PASS. Regex at line 497 includes TRUNCATE.
+    test_execute_cypher_blocklist_rejects_truncate passes.
+  - LIMIT append uses rstrip() before semicolon stripping: PASS.
+    tools.py lines 507-511: q = query.rstrip(); removes trailing semicolon; then
+    checks "limit" not in q.lower() before appending.
+
+  Test count:
+  - test_server.py: 1 test (PASS)
+  - test_mcp_tools.py: 26 tests (PASS)
+  - All 129 previously passing tests still pass (130 collected, 1 skipped)
+  - 27 new Phase 5 tests: confirmed
+
+  Warnings (non-blocking):
+
+  WARNING 1 — stdout redirect deferred to main(), not module load.
+    _configure_mcp_logging() is called in main() rather than at module level.
+    FastMCP currently emits nothing to stdout at import/construction time (verified),
+    so the guard is effective in practice. Risk materialises only if a future FastMCP
+    version adds stdout output at import time. One-line fix: add
+    _configure_mcp_logging() call at module level in server.py before or immediately
+    after the FastMCP instantiation line.
+
+  WARNING 2 — execute_cypher acceptance test queries differ from plan literals.
+    Two of the four plan acceptance criterion queries are not tested verbatim:
+    (a) "MATCH (n) RETURN n LIMIT 10" vs "MATCH (n:Repo) RETURN n.path AS path LIMIT 10"
+    (b) "MATCH (n) WHERE n.sql = 'DROP TABLE x' RETURN n" vs the contains()-based test.
+    The intent of each criterion is covered. Verbatim coverage would require adding two
+    additional test cases in test_mcp_tools.py. Acceptable gap for Phase 5; developer
+    may add in a gap-fix pass if desired.
+
+  No blockers.
+
+  Next step: developer proceeds to Phase 6 (Benchmarks and CI).
