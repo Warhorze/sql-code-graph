@@ -393,7 +393,159 @@ associated with `Table` nodes `DEFINED_IN` the file.
 
 ---
 
-## 6. Summary Assessment
+## 6. ETL Lineage Gap
+
+Analysis date: 2026-05-03
+Triggered by: architect-reviewer Q&A — "why is ETL excluded and does that make sense?"
+
+### 6.1 Is ETL explicitly excluded?
+
+ETL is not named in the Non-Goals section of either the blueprint or `plan/sqlcg.md`.
+The Non-Goals list covers: `add_information_schema` implementation, the wizard,
+mixed-dialect single-directory indexing, DataHub integration beyond the snowflake
+optional extra, recursive CTE column-level lineage, and production KùzuDB cluster
+mode. There is no line that says "ETL pipelines are out of scope."
+
+ETL is excluded by omission — the design documents simply never name ETL as a target
+use case. The stated niche is "a corpus of `.sql` files" with the example being DDL
+and DML that already live in version-controlled repos. The DWH validation target
+(Phase 7) indexes `ddl/` only, which is pure DDL.
+
+### 6.2 What SQL patterns are currently in scope
+
+The `_classify()` method on `SqlParser` recognises nine statement kinds:
+`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE_TABLE`, `CREATE_VIEW`,
+`CTAS` (CREATE TABLE ... AS SELECT), `COPY_INTO`, and `CREATE_PROCEDURE`/`UNKNOWN`.
+
+`INSERT INTO ... SELECT` is fully in scope — it is classified as `INSERT` with
+`sources` set to all tables in the SELECT body and column lineage extracted through
+`sg_lineage`. `CTAS` (CREATE TABLE AS SELECT) is also explicitly handled. Standard
+`COPY INTO table` (Snowflake loading from a stage) is handled with a `STAGE` source
+node and `LOADS_FROM_STAGE` relationship, preventing a false table-to-table edge.
+
+### 6.3 What ETL patterns are only partially handled
+
+**Scripting blocks and stored procedures** (blueprint gaps 3 and 5) are the central
+ETL gap. Snowflake Scripting blocks (`BEGIN ... END`) and `CREATE PROCEDURE` bodies
+fall back to `exp.Command` in sqlglot. The `SnowflakeParser._parse_scripting_file`
+method extracts embedded DML via a `_EMBEDDED_DML` regex and re-parses each match
+independently. This recovers table-level edges at roughly 65-75% recall (blueprint
+accuracy table), but column lineage is always `[]` and `confidence` is capped at 0.3.
+The key limitation is that these extracted statements are parsed in isolation — there
+is no session context. A `CREATE TEMP TABLE t AS SELECT ...` followed by
+`INSERT INTO result SELECT * FROM t` produces two disconnected parse results, not
+a chained lineage edge through `t`.
+
+**DataHub `SqlParsingAggregator` as a partial fix.** The blueprint notes that the
+`acryl-datahub[sql-parsing]` optional extra provides `SqlParsingAggregator`, which
+maintains session-scoped temp table state across statements. This improves table-level
+accuracy by ~15 points for scripting blocks and stored procedures. It is already
+wired into the design for use inside `_parse_scripting_file`, but is an optional
+dependency (`[snowflake]` extra) and still produces 0% column-level lineage for
+procedural code.
+
+**`COPY INTO ... FROM @stage`** is handled as a load event, not as lineage. The
+graph records that a table was loaded from a stage, but there are no column-level
+edges between the stage file schema and the target table columns, because the file
+schema is not available to a static parser.
+
+**dbt model chains.** The `dbt_adapter.py` loads `manifest.json` to enrich the
+`SchemaResolver` with model column types and resolves `ref()` to qualified names.
+This is schema enrichment, not ETL pipeline lineage. It resolves column types for
+SQL inside dbt models, but it does not represent the multi-step dbt DAG as a lineage
+graph. The dbt DAG is implicit — each dbt model's SQL is indexed as an independent
+file; `CrossFileAggregator.resolve_pass2` resolves cross-model view references, which
+approximates dbt lineage but is not a direct representation of it.
+
+**Multi-step pipeline SQL.** A pattern common in Snowflake ETL:
+```sql
+CREATE OR REPLACE TEMP TABLE stage_orders AS SELECT ...;
+INSERT INTO dwh.orders SELECT o.*, c.name FROM stage_orders o JOIN customers c ...;
+```
+These two statements, if they appear in the same file, are parsed as independent
+`QueryNode` objects. `stage_orders` in the `INSERT` will resolve as a source table
+reference, and if it was defined earlier in the same file it will appear in
+`defined_tables`. However, column lineage through the temp table is broken: the
+`sg_lineage` call for the INSERT sees `stage_orders` as a table with unknown schema
+unless the DDL sniffer already registered its columns from the CTAS above.
+Pass-1 DDL sniffing does register CTAS targets into `SchemaResolver`, so within a
+single file this should partially work. Cross-file temp table chains do not resolve.
+
+### 6.4 What full ETL lineage support would require
+
+Four capabilities are missing and each requires non-trivial work:
+
+1. **Cross-statement session context.** Temp tables and variables defined in one
+   statement must be visible as schema to subsequent statements in the same session.
+   `DataHub SqlParsingAggregator` with `session_id` is the right tool for intra-file
+   session tracking. For cross-file session tracking (Snowflake tasks, dbt run
+   sequences), there is no off-the-shelf solution — it would require an explicit
+   pipeline execution order model, which is not representable in a static file walker.
+
+2. **Stored procedure body full parsing.** Snowflake `$$...$$` blocks and T-SQL
+   `BEGIN/END` bodies currently fall to regex extraction. A proper solution would
+   use sqlglot's `dialect="snowflake"` parser on the extracted body after stripping
+   the procedure wrapper. The blocker is that sqlglot classifies these as `exp.Command`
+   and does not expose a stored-procedure-body parser. This is blueprint Gap 5,
+   classified as a "design limitation" with "workaround only" resolution path.
+
+3. **COPY INTO column lineage.** Inferring column mapping from a stage file to a
+   target table requires either an explicit column list in the COPY statement or an
+   external schema definition. This is a fundamental static-analysis limit (same
+   category as Gap 4 — IDENTIFIER() dynamic references).
+
+4. **Pipeline execution order.** For multi-step ETL (dbt DAG, Snowflake tasks,
+   Airflow SQL operators), the pipeline DAG determines which temp table from step N
+   is the source for step N+1. Without a DAG model, the graph can only record that a
+   temp table exists and which columns it has — it cannot assert that a particular
+   downstream table was populated from that temp table in a specific run order.
+
+### 6.5 Deliberate deferral, plan gap, or fundamental limit?
+
+It is all three, depending on the ETL pattern:
+
+- **Deliberate deferral**: The Non-Goals section defers `add_information_schema` and
+  DataHub pipeline integration. The spirit of this is "we index static SQL files, not
+  pipeline orchestrators." ETL pipeline SQL *files* are in scope; the pipeline
+  execution model is not.
+
+- **Plan gap**: Multi-step intra-file temp table chains are partially solvable with
+  the existing `SchemaResolver` DDL sniffer plus `DataHub SqlParsingAggregator` for
+  session context. This is not described as an explicit gap anywhere in the plan — it
+  falls out of the existing machinery silently rather than being named and handled.
+  The benchmark targets do not include a "multi-step ETL" fixture, so the quality of
+  this path is unmeasured.
+
+- **Fundamental limit**: Dynamic SQL via `IDENTIFIER()`, cross-session temp tables,
+  and COPY INTO column mapping are fundamental static-analysis limits acknowledged in
+  the blueprint as such. They cannot be resolved without runtime information.
+
+### 6.6 Does the exclusion make sense?
+
+The exclusion is reasonable for v1 with one caveat. The design targets "a corpus of
+`.sql` files" — the canonical example being DDL and DML in a data warehouse repo.
+In that context, the most common lineage questions are "which tables does this view
+read?" and "which downstream views depend on this table?" — both answerable with the
+current scope.
+
+The caveat is that the DWH validation target in Phase 7 explicitly indexes Snowflake
+DDL and views, but the DWH's actual data movement happens in ETL jobs that are not
+`.sql` files in `ddl/`. If the goal is full production lineage for the DWH, the
+Phase 7 results will show good lineage within the DDL layer and zero lineage for the
+ETL-to-DDL boundary. This should be stated explicitly in the Phase 7 parse quality
+report (`docs/DWH_PARSE_REPORT.md`) rather than leaving it as an unexplained gap in
+the lineage graph.
+
+The practical recommendation: add a synthetic multi-step ETL fixture
+(`tests/fixtures/synthetic/etl_chain.sql`) with known expected lineage to benchmark
+whether the current pass-1 DDL-sniffing + SchemaResolver path resolves intra-file
+temp table chains correctly. If it does, document it as a supported case. If it does
+not, name it as a known limitation rather than leaving it as unmeasured silent
+degradation.
+
+---
+
+## 7. Summary Assessment
 
 The blueprint is at a high quality for a pre-implementation design document. The v1.2
 changes (typed `LineageEdge`, explicit `GraphBackend` ABC, caching with invalidation,
