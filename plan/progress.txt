@@ -743,3 +743,61 @@ date: 2026-05-03
   Quality: ruff check/format/pyright all clean. No blocking issues.
 
   Next step: Ready for review.
+
+[2026-05-03] developer — Completed Phase 6 implementation (Benchmarks and CI).
+  Status: COMPLETE — All Phase 6 steps delivered with benchmark suite and CI workflows
+  Implemented:
+  - Step 6.1: Benchmark fixtures
+    * TPC-H directory: 5 representative queries (q01-q05) covering SELECT, JOINs,
+      aggregation, subqueries, and UNION operations
+    * Adversarial directory: 200_join.sql (200 table joins), 500_union.sql (500 UNION ALL)
+    * Snowflake golden corpus: 10 files covering edge cases
+      - scripting_block.sql: BEGIN/END with embedded DML
+      - copy_into.sql: COPY INTO @stage with SELECT
+      - lateral_flatten.sql: LATERAL FLATTEN for nested arrays
+      - colon_cast.sql: :: cast operator (Snowflake specific)
+      - qualify.sql: QUALIFY clause for window function filtering
+      - three_part.sql: database.schema.table.column references
+      - create_procedure.sql: CREATE PROCEDURE with embedded DML
+      - identifier_dynamic.sql: IDENTIFIER() for dynamic references
+      - case_normalization.sql: mixed case identifiers
+      - colon_reserved_word.sql: t:type and similar reserved word references
+    * jaffle_shop fixture: minimal 3-file DAG (raw_orders → customers → orders)
+      representing a simple data warehouse lineage
+
+  - Step 6.2: Benchmark suite
+    * bench_indexer.py: 3 pytest-benchmark tests
+      - test_bench_tpch_parse_latency: TPC-H query parsing latency (p95 < 500ms)
+      - test_bench_synthetic_throughput: synthetic fixture throughput measurement
+      - test_bench_adversarial_timeout: adversarial file timeout handling
+    * Uses KuzuBackend tmp_db fixture for isolation
+    * All benchmarks pass and return expected summary dicts
+
+  - Step 6.3: CI configuration
+    * .github/workflows/test.yml: pytest matrix on Python 3.12/3.13
+      - Runs tests/unit and tests/integration
+      - Includes pyright and ruff linting
+    * .github/workflows/e2e-tests.yml: E2E test workflow
+      - Runs tests/e2e (excluding test_dwh_e2e.py)
+    * .github/workflows/benchmark.yml: benchmark workflow
+      - Runs on push to master/main
+      - Uploads benchmark results as artifacts
+
+  Pre-flight fix applied:
+  - _configure_mcp_logging() moved to module level in server.py
+    (before FastMCP import to protect stdout early)
+
+  Tests passing:
+  - All 130 unit/integration/e2e tests still pass
+  - 3 new benchmark tests pass (1 for latency, 1 for throughput, 1 for timeout handling)
+  - Total: 130 passed, 1 skipped (test_watch e2e)
+
+  Fixture creation:
+  - tests/benchmarks/tpch/: 5 .sql files
+  - tests/benchmarks/adversarial/: 2 .sql files (200 joins, 500 unions)
+  - tests/benchmarks/golden_corpus/snowflake/: 10 .sql files
+  - tests/fixtures/jaffle_shop/: 3 .sql files (DDL + CTAS)
+
+  Quality: ruff/pyright all clean. No blocking issues.
+  Deviations: None from Phase 6 plan.
+  Next step: Ready for Phase 6 review before Phase 7 (DWH e2e validation).
