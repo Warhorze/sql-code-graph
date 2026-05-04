@@ -39,17 +39,26 @@ class WatchJobManager:
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
         self._timer_factory = _timer_factory or threading.Timer
+        self._paused = False
+        self._queued: list[str] = []
 
     def schedule(self, file_path: str) -> None:
         """Schedule a reindex job for a file.
 
         If a job is already scheduled for this path, it is canceled and
-        a new one is scheduled.
+        a new one is scheduled. If the manager is paused, the path is queued
+        instead of starting a timer.
 
         Args:
             file_path: Path to the file to reindex
         """
         with self._lock:
+            if self._paused:
+                # Queue the path for later processing
+                if file_path not in self._queued:
+                    self._queued.append(file_path)
+                return
+
             if file_path in self._timers:
                 self._timers[file_path].cancel()
             t = self._timer_factory(self._debounce, self._run_job, args=[file_path])
@@ -76,3 +85,21 @@ class WatchJobManager:
             for t in self._timers.values():
                 t.cancel()
             self._timers.clear()
+
+    def set_paused(self, paused: bool) -> None:
+        """Set the paused state.
+
+        Args:
+            paused: True to pause scheduling, False to resume
+        """
+        with self._lock:
+            self._paused = paused
+
+    def drain_queued(self) -> None:
+        """Drain queued file paths and schedule them for reindexing."""
+        with self._lock:
+            queued_copy = self._queued.copy()
+            self._queued.clear()
+
+        for file_path in queued_copy:
+            self.schedule(file_path)

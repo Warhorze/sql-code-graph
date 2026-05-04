@@ -37,7 +37,7 @@ def watch_cmd(  # noqa: B008
 
         spec = load_ignore_spec(path)
         job_manager = WatchJobManager(indexer, backend, dialect)
-        handler = SqlFileEventHandler(job_manager, backend, spec, path)
+        handler = SqlFileEventHandler(job_manager, backend, spec, path, indexer=indexer)
         observer = Observer()
         observer.schedule(handler, str(path), recursive=True)
         observer.start()
@@ -51,4 +51,7 @@ def watch_cmd(  # noqa: B008
             observer.stop()
             observer.join(timeout=5)
             job_manager.cancel_all()
+            if handler._branch_monitor is not None:
+                handler._branch_monitor.stop()
+                handler._branch_monitor.join(timeout=5)
             console.print("Stopped.")
