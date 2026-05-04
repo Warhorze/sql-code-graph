@@ -930,14 +930,6 @@ Mart layer:
 
 This gives 3 lineage hops (raw → staging → dim/fact → mart) with known edge topology.
 
-**Note on the existing `tests/e2e/test_dwh_e2e.py`**
-
-The prior implementation of Phase 7 (`feat/phase-7-dwh-validation` branch) targeted the
-private DWH at `/home/ignwrad/Projects/dwh`. That file must be replaced entirely with the
-new Airbnb-based test file. The developer must replace `tests/e2e/test_dwh_e2e.py` with
-`tests/e2e/test_airbnb_e2e.py` as described in Steps 7.2 and 7.3 below, and delete the
-old file.
-
 ---
 
 **Step 7.1 — Airbnb fixture creation**
@@ -1616,3 +1608,192 @@ For the `sqlcg watch` production use case, document that large repos (>1000 file
 should use `sqlcg index` for the initial full index and only then start `watch` —
 running `watch` from scratch on a 10,000-file repo will trigger 10,000 concurrent
 timer expirations.
+
+---
+
+### Phase 9 — Git-Aware Graph Freshness (Days 39–41)
+
+**Reviewer Corrections (plan-reviewer, 2026-05-04)**
+
+Issues found and fixed in this plan before implementation:
+
+- BLOCKER fixed (Step 9.1 + 9.2): The hook script written by `install-hooks` calls
+  `sqlcg index --dialect auto --quiet` but `--quiet` did not exist in `index_cmd` and
+  was not mentioned in Step 9.2. Added `--quiet` flag to Step 9.2 tasks and acceptance
+  criteria. Added an implementation order note: Step 9.2 must be complete before the
+  Step 9.1 e2e test exercises the hook end-to-end.
+
+- BLOCKER fixed (Step 9.1): Idempotency check string was unspecified — "if the hook
+  already contains the sqlcg line" left ambiguous which string to check. Specified
+  `# sqlcg post-checkout hook` as the sentinel (first comment line of every sqlcg-authored
+  hook). Same sentinel is used for existing-hook detection.
+
+- BLOCKER fixed (Step 9.3): The locking mechanism for "block new file events from being
+  scheduled until resync completes" was unspecified. `cancel_all()` only cancels pending
+  timers; in-flight `_run_job` calls continue, and `schedule()` accepts new events
+  immediately. Added concrete specification: `_paused: bool`, `_queued: list[str]`,
+  all guarded by the existing `_lock`. `BranchMonitor` sets `_paused=True`, drains
+  timers, runs `index_repo`, then sets `_paused=False` and drains `_queued`.
+
+- BLOCKER fixed (Step 9.3 acceptance + Step 9.4): `BranchMonitor` acceptance criterion
+  said it exits when `cancel_all()` is called — but `WatchJobManager.cancel_all()` only
+  cancels file timers and has no knowledge of `BranchMonitor`. Fixed: `BranchMonitor`
+  must expose `stop()` + `join()`, called from `watch.py`'s `finally` block. Also added
+  an explicit test task in Step 9.4 for the `_queued` drain behaviour.
+
+**Context**
+
+The watcher (`SqlFileEventHandler` + `WatchJobManager` in `src/sqlcg/indexer/watcher.py`
+and `src/sqlcg/core/jobs.py`) handles continuous within-branch development well: each
+file save triggers a debounced single-file reindex. But it has a blind spot: `git checkout`
+fires a flood of simultaneous file events for every file that differs between branches,
+which causes three problems:
+
+1. **Event flood** — dozens of modify/delete events arrive at once; the debouncer partially
+   absorbs them but each file still queues a separate reindex job, serialised by KùzuDB's
+   single-writer lock.
+2. **Partial state** — if a reindex job is in-flight when the checkout completes, the graph
+   contains a mix of old-branch and new-branch nodes until all jobs drain.
+3. **Stale deletions** — files deleted by checkout fire `on_deleted`, but if the watcher
+   missed the event (race condition, rapid checkout) those nodes persist in the graph.
+
+The fix is a `post-checkout` git hook that triggers a **full resync** atomically from the
+new branch's file tree, bypassing the watcher's per-file debounce logic entirely. The
+watcher then handles all within-branch changes as before.
+
+---
+
+**Step 9.1 — `sqlcg git install-hooks`**
+
+- Files affected: `src/sqlcg/cli/commands/git.py` (new), `src/sqlcg/cli/main.py`
+- Tasks:
+  - Add a `git` subcommand group with one command: `install-hooks`
+  - `sqlcg git install-hooks [--repo <path>]` writes `.git/hooks/post-checkout` to the
+    target repo (default: `Path.cwd()`)
+  - The hook script content (written verbatim by the command):
+    ```bash
+    #!/bin/sh
+    # sqlcg post-checkout hook — resync graph after branch switch
+    # $3 == 1 means branch checkout (not file checkout); skip file checkouts
+    [ "$3" = "1" ] || exit 0
+    sqlcg index "$(git rev-parse --show-toplevel)" --dialect auto --quiet || true
+    ```
+  - `--dialect auto` is a new flag for the `index` command (Step 9.2) that reads dialect
+    from a `.sqlcg.toml` config file if present, or falls back to `snowflake`
+  - After writing the hook, `chmod +x .git/hooks/post-checkout`
+  - If a `post-checkout` hook already exists and was not written by sqlcg, print a WARNING
+    and do not overwrite — instruct the user to manually append the hook line
+  - Idempotent: if the hook file already contains the sentinel string
+    `# sqlcg post-checkout hook`, skip silently (this is the first comment line of
+    the script body; it is always present in hooks written by sqlcg). Use
+    `'# sqlcg post-checkout hook' in existing_content` as the check.
+  - The same sentinel string is used for the existing-hook detection: if
+    `.git/hooks/post-checkout` exists and does NOT contain `# sqlcg post-checkout hook`,
+    treat it as a user hook and warn without overwriting.
+  - Implementation order dependency: `--dialect auto` and `--quiet` (Step 9.2) must be
+    implemented before the e2e test in `test_git_hook_install.py` exercises the hook script
+    end-to-end. Developer must complete Step 9.2 before Step 9.1 tests are run.
+- Acceptance:
+  - `sqlcg git install-hooks` in a git repo creates `.git/hooks/post-checkout` with `+x`
+  - Running the hook with `$3=0` (file checkout) exits 0 without calling `sqlcg index`
+  - Running the hook with `$3=1` (branch checkout) calls `sqlcg index`
+  - Idempotency: running `install-hooks` twice does not duplicate the hook line
+  - `install-hooks` warns and skips when a hook exists without `# sqlcg post-checkout hook`
+
+**Step 9.2 — `--dialect auto` flag and `--quiet` flag for `sqlcg index`**
+
+- Files affected: `src/sqlcg/cli/commands/index.py`, `src/sqlcg/core/config.py`
+- Implementation order note: Step 9.2 must be completed before Step 9.1 is tested,
+  because the hook script written by `install-hooks` calls `sqlcg index --dialect auto
+  --quiet`. Both flags must exist in the `index` command before the hook script is
+  exercised in e2e tests.
+- Tasks:
+  - Add `--dialect auto` as a valid value for the existing `--dialect` option
+  - When `auto` is selected: read `dialect` from `.sqlcg.toml` in the repo root if present;
+    fall back to `snowflake` if absent
+  - `.sqlcg.toml` schema (minimal): `[sqlcg]\ndialect = "snowflake"`
+  - `get_dialect(path: Path) -> str` helper in `config.py`
+  - Add `--quiet` / `-q` boolean flag to `index_cmd` (default `False`). When `True`,
+    suppress the `[green]Indexed N files...[/green]` summary line printed to the console.
+    All other console output (errors, warnings) is still emitted. This flag is used by
+    the git hook so that `git checkout` output is not polluted by the index summary.
+- Acceptance:
+  - `sqlcg index /path --dialect auto` with no `.sqlcg.toml` uses `snowflake`
+  - `sqlcg index /path --dialect auto` with `.sqlcg.toml` containing `dialect = "bigquery"` uses `bigquery`
+  - `sqlcg index /path --quiet` suppresses the summary line; exit code is still 0
+  - Existing explicit `--dialect snowflake` behaviour is unchanged
+
+**Step 9.3 — Watcher branch-switch guard**
+
+- Files affected: `src/sqlcg/indexer/watcher.py`, `src/sqlcg/cli/commands/watch.py`
+- Tasks:
+  - Add a `BranchMonitor` thread to `SqlFileEventHandler.__init__` that polls
+    `git rev-parse --abbrev-ref HEAD` every 2 seconds
+  - When the branch name changes: call `job_manager.cancel_all()` to drain pending jobs,
+    then call `indexer.index_repo()` (full resync of the watched path) before resuming
+    normal event handling
+  - This is a safety net for users who switch branches without the git hook installed
+  - The resync must hold a lock that blocks new file events from being scheduled until
+    it completes (prevents mixed-branch nodes). Implement this by adding a
+    `_paused: bool = False` flag and a companion `threading.Condition` (or `threading.Event`)
+    to `WatchJobManager`. The `schedule()` method must check `_paused` under the existing
+    `_lock` and, if paused, store the path in a `_queued: list[str]` buffer instead of
+    starting a timer. `BranchMonitor` sets `_paused = True` before calling `cancel_all()`,
+    then calls `index_repo()`, then sets `_paused = False` and drains `_queued` by calling
+    `schedule()` for each buffered path. All flag reads and writes must be inside `_lock`.
+  - `BranchMonitor` must expose a `stop()` method (sets an internal `threading.Event`
+    that the polling loop checks) and a `join()` method. Both are called from the `finally`
+    block in `watch.py`. Do NOT rely on `cancel_all()` to stop `BranchMonitor` — that
+    method only drains file-event timers and has no knowledge of the monitor thread.
+- Acceptance:
+  - Simulated branch switch (mock `git rev-parse` return value changes) triggers
+    `cancel_all()` + `index_repo()` in the correct order
+  - File events received during the resync are queued (stored in `_queued`) and replayed
+    after resync completes — not dropped and not executed during the resync window
+  - `BranchMonitor` thread exits cleanly when `BranchMonitor.stop()` + `join()` are
+    called from `watch.py`'s `finally` block
+
+**Step 9.4 — Tests**
+
+- Files affected: `tests/unit/test_git_hooks.py`, `tests/unit/test_branch_monitor.py`,
+  `tests/e2e/test_git_hook_install.py`
+- Tasks:
+  - `test_git_hooks.py`: hook file content is correct; idempotency; `$3=0` early-exit
+    condition; existing-hook warning (no overwrite)
+  - `test_branch_monitor.py`: mock `git rev-parse`; assert `cancel_all` + `index_repo`
+    called in order on branch change; assert no call on same-branch poll;
+    assert that `job_manager.schedule()` calls received while `_paused=True` are NOT
+    executed until `_paused` is cleared (verifies the queued-not-dropped guarantee)
+  - `test_git_hook_install.py` (e2e): `sqlcg git install-hooks` in a real tmp git repo;
+    assert hook file exists and is executable; run hook script with `$3=1` and assert
+    it invokes `sqlcg index`
+  - `--dialect auto` covered in existing `tests/unit/test_config.py` (extend it)
+
+---
+
+**Phase 9 Acceptance Criteria**
+
+- [ ] `sqlcg git install-hooks` creates an executable `post-checkout` hook in the target repo
+- [ ] Hook skips indexing on file checkout (`$3=0`) and runs it on branch checkout (`$3=1`)
+- [ ] `install-hooks` is idempotent — running twice produces one hook line, not two
+- [ ] `install-hooks` warns and exits 0 without overwriting a pre-existing non-sqlcg hook
+      (detection uses `# sqlcg post-checkout hook` sentinel string)
+- [ ] `sqlcg index --dialect auto` resolves dialect from `.sqlcg.toml` or falls back to `snowflake`
+- [ ] `sqlcg index --quiet` suppresses the summary console line without changing exit code or parse behaviour
+- [ ] `BranchMonitor` triggers `cancel_all()` + `index_repo()` when branch changes
+- [ ] File events during a branch-switch resync are buffered in `_queued` and replayed after resync —
+      not dropped and not executed concurrently with the resync
+- [ ] `BranchMonitor` thread exits cleanly via `BranchMonitor.stop()` + `join()` from `watch.py` `finally`
+- [ ] All existing watcher tests still pass
+
+---
+
+**Phase 9 Risks and Mitigations**
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|-----------|
+| `git rev-parse` unavailable (not a git repo) | Low | Low | `BranchMonitor` catches `CalledProcessError`; logs DEBUG and disables itself silently |
+| Hook overwrites user's existing `post-checkout` | Low | High | Explicit check for existing hook content; warn + skip if not authored by sqlcg |
+| Branch-switch resync blocks watcher for large repos | Medium | Medium | Resync runs in background thread; file events are queued (not dropped) during resync |
+| `--dialect auto` fallback to `snowflake` wrong for most repos | Medium | Low | Users set `.sqlcg.toml`; fallback is documented; explicit `--dialect` always wins |
+| `BranchMonitor` 2s polling adds overhead | Low | Low | One `git rev-parse` call per 2s is negligible; thread exits cleanly on shutdown |
