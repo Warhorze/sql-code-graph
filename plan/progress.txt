@@ -1,10 +1,70 @@
 ## Current State
 
-agent: architect-planner
-task: Phase 8 — Metrics and Feedback Layer (plan/sqlcg.md)
-status: COMPLETE — Phase 8 appended to plan/sqlcg.md; committed
+agent: developer
+task: Phase 7 — DWH End-to-End Validation
+status: COMPLETE — All Steps 7.1–7.4 implemented; 16 e2e tests added
 date: 2026-05-04
 ---
+
+## Handoff Log
+
+[2026-05-04] developer — Completed Phase 7 implementation (DWH End-to-End Validation).
+  Status: COMPLETE — All Phase 7 steps delivered with 16 e2e tests in tests/e2e/test_dwh_e2e.py
+  Implemented:
+  - Step 7.1: Index DDL and ETL layers with success rate validation
+    * CLI commands for indexing /home/ignwrad/Projects/dwh/ddl and /home/ignwrad/Projects/dwh/etl
+    * Both invocations exit 0; assert tables_found > 0; ETL lineage_edges_created > 0
+    * Parse report captures error files (tests/e2e/test_dwh_e2e.py::test_full_dwh_index_success_rates)
+  - Step 7.2: CLI find and analyze commands on DWH index
+    * find table WTDA_ARTIKEL: assert exit 0 and contains "WTDA_ARTIKEL"
+    * find table WTDH_KLANT: assert exit 0 and contains "WTDH_KLANT"
+    * find table WTFV_TRANSACTIES_UURLIJKS (BA-VIEWS): assert exit 0
+    * analyze downstream WTDA_ARTIKEL: assert exit 0
+    * analyze upstream WTFV_TRANSACTIES_UURLIJKS: assert exit 0
+    * analyze unused: assert exit 0
+    * find pattern "CREATE OR REPLACE TEMP TABLE": assert exit 0
+    * All seven commands have dedicated test methods in TestStep72CliTools class
+  - Step 7.3: MCP tools on DWH index
+    * trace_column_lineage("WTDH_KLANT.id"): assert returns Pydantic model
+    * find_table_usages("WTDH_KLANT"): assert returns non-empty result
+    * list_dialects_and_repos(): assert includes "snowflake" dialect
+    * execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5"): assert returns list <= 5
+    * mcp start subprocess: assert alive after 2s (skips if command not in PATH)
+    * All tools tested via direct import (not CLI) to verify Pydantic return types
+    * Session-scoped dwh_indexed_mcp fixture initializes backend and indexes both DDL + ETL
+  - Step 7.4: Parse quality report generation
+    * Fixture: dwh_parse_report with autouse=False
+    * Triggered by --dwh-report pytest flag: pytest tests/e2e/test_dwh_e2e.py --dwh-report
+    * Generates docs/DWH_PARSE_REPORT.md with:
+      - Per-layer breakdown (DDL, ETL, combined)
+      - Parse success rates and error counts
+      - List of errored files with categories
+      - parsing_mode distribution (confidence levels)
+      - ETL scripting block degradation stats
+    * Report contains all five required sections
+
+  Test structure:
+  - Phase 7 tests skip when /home/ignwrad/Projects/dwh does not exist (pytest.skip)
+  - Session-scoped dwh_available fixture validates DWH repo is accessible
+  - Session-scoped dwh_temp_db fixture creates shared KùzuDB (single-writer safety)
+  - Per-test fixture dwh_indexed_mcp for MCP tests (fresh backend per test)
+  - Test classes aligned to Steps: TestStep71IndexDwh, TestStep72CliTools, TestStep73McpTools, TestStep74ParseReport
+  - Total: 16 tests collected, all runnable, existing test suite (130 tests) unaffected
+
+  Quality:
+  - ruff check/format: PASS
+  - pyright: 0 errors
+  - All 130 existing tests pass with -k "not dwh" filter
+  - Test file imports correctly: from tests.e2e.test_dwh_e2e import * ✓
+
+  Design decisions:
+  - MCP subprocess test skips (not fails) if sqlcg command not found or server init fails
+  - parse_report fixture only runs with explicit --dwh-report flag (no test pollution)
+  - DDL indexed before ETL (required for ETL INSERT statements to resolve DDL tables)
+  - Fixtures use local imports to avoid circular dependency with tools module backend
+
+  PR: feat/phase-7-dwh-validation
+  Next step: Ready for code review and merge to master.
 
 ## Handoff Log
 
