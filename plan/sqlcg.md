@@ -1049,6 +1049,552 @@ All SQL in both layers uses the Snowflake dialect.
 
 ---
 
+### Phase 8 — Metrics and Feedback Layer (Days 34–38)
+
+**Context**
+
+Phase 8 adds a lightweight observability layer that records tool call activity,
+indexing run history, and LLM-submitted relevance feedback to a local SQLite database
+at `~/.sqlcg/metrics.db`. No new runtime dependencies are introduced (stdlib `sqlite3`
+only). All writes are append-only; reads are aggregates. Two new CLI commands expose
+the data: `sqlcg gain` (numeric summary) and `sqlcg report` (FP/error cluster report
+with a pre-filled GitHub issue URL).
+
+**Phase 8 Non-Goals**
+
+- Server-side telemetry or any outbound network call
+- Automatic GitHub issue creation (report command generates the URL only)
+- Retention policy or pruning of old rows (all rows are kept for the v1 lifetime)
+- Metrics encryption or access control (local single-user tool)
+- False negative (FN) feedback collection — LLMs cannot reliably self-report missed
+  results; TP/FP only
+
+---
+
+**Step 8.1 — SQLite metrics store**
+
+- Files affected:
+  - `src/sqlcg/metrics/__init__.py` (new — empty init, makes package importable)
+  - `src/sqlcg/metrics/store.py` (new — all SQLite read/write logic)
+
+- Tasks:
+  - `store.py` must be importable without a KùzuDB backend present (no import of
+    `kuzu`, `graph_db`, or any `sqlcg.core` symbol at module level)
+  - Define `METRICS_DB_PATH: Path` constant:
+    `Path.home() / ".sqlcg" / "metrics.db"` — consistent with the KùzuDB path
+    convention in `get_db_path()` from `config.py`
+  - Define `MetricsStore` class:
+    ```python
+    class MetricsStore:
+        def __init__(self, db_path: Path = METRICS_DB_PATH) -> None: ...
+        def init_schema(self) -> None: ...  # CREATE TABLE IF NOT EXISTS
+        def record_tool_call(
+            self,
+            tool_name: str,
+            timestamp: float,       # time.time()
+            duration_ms: float,     # wall-clock, milliseconds
+            row_count: int,
+            repo_path: str,
+        ) -> None: ...
+        def record_index_run(
+            self,
+            timestamp: float,
+            repo_path: str,
+            duration_ms: float,
+            files_parsed: int,
+            parse_errors: int,
+            lineage_edges_created: int,
+        ) -> None: ...
+        # Derived metrics (computed properties)
+        def get_parse_success_rate(self) -> float: ...  # parse_errors / files_parsed
+        def close(self) -> None: ...
+    ```
+  - DDL (all tables created with `CREATE TABLE IF NOT EXISTS`):
+    ```sql
+    CREATE TABLE IF NOT EXISTS tool_calls (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool_name   TEXT    NOT NULL,
+        timestamp   REAL    NOT NULL,   -- Unix epoch float
+        duration_ms REAL    NOT NULL,
+        row_count   INTEGER NOT NULL DEFAULT 0,
+        repo_path   TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS index_runs (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp            REAL    NOT NULL,
+        repo_path            TEXT    NOT NULL,
+        duration_ms          REAL    NOT NULL,
+        files_parsed         INTEGER NOT NULL,
+        parse_errors         INTEGER NOT NULL,
+        lineage_edges_created INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS feedback (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool_name  TEXT NOT NULL,
+        query      TEXT NOT NULL,
+        label      TEXT NOT NULL CHECK(label IN ('TP', 'FP')),
+        note       TEXT NOT NULL DEFAULT '',
+        timestamp  REAL NOT NULL
+    );
+    ```
+  - `init_schema()` creates the database file (including parent directory) and all three
+    tables. It is called once at process startup; calling it multiple times is safe
+    (`IF NOT EXISTS` guards prevent duplication).
+  - All write methods must be wrapped in `try/except Exception`: log a WARNING via
+    `sqlcg.utils.logging.getLogger` and return without raising. A metrics write failure
+    must never propagate to the caller or crash a tool call.
+  - `MetricsStore.__enter__` / `__exit__` for use as a context manager (calls `close()`
+    on exit).
+  - Opt-out: check `os.environ.get("SQLCG_METRICS", "1") == "0"` at the top of each
+    write method; return immediately (no write, no error) when metrics are disabled.
+    Read methods are not guarded — they should always return data if the database exists.
+  - `db_path.parent.mkdir(parents=True, exist_ok=True)` before connecting (consistent
+    with how `get_db_path()` creates its parent in `index_cmd`).
+  - Use `sqlite3.connect(str(db_path))` — do not use `pathlib.Path` directly with
+    `sqlite3.connect` (stdlib behaviour varies across Python minor versions).
+
+- Acceptance:
+  - `from sqlcg.metrics.store import MetricsStore` succeeds in an environment where
+    `kuzu` is not installed
+  - `MetricsStore().init_schema()` is idempotent (call twice, no error, tables exist)
+  - `record_tool_call(...)` with `SQLCG_METRICS=0` set is a no-op (no row written)
+  - `record_tool_call(...)` exception is caught and logged as WARNING; caller does not
+    see the exception
+  - `record_index_run(...)` appends a row; reading it back returns the stored values
+
+---
+
+**Step 8.2 — Instrument MCP tools and the indexer**
+
+- Files affected:
+  - `src/sqlcg/server/tools.py` (instrument every `@mcp.tool()` call)
+  - `src/sqlcg/indexer/indexer.py` (instrument `index_repo`)
+
+- Tasks (tools.py):
+  - Import `MetricsStore` at the top of `tools.py` (lazy import inside each decorator
+    is acceptable if it avoids a circular import, but module-level import is preferred).
+  - Define a module-level `_metrics: MetricsStore | None = None`. Initialise it inside
+    `init_backend()` immediately after `_backend` is set:
+    ```python
+    _metrics = MetricsStore()
+    _metrics.init_schema()
+    ```
+    Add a corresponding `_metrics.close()` call in `shutdown_backend()`.
+  - For each of the eight `@mcp.tool()` functions (`index_repo`, `trace_column_lineage`,
+    `find_table_usages`, `get_downstream_dependencies`, `get_upstream_dependencies`,
+    `search_sql_pattern`, `list_dialects_and_repos`, `execute_cypher`), wrap the body
+    in a timing block:
+    ```python
+    import time
+    _t0 = time.monotonic()
+    try:
+        result = <original body>
+    finally:
+        if _metrics is not None:
+            _metrics.record_tool_call(
+                tool_name="<name>",
+                timestamp=time.time(),
+                duration_ms=(time.monotonic() - _t0) * 1000,
+                row_count=<len(result) if iterable else 1>,
+                repo_path=<repo_path arg or "" if not applicable>,
+            )
+    return result
+    ```
+  - `row_count` extraction rules per tool:
+    - `index_repo`: 0 (summary dict, not a row collection)
+    - `trace_column_lineage`: `len(result.lineage)`
+    - `find_table_usages`: `len(result.usages)`
+    - `get_downstream_dependencies` / `get_upstream_dependencies`: `len(result.nodes)`
+    - `search_sql_pattern`: `len(result.matches)`
+    - `list_dialects_and_repos`: `len(result.repos)`
+    - `execute_cypher`: `len(result)` (returns `list[dict]`)
+  - `repo_path` extraction: use the `repo_path` argument where the tool accepts one
+    (only `index_repo`); pass `""` for all query tools.
+  - The timing block must not change any existing exception propagation — exceptions
+    from the tool body must still propagate after the metrics write.
+
+- Tasks (indexer.py):
+  - Import `MetricsStore` at the top of `indexer.py`. Instantiate it in `index_repo`:
+    ```python
+    _ms = MetricsStore()
+    _ms.init_schema()
+    t0 = time.monotonic()
+    ```
+    After the final return dict is assembled, before the `return`:
+    ```python
+    _ms.record_index_run(
+        timestamp=time.time(),
+        repo_path=str(path),
+        duration_ms=(time.monotonic() - t0) * 1000,
+        files_parsed=result["files_parsed"],
+        parse_errors=result["parse_errors"],
+        lineage_edges_created=result["lineage_edges_created"],
+    )
+    _ms.close()
+    ```
+  - The `MetricsStore` instance in `index_repo` is local (not module-level) because
+    `index_repo` can be called concurrently (watcher) and SQLite is not safe to share
+    across threads without connection-per-thread. Each call opens and closes its own
+    connection.
+  - Wrap the `record_index_run` + `close` block in `try/finally` so `close()` is always
+    called even if the metrics write silently fails.
+
+- Acceptance:
+  - After `sqlcg index tests/fixtures/synthetic/ --dialect ansi`, a row exists in
+    `~/.sqlcg/metrics.db` table `index_runs`
+  - After calling any MCP tool, a row exists in `tool_calls`
+  - With `SQLCG_METRICS=0`, neither table receives a row
+  - Raising an exception inside a tool (e.g. `NotIndexedError`) still results in a row
+    in `tool_calls` (metrics write happens in `finally`)
+
+---
+
+**Step 8.3 — `submit_feedback` MCP tool**
+
+- Files affected:
+  - `src/sqlcg/server/tools.py` (add new `@mcp.tool()`)
+
+- Tasks:
+  - Add `submit_feedback` as the ninth MCP tool:
+    ```python
+    @mcp.tool()
+    def submit_feedback(
+        tool_name: str,
+        query: str,
+        label: str,
+        note: str = "",
+    ) -> dict:
+        """Rate a tool result as useful (TP) or not useful (FP).
+        Call after evaluating any tool result.
+
+        Args:
+            tool_name: Name of the tool whose result is being rated.
+            query: The query or input that produced the result.
+            label: "TP" (result was correct) or "FP" (result was wrong).
+            note: Optional explanation (max 500 chars).
+
+        Returns:
+            {"status": "recorded"} on success, {"status": "skipped"} if metrics off.
+
+        Raises:
+            ValueError: If label is not "TP" or "FP".
+        """
+    ```
+  - Validate `label in {"TP", "FP"}` — raise `ValueError` with a clear message if not.
+  - Validate `len(note) <= 500` — silently truncate to 500 chars (do not raise; the
+    LLM may produce long notes).
+  - Write via `_metrics.record_feedback(tool_name, query, label, note, time.time())`
+    (add `record_feedback` method to `MetricsStore`).
+  - Return `{"status": "recorded"}` on success, `{"status": "skipped"}` if
+    `SQLCG_METRICS=0` is set (the `record_feedback` no-op returns without writing;
+    the tool still needs to communicate that skip to the caller).
+  - Docstring system prompt hint: "Call after evaluating any tool result." — this is the
+    nudge (10 words) that encourages the LLM to call it without requiring a full system
+    prompt change.
+  - The tool must NOT call `_assert_indexed()` — feedback can be submitted even on an
+    unindexed graph (e.g. to record a FP from a cached result).
+  - `note` truncation and label validation happen before the metrics write attempt.
+
+- `MetricsStore.record_feedback` addition to `store.py`:
+  ```python
+  def record_feedback(
+      self,
+      tool_name: str,
+      query: str,
+      label: str,         # "TP" or "FP" — caller validates
+      note: str,
+      timestamp: float,
+  ) -> None: ...
+  ```
+  Uses the same try/except + opt-out pattern as other write methods.
+
+- Acceptance:
+  - `submit_feedback("trace_column_lineage", "orders.amount", "TP")` returns
+    `{"status": "recorded"}` and a row exists in the `feedback` table
+  - `submit_feedback("trace_column_lineage", "orders.amount", "FN")` raises `ValueError`
+  - `submit_feedback(..., note="x" * 600)` stores exactly 500 characters, no exception
+  - With `SQLCG_METRICS=0`, returns `{"status": "skipped"}` and no row is written
+  - The tool is visible in the FastMCP tool listing alongside the eight existing tools
+
+---
+
+**Step 8.4 — `sqlcg gain` CLI command**
+
+- Files affected:
+  - `src/sqlcg/cli/commands/gain.py` (new)
+  - `src/sqlcg/cli/main.py` (register command)
+
+- Tasks:
+  - `gain.py` defines a single Typer command `gain_cmd` registered as `sqlcg gain`.
+  - `gain_cmd` signature:
+    ```python
+    def gain_cmd(
+        json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON output"),
+    ) -> None:
+        """Show metrics summary: tool call counts, parse quality trend, TP rate."""
+    ```
+  - Open `MetricsStore(METRICS_DB_PATH)` — if the file does not exist, print a message
+    "No metrics collected yet. Run sqlcg index or use an MCP tool first." and exit 0.
+    Do not create the file just by running `sqlcg gain`.
+  - Compute and display (or serialise) the following sections. All queries use SQLite
+    aggregate functions — no in-Python loops over raw rows:
+
+    **Section A — Total MCP tool calls**
+    ```sql
+    SELECT COUNT(*) AS total FROM tool_calls;
+    SELECT COUNT(*) AS last_7d FROM tool_calls
+    WHERE timestamp > strftime('%s', 'now') - 7*86400;
+    ```
+    Display: "Total tool calls: {total} (last 7 days: {last_7d})"
+
+    **Section B — Parse success rate trend (last 5 index runs)**
+    ```sql
+    SELECT timestamp, repo_path,
+           CAST(files_parsed - parse_errors AS REAL) / NULLIF(files_parsed, 0) AS success_rate
+    FROM index_runs
+    ORDER BY timestamp DESC
+    LIMIT 5;
+    ```
+    Display: one row per run, formatted as
+    `  {date} {repo_path}: {success_rate:.0%}` (newest first).
+    If fewer than 1 run: "No indexing runs recorded yet."
+    No sparkline required — plain percentages are acceptable. A simple ASCII sparkline
+    (characters `▁▂▃▄▅▆▇█` proportional to the rate) is optional but not required for
+    acceptance.
+
+    **Section C — TP rate from feedback**
+    ```sql
+    SELECT
+        SUM(CASE WHEN label = 'TP' THEN 1 ELSE 0 END) AS tp,
+        COUNT(*) AS total
+    FROM feedback;
+    ```
+    Display: "Feedback TP rate: {tp}/{total} ({rate:.0%})" only if `total >= 5`.
+    If `total < 5`: "Feedback: {total} sample(s) — need 5 to show TP rate."
+
+    **Section D — Top 3 most-called tools**
+    ```sql
+    SELECT tool_name, COUNT(*) AS calls
+    FROM tool_calls
+    GROUP BY tool_name
+    ORDER BY calls DESC
+    LIMIT 3;
+    ```
+    Display: numbered list `  1. {tool_name}: {calls} calls`.
+    If no calls: "No tool calls recorded yet."
+
+  - `--json` output: return a single JSON object with keys `total_calls`, `last_7d_calls`,
+    `index_runs` (list of `{timestamp, repo_path, success_rate}`), `feedback_tp`,
+    `feedback_total`, `top_tools` (list of `{tool_name, calls}`). Use `json.dumps(...,
+    indent=2)` and print to stdout.
+  - Register in `main.py`:
+    ```python
+    from sqlcg.cli.commands import gain
+    app.command("gain")(gain.gain_cmd)
+    ```
+
+- Acceptance:
+  - `sqlcg gain` with no metrics database exits 0 with the "No metrics" message
+  - `sqlcg gain` after `sqlcg index` and one MCP tool call shows non-zero values in
+    Sections A and B
+  - `sqlcg gain --json` outputs valid JSON with all required keys
+  - TP rate section is hidden when fewer than 5 feedback samples exist
+  - `sqlcg gain` exits 0 in all cases (metrics absence is not an error)
+
+---
+
+**Step 8.5 — `sqlcg report` CLI command**
+
+- Files affected:
+  - `src/sqlcg/cli/commands/report.py` (new)
+  - `src/sqlcg/cli/main.py` (register command)
+
+- Tasks:
+  - `report.py` defines a single Typer command `report_cmd` registered as `sqlcg report`.
+  - `report_cmd` signature:
+    ```python
+    def report_cmd(
+        stdout: bool = typer.Option(False, "--stdout", help="Print to stdout instead of file"),
+        output: Path = typer.Option(
+            Path("docs/METRICS_REPORT.md"),
+            "--output", "-o",
+            help="Output file path",
+        ),
+    ) -> None:
+        """Generate a metrics report with FP clusters and parse error patterns."""
+    ```
+  - If metrics database does not exist: print "No metrics collected yet." and exit 0.
+  - Compute the following sections via SQL queries:
+
+    **Section 1 — FP clusters** (files or query patterns with FP rate > 50%, min 3 samples)
+    ```sql
+    SELECT query,
+           SUM(CASE WHEN label = 'FP' THEN 1 ELSE 0 END) AS fp_count,
+           COUNT(*) AS total,
+           CAST(SUM(CASE WHEN label = 'FP' THEN 1 ELSE 0 END) AS REAL) / COUNT(*) AS fp_rate
+    FROM feedback
+    GROUP BY query
+    HAVING total >= 3 AND fp_rate > 0.5
+    ORDER BY fp_rate DESC;
+    ```
+    Render as a Markdown table: `| Query | FP Count | Total | FP Rate |`.
+    If no qualifying rows: "No FP clusters found (need ≥3 samples per query pattern)."
+
+    **Section 2 — Parse error clusters** (files that errored across multiple index runs)
+    ```sql
+    SELECT repo_path, COUNT(*) AS run_count,
+           SUM(parse_errors) AS total_errors,
+           CAST(SUM(parse_errors) AS REAL) / NULLIF(SUM(files_parsed), 0) AS error_rate
+    FROM index_runs
+    GROUP BY repo_path
+    HAVING run_count >= 2 AND total_errors > 0
+    ORDER BY total_errors DESC;
+    ```
+    Render as a Markdown table: `| Repo Path | Runs | Total Errors | Error Rate |`.
+    If no qualifying rows: "No parse error clusters found."
+
+    **Section 3 — Pre-filled GitHub issue URL**
+    - Compute a `report_hash`: `hashlib.md5(report_content.encode()).hexdigest()[:8]`
+      (used in the issue title to identify the specific report; stdlib `hashlib` only).
+    - Issue title: `[sqlcg metrics] FP clusters report {report_hash}`
+    - Issue body (URL-encoded): the Markdown content of Sections 1 and 2, truncated to
+      2000 characters if longer (GitHub URL length limit is 8192; 2000 chars is safe).
+    - Pre-filled URL format:
+      ```
+      https://github.com/Warhorze/sql-code-graph/issues/new?title={title}&body={body}
+      ```
+      Use `urllib.parse.quote` (stdlib) for URL encoding. No requests/httpx import.
+    - Render this URL under a "## File an Issue" heading in the report.
+    - The URL is copy-paste ready — it must be a single line with no line breaks inside
+      the URL itself.
+
+  - Output:
+    - With `--stdout`: print the Markdown to stdout.
+    - Without `--stdout`: write to `--output` path (default `docs/METRICS_REPORT.md`),
+      creating parent directories as needed. Print "Report written to {output}" to
+      the console (stderr-safe via `console.print()`).
+  - Register in `main.py`:
+    ```python
+    from sqlcg.cli.commands import report
+    app.command("report")(report.report_cmd)
+    ```
+
+- Acceptance:
+  - `sqlcg report --stdout` with no metrics database exits 0 with the "No metrics" message
+  - `sqlcg report --stdout` with seed data produces valid Markdown with all three sections
+  - FP cluster table appears only when ≥3 samples with FP rate >50% exist
+  - Parse error cluster table appears only when ≥2 runs with parse errors exist
+  - GitHub issue URL is a valid URL (parseable by `urllib.parse.urlparse`) with no
+    newlines embedded
+  - `report_hash` changes when the report content changes
+
+---
+
+**Step 8.6 — Unit tests**
+
+- Files affected:
+  - `tests/unit/test_metrics.py` (new — all Phase 8 unit tests)
+
+- Tasks:
+  - All tests use a `tmp_path` fixture (pytest built-in) to write to a throwaway SQLite
+    file, never to `~/.sqlcg/metrics.db`.
+  - Test organisation — test classes per concern:
+
+    **`TestMetricsStore`** — store.py unit tests:
+    - `test_init_schema_is_idempotent`: call `init_schema()` twice, assert no error and
+      three tables exist (query `sqlite_master`)
+    - `test_record_tool_call_writes_row`: call `record_tool_call(...)`, assert one row
+      in `tool_calls` with correct field values
+    - `test_record_index_run_writes_row`: call `record_index_run(...)`, assert row in
+      `index_runs`
+    - `test_record_feedback_writes_row`: call `record_feedback(..., label="TP")`, assert row
+    - `test_write_is_noop_when_disabled`: set `os.environ["SQLCG_METRICS"] = "0"`, call
+      `record_tool_call(...)`, assert table has 0 rows
+    - `test_write_does_not_raise_on_sqlite_error`: monkeypatch `sqlite3.Connection.execute`
+      to raise `sqlite3.OperationalError`; assert `record_tool_call(...)` returns without
+      raising and that a WARNING was logged
+    - `test_context_manager_closes_connection`: use `with MetricsStore(...) as ms:` block;
+      after the block, assert `ms._conn` is closed (check `ms._conn` is None or
+      `_closed` attribute depending on implementation)
+
+    **`TestSubmitFeedbackTool`** — submit_feedback MCP tool unit tests:
+    - `test_submit_feedback_tp_recorded`: call with `label="TP"`, assert return
+      `{"status": "recorded"}` and row in `feedback` table
+    - `test_submit_feedback_invalid_label_raises`: call with `label="FN"`, assert
+      `ValueError` raised
+    - `test_submit_feedback_note_truncated`: call with `note="x" * 600`, assert stored
+      note is exactly 500 characters
+    - `test_submit_feedback_skipped_when_metrics_off`: set `SQLCG_METRICS=0`, assert
+      return is `{"status": "skipped"}` and no row written
+
+    **`TestGainCommand`** — gain.py unit tests (use `typer.testing.CliRunner`):
+    - `test_gain_no_database_exits_0`: run `sqlcg gain` with no metrics.db, assert
+      exit 0 and "No metrics" in output
+    - `test_gain_shows_total_calls`: seed `tool_calls` with 3 rows, assert output
+      contains "Total tool calls: 3"
+    - `test_gain_hides_tp_rate_below_5_samples`: seed `feedback` with 3 rows, assert
+      "need 5" appears in output
+    - `test_gain_shows_tp_rate_at_5_samples`: seed `feedback` with 5 TP rows, assert
+      TP rate section is shown with "5/5"
+    - `test_gain_json_flag_produces_valid_json`: run `sqlcg gain --json`, parse output
+      as JSON, assert all required keys present
+
+    **`TestReportCommand`** — report.py unit tests (use `typer.testing.CliRunner`):
+    - `test_report_no_database_exits_0`: run `sqlcg report --stdout` with no metrics.db,
+      assert exit 0
+    - `test_report_fp_cluster_appears_in_output`: seed `feedback` with 4 FP rows for the
+      same query (FP rate = 1.0 > 0.5, count ≥ 3), assert the query appears in
+      `--stdout` output
+    - `test_report_fp_cluster_hidden_when_insufficient_samples`: seed 2 FP rows for a
+      query (count < 3), assert the query does NOT appear in output
+    - `test_report_parse_error_cluster_appears`: seed `index_runs` with 2 runs for the
+      same repo, both with parse_errors > 0, assert the repo path appears in output
+    - `test_report_github_url_is_valid`: seed any data, run `--stdout`, extract the
+      GitHub URL line, assert `urllib.parse.urlparse(url).scheme == "https"`
+    - `test_report_writes_to_file`: run without `--stdout`, assert the output file is
+      created and non-empty
+
+- Acceptance:
+  - `pytest tests/unit/test_metrics.py` passes with 0 failures
+  - All tests use `tmp_path`; no test touches `~/.sqlcg/`
+  - Coverage of `store.py`, `gain.py`, `report.py`, and the `submit_feedback` function
+    in `tools.py` reaches ≥ 80% (measured; not enforced as a gate, but recorded)
+
+---
+
+## Phase 8 Acceptance Criteria
+
+- [ ] `from sqlcg.metrics.store import MetricsStore` succeeds without `kuzu` installed
+- [ ] `MetricsStore.init_schema()` is idempotent
+- [ ] With `SQLCG_METRICS=0`, no rows are written to any metrics table
+- [ ] A failed metrics write logs WARNING and does not propagate to the caller
+- [ ] After `sqlcg index`, a row exists in `index_runs` with correct `files_parsed` value
+- [ ] After calling any MCP tool, a row exists in `tool_calls` with correct `tool_name`
+- [ ] `submit_feedback("t", "q", "FN")` raises `ValueError`
+- [ ] `submit_feedback("t", "q", "TP", note="x"*600)` stores 500 chars, returns `{"status": "recorded"}`
+- [ ] `sqlcg gain` exits 0 with no metrics database present
+- [ ] `sqlcg gain --json` outputs valid JSON with keys: `total_calls`, `last_7d_calls`, `index_runs`, `feedback_tp`, `feedback_total`, `top_tools`
+- [ ] `sqlcg report --stdout` exits 0 with no metrics database present
+- [ ] FP cluster table is hidden when no query has ≥3 samples with FP rate > 50%
+- [ ] GitHub issue URL in `sqlcg report` output is a valid HTTPS URL parseable by `urllib.parse.urlparse`
+- [ ] `pytest tests/unit/test_metrics.py` passes with 0 failures (minimum 20 test cases)
+
+---
+
+## Phase 8 Risks and Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|-----------|
+| SQLite write failure on low-disk-space or permission error | Low | Low | try/except wraps every write; WARNING logged; tool call is unaffected |
+| `metrics.db` grows unbounded on high-use installations | Low | Low | v1 has no pruning; document that users can delete the file at any time; v2 can add retention policy |
+| LLM calls `submit_feedback` with FN label | Medium | None | `ValueError` raised before any write; no FN rows can exist in the database |
+| Concurrent MCP tool calls race on `_metrics` singleton | Low | Low | SQLite's serialised write mode (`check_same_thread=True`) + WAL journal mode prevents corruption; each watcher job uses its own local `MetricsStore` instance (no singleton in indexer path) |
+| GitHub issue URL exceeds browser limit | Low | Low | Body is truncated to 2000 chars; title is fixed-length; total URL is well within 8192 char limit |
+| `gain.py` or `report.py` SQL queries time out on large metrics.db | Very Low | Low | All queries use indexed columns (timestamp, label, tool_name); no full-table scans; no index DDL needed for v1 volumes |
+| `submit_feedback` docstring hint is ignored by LLM | Medium | Low | The tool is always available and surfaced in the tool listing; LLM may call it if Claude's tool-selection improves; no correctness risk if it is never called |
+
+---
+
 ## Rollout Notes
 
 This is a greenfield project with no existing users; no migration or rollback plan is

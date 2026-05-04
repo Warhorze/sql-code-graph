@@ -1,8 +1,8 @@
 ## Current State
 
-agent: architect-reviewer
-task: PR #1 inline comment review
-status: COMPLETE — action list produced; ARCHITECTURE_REVIEW.md Section 8 added
+agent: architect-planner
+task: Phase 8 — Metrics and Feedback Layer (plan/sqlcg.md)
+status: COMPLETE — Phase 8 appended to plan/sqlcg.md; committed
 date: 2026-05-04
 ---
 
@@ -694,6 +694,29 @@ date: 2026-05-04
   No blockers.
 
   Next step: developer proceeds to Phase 6 (Benchmarks and CI).
+
+[2026-05-04] architect-planner — Phase 8 plan complete (Metrics and Feedback Layer).
+  Summary: Appended Phase 8 (Steps 8.1–8.6) to plan/sqlcg.md. Phase 8 adds:
+  - Step 8.1: MetricsStore (src/sqlcg/metrics/store.py) — SQLite-only, importable
+    without KùzuDB, opt-out via SQLCG_METRICS=0, all writes wrapped in try/except.
+    Three tables: tool_calls, index_runs, feedback. Append-only, no UPDATE/DELETE.
+  - Step 8.2: Instrumentation in tools.py (timing wrapper for all 8 MCP tools) and
+    indexer.py (record_index_run per index_repo call). Module-level _metrics singleton
+    in tools.py; local MetricsStore instance per index_repo call (thread-safe).
+  - Step 8.3: submit_feedback MCP tool — 9th MCP tool accepting TP/FP labels;
+    validates label before write; truncates note to 500 chars; docstring hint nudges LLM.
+  - Step 8.4: sqlcg gain command — Sections A (call counts), B (parse success trend,
+    last 5 runs), C (TP rate, min 5 samples), D (top 3 tools); --json flag.
+  - Step 8.5: sqlcg report command — FP clusters (>50% FP rate, min 3 samples),
+    parse error clusters (multi-run repos with errors), pre-filled GitHub issue URL
+    (no network call; urllib.parse.quote; report_hash via hashlib.md5).
+  - Step 8.6: 20+ unit tests in tests/unit/test_metrics.py — all using tmp_path,
+    no ~/.sqlcg/ writes; CliRunner tests for gain and report commands.
+  Constraints honoured: stdlib sqlite3 only, no new runtime deps; importable without
+  kuzu; writes never raise; all writes append-only.
+  Next step: developer implements Phase 8 starting with Step 8.1 (store.py), then
+  Step 8.2 (instrumentation), then Step 8.3 (submit_feedback), then Steps 8.4 and 8.5
+  (CLI commands), then Step 8.6 (tests). Register both CLI commands in main.py.
 
 [2026-05-04] architect-reviewer — PR #1 inline comment review.
   Summary: Reviewed all 8 inline comments on feat/phase-4-cli PR #1 from Warhorze.
