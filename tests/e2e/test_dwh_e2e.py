@@ -617,18 +617,3 @@ class TestStep74ParseReport:
         assert dwh_parse_report.exists()
         content = dwh_parse_report.read_text()
         assert "# DWH Parse Quality Report" in content
-
-
-# ============================================================================
-# pytest hook for --dwh-report flag
-# ============================================================================
-
-
-def pytest_addoption(parser):
-    """Add --dwh-report command-line option."""
-    parser.addoption(
-        "--dwh-report",
-        action="store_true",
-        default=False,
-        help="Generate DWH parse quality report (docs/DWH_PARSE_REPORT.md)",
-    )
