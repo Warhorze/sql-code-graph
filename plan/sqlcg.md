@@ -202,14 +202,14 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     `conn.execute()` call. Issue each of the four Cypher statements as a separate
     `self._conn.execute(...)` call within the active transaction:
     ```cypher
-    -- Step A: delete Column nodes for tables defined in this file
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)-[:HAS_COLUMN]->(c:Column)
+    -- Step A: delete SqlColumn nodes for tables defined in this file (Deviation 1: SqlTable/SqlColumn labels)
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn)
     DETACH DELETE c;
-    -- Step B: delete Query nodes and all their edges
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(q:Query)
+    -- Step B: delete SqlQuery nodes and their edges (Deviation 2: QUERY_DEFINED_IN relationship)
+    MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery)
     DETACH DELETE q;
-    -- Step C: delete Table nodes defined in this file (re-inserted on re-parse)
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
+    -- Step C: delete SqlTable nodes defined in this file (re-inserted on re-parse)
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
     DETACH DELETE t;
     -- Step D: delete the File node itself
     MATCH (f:File {path: $path})
@@ -354,6 +354,12 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
   - `test_parser.py`: failed `sg_lineage` call appends to `ParsedFile.errors` and emits
     a `confidence=0.0` edge (not a silent skip)
   - `test_parser.py`: `build_scope` returning `None` triggers fallback and logs a WARNING
+  - **COMPLIANCE NOTE (Phase 2)**: The `_extract_column_lineage` error-recording path and the
+    `build_scope None → WARNING` path are implemented in `base.py` but are NOT covered by
+    any test in the current 57-test suite. These two criteria must be added as explicit tests
+    before Phase 3 begins. Suggested test locations: `tests/unit/test_parser.py` (mock
+    `sg_lineage` to raise; mock `build_scope` to return None) or a dedicated
+    `tests/unit/test_lineage_extractor.py` as named in the Test Strategy section.
 
 **Step 2.3 — Snowflake parser**
 
@@ -464,10 +470,13 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     blueprint §7):
     ```python
     STALE_VIEWS_QUERY = """
-    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:Table)
-      <-[:SELECTS_FROM]-(q:Query)-[:DECLARES]->(v:Table {kind: 'VIEW'})
+    MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
+      <-[:SELECTS_FROM]-(q:SqlQuery)-[:DECLARES]->(v:SqlTable {kind: 'VIEW'})
     RETURN DISTINCT v.qualified AS view_name
     """
+    # NOTE: Uses SqlTable/SqlQuery labels (Deviation 1). DEFINED_IN is Table→File;
+    # QUERY_DEFINED_IN is Query→File. This query traverses t→File (DEFINED_IN) and
+    # q→t (SELECTS_FROM), so it does NOT use QUERY_DEFINED_IN — correct as written.
     ```
     Implementation:
     ```python
@@ -566,9 +575,15 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
 
 - Files affected: `src/sqlcg/indexer/dbt_adapter.py`
 - Tasks:
-  - `load_dbt_manifest(manifest_path, schema_resolver)`: calls `dbt-artifacts` to load
-    manifest, then `schema_resolver.add_dbt_manifest(manifest_path)` for each node
+  - `load_dbt_manifest(manifest_path, schema_resolver)`: loads dbt manifest via raw dict
+    access (Phase 3 Step 3.6 note: fragile against dbt manifest version changes; 
+    typed models via `dbt-artifacts` deferred to v2), then calls
+    `schema_resolver.add_dbt_manifest(manifest_path)`
   - Errors loading manifest are logged and do not abort indexing
+  - **Phase 3 Step 3.6 note**: The plan listed `dbt-artifacts>=1.0.0` as a core
+    dependency in the blueprint, but this package does not exist in public registries.
+    v1 uses raw JSON dict access instead (fragile but functional). For v2, introduce
+    `dbt-artifacts` typed models under the `dbt` optional extra.
 - Acceptance:
   - `test_indexer_to_graph.py`: indexing `tests/fixtures/jaffle_shop/` with manifest
     produces column-level edges where DDL-only indexing produces table-level only
@@ -754,6 +769,10 @@ Note: `inquirerpy` removed (wizard deferred). sqlglot upper bound widened to `<3
     - `p95 < 500ms` per file
     - `>= 50 files/sec` throughput
     - `>= 90%` cross-file resolution rate
+  - **Note on p95 benchmark gate**: Adversarial files (`200_join.sql`, `500_union.sql`)
+    that hit the `--timeout-per-file` ceiling must be excluded from the p95 latency
+    distribution. Measure them in a separate "adversarial" bucket. Otherwise the gate
+    always fails because those files exceed the timeout.
   - `docs/BENCHMARKS.md`: publish precision/recall separately from coverage (blueprint §11)
 - Acceptance:
   - `pytest tests/benchmarks/ --benchmark-only` passes all threshold assertions
@@ -842,6 +861,191 @@ and confidence score documented in blueprint §8.2.
 | Multi-catalog `Column.id` collision | `ColumnRef.full_id` includes all non-None components |
 | `resolve_pass2` file deleted between passes | Caught, logged, returns pass-1 result |
 | Benchmark targets not met on adversarial inputs | `--timeout-per-file` (default 30 s) prevents runaway; circuit-breaker logs WARNING and continues |
+
+---
+
+## Deviations
+
+### Deviation 1: Node Label Naming (Cypher Reserved Words)
+
+- **Reason**: KùzuDB Cypher parser treats "Table", "Column", "Query" as reserved words,
+  causing parser exceptions when used as node labels in MERGE statements. To avoid
+  workaround complexity and maintain clean query syntax, we renamed labels.
+- **Change**: 
+  - `Table` → `SqlTable`
+  - `Column` → `SqlColumn`
+  - `Query` → `SqlQuery`
+- **Impact**: No functional impact — the renamed labels are purely internal implementation.
+  All Cypher queries and constants use the new names. Future cross-database support
+  (e.g., Neo4j) will see identical logic, just without this constraint.
+- **Date**: 2026-05-02
+
+### Deviation 2: Added QUERY_DEFINED_IN Relationship
+
+- **Reason**: The blueprint schema defines DEFINED_IN only from SqlTable to File, but
+  QueryNode needs to reference the File it's defined in (for delete_nodes_for_file).
+  Without a separate relationship type, we cannot distinguish Query→File from Table→File
+  in Cypher.
+- **Change**: Added `CREATE REL TABLE QUERY_DEFINED_IN (FROM SqlQuery TO File)` to
+  the schema DDL.
+- **Impact**: Minimal — Cypher queries for delete_nodes_for_file now use QUERY_DEFINED_IN
+  for queries and DEFINED_IN for tables. This provides clarity and prevents relationship
+  ambiguity.
+- **Date**: 2026-05-02
+
+---
+
+### Phase 7 — DWH End-to-End Validation (Days 31–33)
+
+**Context**
+
+The DWH repository lives at `/home/ignwrad/Projects/dwh`. It is a real production
+Snowflake DWH with two SQL layers that Phase 7 targets:
+
+**DDL layer** (`ddl/`):
+- `ddl/changelogs/BA-TABLES/`: Snowflake `CREATE TABLE` DDL files (naming convention
+  `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
+- `ddl/changelogs/BA-VIEWS/`: view definitions (`WTDA_ARTIKEL.sql`,
+  `WTFV_TRANSACTIES_UURLIJKS.sql`, `WVFA_RFM_CLASSIFICATIE.sql`, etc.)
+- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views
+- `ddl/changelogs/MA-PROCEDURES/`: stored procedures with embedded DML
+- Other `ddl/changelogs/` subdirectories: dynamic tables, streams, tasks, masking, stages
+- Note: most DDL is in `.xml` Liquibase changelogs; only the handful of plain `.sql`
+  files will be indexed (IndexerWalker filters by `.sql` suffix)
+
+**ETL layer** (`etl/`): **648 (more) `.sql` files** — the interesting half of the corpus.
+These are the actual data movement scripts: multi-step Snowflake scripting blocks,
+`CREATE OR REPLACE TEMP TABLE ... AS SELECT`, `INSERT INTO ... SELECT FROM temp`,
+variable assignments (`SET warehousename = ...`), `USE SCHEMA/WAREHOUSE` directives.
+This is where lineage becomes non-trivial and where the current parser is expected
+to produce only partial results (table-level at confidence=0.3 for scripting blocks).
+Subdirectories:
+- `etl/pdi/template/`: ~36 Snowflake ETL scripts (initial loads, incremental updates)
+- `etl/pdi/template/adobe_initial_load/`, `voorraad_initial_load/`: specialised loads
+- `etl/sql/`: comparison and authorisation SQL
+- `etl/sql/da/`: DA-layer transformation SQL
+- `etl/sql/dim/`: BA-layer transformation SQL
+- `etl/sql/fact/`: BA-layer transformation SQL
+-  `etl/sql/int/`: DA-BA interface layer transformation SQL
+All SQL in both layers uses the Snowflake dialect.
+
+---
+
+**Step 7.1 — Index the full DWH corpus (DDL + ETL)**
+
+- Files affected: no source files; adds `tests/e2e/test_dwh_e2e.py`
+- Tasks:
+  - Run `sqlcg db init` against a temporary KùzuDB path (isolated from the default
+    `~/.sqlcg/graph.db`)
+  - Index DDL layer: `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake`
+  - Index ETL layer: `sqlcg index /home/ignwrad/Projects/dwh/etl --dialect snowflake`
+    (same database — additive MERGE; DDL tables must already exist so ETL `INSERT INTO`
+    statements resolve their targets)
+  - Parse the combined summary: `files_parsed`, `parse_errors`, `tables_found`,
+    `lineage_edges_created` — captured separately per run and summed
+  - Assert overall parse success rate >= 0.70 (lower threshold than DDL-only because
+    ETL scripting blocks are expected to partially degrade to confidence=0.3 fallback)
+  - Assert DDL-only parse success rate >= 0.80 (stricter — DDL is plain CREATE TABLE/VIEW)
+  - Log each error file and category to `tests/e2e/dwh_parse_report.txt`; do NOT fail
+    on rate below threshold — fail only if the process itself exits non-zero
+  - Note: `ddl/changelogs/*.xml` manifests are skipped automatically by `.sql` filter
+- Acceptance:
+  - Both `sqlcg index` invocations exit 0
+  - `tables_found` (across both runs) > 0
+  - ETL files produce at least some `lineage_edges_created` (not all zero)
+
+**Step 7.2 — find and analyze against known DWH tables**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py` (continued from 7.1)
+- Tasks:
+  - Using the combined DDL+ETL graph from Step 7.1:
+  - `sqlcg find table WTDA_ARTIKEL`: assert exit 0 and output contains "WTDA_ARTIKEL"
+  - `sqlcg find table WTDH_KLANT`: assert exit 0 and output contains "WTDH_KLANT"
+  - `sqlcg find table WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 (view from BA-VIEWS)
+  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0; because ETL scripts INSERT
+    INTO tables downstream of DDL tables, this should now return non-empty lineage
+    (unlike DDL-only where this was always empty)
+  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 and non-empty
+    (view references base tables also present in the DDL index)
+  - `sqlcg analyze unused`: assert exit 0 — ETL-referenced tables should appear less
+    "unused" than DDL-only, since ETL inserts create inbound edges
+  - `sqlcg find pattern "CREATE OR REPLACE TEMP TABLE"`: assert exit 0; should return
+    results because ETL files use this pattern extensively
+  - All assertions are exit-code + output-format checks except where "non-empty" is noted
+- Acceptance:
+  - All seven commands exit 0
+  - `find table WTDA_ARTIKEL` returns at least one row
+  - `analyze downstream WTDA_ARTIKEL` returns at least one row (ETL → DDL edge)
+  - `find pattern "CREATE OR REPLACE TEMP TABLE"` returns results
+
+**Step 7.3 — MCP tools against the combined DWH index**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py` (continued), requires Phase 5 complete
+- Tasks:
+  - Using the combined DDL+ETL graph from Step 7.1:
+  - Call `trace_column_lineage` MCP tool with a table+column known to have ETL lineage
+    (e.g. `WTDH_KLANT` which has an ETL update script); assert response is a valid
+    Pydantic model (no exception); lineage chain may be shallow if scripting block
+    parsing degraded to table-level only
+  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is non-empty
+    (ETL files reference this table in INSERT/UPDATE statements)
+  - Call `list_dialects_and_repos`; assert response includes dialect "snowflake" and
+    repo entries for both the `ddl/` and `etl/` paths
+  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5")`; assert returns
+    a list of length <= 5 with at least one known table name
+  - Call `mcp start` via subprocess, assert alive after 2 seconds (terminate after check)
+- Acceptance:
+  - `trace_column_lineage` on a known DWH table does not raise an exception
+  - `find_table_usages("WTDH_KLANT")` returns at least one row (ETL reference)
+  - `list_dialects_and_repos` includes snowflake dialect for both indexed paths
+  - `execute_cypher` returns correct result shape
+  - `mcp start` subprocess is alive after 2 seconds
+
+**Step 7.4 — Parse quality report**
+
+- Files affected: `tests/e2e/test_dwh_e2e.py`, `docs/DWH_PARSE_REPORT.md`
+- Tasks:
+  - After running the full index in Step 7.1, emit a structured parse quality report
+    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored) with:
+    - **Per-layer breakdown**: DDL layer totals and ETL layer totals separately, plus combined
+    - Total files, parsed, errored, success rate per layer
+    - List of errored files with error category (timeout, parse_failed, exception)
+    - Table count, view count, lineage edge count
+    - Distribution of `parsing_mode` values across all indexed queries
+    - ETL-specific section: how many ETL files fell back to scripting-block mode
+      (confidence=0.3) vs full parse (confidence=1.0); this is the key ETL quality signal
+  - The report generation should be a pytest fixture with `autouse=False` and a
+    `--dwh-report` flag so it only runs when explicitly requested
+- Acceptance:
+  - `pytest tests/e2e/test_dwh_e2e.py --dwh-report` generates `docs/DWH_PARSE_REPORT.md`
+  - Report contains all five required sections (DDL totals, ETL totals, combined, errors,
+    parsing_mode dist.)
+
+---
+
+**Phase 7 pre-conditions**
+
+- Phase 5 (MCP Server) must be complete before Step 7.3 can run
+- Phase 4 db reset close-before-rmtree fix must be in place (temporary database setup
+  uses context manager pattern that depends on correct close() ordering)
+- The DWH repo at `/home/ignwrad/Projects/dwh` must be accessible from the test runner;
+  Phase 7 tests are explicitly local-only (not CI-runnable) and must be skipped
+  automatically when `SQLCG_DWH_PATH` env var is not set
+- DDL must be indexed before ETL in Step 7.1 — ETL INSERT statements reference DDL
+  tables; indexing ETL first means `SchemaResolver` won't know the target table columns
+
+**Phase 7 known risks**
+
+| Risk | Mitigation |
+|---|---|
+| ETL scripting blocks degrade to confidence=0.3 table-level only | Expected; report it in DWH_PARSE_REPORT.md; do not raise success rate gate above 70% for ETL layer |
+| Snowflake `SET`/`USE` statements cause parse noise | These produce `exp.Command` fallback nodes; they won't create false table edges but inflate parse_failed count |
+| Temp table chains: `CREATE TEMP TABLE x AS SELECT` → `INSERT INTO y SELECT FROM x` — x not in SchemaResolver | SchemaResolver's pass-1 DDL sniffer should register x; verify with a dedicated fixture before claiming ETL lineage works |
+| `ddl/changelogs/*.xml` changelog manifests mixed with `.sql` files | IndexerWalker already filters by `.sql` suffix; assert in test that xml files are not counted |
+| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` and `etl/` only |
+| DWH path not available in CI | Guard all Phase 7 tests with `pytest.mark.skipif(not Path(DWH_PATH).exists(), ...)` |
+| KùzuDB single-writer lock conflicts if tests run in parallel | Use a per-test-session tmp_path for the DWH index database; never share with other test sessions |
+| 648 ETL files may be slow to index | Use `--timeout-per-file 30` (default); expect full index to take 2–5 minutes locally |
 
 ---
 

@@ -1,0 +1,43 @@
+# Common backup and temporary files
+*.bak
+*.bak.*
+*.tmp
+*~
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Development and environment
+.env
+.venv
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Package managers
+node_modules/
+package-lock.json
+yarn.lock
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Temporary directories
+tmp/
+temp/
