@@ -54,7 +54,7 @@ class Neo4jBackend(GraphBackend):
 
         Creates indexes and constraints for efficient querying.
         """
-        # Create indexes on primary key fields — uses renamed labels (Deviation 1)
+        # IF NOT EXISTS already ensures idempotency; APOC utilities add no safety benefit here.
         indexes = [
             f"CREATE INDEX idx_repo_path IF NOT EXISTS FOR (r:{NODE_REPO}) ON (r.path)",
             f"CREATE INDEX idx_file_path IF NOT EXISTS FOR (f:{NODE_FILE}) ON (f.path)",

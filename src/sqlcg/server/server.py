@@ -7,6 +7,7 @@ stdout to stderr to prevent user logs from corrupting the protocol stream.
 
 import sys
 
+from dotenv import load_dotenv
 from mcp.server import FastMCP
 
 from sqlcg.utils.logging import getLogger
@@ -41,6 +42,8 @@ def main(db_path: str | None = None) -> None:
     Raises:
         RuntimeError: If tools fail to initialize or FastMCP server fails.
     """
+    load_dotenv()
+
     # Import tools module to trigger tool registration via @mcp.tool() decorators
     import sqlcg.server.tools
 

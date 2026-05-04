@@ -2,6 +2,7 @@
 
 from sqlcg.core.schema import NodeLabel, RelType
 
+# Scope is bounded by exact path match; APOC procedures are not required.
 # Delete Column nodes for tables defined in a file
 DELETE_COLUMNS_FOR_FILE = (
     f"MATCH (f:{NodeLabel.FILE} {{path: $path}})"

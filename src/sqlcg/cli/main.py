@@ -1,6 +1,7 @@
 """Main CLI entry point for sqlcg."""
 
 import typer
+from dotenv import load_dotenv
 
 from sqlcg.cli.commands import analyze, db, find, index, mcp, watch
 
@@ -27,6 +28,7 @@ def version() -> None:
 
 def main() -> None:
     """SQL Code Graph - SQL lineage and dependency analysis tool."""
+    load_dotenv()
     app()
 
 

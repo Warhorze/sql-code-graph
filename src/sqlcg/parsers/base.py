@@ -2,11 +2,26 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from sqlcg.lineage.schema_resolver import SchemaResolver
+
+
+class QueryKind(StrEnum):
+    """SQL query classification types."""
+
+    SELECT = "SELECT"
+    INSERT = "INSERT"
+    UPDATE = "UPDATE"
+    DELETE = "DELETE"
+    CREATE_TABLE = "CREATE_TABLE"
+    CREATE_VIEW = "CREATE_VIEW"
+    CREATE_PROC = "CREATE_PROC"
+    MERGE = "MERGE"
+    OTHER = "OTHER"
 
 
 @dataclass(frozen=True)
@@ -209,27 +224,29 @@ class SqlParser(ABC):
         """
         import sqlglot.expressions as exp
 
-        if isinstance(stmt, exp.Select):
-            return "SELECT"
-        elif isinstance(stmt, exp.Insert):
-            return "INSERT"
-        elif isinstance(stmt, exp.Update):
-            return "UPDATE"
-        elif isinstance(stmt, exp.Delete):
-            return "DELETE"
-        elif isinstance(stmt, exp.Create):
-            if stmt.kind == "TABLE":
-                return "CREATE_TABLE"
-            elif stmt.kind == "VIEW":
-                return "CREATE_VIEW"
-            elif stmt.kind in ("PROCEDURE", "FUNCTION"):
-                return "CREATE_PROC"
-            else:
-                return "CREATE_TABLE"  # Default to table
-        elif isinstance(stmt, exp.Merge):
-            return "MERGE"
-        else:
-            return "OTHER"
+        match stmt:
+            case exp.Select():
+                return QueryKind.SELECT
+            case exp.Insert():
+                return QueryKind.INSERT
+            case exp.Update():
+                return QueryKind.UPDATE
+            case exp.Delete():
+                return QueryKind.DELETE
+            case exp.Create():
+                match stmt.kind:
+                    case "TABLE":
+                        return QueryKind.CREATE_TABLE
+                    case "VIEW":
+                        return QueryKind.CREATE_VIEW
+                    case "PROCEDURE" | "FUNCTION":
+                        return QueryKind.CREATE_PROC
+                    case _:
+                        return QueryKind.CREATE_TABLE  # Default to table
+            case exp.Merge():
+                return QueryKind.MERGE
+            case _:
+                return QueryKind.OTHER
 
     def _real_tables(self, scope: Any) -> list[TableRef]:
         """Return real (non-CTE) tables referenced in a scope.
@@ -276,24 +293,24 @@ class SqlParser(ABC):
         """
         import sqlglot.expressions as exp
 
-        if isinstance(table_expr, exp.Table):
-            return TableRef(
-                catalog=table_expr.catalog,
-                db=table_expr.db,
-                name=table_expr.name,
-            )
-        elif isinstance(table_expr, exp.Identifier):
-            return TableRef(name=table_expr.name)
-        elif isinstance(table_expr, exp.Schema):
-            # Schema wraps the actual table
-            return SqlParser._convert_table_expr_to_ref(table_expr.this)
-        else:
-            # Try to extract name from string representation
-            name = str(table_expr)
-            if name:
-                return TableRef(name=name)
-
-        return None
+        match table_expr:
+            case exp.Table():
+                return TableRef(
+                    catalog=table_expr.catalog,
+                    db=table_expr.db,
+                    name=table_expr.name,
+                )
+            case exp.Identifier():
+                return TableRef(name=table_expr.name)
+            case exp.Schema():
+                # Schema wraps the actual table
+                return SqlParser._convert_table_expr_to_ref(table_expr.this)
+            case _:
+                # Try to extract name from string representation
+                name = str(table_expr)
+                if name:
+                    return TableRef(name=name)
+                return None
 
     def _extract_column_lineage(
         self, stmt: Any, path: Path, out: ParsedFile, schema: dict

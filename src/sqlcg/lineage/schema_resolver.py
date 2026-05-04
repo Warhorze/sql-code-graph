@@ -181,23 +181,18 @@ class SchemaResolver:
         """
         import sqlglot.expressions as exp
 
-        catalog = None
-        db = None
-        table_name = ""
-
-        if isinstance(table_expr, exp.Table):
-            # table.name is the table identifier
-            # table.db is the schema (if present)
-            table_name = table_expr.name
-            if table_expr.db:
-                db = table_expr.db
-            if table_expr.catalog:
-                catalog = table_expr.catalog
-        elif isinstance(table_expr, exp.Identifier):
-            table_name = table_expr.name
-        else:
-            # Try to extract name from expression
-            if hasattr(table_expr, "name"):
-                table_name = table_expr.name
-
-        return catalog, db, table_name
+        match table_expr:
+            case exp.Table():
+                # table.name is the table identifier
+                # table.db is the schema (if present)
+                return (
+                    table_expr.catalog,
+                    table_expr.db,
+                    table_expr.name,
+                )
+            case exp.Identifier():
+                return (None, None, table_expr.name)
+            case _:
+                # Try to extract name from expression
+                table_name = table_expr.name if hasattr(table_expr, "name") else ""
+                return (None, None, table_name)

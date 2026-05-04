@@ -137,6 +137,7 @@ class KuzuBackend(GraphBackend):
         src_pk_field = self._pk_field(src_label)
         dst_pk_field = self._pk_field(dst_label)
 
+        # langchain_kuzu incompatible with our typed DDL schema.
         query = f"""
             MATCH (src:{src_label} {{{src_pk_field}: $src_key}})
             MATCH (dst:{dst_label} {{{dst_pk_field}: $dst_key}})

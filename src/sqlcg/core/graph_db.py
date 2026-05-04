@@ -1,6 +1,5 @@
 """Abstract base class for graph database backends."""
 
-import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -10,9 +9,6 @@ from sqlcg.core.schema import NodeLabel
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
-
-# Regex for validating property key names (identifiers)
-_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class GraphBackend(ABC):
@@ -159,7 +155,7 @@ class GraphBackend(ABC):
             ValueError: If any property key is not a valid identifier
         """
         for key in properties:
-            if not _IDENT_RE.match(key):
+            if not key.isidentifier():
                 raise ValueError(f"Invalid property key: {key!r}")
 
     @contextmanager
