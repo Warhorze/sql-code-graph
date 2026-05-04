@@ -1,9 +1,9 @@
 ## Current State
 
-agent: plan-reviewer
-task: Phase 5 MCP Server compliance review
-status: READY FOR PHASE 6
-date: 2026-05-03
+agent: architect-reviewer
+task: PR #1 inline comment review
+status: COMPLETE — action list produced; ARCHITECTURE_REVIEW.md Section 8 added
+date: 2026-05-04
 ---
 
 ## Handoff Log
@@ -694,6 +694,29 @@ date: 2026-05-03
   No blockers.
 
   Next step: developer proceeds to Phase 6 (Benchmarks and CI).
+
+[2026-05-04] architect-reviewer — PR #1 inline comment review.
+  Summary: Reviewed all 8 inline comments on feat/phase-4-cli PR #1 from Warhorze.
+  Produced ARCHITECTURE_REVIEW.md Section 8 with per-comment assessment and ranked action list.
+  Key findings:
+  - Comment 1 (config.py module-level side effect): Valid. Remove _load_env() from module
+    scope; call load_dotenv() only from entry-point functions.
+  - Comment 2 (split config functions vs Pydantic model): Valid architectural concern.
+    Introduce KuzuConfig and Neo4jConfig Pydantic models for typed, validated config.
+  - Comment 3 (regex vs isidentifier): Valid. Replace _IDENT_RE with str.isidentifier().
+  - Comment 4 (APOC for init_schema): Misdirected. APOC not applicable; IF NOT EXISTS
+    already handles idempotency. Add clarifying comment.
+  - Comment 5 (langchain_kuzu instead of hand-rolled MERGE): Not viable — KuzuGraph uses
+    a generic GraphDocument schema incompatible with this project's typed DDL schema.
+    Add a comment explaining the trade-off.
+  - Comment 6 (APOC for queries.py): Same as Comment 4. Parameterised $path prevents
+    injection; DETACH DELETE scope limited to exact equality match.
+  - Comments 7+8 (elif chains vs match/case): Valid style concern. Project is Python 3.12+;
+    match/case is idiomatic. Refactor _classify and _convert_table_expr_to_ref.
+  Two new architectural findings added: (a) module-level side effect amplifies finding 3.3;
+  (b) no typed config validation layer (related to finding 3.8).
+  No blocking questions.
+  Next step: developer addresses action list items 1-5 (code changes); items 6-7 are docs-only.
 
 [2026-05-03] developer — Phase 5 critical bug fixes (C1, C2, W1, W2).
   Status: COMPLETE — All four bugs/warnings fixed and tested
