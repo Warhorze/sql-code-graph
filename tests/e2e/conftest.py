@@ -9,3 +9,9 @@ def pytest_addoption(parser):
         default=False,
         help="Generate DWH parse quality report (docs/DWH_PARSE_REPORT.md)",
     )
+    parser.addoption(
+        "--fixture-report",
+        action="store_true",
+        default=False,
+        help="Generate Airbnb fixture parse quality report (docs/AIRBNB_PARSE_REPORT.md)",
+    )
