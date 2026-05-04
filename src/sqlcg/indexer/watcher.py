@@ -109,6 +109,9 @@ class BranchMonitor(threading.Thread):
             db: GraphBackend instance
             _poll_interval: Polling interval in seconds (for testing)
         """
+        # daemon=False ensures that if index_repo() is in-flight when shutdown is requested,
+        # the process will wait (via join(timeout=5) in watch.py) up to 5 seconds before exiting.
+        # This avoids data loss from killing an in-progress resync.
         super().__init__(daemon=False)
         self._watched_path = watched_path
         self._job_manager = job_manager
