@@ -1,6 +1,7 @@
 """MCP tools for SQL code graph queries and indexing."""
 
 import re
+import time
 from collections import deque
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from sqlcg.core.config import get_db_path
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.indexer.indexer import Indexer
+from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
     DependencyNode,
@@ -29,6 +31,9 @@ logger = getLogger(__name__)
 # Module-level singleton backend (KùzuDB single-writer model)
 _backend: GraphBackend | None = None
 
+# Module-level metrics store singleton
+_metrics: MetricsStore | None = None
+
 
 def init_backend(db_path: str | None = None) -> None:
     """Initialize the module-level backend singleton.
@@ -39,7 +44,7 @@ def init_backend(db_path: str | None = None) -> None:
     Raises:
         RuntimeError: If backend initialization fails
     """
-    global _backend
+    global _backend, _metrics
     path = db_path or str(get_db_path())
     backend = KuzuBackend(path)
     try:
@@ -50,6 +55,14 @@ def init_backend(db_path: str | None = None) -> None:
     _backend = backend
     logger.debug(f"Backend initialized: {path}")
 
+    # Initialize metrics store (best-effort, failures are logged as WARNING)
+    try:
+        metrics_path = Path.home() / ".sqlcg" / "metrics.db"
+        _metrics = MetricsStore(metrics_path)
+        _metrics.init_schema()
+    except Exception as exc:
+        logger.warning(f"Failed to initialize metrics store: {exc}")
+
 
 def shutdown_backend() -> None:
     """Shutdown the module-level backend singleton.
@@ -57,11 +70,14 @@ def shutdown_backend() -> None:
     Closes the database connection and clears the global reference.
     Safe to call multiple times.
     """
-    global _backend
+    global _backend, _metrics
     if _backend is not None:
         _backend.close()
         _backend = None
         logger.debug("Backend shut down")
+    if _metrics is not None:
+        _metrics.close()
+        _metrics = None
 
 
 def _get_backend() -> GraphBackend:
@@ -113,6 +129,47 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     return table_id, column_name
 
 
+def _record_tool_call(tool_name: str, duration_ms: float, success: bool = True) -> None:
+    """Record a tool call to metrics (best-effort).
+
+    Args:
+        tool_name: Name of the tool.
+        duration_ms: Execution time in milliseconds.
+        success: Whether the call succeeded.
+    """
+    global _metrics
+    if _metrics is not None:
+        try:
+            _metrics.record_tool_call(tool_name, duration_ms, success)
+        except Exception as exc:
+            logger.warning(f"Failed to record metrics for {tool_name}: {exc}")
+
+
+def _timed_tool(tool_name: str):
+    """Decorator to record tool execution timing and success.
+
+    Args:
+        tool_name: Name of the tool to record.
+    """
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            try:
+                result = func(*args, **kwargs)
+                duration_ms = (time.time() - start_time) * 1000
+                _record_tool_call(tool_name, duration_ms, True)
+                return result
+            except Exception:
+                duration_ms = (time.time() - start_time) * 1000
+                _record_tool_call(tool_name, duration_ms, False)
+                raise
+
+        return wrapper
+
+    return decorator
+
+
 @mcp.tool()
 def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
     """Index a repository of SQL files.
@@ -127,52 +184,79 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
     Returns:
         Dict with keys: files_parsed, parse_errors, tables_found, lineage_edges_created
     """
-    db = _get_backend()
-    indexer = Indexer()
-    path = Path(repo_path).resolve()
-    if not path.exists():
-        raise ValueError(f"Repository path does not exist: {repo_path}")
-    if not path.is_dir():
-        raise ValueError(f"Repository path is not a directory: {repo_path}")
+    global _metrics
+    start_time = time.time()
+    success = True
 
-    # Ensure the Repo node exists for this repository
-    from sqlcg.core.schema import NodeLabel, RelType
+    try:
+        db = _get_backend()
+        indexer = Indexer()
+        path = Path(repo_path).resolve()
+        if not path.exists():
+            raise ValueError(f"Repository path does not exist: {repo_path}")
+        if not path.is_dir():
+            raise ValueError(f"Repository path is not a directory: {repo_path}")
 
-    abs_path = str(path)
-    db.upsert_node(
-        NodeLabel.REPO,
-        abs_path,
-        {
-            "path": abs_path,
-            "name": path.name,
-        },
-    )
+        # Ensure the Repo node exists for this repository
+        from sqlcg.core.schema import NodeLabel, RelType
 
-    # Index the repository (with absolute path)
-    result = indexer.index_repo(path, dialect, db)
-
-    # Create BELONGS_TO relationships from File nodes to Repo node
-    # Query for all File nodes in this repo and link them to the Repo
-    files_query = """
-    MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix
-    RETURN f.path AS path
-    """
-    repo_prefix = abs_path.rstrip("/") + "/"
-    file_rows = db.run_read(files_query, {"repo_prefix": repo_prefix})
-    for row in file_rows:
-        db.upsert_edge(
-            NodeLabel.FILE,
-            row["path"],
+        abs_path = str(path)
+        db.upsert_node(
             NodeLabel.REPO,
             abs_path,
-            RelType.BELONGS_TO,
-            {},
+            {
+                "path": abs_path,
+                "name": path.name,
+            },
         )
 
-    logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
-    return result
+        # Index the repository (with absolute path)
+        result = indexer.index_repo(path, dialect, db)
+
+        # Create BELONGS_TO relationships from File nodes to Repo node
+        # Query for all File nodes in this repo and link them to the Repo
+        files_query = """
+        MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix
+        RETURN f.path AS path
+        """
+        repo_prefix = abs_path.rstrip("/") + "/"
+        file_rows = db.run_read(files_query, {"repo_prefix": repo_prefix})
+        for row in file_rows:
+            db.upsert_edge(
+                NodeLabel.FILE,
+                row["path"],
+                NodeLabel.REPO,
+                abs_path,
+                RelType.BELONGS_TO,
+                {},
+            )
+
+        logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
+
+        # Record metrics
+        duration_ms = (time.time() - start_time) * 1000
+        if _metrics is not None:
+            try:
+                _metrics.record_index_run(
+                    abs_path,
+                    result.get("files_parsed", 0),
+                    result.get("parse_errors", 0),
+                    result.get("tables_found", 0),
+                    result.get("lineage_edges_created", 0),
+                    duration_ms,
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to record index run metrics: {exc}")
+
+        return result
+    except Exception:
+        success = False
+        duration_ms = (time.time() - start_time) * 1000
+        _record_tool_call("index_repo", duration_ms, success)
+        raise
 
 
+@_timed_tool("trace_column_lineage")
 @mcp.tool()
 def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
     """Trace upstream lineage of a column.
@@ -239,6 +323,7 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
     return LineageResult(column=table_col, lineage=lineage)
 
 
+@_timed_tool("find_table_usages")
 @mcp.tool()
 def find_table_usages(table_name: str) -> TableUsageResult:
     """Find all queries that use a given table.
@@ -278,6 +363,7 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     return TableUsageResult(table=table_name, usages=usages)
 
 
+@_timed_tool("get_downstream_dependencies")
 @mcp.tool()
 def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
     """Find all downstream dependencies of a column.
@@ -342,6 +428,7 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
     return DependencyResult(root=table_col, nodes=nodes)
 
 
+@_timed_tool("get_upstream_dependencies")
 @mcp.tool()
 def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
     """Find all upstream dependencies of a column.
@@ -406,6 +493,7 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
     return DependencyResult(root=table_col, nodes=nodes)
 
 
+@_timed_tool("search_sql_pattern")
 @mcp.tool()
 def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
     """Search for SQL patterns in indexed queries.
@@ -448,6 +536,7 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
     return SqlPatternResult(pattern=query, matches=matches)
 
 
+@_timed_tool("list_dialects_and_repos")
 @mcp.tool()
 def list_dialects_and_repos() -> DialectRepoResult:
     """List all indexed repositories and their SQL dialects.
@@ -482,6 +571,7 @@ def list_dialects_and_repos() -> DialectRepoResult:
     return DialectRepoResult(repos=repos)
 
 
+@_timed_tool("execute_cypher")
 @mcp.tool()
 def execute_cypher(query: str) -> list[dict]:
     """Execute a read-only Cypher query against the graph.
@@ -537,3 +627,48 @@ def execute_cypher(query: str) -> list[dict]:
     except Exception as e:
         logger.error(f"Cypher execution failed: {e}")
         raise
+
+
+@mcp.tool()
+def submit_feedback(
+    tool_name: str,
+    query: str,
+    label: str,
+    note: str = "",
+) -> dict:
+    """Submit feedback on a tool result.
+
+    This tool allows users to correct the MCP server's results. Feedback
+    is collected and analyzed to identify patterns and false positives.
+
+    **For Claude**: When a user says "that result was wrong" or "this is a
+    false positive", call this tool with label="FP". When they confirm
+    "that's correct", call with label="TP". Use the query or pattern as
+    the 'query' argument and include any user feedback in the 'note'.
+
+    Args:
+        tool_name: Name of the tool being evaluated (e.g., "trace_column_lineage")
+        query: The query or pattern that was evaluated
+        label: Feedback label: "TP" (true positive) or "FP" (false positive)
+        note: Optional user note (truncated to 500 chars)
+
+    Returns:
+        Dict with status: "recorded" or "skipped"
+
+    Raises:
+        ValueError: If label is not "TP" or "FP"
+    """
+    global _metrics
+
+    if label not in ("TP", "FP"):
+        raise ValueError(f"Invalid label: {label}. Must be 'TP' or 'FP'.")
+
+    if _metrics is not None:
+        try:
+            _metrics.record_feedback(tool_name, query, label, note)
+            return {"status": "recorded"}
+        except Exception as exc:
+            logger.warning(f"Failed to record feedback: {exc}")
+            return {"status": "skipped"}
+    else:
+        return {"status": "skipped"}

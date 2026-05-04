@@ -895,157 +895,705 @@ and confidence score documented in blueprint §8.2.
 
 ---
 
-### Phase 7 — DWH End-to-End Validation (Days 31–33)
+### Phase 7 — Airbnb Fixture End-to-End Validation (Days 31–33)
 
 **Context**
 
-The DWH repository lives at `/home/ignwrad/Projects/dwh`. It is a real production
-Snowflake DWH with two SQL layers that Phase 7 targets:
+Phase 7 validates the full sqlcg pipeline against the public dbt Airbnb dataset (from
+dbt Learn tutorials). The corpus is committed to the repository under
+`tests/fixtures/airbnb/` — no external path dependency, no environment variable guard,
+and all tests run in CI.
 
-**DDL layer** (`ddl/`):
-- `ddl/changelogs/BA-TABLES/`: Snowflake `CREATE TABLE` DDL files (naming convention
-  `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
-- `ddl/changelogs/BA-VIEWS/`: view definitions (`WTDA_ARTIKEL.sql`,
-  `WTFV_TRANSACTIES_UURLIJKS.sql`, `WVFA_RFM_CLASSIFICATIE.sql`, etc.)
-- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views
-- `ddl/changelogs/MA-PROCEDURES/`: stored procedures with embedded DML
-- Other `ddl/changelogs/` subdirectories: dynamic tables, streams, tasks, masking, stages
-- Note: most DDL is in `.xml` Liquibase changelogs; only the handful of plain `.sql`
-  files will be indexed (IndexerWalker filters by `.sql` suffix)
+The Airbnb dataset has a known four-layer lineage structure (raw → staging → dimension/fact
+→ mart) that enables concrete assertions about graph content, not just exit codes. All files
+use Snowflake dialect and are syntactically valid sqlglot-parseable SQL.
 
-**ETL layer** (`etl/`): **648 (more) `.sql` files** — the interesting half of the corpus.
-These are the actual data movement scripts: multi-step Snowflake scripting blocks,
-`CREATE OR REPLACE TEMP TABLE ... AS SELECT`, `INSERT INTO ... SELECT FROM temp`,
-variable assignments (`SET warehousename = ...`), `USE SCHEMA/WAREHOUSE` directives.
-This is where lineage becomes non-trivial and where the current parser is expected
-to produce only partial results (table-level at confidence=0.3 for scripting blocks).
-Subdirectories:
-- `etl/pdi/template/`: ~36 Snowflake ETL scripts (initial loads, incremental updates)
-- `etl/pdi/template/adobe_initial_load/`, `voorraad_initial_load/`: specialised loads
-- `etl/sql/`: comparison and authorisation SQL
-- `etl/sql/da/`: DA-layer transformation SQL
-- `etl/sql/dim/`: BA-layer transformation SQL
-- `etl/sql/fact/`: BA-layer transformation SQL
--  `etl/sql/int/`: DA-BA interface layer transformation SQL
-All SQL in both layers uses the Snowflake dialect.
+**Fixture structure** (`tests/fixtures/airbnb/`):
+
+Raw layer — source DDL:
+- `raw_listings.sql` — `CREATE TABLE raw_listings (id, listing_url, name, room_type, minimum_nights, host_id, price, created_at, updated_at)`
+- `raw_hosts.sql` — `CREATE TABLE raw_hosts (id, name, is_superhost, created_at, updated_at)`
+- `raw_reviews.sql` — `CREATE TABLE raw_reviews (listing_id, date, reviewer_name, comments, sentiment)`
+
+Staging layer — views selecting from raw:
+- `src_listings.sql` — `CREATE OR REPLACE VIEW src_listings AS SELECT ... FROM raw_listings WHERE minimum_nights > 0`
+- `src_hosts.sql` — `CREATE OR REPLACE VIEW src_hosts AS SELECT ... FROM raw_hosts`
+- `src_reviews.sql` — `CREATE OR REPLACE VIEW src_reviews AS SELECT ... FROM raw_reviews WHERE sentiment != 'NOT VERIFIED'`
+
+Dimension/fact layer — joins across staging:
+- `dim_listings_cleansed.sql` — JOIN of `src_listings` + `src_hosts`
+- `dim_hosts_cleansed.sql` — SELECT from `src_hosts` with transforms
+- `fct_reviews.sql` — JOIN of `src_reviews` + `dim_listings_cleansed`
+
+Mart layer:
+- `mart_fullmoon_reviews.sql` — JOIN of `fct_reviews` with a date condition
+
+This gives 3 lineage hops (raw → staging → dim/fact → mart) with known edge topology.
 
 ---
 
-**Step 7.1 — Index the full DWH corpus (DDL + ETL)**
+**Step 7.1 — Airbnb fixture creation**
 
-- Files affected: no source files; adds `tests/e2e/test_dwh_e2e.py`
+- Files affected: `tests/fixtures/airbnb/` (10 new `.sql` files, no source code changes)
 - Tasks:
-  - Run `sqlcg db init` against a temporary KùzuDB path (isolated from the default
-    `~/.sqlcg/graph.db`)
-  - Index DDL layer: `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake`
-  - Index ETL layer: `sqlcg index /home/ignwrad/Projects/dwh/etl --dialect snowflake`
-    (same database — additive MERGE; DDL tables must already exist so ETL `INSERT INTO`
-    statements resolve their targets)
-  - Parse the combined summary: `files_parsed`, `parse_errors`, `tables_found`,
-    `lineage_edges_created` — captured separately per run and summed
-  - Assert overall parse success rate >= 0.70 (lower threshold than DDL-only because
-    ETL scripting blocks are expected to partially degrade to confidence=0.3 fallback)
-  - Assert DDL-only parse success rate >= 0.80 (stricter — DDL is plain CREATE TABLE/VIEW)
-  - Log each error file and category to `tests/e2e/dwh_parse_report.txt`; do NOT fail
-    on rate below threshold — fail only if the process itself exits non-zero
-  - Note: `ddl/changelogs/*.xml` manifests are skipped automatically by `.sql` filter
+  - Create the directory `tests/fixtures/airbnb/`
+  - Author all 10 SQL files listed in the fixture structure above. Requirements:
+    - Each file must be syntactically valid Snowflake SQL parseable by
+      `sqlglot.parse(sql, dialect="snowflake")` without raising
+    - Raw layer files use `CREATE TABLE` DDL with explicit column lists and Snowflake
+      data types (e.g. `STRING`, `NUMBER`, `BOOLEAN`, `TIMESTAMP_NTZ`)
+    - Staging layer files use `CREATE OR REPLACE VIEW name AS SELECT ...` selecting from
+      the corresponding raw table, with at least one `WHERE` clause filter
+    - `dim_listings_cleansed.sql` and `fct_reviews.sql` must contain an explicit `JOIN`
+      clause referencing two upstream tables by name — this is what generates SELECTS_FROM
+      lineage edges to both parents
+    - `mart_fullmoon_reviews.sql` must reference `fct_reviews` as a source table
+    - No Snowflake scripting blocks (`BEGIN ... END`) — clean SQL only; the fixture
+      tests parser correctness, not scripting-block fallback
+  - Commit the fixtures to the repository
 - Acceptance:
-  - Both `sqlcg index` invocations exit 0
-  - `tables_found` (across both runs) > 0
-  - ETL files produce at least some `lineage_edges_created` (not all zero)
+  - `sqlglot.parse(open(f).read(), dialect="snowflake")` does not raise for all 10 files
+  - The 10 files form at least 3 distinct layers (raw, staging, downstream) as required
+    for the Step 7.2 lineage assertions
 
-**Step 7.2 — find and analyze against known DWH tables**
+**Step 7.2 — Index and assert structural results**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py` (continued from 7.1)
+- Files affected: `tests/e2e/test_airbnb_e2e.py` (new file; replaces `test_dwh_e2e.py`)
 - Tasks:
-  - Using the combined DDL+ETL graph from Step 7.1:
-  - `sqlcg find table WTDA_ARTIKEL`: assert exit 0 and output contains "WTDA_ARTIKEL"
-  - `sqlcg find table WTDH_KLANT`: assert exit 0 and output contains "WTDH_KLANT"
-  - `sqlcg find table WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 (view from BA-VIEWS)
-  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0; because ETL scripts INSERT
-    INTO tables downstream of DDL tables, this should now return non-empty lineage
-    (unlike DDL-only where this was always empty)
-  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 and non-empty
-    (view references base tables also present in the DDL index)
-  - `sqlcg analyze unused`: assert exit 0 — ETL-referenced tables should appear less
-    "unused" than DDL-only, since ETL inserts create inbound edges
-  - `sqlcg find pattern "CREATE OR REPLACE TEMP TABLE"`: assert exit 0; should return
-    results because ETL files use this pattern extensively
-  - All assertions are exit-code + output-format checks except where "non-empty" is noted
-- Acceptance:
-  - All seven commands exit 0
-  - `find table WTDA_ARTIKEL` returns at least one row
-  - `analyze downstream WTDA_ARTIKEL` returns at least one row (ETL → DDL edge)
-  - `find pattern "CREATE OR REPLACE TEMP TABLE"` returns results
+  - Create a session-scoped pytest fixture `airbnb_indexed` that:
+    1. Runs `sqlcg db init` against a `tmp_path_factory`-scoped KùzuDB path
+    2. Runs `sqlcg index tests/fixtures/airbnb/ --dialect snowflake` against that path
+    3. Captures the summary dict (`files_parsed`, `parse_errors`, `tables_found`,
+       `lineage_edges_created`)
+    4. Yields the tmp db path and summary for use by all tests in this module
+  - No `pytest.mark.skipif` on any env var — the fixture is always available and runs in CI
+  - Assertions must verify actual graph content, not just exit codes
+- Acceptance criteria (each is a separate test method; class name must read as plain English):
+  - `tables_found >= 9` — raw, staging, dimension/fact, and mart objects all indexed
+  - `lineage_edges_created > 0` — staging views produce SELECTS_FROM edges to raw tables
+  - `parse_errors == 0` — clean Snowflake SQL produces zero parse failures
+  - `sqlcg find table raw_listings` (via subprocess) exits 0 and stdout contains
+    `"raw_listings"`
+  - `sqlcg find table dim_listings_cleansed` (via subprocess) exits 0 and stdout contains
+    `"dim_listings_cleansed"`
+  - `sqlcg find pattern "SELECT"` (via subprocess) exits 0 and stdout is non-empty
+  - `sqlcg analyze upstream fct_reviews` (via subprocess) exits 0 and stdout is non-empty
+    (has upstream lineage through the JOIN in `fct_reviews.sql`)
 
-**Step 7.3 — MCP tools against the combined DWH index**
+**Step 7.3 — MCP tools with real assertions**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py` (continued), requires Phase 5 complete
+- Files affected: `tests/e2e/test_airbnb_e2e.py` (continued), requires Phase 5 complete
 - Tasks:
-  - Using the combined DDL+ETL graph from Step 7.1:
-  - Call `trace_column_lineage` MCP tool with a table+column known to have ETL lineage
-    (e.g. `WTDH_KLANT` which has an ETL update script); assert response is a valid
-    Pydantic model (no exception); lineage chain may be shallow if scripting block
-    parsing degraded to table-level only
-  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is non-empty
-    (ETL files reference this table in INSERT/UPDATE statements)
-  - Call `list_dialects_and_repos`; assert response includes dialect "snowflake" and
-    repo entries for both the `ddl/` and `etl/` paths
-  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5")`; assert returns
-    a list of length <= 5 with at least one known table name
-  - Call `mcp start` via subprocess, assert alive after 2 seconds (terminate after check)
+  - Reuse the `airbnb_indexed` session fixture from Step 7.2; call MCP tool functions
+    directly via import (not via subprocess) so return types are verifiable
+  - Call `find_table_usages("raw_listings")`: assert the result is non-empty — `src_listings`
+    selects from `raw_listings` so at least one usage must exist
+  - Call `list_dialects_and_repos`: assert the result includes dialect `"snowflake"`
+  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 10")`: assert the return
+    value is a list and at least one entry has the name `"raw_listings"`
+  - Call `trace_column_lineage` with a known column reference: assert it does not raise
+    any exception (lineage may be partial — assert no exception only, not depth)
+  - Start `mcp start` via subprocess: assert the process is alive after 2 seconds; terminate
+    after check; skip (not fail) if the `sqlcg` entry point is not found in PATH
 - Acceptance:
-  - `trace_column_lineage` on a known DWH table does not raise an exception
-  - `find_table_usages("WTDH_KLANT")` returns at least one row (ETL reference)
-  - `list_dialects_and_repos` includes snowflake dialect for both indexed paths
-  - `execute_cypher` returns correct result shape
-  - `mcp start` subprocess is alive after 2 seconds
+  - `find_table_usages("raw_listings")` returns at least one usage
+  - `list_dialects_and_repos` result includes dialect `"snowflake"`
+  - `execute_cypher(...)` returns a list containing a row where `t.name == "raw_listings"`
+  - `trace_column_lineage` does not raise
+  - `mcp start` subprocess is alive after 2 seconds (or test is skipped)
 
 **Step 7.4 — Parse quality report**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py`, `docs/DWH_PARSE_REPORT.md`
+- Files affected: `tests/e2e/test_airbnb_e2e.py`, `docs/AIRBNB_PARSE_REPORT.md`
 - Tasks:
-  - After running the full index in Step 7.1, emit a structured parse quality report
-    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored) with:
-    - **Per-layer breakdown**: DDL layer totals and ETL layer totals separately, plus combined
+  - After indexing in the `airbnb_indexed` fixture, emit a structured parse quality report
+    to `docs/AIRBNB_PARSE_REPORT.md` (generated, not hand-authored) with:
+    - **Per-layer breakdown**: raw layer totals, staging layer totals, dim/fact layer totals,
+      mart layer totals — identified by filename prefix (`raw_`, `src_`, `dim_`/`fct_`, `mart_`)
     - Total files, parsed, errored, success rate per layer
-    - List of errored files with error category (timeout, parse_failed, exception)
-    - Table count, view count, lineage edge count
-    - Distribution of `parsing_mode` values across all indexed queries
-    - ETL-specific section: how many ETL files fell back to scripting-block mode
-      (confidence=0.3) vs full parse (confidence=1.0); this is the key ETL quality signal
-  - The report generation should be a pytest fixture with `autouse=False` and a
-    `--dwh-report` flag so it only runs when explicitly requested
+    - List of errored files with error category (parse_failed, exception)
+    - Table/view count and lineage edge count
+    - Distribution of `parsing_mode` values across all indexed queries (full-parse vs
+      scripting-block fallback)
+  - The report generation is a pytest fixture with `autouse=False` and a `--fixture-report`
+    flag (renamed from `--dwh-report` — the flag now applies to any committed fixture corpus,
+    not DWH-specific data)
 - Acceptance:
-  - `pytest tests/e2e/test_dwh_e2e.py --dwh-report` generates `docs/DWH_PARSE_REPORT.md`
-  - Report contains all five required sections (DDL totals, ETL totals, combined, errors,
-    parsing_mode dist.)
+  - `pytest tests/e2e/test_airbnb_e2e.py --fixture-report` generates
+    `docs/AIRBNB_PARSE_REPORT.md`
+  - Report contains all four required sections (per-layer breakdown, error list, table/edge
+    counts, parsing_mode distribution)
+  - For the clean Airbnb corpus, the error list section is empty and all `parsing_mode`
+    values are `"full_parse"` or `"standard"` — no `"scripting_block_fallback"` entries
 
 ---
 
 **Phase 7 pre-conditions**
 
 - Phase 5 (MCP Server) must be complete before Step 7.3 can run
-- Phase 4 db reset close-before-rmtree fix must be in place (temporary database setup
-  uses context manager pattern that depends on correct close() ordering)
-- The DWH repo at `/home/ignwrad/Projects/dwh` must be accessible from the test runner;
-  Phase 7 tests are explicitly local-only (not CI-runnable) and must be skipped
-  automatically when `SQLCG_DWH_PATH` env var is not set
-- DDL must be indexed before ETL in Step 7.1 — ETL INSERT statements reference DDL
-  tables; indexing ETL first means `SchemaResolver` won't know the target table columns
+- Phase 4 db reset close-before-rmtree fix must be in place (Step 7.2 session fixture
+  uses tmp KùzuDB paths that depend on correct `close()` ordering before `rmtree`)
+- All 10 fixture files must parse without error under sqlglot Snowflake dialect before
+  Step 7.2 tests are written — verify with a one-off parse call during fixture authoring
+- The existing `tests/e2e/test_dwh_e2e.py` must be deleted and replaced with
+  `tests/e2e/test_airbnb_e2e.py`; the old file must not remain in the working tree
 
 **Phase 7 known risks**
 
 | Risk | Mitigation |
 |---|---|
-| ETL scripting blocks degrade to confidence=0.3 table-level only | Expected; report it in DWH_PARSE_REPORT.md; do not raise success rate gate above 70% for ETL layer |
-| Snowflake `SET`/`USE` statements cause parse noise | These produce `exp.Command` fallback nodes; they won't create false table edges but inflate parse_failed count |
-| Temp table chains: `CREATE TEMP TABLE x AS SELECT` → `INSERT INTO y SELECT FROM x` — x not in SchemaResolver | SchemaResolver's pass-1 DDL sniffer should register x; verify with a dedicated fixture before claiming ETL lineage works |
-| `ddl/changelogs/*.xml` changelog manifests mixed with `.sql` files | IndexerWalker already filters by `.sql` suffix; assert in test that xml files are not counted |
-| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` and `etl/` only |
-| DWH path not available in CI | Guard all Phase 7 tests with `pytest.mark.skipif(not Path(DWH_PATH).exists(), ...)` |
-| KùzuDB single-writer lock conflicts if tests run in parallel | Use a per-test-session tmp_path for the DWH index database; never share with other test sessions |
-| 648 ETL files may be slow to index | Use `--timeout-per-file 30` (default); expect full index to take 2–5 minutes locally |
+| Snowflake dialect syntax in fixtures rejected by sqlglot | Validate each file with `sqlglot.parse(..., dialect="snowflake")` during Step 7.1; fix syntax before committing |
+| `tables_found` assertion off-by-one if a staging view is not indexed as a SqlTable node | KùzuDB schema counts CREATE TABLE DDL-defined tables and CREATE VIEW nodes; lower bound is 9 to allow one possible view/table collapse |
+| `fct_reviews` upstream chain too shallow for `analyze upstream` to return output | Ensure `fct_reviews.sql` JOINs `src_reviews` and `dim_listings_cleansed` by name, creating at least two SELECTS_FROM edges |
+| KùzuDB single-writer lock conflicts if tests run in parallel | Session-scoped `airbnb_indexed` fixture creates one DB per test session; do not use `pytest -n` with e2e tests |
+| `trace_column_lineage` returns empty without schema enrichment | Expected — assert no exception only, not non-empty lineage; column lineage degrades gracefully per finding 3.4 |
+
+
+---
+
+### Phase 8 — Metrics and Feedback Layer (Days 34–38)
+
+**Context**
+
+Phase 8 adds a lightweight observability layer that records tool call activity,
+indexing run history, and LLM-submitted relevance feedback to a local SQLite database
+at `~/.sqlcg/metrics.db`. No new runtime dependencies are introduced (stdlib `sqlite3`
+only). All writes are append-only; reads are aggregates. Two new CLI commands expose
+the data: `sqlcg gain` (numeric summary) and `sqlcg report` (FP/error cluster report
+with a pre-filled GitHub issue URL).
+
+**Phase 8 Non-Goals**
+
+- Server-side telemetry or any outbound network call
+- Automatic GitHub issue creation (report command generates the URL only)
+- Retention policy or pruning of old rows (all rows are kept for the v1 lifetime)
+- Metrics encryption or access control (local single-user tool)
+- False negative (FN) feedback collection — LLMs cannot reliably self-report missed
+  results; TP/FP only
+
+---
+
+**Step 8.1 — SQLite metrics store**
+
+- Files affected:
+  - `src/sqlcg/metrics/__init__.py` (new — empty init, makes package importable)
+  - `src/sqlcg/metrics/store.py` (new — all SQLite read/write logic)
+
+- Tasks:
+  - `store.py` must be importable without a KùzuDB backend present (no import of
+    `kuzu`, `graph_db`, or any `sqlcg.core` symbol at module level)
+  - Define `METRICS_DB_PATH: Path` constant:
+    `Path.home() / ".sqlcg" / "metrics.db"` — consistent with the KùzuDB path
+    convention in `get_db_path()` from `config.py`
+  - Define `MetricsStore` class:
+    ```python
+    class MetricsStore:
+        def __init__(self, db_path: Path = METRICS_DB_PATH) -> None: ...
+        def init_schema(self) -> None: ...  # CREATE TABLE IF NOT EXISTS
+        def record_tool_call(
+            self,
+            tool_name: str,
+            timestamp: float,       # time.time()
+            duration_ms: float,     # wall-clock, milliseconds
+            row_count: int,
+            repo_path: str,
+        ) -> None: ...
+        def record_index_run(
+            self,
+            timestamp: float,
+            repo_path: str,
+            duration_ms: float,
+            files_parsed: int,
+            parse_errors: int,
+            lineage_edges_created: int,
+        ) -> None: ...
+        # Derived metrics (computed properties)
+        def get_parse_success_rate(self) -> float: ...  # parse_errors / files_parsed
+        def close(self) -> None: ...
+    ```
+  - DDL (all tables created with `CREATE TABLE IF NOT EXISTS`):
+    ```sql
+    CREATE TABLE IF NOT EXISTS tool_calls (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool_name   TEXT    NOT NULL,
+        timestamp   REAL    NOT NULL,   -- Unix epoch float
+        duration_ms REAL    NOT NULL,
+        row_count   INTEGER NOT NULL DEFAULT 0,
+        repo_path   TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS index_runs (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp            REAL    NOT NULL,
+        repo_path            TEXT    NOT NULL,
+        duration_ms          REAL    NOT NULL,
+        files_parsed         INTEGER NOT NULL,
+        parse_errors         INTEGER NOT NULL,
+        lineage_edges_created INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS feedback (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        tool_name  TEXT NOT NULL,
+        query      TEXT NOT NULL,
+        label      TEXT NOT NULL CHECK(label IN ('TP', 'FP')),
+        note       TEXT NOT NULL DEFAULT '',
+        timestamp  REAL NOT NULL
+    );
+    ```
+  - `init_schema()` creates the database file (including parent directory) and all three
+    tables. It is called once at process startup; calling it multiple times is safe
+    (`IF NOT EXISTS` guards prevent duplication).
+  - All write methods must be wrapped in `try/except Exception`: log a WARNING via
+    `sqlcg.utils.logging.getLogger` and return without raising. A metrics write failure
+    must never propagate to the caller or crash a tool call.
+  - `MetricsStore.__enter__` / `__exit__` for use as a context manager (calls `close()`
+    on exit).
+  - Opt-out: check `os.environ.get("SQLCG_METRICS", "1") == "0"` at the top of each
+    write method; return immediately (no write, no error) when metrics are disabled.
+    Read methods are not guarded — they should always return data if the database exists.
+  - `db_path.parent.mkdir(parents=True, exist_ok=True)` before connecting (consistent
+    with how `get_db_path()` creates its parent in `index_cmd`).
+  - Use `sqlite3.connect(str(db_path))` — do not use `pathlib.Path` directly with
+    `sqlite3.connect` (stdlib behaviour varies across Python minor versions).
+
+- Acceptance:
+  - `from sqlcg.metrics.store import MetricsStore` succeeds in an environment where
+    `kuzu` is not installed
+  - `MetricsStore().init_schema()` is idempotent (call twice, no error, tables exist)
+  - `record_tool_call(...)` with `SQLCG_METRICS=0` set is a no-op (no row written)
+  - `record_tool_call(...)` exception is caught and logged as WARNING; caller does not
+    see the exception
+  - `record_index_run(...)` appends a row; reading it back returns the stored values
+
+---
+
+**Step 8.2 — Instrument MCP tools and the indexer**
+
+- Files affected:
+  - `src/sqlcg/server/tools.py` (instrument every `@mcp.tool()` call)
+  - `src/sqlcg/indexer/indexer.py` (instrument `index_repo`)
+
+- Tasks (tools.py):
+  - Import `MetricsStore` at the top of `tools.py` (lazy import inside each decorator
+    is acceptable if it avoids a circular import, but module-level import is preferred).
+  - Define a module-level `_metrics: MetricsStore | None = None`. Initialise it inside
+    `init_backend()` immediately after `_backend` is set:
+    ```python
+    _metrics = MetricsStore()
+    _metrics.init_schema()
+    ```
+    Add a corresponding `_metrics.close()` call in `shutdown_backend()`.
+  - For each of the eight `@mcp.tool()` functions (`index_repo`, `trace_column_lineage`,
+    `find_table_usages`, `get_downstream_dependencies`, `get_upstream_dependencies`,
+    `search_sql_pattern`, `list_dialects_and_repos`, `execute_cypher`), wrap the body
+    in a timing block:
+    ```python
+    import time
+    _t0 = time.monotonic()
+    try:
+        result = <original body>
+    finally:
+        if _metrics is not None:
+            _metrics.record_tool_call(
+                tool_name="<name>",
+                timestamp=time.time(),
+                duration_ms=(time.monotonic() - _t0) * 1000,
+                row_count=<len(result) if iterable else 1>,
+                repo_path=<repo_path arg or "" if not applicable>,
+            )
+    return result
+    ```
+  - `row_count` extraction rules per tool:
+    - `index_repo`: 0 (summary dict, not a row collection)
+    - `trace_column_lineage`: `len(result.lineage)`
+    - `find_table_usages`: `len(result.usages)`
+    - `get_downstream_dependencies` / `get_upstream_dependencies`: `len(result.nodes)`
+    - `search_sql_pattern`: `len(result.matches)`
+    - `list_dialects_and_repos`: `len(result.repos)`
+    - `execute_cypher`: `len(result)` (returns `list[dict]`)
+  - `repo_path` extraction: use the `repo_path` argument where the tool accepts one
+    (only `index_repo`); pass `""` for all query tools.
+  - The timing block must not change any existing exception propagation — exceptions
+    from the tool body must still propagate after the metrics write.
+
+- Tasks (indexer.py):
+  - Import `MetricsStore` at the top of `indexer.py`. Instantiate it in `index_repo`:
+    ```python
+    _ms = MetricsStore()
+    _ms.init_schema()
+    t0 = time.monotonic()
+    ```
+    After the final return dict is assembled, before the `return`:
+    ```python
+    _ms.record_index_run(
+        timestamp=time.time(),
+        repo_path=str(path),
+        duration_ms=(time.monotonic() - t0) * 1000,
+        files_parsed=result["files_parsed"],
+        parse_errors=result["parse_errors"],
+        lineage_edges_created=result["lineage_edges_created"],
+    )
+    _ms.close()
+    ```
+  - The `MetricsStore` instance in `index_repo` is local (not module-level) because
+    `index_repo` can be called concurrently (watcher) and SQLite is not safe to share
+    across threads without connection-per-thread. Each call opens and closes its own
+    connection.
+  - Wrap the `record_index_run` + `close` block in `try/finally` so `close()` is always
+    called even if the metrics write silently fails.
+
+- Acceptance:
+  - After `sqlcg index tests/fixtures/synthetic/ --dialect ansi`, a row exists in
+    `~/.sqlcg/metrics.db` table `index_runs`
+  - After calling any MCP tool, a row exists in `tool_calls`
+  - With `SQLCG_METRICS=0`, neither table receives a row
+  - Raising an exception inside a tool (e.g. `NotIndexedError`) still results in a row
+    in `tool_calls` (metrics write happens in `finally`)
+
+---
+
+**Step 8.3 — `submit_feedback` MCP tool**
+
+- Files affected:
+  - `src/sqlcg/server/tools.py` (add new `@mcp.tool()`)
+
+- Tasks:
+  - Add `submit_feedback` as the ninth MCP tool:
+    ```python
+    @mcp.tool()
+    def submit_feedback(
+        tool_name: str,
+        query: str,
+        label: str,
+        note: str = "",
+    ) -> dict:
+        """Rate a tool result as useful (TP) or not useful (FP).
+        Call after evaluating any tool result.
+
+        Args:
+            tool_name: Name of the tool whose result is being rated.
+            query: The query or input that produced the result.
+            label: "TP" (result was correct) or "FP" (result was wrong).
+            note: Optional explanation (max 500 chars).
+
+        Returns:
+            {"status": "recorded"} on success, {"status": "skipped"} if metrics off.
+
+        Raises:
+            ValueError: If label is not "TP" or "FP".
+        """
+    ```
+  - Validate `label in {"TP", "FP"}` — raise `ValueError` with a clear message if not.
+  - Validate `len(note) <= 500` — silently truncate to 500 chars (do not raise; the
+    LLM may produce long notes).
+  - Write via `_metrics.record_feedback(tool_name, query, label, note, time.time())`
+    (add `record_feedback` method to `MetricsStore`).
+  - Return `{"status": "recorded"}` on success, `{"status": "skipped"}` if
+    `SQLCG_METRICS=0` is set (the `record_feedback` no-op returns without writing;
+    the tool still needs to communicate that skip to the caller).
+  - Docstring system prompt hint: "Call after evaluating any tool result." — this is the
+    nudge (10 words) that encourages the LLM to call it without requiring a full system
+    prompt change.
+  - The tool must NOT call `_assert_indexed()` — feedback can be submitted even on an
+    unindexed graph (e.g. to record a FP from a cached result).
+  - `note` truncation and label validation happen before the metrics write attempt.
+
+- `MetricsStore.record_feedback` addition to `store.py`:
+  ```python
+  def record_feedback(
+      self,
+      tool_name: str,
+      query: str,
+      label: str,         # "TP" or "FP" — caller validates
+      note: str,
+      timestamp: float,
+  ) -> None: ...
+  ```
+  Uses the same try/except + opt-out pattern as other write methods.
+
+- Acceptance:
+  - `submit_feedback("trace_column_lineage", "orders.amount", "TP")` returns
+    `{"status": "recorded"}` and a row exists in the `feedback` table
+  - `submit_feedback("trace_column_lineage", "orders.amount", "FN")` raises `ValueError`
+  - `submit_feedback(..., note="x" * 600)` stores exactly 500 characters, no exception
+  - With `SQLCG_METRICS=0`, returns `{"status": "skipped"}` and no row is written
+  - The tool is visible in the FastMCP tool listing alongside the eight existing tools
+
+---
+
+**Step 8.4 — `sqlcg gain` CLI command**
+
+- Files affected:
+  - `src/sqlcg/cli/commands/gain.py` (new)
+  - `src/sqlcg/cli/main.py` (register command)
+
+- Tasks:
+  - `gain.py` defines a single Typer command `gain_cmd` registered as `sqlcg gain`.
+  - `gain_cmd` signature:
+    ```python
+    def gain_cmd(
+        json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON output"),
+    ) -> None:
+        """Show metrics summary: tool call counts, parse quality trend, TP rate."""
+    ```
+  - Open `MetricsStore(METRICS_DB_PATH)` — if the file does not exist, print a message
+    "No metrics collected yet. Run sqlcg index or use an MCP tool first." and exit 0.
+    Do not create the file just by running `sqlcg gain`.
+  - Compute and display (or serialise) the following sections. All queries use SQLite
+    aggregate functions — no in-Python loops over raw rows:
+
+    **Section A — Total MCP tool calls**
+    ```sql
+    SELECT COUNT(*) AS total FROM tool_calls;
+    SELECT COUNT(*) AS last_7d FROM tool_calls
+    WHERE timestamp > strftime('%s', 'now') - 7*86400;
+    ```
+    Display: "Total tool calls: {total} (last 7 days: {last_7d})"
+
+    **Section B — Parse success rate trend (last 5 index runs)**
+    ```sql
+    SELECT timestamp, repo_path,
+           CAST(files_parsed - parse_errors AS REAL) / NULLIF(files_parsed, 0) AS success_rate
+    FROM index_runs
+    ORDER BY timestamp DESC
+    LIMIT 5;
+    ```
+    Display: one row per run, formatted as
+    `  {date} {repo_path}: {success_rate:.0%}` (newest first).
+    If fewer than 1 run: "No indexing runs recorded yet."
+    No sparkline required — plain percentages are acceptable. A simple ASCII sparkline
+    (characters `▁▂▃▄▅▆▇█` proportional to the rate) is optional but not required for
+    acceptance.
+
+    **Section C — TP rate from feedback**
+    ```sql
+    SELECT
+        SUM(CASE WHEN label = 'TP' THEN 1 ELSE 0 END) AS tp,
+        COUNT(*) AS total
+    FROM feedback;
+    ```
+    Display: "Feedback TP rate: {tp}/{total} ({rate:.0%})" only if `total >= 5`.
+    If `total < 5`: "Feedback: {total} sample(s) — need 5 to show TP rate."
+
+    **Section D — Top 3 most-called tools**
+    ```sql
+    SELECT tool_name, COUNT(*) AS calls
+    FROM tool_calls
+    GROUP BY tool_name
+    ORDER BY calls DESC
+    LIMIT 3;
+    ```
+    Display: numbered list `  1. {tool_name}: {calls} calls`.
+    If no calls: "No tool calls recorded yet."
+
+  - `--json` output: return a single JSON object with keys `total_calls`, `last_7d_calls`,
+    `index_runs` (list of `{timestamp, repo_path, success_rate}`), `feedback_tp`,
+    `feedback_total`, `top_tools` (list of `{tool_name, calls}`). Use `json.dumps(...,
+    indent=2)` and print to stdout.
+  - Register in `main.py`:
+    ```python
+    from sqlcg.cli.commands import gain
+    app.command("gain")(gain.gain_cmd)
+    ```
+
+- Acceptance:
+  - `sqlcg gain` with no metrics database exits 0 with the "No metrics" message
+  - `sqlcg gain` after `sqlcg index` and one MCP tool call shows non-zero values in
+    Sections A and B
+  - `sqlcg gain --json` outputs valid JSON with all required keys
+  - TP rate section is hidden when fewer than 5 feedback samples exist
+  - `sqlcg gain` exits 0 in all cases (metrics absence is not an error)
+
+---
+
+**Step 8.5 — `sqlcg report` CLI command**
+
+- Files affected:
+  - `src/sqlcg/cli/commands/report.py` (new)
+  - `src/sqlcg/cli/main.py` (register command)
+
+- Tasks:
+  - `report.py` defines a single Typer command `report_cmd` registered as `sqlcg report`.
+  - `report_cmd` signature:
+    ```python
+    def report_cmd(
+        stdout: bool = typer.Option(False, "--stdout", help="Print to stdout instead of file"),
+        output: Path = typer.Option(
+            Path("docs/METRICS_REPORT.md"),
+            "--output", "-o",
+            help="Output file path",
+        ),
+    ) -> None:
+        """Generate a metrics report with FP clusters and parse error patterns."""
+    ```
+  - If metrics database does not exist: print "No metrics collected yet." and exit 0.
+  - Compute the following sections via SQL queries:
+
+    **Section 1 — FP clusters** (files or query patterns with FP rate > 50%, min 3 samples)
+    ```sql
+    SELECT query,
+           SUM(CASE WHEN label = 'FP' THEN 1 ELSE 0 END) AS fp_count,
+           COUNT(*) AS total,
+           CAST(SUM(CASE WHEN label = 'FP' THEN 1 ELSE 0 END) AS REAL) / COUNT(*) AS fp_rate
+    FROM feedback
+    GROUP BY query
+    HAVING total >= 3 AND fp_rate > 0.5
+    ORDER BY fp_rate DESC;
+    ```
+    Render as a Markdown table: `| Query | FP Count | Total | FP Rate |`.
+    If no qualifying rows: "No FP clusters found (need ≥3 samples per query pattern)."
+
+    **Section 2 — Parse error clusters** (files that errored across multiple index runs)
+    ```sql
+    SELECT repo_path, COUNT(*) AS run_count,
+           SUM(parse_errors) AS total_errors,
+           CAST(SUM(parse_errors) AS REAL) / NULLIF(SUM(files_parsed), 0) AS error_rate
+    FROM index_runs
+    GROUP BY repo_path
+    HAVING run_count >= 2 AND total_errors > 0
+    ORDER BY total_errors DESC;
+    ```
+    Render as a Markdown table: `| Repo Path | Runs | Total Errors | Error Rate |`.
+    If no qualifying rows: "No parse error clusters found."
+
+    **Section 3 — Pre-filled GitHub issue URL**
+    - Compute a `report_hash`: `hashlib.md5(report_content.encode()).hexdigest()[:8]`
+      (used in the issue title to identify the specific report; stdlib `hashlib` only).
+    - Issue title: `[sqlcg metrics] FP clusters report {report_hash}`
+    - Issue body (URL-encoded): the Markdown content of Sections 1 and 2, truncated to
+      2000 characters if longer (GitHub URL length limit is 8192; 2000 chars is safe).
+    - Pre-filled URL format:
+      ```
+      https://github.com/Warhorze/sql-code-graph/issues/new?title={title}&body={body}
+      ```
+      Use `urllib.parse.quote` (stdlib) for URL encoding. No requests/httpx import.
+    - Render this URL under a "## File an Issue" heading in the report.
+    - The URL is copy-paste ready — it must be a single line with no line breaks inside
+      the URL itself.
+
+  - Output:
+    - With `--stdout`: print the Markdown to stdout.
+    - Without `--stdout`: write to `--output` path (default `docs/METRICS_REPORT.md`),
+      creating parent directories as needed. Print "Report written to {output}" to
+      the console (stderr-safe via `console.print()`).
+  - Register in `main.py`:
+    ```python
+    from sqlcg.cli.commands import report
+    app.command("report")(report.report_cmd)
+    ```
+
+- Acceptance:
+  - `sqlcg report --stdout` with no metrics database exits 0 with the "No metrics" message
+  - `sqlcg report --stdout` with seed data produces valid Markdown with all three sections
+  - FP cluster table appears only when ≥3 samples with FP rate >50% exist
+  - Parse error cluster table appears only when ≥2 runs with parse errors exist
+  - GitHub issue URL is a valid URL (parseable by `urllib.parse.urlparse`) with no
+    newlines embedded
+  - `report_hash` changes when the report content changes
+
+---
+
+**Step 8.6 — Unit tests**
+
+- Files affected:
+  - `tests/unit/test_metrics.py` (new — all Phase 8 unit tests)
+
+- Tasks:
+  - All tests use a `tmp_path` fixture (pytest built-in) to write to a throwaway SQLite
+    file, never to `~/.sqlcg/metrics.db`.
+  - Test organisation — test classes per concern:
+
+    **`TestMetricsStore`** — store.py unit tests:
+    - `test_init_schema_is_idempotent`: call `init_schema()` twice, assert no error and
+      three tables exist (query `sqlite_master`)
+    - `test_record_tool_call_writes_row`: call `record_tool_call(...)`, assert one row
+      in `tool_calls` with correct field values
+    - `test_record_index_run_writes_row`: call `record_index_run(...)`, assert row in
+      `index_runs`
+    - `test_record_feedback_writes_row`: call `record_feedback(..., label="TP")`, assert row
+    - `test_write_is_noop_when_disabled`: set `os.environ["SQLCG_METRICS"] = "0"`, call
+      `record_tool_call(...)`, assert table has 0 rows
+    - `test_write_does_not_raise_on_sqlite_error`: monkeypatch `sqlite3.Connection.execute`
+      to raise `sqlite3.OperationalError`; assert `record_tool_call(...)` returns without
+      raising and that a WARNING was logged
+    - `test_context_manager_closes_connection`: use `with MetricsStore(...) as ms:` block;
+      after the block, assert `ms._conn` is closed (check `ms._conn` is None or
+      `_closed` attribute depending on implementation)
+
+    **`TestSubmitFeedbackTool`** — submit_feedback MCP tool unit tests:
+    - `test_submit_feedback_tp_recorded`: call with `label="TP"`, assert return
+      `{"status": "recorded"}` and row in `feedback` table
+    - `test_submit_feedback_invalid_label_raises`: call with `label="FN"`, assert
+      `ValueError` raised
+    - `test_submit_feedback_note_truncated`: call with `note="x" * 600`, assert stored
+      note is exactly 500 characters
+    - `test_submit_feedback_skipped_when_metrics_off`: set `SQLCG_METRICS=0`, assert
+      return is `{"status": "skipped"}` and no row written
+
+    **`TestGainCommand`** — gain.py unit tests (use `typer.testing.CliRunner`):
+    - `test_gain_no_database_exits_0`: run `sqlcg gain` with no metrics.db, assert
+      exit 0 and "No metrics" in output
+    - `test_gain_shows_total_calls`: seed `tool_calls` with 3 rows, assert output
+      contains "Total tool calls: 3"
+    - `test_gain_hides_tp_rate_below_5_samples`: seed `feedback` with 3 rows, assert
+      "need 5" appears in output
+    - `test_gain_shows_tp_rate_at_5_samples`: seed `feedback` with 5 TP rows, assert
+      TP rate section is shown with "5/5"
+    - `test_gain_json_flag_produces_valid_json`: run `sqlcg gain --json`, parse output
+      as JSON, assert all required keys present
+
+    **`TestReportCommand`** — report.py unit tests (use `typer.testing.CliRunner`):
+    - `test_report_no_database_exits_0`: run `sqlcg report --stdout` with no metrics.db,
+      assert exit 0
+    - `test_report_fp_cluster_appears_in_output`: seed `feedback` with 4 FP rows for the
+      same query (FP rate = 1.0 > 0.5, count ≥ 3), assert the query appears in
+      `--stdout` output
+    - `test_report_fp_cluster_hidden_when_insufficient_samples`: seed 2 FP rows for a
+      query (count < 3), assert the query does NOT appear in output
+    - `test_report_parse_error_cluster_appears`: seed `index_runs` with 2 runs for the
+      same repo, both with parse_errors > 0, assert the repo path appears in output
+    - `test_report_github_url_is_valid`: seed any data, run `--stdout`, extract the
+      GitHub URL line, assert `urllib.parse.urlparse(url).scheme == "https"`
+    - `test_report_writes_to_file`: run without `--stdout`, assert the output file is
+      created and non-empty
+
+- Acceptance:
+  - `pytest tests/unit/test_metrics.py` passes with 0 failures
+  - All tests use `tmp_path`; no test touches `~/.sqlcg/`
+  - Coverage of `store.py`, `gain.py`, `report.py`, and the `submit_feedback` function
+    in `tools.py` reaches ≥ 80% (measured; not enforced as a gate, but recorded)
+
+---
+
+## Phase 8 Acceptance Criteria
+
+- [ ] `from sqlcg.metrics.store import MetricsStore` succeeds without `kuzu` installed
+- [ ] `MetricsStore.init_schema()` is idempotent
+- [ ] With `SQLCG_METRICS=0`, no rows are written to any metrics table
+- [ ] A failed metrics write logs WARNING and does not propagate to the caller
+- [ ] After `sqlcg index`, a row exists in `index_runs` with correct `files_parsed` value
+- [ ] After calling any MCP tool, a row exists in `tool_calls` with correct `tool_name`
+- [ ] `submit_feedback("t", "q", "FN")` raises `ValueError`
+- [ ] `submit_feedback("t", "q", "TP", note="x"*600)` stores 500 chars, returns `{"status": "recorded"}`
+- [ ] `sqlcg gain` exits 0 with no metrics database present
+- [ ] `sqlcg gain --json` outputs valid JSON with keys: `total_calls`, `last_7d_calls`, `index_runs`, `feedback_tp`, `feedback_total`, `top_tools`
+- [ ] `sqlcg report --stdout` exits 0 with no metrics database present
+- [ ] FP cluster table is hidden when no query has ≥3 samples with FP rate > 50%
+- [ ] GitHub issue URL in `sqlcg report` output is a valid HTTPS URL parseable by `urllib.parse.urlparse`
+- [ ] `pytest tests/unit/test_metrics.py` passes with 0 failures (minimum 20 test cases)
+
+---
+
+## Phase 8 Risks and Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|-----------|
+| SQLite write failure on low-disk-space or permission error | Low | Low | try/except wraps every write; WARNING logged; tool call is unaffected |
+| `metrics.db` grows unbounded on high-use installations | Low | Low | v1 has no pruning; document that users can delete the file at any time; v2 can add retention policy |
+| LLM calls `submit_feedback` with FN label | Medium | None | `ValueError` raised before any write; no FN rows can exist in the database |
+| Concurrent MCP tool calls race on `_metrics` singleton | Low | Low | SQLite's serialised write mode (`check_same_thread=True`) + WAL journal mode prevents corruption; each watcher job uses its own local `MetricsStore` instance (no singleton in indexer path) |
+| GitHub issue URL exceeds browser limit | Low | Low | Body is truncated to 2000 chars; title is fixed-length; total URL is well within 8192 char limit |
+| `gain.py` or `report.py` SQL queries time out on large metrics.db | Very Low | Low | All queries use indexed columns (timestamp, label, tool_name); no full-table scans; no index DDL needed for v1 volumes |
+| `submit_feedback` docstring hint is ignored by LLM | Medium | Low | The tool is always available and surfaced in the tool listing; LLM may call it if Claude's tool-selection improves; no correctness risk if it is never called |
 
 ---
 
@@ -1060,3 +1608,192 @@ For the `sqlcg watch` production use case, document that large repos (>1000 file
 should use `sqlcg index` for the initial full index and only then start `watch` —
 running `watch` from scratch on a 10,000-file repo will trigger 10,000 concurrent
 timer expirations.
+
+---
+
+### Phase 9 — Git-Aware Graph Freshness (Days 39–41)
+
+**Reviewer Corrections (plan-reviewer, 2026-05-04)**
+
+Issues found and fixed in this plan before implementation:
+
+- BLOCKER fixed (Step 9.1 + 9.2): The hook script written by `install-hooks` calls
+  `sqlcg index --dialect auto --quiet` but `--quiet` did not exist in `index_cmd` and
+  was not mentioned in Step 9.2. Added `--quiet` flag to Step 9.2 tasks and acceptance
+  criteria. Added an implementation order note: Step 9.2 must be complete before the
+  Step 9.1 e2e test exercises the hook end-to-end.
+
+- BLOCKER fixed (Step 9.1): Idempotency check string was unspecified — "if the hook
+  already contains the sqlcg line" left ambiguous which string to check. Specified
+  `# sqlcg post-checkout hook` as the sentinel (first comment line of every sqlcg-authored
+  hook). Same sentinel is used for existing-hook detection.
+
+- BLOCKER fixed (Step 9.3): The locking mechanism for "block new file events from being
+  scheduled until resync completes" was unspecified. `cancel_all()` only cancels pending
+  timers; in-flight `_run_job` calls continue, and `schedule()` accepts new events
+  immediately. Added concrete specification: `_paused: bool`, `_queued: list[str]`,
+  all guarded by the existing `_lock`. `BranchMonitor` sets `_paused=True`, drains
+  timers, runs `index_repo`, then sets `_paused=False` and drains `_queued`.
+
+- BLOCKER fixed (Step 9.3 acceptance + Step 9.4): `BranchMonitor` acceptance criterion
+  said it exits when `cancel_all()` is called — but `WatchJobManager.cancel_all()` only
+  cancels file timers and has no knowledge of `BranchMonitor`. Fixed: `BranchMonitor`
+  must expose `stop()` + `join()`, called from `watch.py`'s `finally` block. Also added
+  an explicit test task in Step 9.4 for the `_queued` drain behaviour.
+
+**Context**
+
+The watcher (`SqlFileEventHandler` + `WatchJobManager` in `src/sqlcg/indexer/watcher.py`
+and `src/sqlcg/core/jobs.py`) handles continuous within-branch development well: each
+file save triggers a debounced single-file reindex. But it has a blind spot: `git checkout`
+fires a flood of simultaneous file events for every file that differs between branches,
+which causes three problems:
+
+1. **Event flood** — dozens of modify/delete events arrive at once; the debouncer partially
+   absorbs them but each file still queues a separate reindex job, serialised by KùzuDB's
+   single-writer lock.
+2. **Partial state** — if a reindex job is in-flight when the checkout completes, the graph
+   contains a mix of old-branch and new-branch nodes until all jobs drain.
+3. **Stale deletions** — files deleted by checkout fire `on_deleted`, but if the watcher
+   missed the event (race condition, rapid checkout) those nodes persist in the graph.
+
+The fix is a `post-checkout` git hook that triggers a **full resync** atomically from the
+new branch's file tree, bypassing the watcher's per-file debounce logic entirely. The
+watcher then handles all within-branch changes as before.
+
+---
+
+**Step 9.1 — `sqlcg git install-hooks`**
+
+- Files affected: `src/sqlcg/cli/commands/git.py` (new), `src/sqlcg/cli/main.py`
+- Tasks:
+  - Add a `git` subcommand group with one command: `install-hooks`
+  - `sqlcg git install-hooks [--repo <path>]` writes `.git/hooks/post-checkout` to the
+    target repo (default: `Path.cwd()`)
+  - The hook script content (written verbatim by the command):
+    ```bash
+    #!/bin/sh
+    # sqlcg post-checkout hook — resync graph after branch switch
+    # $3 == 1 means branch checkout (not file checkout); skip file checkouts
+    [ "$3" = "1" ] || exit 0
+    sqlcg index "$(git rev-parse --show-toplevel)" --dialect auto --quiet || true
+    ```
+  - `--dialect auto` is a new flag for the `index` command (Step 9.2) that reads dialect
+    from a `.sqlcg.toml` config file if present, or falls back to `snowflake`
+  - After writing the hook, `chmod +x .git/hooks/post-checkout`
+  - If a `post-checkout` hook already exists and was not written by sqlcg, print a WARNING
+    and do not overwrite — instruct the user to manually append the hook line
+  - Idempotent: if the hook file already contains the sentinel string
+    `# sqlcg post-checkout hook`, skip silently (this is the first comment line of
+    the script body; it is always present in hooks written by sqlcg). Use
+    `'# sqlcg post-checkout hook' in existing_content` as the check.
+  - The same sentinel string is used for the existing-hook detection: if
+    `.git/hooks/post-checkout` exists and does NOT contain `# sqlcg post-checkout hook`,
+    treat it as a user hook and warn without overwriting.
+  - Implementation order dependency: `--dialect auto` and `--quiet` (Step 9.2) must be
+    implemented before the e2e test in `test_git_hook_install.py` exercises the hook script
+    end-to-end. Developer must complete Step 9.2 before Step 9.1 tests are run.
+- Acceptance:
+  - `sqlcg git install-hooks` in a git repo creates `.git/hooks/post-checkout` with `+x`
+  - Running the hook with `$3=0` (file checkout) exits 0 without calling `sqlcg index`
+  - Running the hook with `$3=1` (branch checkout) calls `sqlcg index`
+  - Idempotency: running `install-hooks` twice does not duplicate the hook line
+  - `install-hooks` warns and skips when a hook exists without `# sqlcg post-checkout hook`
+
+**Step 9.2 — `--dialect auto` flag and `--quiet` flag for `sqlcg index`**
+
+- Files affected: `src/sqlcg/cli/commands/index.py`, `src/sqlcg/core/config.py`
+- Implementation order note: Step 9.2 must be completed before Step 9.1 is tested,
+  because the hook script written by `install-hooks` calls `sqlcg index --dialect auto
+  --quiet`. Both flags must exist in the `index` command before the hook script is
+  exercised in e2e tests.
+- Tasks:
+  - Add `--dialect auto` as a valid value for the existing `--dialect` option
+  - When `auto` is selected: read `dialect` from `.sqlcg.toml` in the repo root if present;
+    fall back to `snowflake` if absent
+  - `.sqlcg.toml` schema (minimal): `[sqlcg]\ndialect = "snowflake"`
+  - `get_dialect(path: Path) -> str` helper in `config.py`
+  - Add `--quiet` / `-q` boolean flag to `index_cmd` (default `False`). When `True`,
+    suppress the `[green]Indexed N files...[/green]` summary line printed to the console.
+    All other console output (errors, warnings) is still emitted. This flag is used by
+    the git hook so that `git checkout` output is not polluted by the index summary.
+- Acceptance:
+  - `sqlcg index /path --dialect auto` with no `.sqlcg.toml` uses `snowflake`
+  - `sqlcg index /path --dialect auto` with `.sqlcg.toml` containing `dialect = "bigquery"` uses `bigquery`
+  - `sqlcg index /path --quiet` suppresses the summary line; exit code is still 0
+  - Existing explicit `--dialect snowflake` behaviour is unchanged
+
+**Step 9.3 — Watcher branch-switch guard**
+
+- Files affected: `src/sqlcg/indexer/watcher.py`, `src/sqlcg/cli/commands/watch.py`
+- Tasks:
+  - Add a `BranchMonitor` thread to `SqlFileEventHandler.__init__` that polls
+    `git rev-parse --abbrev-ref HEAD` every 2 seconds
+  - When the branch name changes: call `job_manager.cancel_all()` to drain pending jobs,
+    then call `indexer.index_repo()` (full resync of the watched path) before resuming
+    normal event handling
+  - This is a safety net for users who switch branches without the git hook installed
+  - The resync must hold a lock that blocks new file events from being scheduled until
+    it completes (prevents mixed-branch nodes). Implement this by adding a
+    `_paused: bool = False` flag and a companion `threading.Condition` (or `threading.Event`)
+    to `WatchJobManager`. The `schedule()` method must check `_paused` under the existing
+    `_lock` and, if paused, store the path in a `_queued: list[str]` buffer instead of
+    starting a timer. `BranchMonitor` sets `_paused = True` before calling `cancel_all()`,
+    then calls `index_repo()`, then sets `_paused = False` and drains `_queued` by calling
+    `schedule()` for each buffered path. All flag reads and writes must be inside `_lock`.
+  - `BranchMonitor` must expose a `stop()` method (sets an internal `threading.Event`
+    that the polling loop checks) and a `join()` method. Both are called from the `finally`
+    block in `watch.py`. Do NOT rely on `cancel_all()` to stop `BranchMonitor` — that
+    method only drains file-event timers and has no knowledge of the monitor thread.
+- Acceptance:
+  - Simulated branch switch (mock `git rev-parse` return value changes) triggers
+    `cancel_all()` + `index_repo()` in the correct order
+  - File events received during the resync are queued (stored in `_queued`) and replayed
+    after resync completes — not dropped and not executed during the resync window
+  - `BranchMonitor` thread exits cleanly when `BranchMonitor.stop()` + `join()` are
+    called from `watch.py`'s `finally` block
+
+**Step 9.4 — Tests**
+
+- Files affected: `tests/unit/test_git_hooks.py`, `tests/unit/test_branch_monitor.py`,
+  `tests/e2e/test_git_hook_install.py`
+- Tasks:
+  - `test_git_hooks.py`: hook file content is correct; idempotency; `$3=0` early-exit
+    condition; existing-hook warning (no overwrite)
+  - `test_branch_monitor.py`: mock `git rev-parse`; assert `cancel_all` + `index_repo`
+    called in order on branch change; assert no call on same-branch poll;
+    assert that `job_manager.schedule()` calls received while `_paused=True` are NOT
+    executed until `_paused` is cleared (verifies the queued-not-dropped guarantee)
+  - `test_git_hook_install.py` (e2e): `sqlcg git install-hooks` in a real tmp git repo;
+    assert hook file exists and is executable; run hook script with `$3=1` and assert
+    it invokes `sqlcg index`
+  - `--dialect auto` covered in existing `tests/unit/test_config.py` (extend it)
+
+---
+
+**Phase 9 Acceptance Criteria**
+
+- [ ] `sqlcg git install-hooks` creates an executable `post-checkout` hook in the target repo
+- [ ] Hook skips indexing on file checkout (`$3=0`) and runs it on branch checkout (`$3=1`)
+- [ ] `install-hooks` is idempotent — running twice produces one hook line, not two
+- [ ] `install-hooks` warns and exits 0 without overwriting a pre-existing non-sqlcg hook
+      (detection uses `# sqlcg post-checkout hook` sentinel string)
+- [ ] `sqlcg index --dialect auto` resolves dialect from `.sqlcg.toml` or falls back to `snowflake`
+- [ ] `sqlcg index --quiet` suppresses the summary console line without changing exit code or parse behaviour
+- [ ] `BranchMonitor` triggers `cancel_all()` + `index_repo()` when branch changes
+- [ ] File events during a branch-switch resync are buffered in `_queued` and replayed after resync —
+      not dropped and not executed concurrently with the resync
+- [ ] `BranchMonitor` thread exits cleanly via `BranchMonitor.stop()` + `join()` from `watch.py` `finally`
+- [ ] All existing watcher tests still pass
+
+---
+
+**Phase 9 Risks and Mitigations**
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|-----------|
+| `git rev-parse` unavailable (not a git repo) | Low | Low | `BranchMonitor` catches `CalledProcessError`; logs DEBUG and disables itself silently |
+| Hook overwrites user's existing `post-checkout` | Low | High | Explicit check for existing hook content; warn + skip if not authored by sqlcg |
+| Branch-switch resync blocks watcher for large repos | Medium | Medium | Resync runs in background thread; file events are queued (not dropped) during resync |
+| `--dialect auto` fallback to `snowflake` wrong for most repos | Medium | Low | Users set `.sqlcg.toml`; fallback is documented; explicit `--dialect` always wins |
+| `BranchMonitor` 2s polling adds overhead | Low | Low | One `git rev-parse` call per 2s is negligible; thread exits cleanly on shutdown |

@@ -3,7 +3,7 @@
 import typer
 from dotenv import load_dotenv
 
-from sqlcg.cli.commands import analyze, db, find, index, mcp, watch
+from sqlcg.cli.commands import analyze, db, find, gain, index, mcp, report, watch
 
 app = typer.Typer(name="sqlcg", help="SQL code graph analyzer")
 
@@ -16,6 +16,8 @@ app.add_typer(mcp.app, name="mcp")
 # Register single commands
 app.command("index")(index.index_cmd)
 app.command("watch")(watch.watch_cmd)
+app.command("gain")(gain.gain_cmd)
+app.command("report")(report.report_cmd)
 
 
 @app.command()

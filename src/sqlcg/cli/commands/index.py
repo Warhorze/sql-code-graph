@@ -44,8 +44,38 @@ def index_cmd(  # noqa: B008
     with get_backend() as backend:
         backend.init_schema()
 
+        # Create Repo node for this repository
+        from sqlcg.core.schema import NodeLabel
+
+        abs_path = str(path.resolve())
+        backend.upsert_node(
+            NodeLabel.REPO,
+            abs_path,
+            {
+                "path": abs_path,
+                "name": path.name,
+            },
+        )
+
+        # Index the repository
         indexer = Indexer()
         summary = indexer.index_repo(path, dialect, backend, dbt_manifest, timeout_per_file)
+
+        # Connect files to repo
+        from sqlcg.core.schema import RelType
+
+        files_query = "MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path"
+        file_rows = backend.run_read(files_query, {"repo_prefix": abs_path})
+        for row in file_rows:
+            backend.upsert_edge(
+                NodeLabel.FILE,
+                row["path"],
+                NodeLabel.REPO,
+                abs_path,
+                RelType.BELONGS_TO,
+                {},
+            )
+
         console.print(
             f"[green]Indexed[/green] {summary['files_parsed']} files — "
             f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
