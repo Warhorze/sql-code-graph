@@ -1,0 +1,313 @@
+"""Main indexer orchestrating parsing and graph persistence."""
+
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
+from pathlib import Path
+
+from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.queries import STALE_VIEWS_QUERY
+from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.indexer.walker import walk_sql_files
+from sqlcg.lineage.aggregator import CrossFileAggregator
+from sqlcg.lineage.schema_resolver import SchemaResolver
+from sqlcg.parsers.base import ParsedFile
+from sqlcg.parsers.registry import get_parser
+from sqlcg.utils.ignore import load_ignore_spec
+from sqlcg.utils.logging import getLogger
+
+logger = getLogger(__name__)
+
+
+class Indexer:
+    """Orchestrates SQL file parsing and graph persistence."""
+
+    def index_repo(
+        self,
+        path: Path,
+        dialect: str | None,
+        db: GraphBackend,
+        dbt_manifest: Path | None = None,
+        timeout_per_file: int = 30,
+    ) -> dict:
+        """Full two-pass index. Returns summary dict.
+
+        Args:
+            path: Root directory to index
+            dialect: SQL dialect (None for ANSI)
+            db: GraphBackend instance
+            dbt_manifest: Optional path to dbt manifest.json
+            timeout_per_file: Timeout in seconds per file (0 = no timeout)
+
+        Returns:
+            Dict with keys: files_parsed, parse_errors, tables_found, lineage_edges_created
+        """
+        spec = load_ignore_spec(path)
+        schema_resolver = SchemaResolver(dialect=dialect)
+        parser = get_parser(dialect, schema_resolver)
+        aggregator = CrossFileAggregator()
+
+        files = list(walk_sql_files(path, spec))
+        pass1_results: list[ParsedFile] = []
+        parse_errors = 0
+
+        # Pass 1: parse all files
+        for file_path in files:
+            try:
+                sql = file_path.read_text(encoding="utf-8")
+                parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
+                aggregator.register_pass1(parsed)
+                pass1_results.append(parsed)
+                parse_errors += len(parsed.errors)
+            except KeyboardInterrupt:
+                logger.info("SIGINT received — flushing progress")
+                self._upsert_all(pass1_results, db)
+                raise
+            except Exception as exc:
+                logger.warning("Failed to parse %s: %s", file_path, exc)
+                parse_errors += 1
+
+        # Optional: load dbt manifest
+        if dbt_manifest:
+            from sqlcg.indexer.dbt_adapter import load_dbt_manifest
+
+            load_dbt_manifest(dbt_manifest, schema_resolver)
+
+        # Pass 2: resolve cross-file references
+        pass2_results: list[ParsedFile] = []
+        for parsed in pass1_results:
+            try:
+                resolved = aggregator.resolve_pass2(parser, parsed)
+                pass2_results.append(resolved)
+            except Exception as exc:
+                logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
+                pass2_results.append(parsed)
+
+        # Upsert all results
+        tables_found = 0
+        lineage_edges = 0
+        for parsed in pass2_results:
+            counts = self._upsert_parsed_file(parsed, db)
+            tables_found += counts["tables"]
+            lineage_edges += counts["edges"]
+
+        return {
+            "files_parsed": len(pass2_results),
+            "parse_errors": parse_errors,
+            "tables_found": tables_found,
+            "lineage_edges_created": lineage_edges,
+        }
+
+    def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
+        """Re-index a single file and its dependent views.
+
+        Args:
+            file_path: Path to the file to re-index
+            db: GraphBackend instance
+            dialect: SQL dialect (None for ANSI)
+        """
+        stale_views = db.run_read(STALE_VIEWS_QUERY, {"path": file_path})
+
+        with db.transaction():
+            db.delete_nodes_for_file(file_path)
+            schema_resolver = SchemaResolver(dialect=dialect)
+            parser = get_parser(dialect, schema_resolver)
+            sql = Path(file_path).read_text(encoding="utf-8")
+            parsed = parser.parse_file(Path(file_path), sql)
+            self._upsert_parsed_file(parsed, db)
+
+        for row in stale_views:
+            self._reindex_view_definition(row["view_name"], db, dialect)
+
+    def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
+        """Parse one file, with optional timeout.
+
+        Args:
+            parser: SqlParser instance
+            path: Path to the file
+            sql: SQL text
+            timeout: Timeout in seconds (0 = no timeout)
+
+        Returns:
+            ParsedFile with parse_failed flag set if timeout occurs
+        """
+        if timeout <= 0:
+            return parser.parse_file(path, sql)
+
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(parser.parse_file, path, sql)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                logger.warning("Timeout parsing %s (>%ds) — skipping", path, timeout)
+                out = ParsedFile(path=path, dialect=parser.DIALECT)
+                out.errors.append(f"timeout:{timeout}s")
+                return out
+
+    def _upsert_parsed_file(self, parsed: ParsedFile, db: GraphBackend) -> dict:
+        """Map ParsedFile → graph nodes/edges.
+
+        Args:
+            parsed: ParsedFile to upsert
+            db: GraphBackend instance
+
+        Returns:
+            Dict with keys: tables, edges
+        """
+        counts = {"tables": 0, "edges": 0}
+
+        # Upsert File node
+        db.upsert_node(
+            NodeLabel.FILE,
+            parsed.path_str,
+            {
+                "path": parsed.path_str,
+                "dialect": parsed.dialect or "",
+            },
+        )
+
+        # Upsert defined tables
+        for table in parsed.defined_tables:
+            db.upsert_node(
+                NodeLabel.TABLE,
+                table.full_id,
+                {
+                    "qualified": table.full_id,
+                    "name": table.name,
+                    "catalog": table.catalog or "",
+                    "db": table.db or "",
+                    "kind": "TABLE",
+                    "defined_in_file": parsed.path_str,
+                },
+            )
+            db.upsert_edge(
+                NodeLabel.TABLE,
+                table.full_id,
+                NodeLabel.FILE,
+                parsed.path_str,
+                RelType.DEFINED_IN,
+                {},
+            )
+            counts["tables"] += 1
+
+        # Upsert query nodes
+        for i, stmt in enumerate(parsed.statements):
+            query_id = f"{parsed.path_str}:{i}"
+            db.upsert_node(
+                NodeLabel.QUERY,
+                query_id,
+                {
+                    "id": query_id,
+                    "file_path": parsed.path_str,
+                    "statement_index": i,
+                    "sql": stmt.sql[:500],
+                    "kind": stmt.kind,
+                    "target_table": stmt.target.full_id if stmt.target else "",
+                    "parse_failed": stmt.parse_failed,
+                    "confidence": stmt.confidence,
+                    "parsing_mode": stmt.parsing_mode,
+                },
+            )
+            db.upsert_edge(
+                NodeLabel.QUERY,
+                query_id,
+                NodeLabel.FILE,
+                parsed.path_str,
+                RelType.QUERY_DEFINED_IN,
+                {},
+            )
+
+            # Source table edges
+            for src_table in stmt.sources:
+                db.upsert_node(
+                    NodeLabel.TABLE,
+                    src_table.full_id,
+                    {
+                        "qualified": src_table.full_id,
+                        "name": src_table.name,
+                        "catalog": src_table.catalog or "",
+                        "db": src_table.db or "",
+                        "kind": "TABLE",
+                        "defined_in_file": "",
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.QUERY,
+                    query_id,
+                    NodeLabel.TABLE,
+                    src_table.full_id,
+                    RelType.SELECTS_FROM,
+                    {},
+                )
+
+            # Column lineage edges
+            for edge in stmt.column_lineage:
+                src_id = edge.src.full_id
+                dst_id = edge.dst.full_id
+                db.upsert_node(
+                    NodeLabel.COLUMN,
+                    src_id,
+                    {
+                        "id": src_id,
+                        "col_name": edge.src.name,
+                        "table_qualified": edge.src.table.full_id,
+                        "catalog": edge.src.table.catalog or "",
+                        "db": edge.src.table.db or "",
+                        "table_name": edge.src.table.name,
+                    },
+                )
+                db.upsert_node(
+                    NodeLabel.COLUMN,
+                    dst_id,
+                    {
+                        "id": dst_id,
+                        "col_name": edge.dst.name,
+                        "table_qualified": edge.dst.table.full_id,
+                        "catalog": edge.dst.table.catalog or "",
+                        "db": edge.dst.table.db or "",
+                        "table_name": edge.dst.table.name,
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.COLUMN,
+                    src_id,
+                    NodeLabel.COLUMN,
+                    dst_id,
+                    RelType.COLUMN_LINEAGE,
+                    {
+                        "transform": edge.transform,
+                        "confidence": edge.confidence,
+                        "query_id": query_id,
+                    },
+                )
+                counts["edges"] += 1
+
+        return counts
+
+    def _upsert_all(self, results: list[ParsedFile], db: GraphBackend) -> None:
+        """Upsert all parsed files.
+
+        Args:
+            results: List of ParsedFile objects
+            db: GraphBackend instance
+        """
+        for parsed in results:
+            self._upsert_parsed_file(parsed, db)
+
+    def _reindex_view_definition(
+        self, view_name: str, db: GraphBackend, dialect: str | None
+    ) -> None:
+        """Re-index the file that defines a view.
+
+        Args:
+            view_name: Qualified view name
+            db: GraphBackend instance
+            dialect: SQL dialect
+        """
+        query = (
+            f"MATCH (t:{NodeLabel.TABLE} {{qualified: $name}})"
+            f"-[:{RelType.DEFINED_IN}]->(f:{NodeLabel.FILE}) "
+            "RETURN f.path AS path"
+        )
+        result = db.run_read(query, {"name": view_name})
+        for row in result:
+            self.reindex_file(row["path"], db, dialect)
