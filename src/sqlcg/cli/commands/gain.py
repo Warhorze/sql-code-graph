@@ -1,7 +1,7 @@
 """The sqlcg gain command — view metrics and feedback analytics."""
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -64,9 +64,10 @@ def gain_cmd(
         all_calls = metrics.execute_query("SELECT COUNT(*) as count FROM tool_calls")
         total_calls = all_calls[0][0] if all_calls else 0
 
-        cutoff_date = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        cutoff_date = (datetime.now(UTC) - timedelta(days=7)).isoformat()
         last_7d = metrics.execute_query(
-            f"SELECT COUNT(*) as count FROM tool_calls WHERE timestamp > '{cutoff_date}'"
+            "SELECT COUNT(*) as count FROM tool_calls WHERE timestamp > ?",
+            (cutoff_date,),
         )
         last_7d_calls = last_7d[0][0] if last_7d else 0
 

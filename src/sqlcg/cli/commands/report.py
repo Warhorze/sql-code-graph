@@ -36,10 +36,7 @@ def report_cmd(
 
     if not metrics_path.exists():
         message = "No metrics collected yet."
-        if stdout:
-            console.print(message)
-        else:
-            console.print(message)
+        console.print(message)
         return
 
     try:

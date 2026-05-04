@@ -7,7 +7,7 @@ WARNING-level logging on failure. Opt-out via SQLCG_METRICS=0.
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ class MetricsStore:
             return
 
         try:
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(UTC).isoformat()
             self._conn.execute(
                 """
                 INSERT INTO tool_calls (timestamp, tool_name, duration_ms, success)
@@ -173,7 +173,7 @@ class MetricsStore:
             return
 
         try:
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(UTC).isoformat()
             self._conn.execute(
                 """
                 INSERT INTO index_runs
@@ -214,7 +214,7 @@ class MetricsStore:
             return
 
         try:
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.now(UTC).isoformat()
             # Truncate note to 500 characters
             truncated_note = note[:500] if note else None
             self._conn.execute(
@@ -228,11 +228,12 @@ class MetricsStore:
         except sqlite3.Error as e:
             logger.warning(f"Failed to record feedback: {e}")
 
-    def execute_query(self, query: str) -> list[tuple]:
+    def execute_query(self, query: str, params: tuple | None = None) -> list[tuple]:
         """Execute a read-only query.
 
         Args:
             query: SQL SELECT query.
+            params: Optional tuple of query parameters for placeholders.
 
         Returns:
             List of result tuples, or empty list on error.
@@ -241,7 +242,10 @@ class MetricsStore:
             return []
 
         try:
-            cursor = self._conn.execute(query)
+            if params:
+                cursor = self._conn.execute(query, params)
+            else:
+                cursor = self._conn.execute(query)
             return cursor.fetchall()
         except sqlite3.Error as e:
             logger.warning(f"Failed to execute query: {e}")
