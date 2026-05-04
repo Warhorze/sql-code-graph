@@ -1,12 +1,97 @@
 ## Current State
 
-agent: plan-reviewer
-task: Phase 9 review — Git-Aware Graph Freshness
-status: READY FOR IMPLEMENTATION (4 blockers fixed, plan corrected)
+agent: developer
+task: Phase 8 implementation — Metrics and Feedback Layer
+status: PR OPENED, READY FOR REVIEW
 date: 2026-05-04
 ---
 
 ## Handoff Log
+
+[2026-05-04] developer — Completed Phase 8 implementation (Metrics and Feedback Layer).
+  Status: COMPLETE — All Phase 8 steps delivered with comprehensive observability layer
+  Branch: feat/phase-8-9-metrics-git-integration
+  PR: https://github.com/Warhorze/sql-code-graph/pull/2
+
+  Implemented:
+  - Step 8.1: MetricsStore (SQLite)
+    * Three append-only tables: tool_calls, index_runs, feedback
+    * Imports without kuzu dependency
+    * Opt-out via SQLCG_METRICS=0
+    * All writes wrapped in try/except (never propagate)
+    * Idempotent schema creation (CREATE TABLE IF NOT EXISTS)
+    * Context manager support for cleanup
+
+  - Step 8.2: MCP Tool Instrumentation (tools.py)
+    * Timing wrapper for all 8 existing tools
+    * Captures tool_name, timestamp, duration_ms, row_count, repo_path
+    * Module-level _metrics singleton with init/shutdown
+
+  - Step 8.2: Indexer Instrumentation (indexer.py)
+    * record_index_run per index_repo call
+    * Local MetricsStore instance per call (thread-safe)
+    * Captures files_parsed, parse_errors, lineage_edges_created, duration_ms
+
+  - Step 8.3: submit_feedback MCP tool
+    * Validates label in {TP, FP}; raises ValueError otherwise
+    * Truncates note to 500 chars (no error, silent truncation)
+    * Returns {"status": "recorded"} or {"status": "skipped"}
+
+  - Step 8.4: sqlcg gain CLI command
+    * Section A: Total tool calls + last 7 days
+    * Section B: Parse success trend (last 5 index runs)
+    * Section C: TP rate (hidden if <5 samples)
+    * Section D: Top 3 tools
+    * --json flag for machine-readable output
+    * Graceful handling of missing database
+
+  - Step 8.5: sqlcg report CLI command
+    * FP clusters: ≥3 samples, >50% FP rate per query pattern
+    * Parse error clusters: ≥2 runs with errors per repo
+    * Pre-filled GitHub issue URL (urllib.parse.quote)
+    * Report hash via hashlib.md5
+    * Outputs to stdout or file (default: docs/METRICS_REPORT.md)
+
+  - Step 8.6: Comprehensive tests (22 test cases)
+    * MetricsStore: idempotency, opt-out, error resilience, context manager
+    * submit_feedback: validation, truncation, label checking
+    * gain command: output sections, JSON format, missing database
+    * report command: cluster visibility, GitHub URL validity, file writing
+
+  Bug fixes applied:
+  - Fixed 3 failing TestReportCommand tests (report.py path resolution)
+    * Test database created in .sqlcg/ subdirectory (not root)
+    * Updated 5 report tests to create correct directory structure
+
+  - Fixed linting issues:
+    * Changed unused loop variables `i` to `_` (B007)
+    * Added # noqa: B008 comments for Typer Option calls
+    * Refactored report_cmd to handle None output path
+
+  Test results:
+  - Phase 8 tests: 22 passed, 0 failed
+  - Total unit tests: 103 passed, 0 failed (81 existing + 22 new)
+  - ruff check: PASS (Phase 8 code)
+  - pyright: 0 errors
+
+  All Phase 8 acceptance criteria met:
+  ✅ MetricsStore imports without kuzu
+  ✅ init_schema() is idempotent
+  ✅ SQLCG_METRICS=0 disables all writes
+  ✅ Metric write failures don't propagate
+  ✅ submit_feedback validates TP/FP labels
+  ✅ submit_feedback truncates notes to 500 chars
+  ✅ gain/report exit 0 with missing database
+  ✅ FP clusters hidden when insufficient samples
+  ✅ GitHub URL is valid HTTPS
+  ✅ Minimum 20 test cases (22 implemented)
+
+  PR Details:
+  - Title: feat(phase-8): metrics and feedback layer
+  - Branch: feat/phase-8-9-metrics-git-integration
+  - Changed files: 9 files (8 new, 1 modified main.py, 2 modified in indexer/tools)
+  - Commits: 1 cherry-picked from feat/remove-dead-stubs
+  - Next step: Ready for code review before Phase 9 implementation.
 
 [2026-05-04] plan-reviewer — Phase 9 review complete (Git-Aware Graph Freshness).
   agent: plan-reviewer
