@@ -1,12 +1,34 @@
 ## Current State
 
-agent: developer
-task: Phase 7 — DWH End-to-End Validation
-status: COMPLETE — All Steps 7.1–7.4 implemented; 16 e2e tests added
+agent: architect-planner
+task: Phase 7 plan revision — Airbnb fixture replaces private DWH corpus
+status: PLAN REVISED — plan/sqlcg.md Phase 7 rewritten; ready for developer re-implementation
 date: 2026-05-04
 ---
 
 ## Handoff Log
+
+[2026-05-04] architect-planner — Phase 7 plan revised (Airbnb fixture replaces private DWH corpus).
+  Summary: Rewrote Phase 7 in plan/sqlcg.md in place. The old DWH-based phase is gone;
+  the new phase targets tests/fixtures/airbnb/ which is committed to the repo and CI-runnable.
+  Key changes:
+  - Step 7.1: Create 10 Snowflake SQL fixture files (3 raw DDL, 3 staging views, 3 dim/fact,
+    1 mart) under tests/fixtures/airbnb/; all must be sqlglot-parseable without raising.
+  - Step 7.2: New test file tests/e2e/test_airbnb_e2e.py with session-scoped airbnb_indexed
+    fixture; assertions check tables_found >= 9, lineage_edges_created > 0, parse_errors == 0,
+    and specific find/analyze CLI outputs containing known table names.
+  - Step 7.3: MCP tool assertions with real content checks — find_table_usages("raw_listings")
+    non-empty, list_dialects_and_repos includes "snowflake", execute_cypher returns row with
+    "raw_listings", trace_column_lineage does not raise.
+  - Step 7.4: Renamed --dwh-report flag to --fixture-report; output to docs/AIRBNB_PARSE_REPORT.md;
+    per-layer breakdown by filename prefix (raw_/src_/dim_fct_/mart_); clean corpus should show
+    zero scripting_block_fallback entries.
+  Removed: all /home/ignwrad/Projects/dwh references from step instructions, SQLCG_DWH_PATH
+  env var guard, pytest.mark.skipif on DWH path, 0.70/0.80 success rate thresholds,
+  ETL scripting block discussion as primary concern.
+  Pre-condition added: developer must delete tests/e2e/test_dwh_e2e.py and replace with
+  tests/e2e/test_airbnb_e2e.py.
+  Next step: developer implements Phase 7 (Steps 7.1–7.4) using the revised plan.
 
 [2026-05-04] developer — Completed Phase 7 implementation (DWH End-to-End Validation).
   Status: COMPLETE — All Phase 7 steps delivered with 16 e2e tests in tests/e2e/test_dwh_e2e.py

@@ -895,157 +895,167 @@ and confidence score documented in blueprint §8.2.
 
 ---
 
-### Phase 7 — DWH End-to-End Validation (Days 31–33)
+### Phase 7 — Airbnb Fixture End-to-End Validation (Days 31–33)
 
 **Context**
 
-The DWH repository lives at `/home/ignwrad/Projects/dwh`. It is a real production
-Snowflake DWH with two SQL layers that Phase 7 targets:
+Phase 7 validates the full sqlcg pipeline against the public dbt Airbnb dataset (from
+dbt Learn tutorials). The corpus is committed to the repository under
+`tests/fixtures/airbnb/` — no external path dependency, no environment variable guard,
+and all tests run in CI.
 
-**DDL layer** (`ddl/`):
-- `ddl/changelogs/BA-TABLES/`: Snowflake `CREATE TABLE` DDL files (naming convention
-  `WTDA_*`, `WTDH_*`, `WTFA_*`, `WTFE_*`)
-- `ddl/changelogs/BA-VIEWS/`: view definitions (`WTDA_ARTIKEL.sql`,
-  `WTFV_TRANSACTIES_UURLIJKS.sql`, `WVFA_RFM_CLASSIFICATIE.sql`, etc.)
-- `ddl/changelogs/IA-ANALYTICS/`: analytics layer views
-- `ddl/changelogs/MA-PROCEDURES/`: stored procedures with embedded DML
-- Other `ddl/changelogs/` subdirectories: dynamic tables, streams, tasks, masking, stages
-- Note: most DDL is in `.xml` Liquibase changelogs; only the handful of plain `.sql`
-  files will be indexed (IndexerWalker filters by `.sql` suffix)
+The Airbnb dataset has a known four-layer lineage structure (raw → staging → dimension/fact
+→ mart) that enables concrete assertions about graph content, not just exit codes. All files
+use Snowflake dialect and are syntactically valid sqlglot-parseable SQL.
 
-**ETL layer** (`etl/`): **648 (more) `.sql` files** — the interesting half of the corpus.
-These are the actual data movement scripts: multi-step Snowflake scripting blocks,
-`CREATE OR REPLACE TEMP TABLE ... AS SELECT`, `INSERT INTO ... SELECT FROM temp`,
-variable assignments (`SET warehousename = ...`), `USE SCHEMA/WAREHOUSE` directives.
-This is where lineage becomes non-trivial and where the current parser is expected
-to produce only partial results (table-level at confidence=0.3 for scripting blocks).
-Subdirectories:
-- `etl/pdi/template/`: ~36 Snowflake ETL scripts (initial loads, incremental updates)
-- `etl/pdi/template/adobe_initial_load/`, `voorraad_initial_load/`: specialised loads
-- `etl/sql/`: comparison and authorisation SQL
-- `etl/sql/da/`: DA-layer transformation SQL
-- `etl/sql/dim/`: BA-layer transformation SQL
-- `etl/sql/fact/`: BA-layer transformation SQL
--  `etl/sql/int/`: DA-BA interface layer transformation SQL
-All SQL in both layers uses the Snowflake dialect.
+**Fixture structure** (`tests/fixtures/airbnb/`):
+
+Raw layer — source DDL:
+- `raw_listings.sql` — `CREATE TABLE raw_listings (id, listing_url, name, room_type, minimum_nights, host_id, price, created_at, updated_at)`
+- `raw_hosts.sql` — `CREATE TABLE raw_hosts (id, name, is_superhost, created_at, updated_at)`
+- `raw_reviews.sql` — `CREATE TABLE raw_reviews (listing_id, date, reviewer_name, comments, sentiment)`
+
+Staging layer — views selecting from raw:
+- `src_listings.sql` — `CREATE OR REPLACE VIEW src_listings AS SELECT ... FROM raw_listings WHERE minimum_nights > 0`
+- `src_hosts.sql` — `CREATE OR REPLACE VIEW src_hosts AS SELECT ... FROM raw_hosts`
+- `src_reviews.sql` — `CREATE OR REPLACE VIEW src_reviews AS SELECT ... FROM raw_reviews WHERE sentiment != 'NOT VERIFIED'`
+
+Dimension/fact layer — joins across staging:
+- `dim_listings_cleansed.sql` — JOIN of `src_listings` + `src_hosts`
+- `dim_hosts_cleansed.sql` — SELECT from `src_hosts` with transforms
+- `fct_reviews.sql` — JOIN of `src_reviews` + `dim_listings_cleansed`
+
+Mart layer:
+- `mart_fullmoon_reviews.sql` — JOIN of `fct_reviews` with a date condition
+
+This gives 3 lineage hops (raw → staging → dim/fact → mart) with known edge topology.
+
+**Note on the existing `tests/e2e/test_dwh_e2e.py`**
+
+The prior implementation of Phase 7 (`feat/phase-7-dwh-validation` branch) targeted the
+private DWH at `/home/ignwrad/Projects/dwh`. That file must be replaced entirely with the
+new Airbnb-based test file. The developer must replace `tests/e2e/test_dwh_e2e.py` with
+`tests/e2e/test_airbnb_e2e.py` as described in Steps 7.2 and 7.3 below, and delete the
+old file.
 
 ---
 
-**Step 7.1 — Index the full DWH corpus (DDL + ETL)**
+**Step 7.1 — Airbnb fixture creation**
 
-- Files affected: no source files; adds `tests/e2e/test_dwh_e2e.py`
+- Files affected: `tests/fixtures/airbnb/` (10 new `.sql` files, no source code changes)
 - Tasks:
-  - Run `sqlcg db init` against a temporary KùzuDB path (isolated from the default
-    `~/.sqlcg/graph.db`)
-  - Index DDL layer: `sqlcg index /home/ignwrad/Projects/dwh/ddl --dialect snowflake`
-  - Index ETL layer: `sqlcg index /home/ignwrad/Projects/dwh/etl --dialect snowflake`
-    (same database — additive MERGE; DDL tables must already exist so ETL `INSERT INTO`
-    statements resolve their targets)
-  - Parse the combined summary: `files_parsed`, `parse_errors`, `tables_found`,
-    `lineage_edges_created` — captured separately per run and summed
-  - Assert overall parse success rate >= 0.70 (lower threshold than DDL-only because
-    ETL scripting blocks are expected to partially degrade to confidence=0.3 fallback)
-  - Assert DDL-only parse success rate >= 0.80 (stricter — DDL is plain CREATE TABLE/VIEW)
-  - Log each error file and category to `tests/e2e/dwh_parse_report.txt`; do NOT fail
-    on rate below threshold — fail only if the process itself exits non-zero
-  - Note: `ddl/changelogs/*.xml` manifests are skipped automatically by `.sql` filter
+  - Create the directory `tests/fixtures/airbnb/`
+  - Author all 10 SQL files listed in the fixture structure above. Requirements:
+    - Each file must be syntactically valid Snowflake SQL parseable by
+      `sqlglot.parse(sql, dialect="snowflake")` without raising
+    - Raw layer files use `CREATE TABLE` DDL with explicit column lists and Snowflake
+      data types (e.g. `STRING`, `NUMBER`, `BOOLEAN`, `TIMESTAMP_NTZ`)
+    - Staging layer files use `CREATE OR REPLACE VIEW name AS SELECT ...` selecting from
+      the corresponding raw table, with at least one `WHERE` clause filter
+    - `dim_listings_cleansed.sql` and `fct_reviews.sql` must contain an explicit `JOIN`
+      clause referencing two upstream tables by name — this is what generates SELECTS_FROM
+      lineage edges to both parents
+    - `mart_fullmoon_reviews.sql` must reference `fct_reviews` as a source table
+    - No Snowflake scripting blocks (`BEGIN ... END`) — clean SQL only; the fixture
+      tests parser correctness, not scripting-block fallback
+  - Commit the fixtures to the repository
 - Acceptance:
-  - Both `sqlcg index` invocations exit 0
-  - `tables_found` (across both runs) > 0
-  - ETL files produce at least some `lineage_edges_created` (not all zero)
+  - `sqlglot.parse(open(f).read(), dialect="snowflake")` does not raise for all 10 files
+  - The 10 files form at least 3 distinct layers (raw, staging, downstream) as required
+    for the Step 7.2 lineage assertions
 
-**Step 7.2 — find and analyze against known DWH tables**
+**Step 7.2 — Index and assert structural results**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py` (continued from 7.1)
+- Files affected: `tests/e2e/test_airbnb_e2e.py` (new file; replaces `test_dwh_e2e.py`)
 - Tasks:
-  - Using the combined DDL+ETL graph from Step 7.1:
-  - `sqlcg find table WTDA_ARTIKEL`: assert exit 0 and output contains "WTDA_ARTIKEL"
-  - `sqlcg find table WTDH_KLANT`: assert exit 0 and output contains "WTDH_KLANT"
-  - `sqlcg find table WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 (view from BA-VIEWS)
-  - `sqlcg analyze downstream WTDA_ARTIKEL`: assert exit 0; because ETL scripts INSERT
-    INTO tables downstream of DDL tables, this should now return non-empty lineage
-    (unlike DDL-only where this was always empty)
-  - `sqlcg analyze upstream WTFV_TRANSACTIES_UURLIJKS`: assert exit 0 and non-empty
-    (view references base tables also present in the DDL index)
-  - `sqlcg analyze unused`: assert exit 0 — ETL-referenced tables should appear less
-    "unused" than DDL-only, since ETL inserts create inbound edges
-  - `sqlcg find pattern "CREATE OR REPLACE TEMP TABLE"`: assert exit 0; should return
-    results because ETL files use this pattern extensively
-  - All assertions are exit-code + output-format checks except where "non-empty" is noted
-- Acceptance:
-  - All seven commands exit 0
-  - `find table WTDA_ARTIKEL` returns at least one row
-  - `analyze downstream WTDA_ARTIKEL` returns at least one row (ETL → DDL edge)
-  - `find pattern "CREATE OR REPLACE TEMP TABLE"` returns results
+  - Create a session-scoped pytest fixture `airbnb_indexed` that:
+    1. Runs `sqlcg db init` against a `tmp_path_factory`-scoped KùzuDB path
+    2. Runs `sqlcg index tests/fixtures/airbnb/ --dialect snowflake` against that path
+    3. Captures the summary dict (`files_parsed`, `parse_errors`, `tables_found`,
+       `lineage_edges_created`)
+    4. Yields the tmp db path and summary for use by all tests in this module
+  - No `pytest.mark.skipif` on any env var — the fixture is always available and runs in CI
+  - Assertions must verify actual graph content, not just exit codes
+- Acceptance criteria (each is a separate test method; class name must read as plain English):
+  - `tables_found >= 9` — raw, staging, dimension/fact, and mart objects all indexed
+  - `lineage_edges_created > 0` — staging views produce SELECTS_FROM edges to raw tables
+  - `parse_errors == 0` — clean Snowflake SQL produces zero parse failures
+  - `sqlcg find table raw_listings` (via subprocess) exits 0 and stdout contains
+    `"raw_listings"`
+  - `sqlcg find table dim_listings_cleansed` (via subprocess) exits 0 and stdout contains
+    `"dim_listings_cleansed"`
+  - `sqlcg find pattern "SELECT"` (via subprocess) exits 0 and stdout is non-empty
+  - `sqlcg analyze upstream fct_reviews` (via subprocess) exits 0 and stdout is non-empty
+    (has upstream lineage through the JOIN in `fct_reviews.sql`)
 
-**Step 7.3 — MCP tools against the combined DWH index**
+**Step 7.3 — MCP tools with real assertions**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py` (continued), requires Phase 5 complete
+- Files affected: `tests/e2e/test_airbnb_e2e.py` (continued), requires Phase 5 complete
 - Tasks:
-  - Using the combined DDL+ETL graph from Step 7.1:
-  - Call `trace_column_lineage` MCP tool with a table+column known to have ETL lineage
-    (e.g. `WTDH_KLANT` which has an ETL update script); assert response is a valid
-    Pydantic model (no exception); lineage chain may be shallow if scripting block
-    parsing degraded to table-level only
-  - Call `find_table_usages` MCP tool with `WTDH_KLANT`; assert response is non-empty
-    (ETL files reference this table in INSERT/UPDATE statements)
-  - Call `list_dialects_and_repos`; assert response includes dialect "snowflake" and
-    repo entries for both the `ddl/` and `etl/` paths
-  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 5")`; assert returns
-    a list of length <= 5 with at least one known table name
-  - Call `mcp start` via subprocess, assert alive after 2 seconds (terminate after check)
+  - Reuse the `airbnb_indexed` session fixture from Step 7.2; call MCP tool functions
+    directly via import (not via subprocess) so return types are verifiable
+  - Call `find_table_usages("raw_listings")`: assert the result is non-empty — `src_listings`
+    selects from `raw_listings` so at least one usage must exist
+  - Call `list_dialects_and_repos`: assert the result includes dialect `"snowflake"`
+  - Call `execute_cypher("MATCH (t:SqlTable) RETURN t.name LIMIT 10")`: assert the return
+    value is a list and at least one entry has the name `"raw_listings"`
+  - Call `trace_column_lineage` with a known column reference: assert it does not raise
+    any exception (lineage may be partial — assert no exception only, not depth)
+  - Start `mcp start` via subprocess: assert the process is alive after 2 seconds; terminate
+    after check; skip (not fail) if the `sqlcg` entry point is not found in PATH
 - Acceptance:
-  - `trace_column_lineage` on a known DWH table does not raise an exception
-  - `find_table_usages("WTDH_KLANT")` returns at least one row (ETL reference)
-  - `list_dialects_and_repos` includes snowflake dialect for both indexed paths
-  - `execute_cypher` returns correct result shape
-  - `mcp start` subprocess is alive after 2 seconds
+  - `find_table_usages("raw_listings")` returns at least one usage
+  - `list_dialects_and_repos` result includes dialect `"snowflake"`
+  - `execute_cypher(...)` returns a list containing a row where `t.name == "raw_listings"`
+  - `trace_column_lineage` does not raise
+  - `mcp start` subprocess is alive after 2 seconds (or test is skipped)
 
 **Step 7.4 — Parse quality report**
 
-- Files affected: `tests/e2e/test_dwh_e2e.py`, `docs/DWH_PARSE_REPORT.md`
+- Files affected: `tests/e2e/test_airbnb_e2e.py`, `docs/AIRBNB_PARSE_REPORT.md`
 - Tasks:
-  - After running the full index in Step 7.1, emit a structured parse quality report
-    to `docs/DWH_PARSE_REPORT.md` (generated, not hand-authored) with:
-    - **Per-layer breakdown**: DDL layer totals and ETL layer totals separately, plus combined
+  - After indexing in the `airbnb_indexed` fixture, emit a structured parse quality report
+    to `docs/AIRBNB_PARSE_REPORT.md` (generated, not hand-authored) with:
+    - **Per-layer breakdown**: raw layer totals, staging layer totals, dim/fact layer totals,
+      mart layer totals — identified by filename prefix (`raw_`, `src_`, `dim_`/`fct_`, `mart_`)
     - Total files, parsed, errored, success rate per layer
-    - List of errored files with error category (timeout, parse_failed, exception)
-    - Table count, view count, lineage edge count
-    - Distribution of `parsing_mode` values across all indexed queries
-    - ETL-specific section: how many ETL files fell back to scripting-block mode
-      (confidence=0.3) vs full parse (confidence=1.0); this is the key ETL quality signal
-  - The report generation should be a pytest fixture with `autouse=False` and a
-    `--dwh-report` flag so it only runs when explicitly requested
+    - List of errored files with error category (parse_failed, exception)
+    - Table/view count and lineage edge count
+    - Distribution of `parsing_mode` values across all indexed queries (full-parse vs
+      scripting-block fallback)
+  - The report generation is a pytest fixture with `autouse=False` and a `--fixture-report`
+    flag (renamed from `--dwh-report` — the flag now applies to any committed fixture corpus,
+    not DWH-specific data)
 - Acceptance:
-  - `pytest tests/e2e/test_dwh_e2e.py --dwh-report` generates `docs/DWH_PARSE_REPORT.md`
-  - Report contains all five required sections (DDL totals, ETL totals, combined, errors,
-    parsing_mode dist.)
+  - `pytest tests/e2e/test_airbnb_e2e.py --fixture-report` generates
+    `docs/AIRBNB_PARSE_REPORT.md`
+  - Report contains all four required sections (per-layer breakdown, error list, table/edge
+    counts, parsing_mode distribution)
+  - For the clean Airbnb corpus, the error list section is empty and all `parsing_mode`
+    values are `"full_parse"` or `"standard"` — no `"scripting_block_fallback"` entries
 
 ---
 
 **Phase 7 pre-conditions**
 
 - Phase 5 (MCP Server) must be complete before Step 7.3 can run
-- Phase 4 db reset close-before-rmtree fix must be in place (temporary database setup
-  uses context manager pattern that depends on correct close() ordering)
-- The DWH repo at `/home/ignwrad/Projects/dwh` must be accessible from the test runner;
-  Phase 7 tests are explicitly local-only (not CI-runnable) and must be skipped
-  automatically when `SQLCG_DWH_PATH` env var is not set
-- DDL must be indexed before ETL in Step 7.1 — ETL INSERT statements reference DDL
-  tables; indexing ETL first means `SchemaResolver` won't know the target table columns
+- Phase 4 db reset close-before-rmtree fix must be in place (Step 7.2 session fixture
+  uses tmp KùzuDB paths that depend on correct `close()` ordering before `rmtree`)
+- All 10 fixture files must parse without error under sqlglot Snowflake dialect before
+  Step 7.2 tests are written — verify with a one-off parse call during fixture authoring
+- The existing `tests/e2e/test_dwh_e2e.py` must be deleted and replaced with
+  `tests/e2e/test_airbnb_e2e.py`; the old file must not remain in the working tree
 
 **Phase 7 known risks**
 
 | Risk | Mitigation |
 |---|---|
-| ETL scripting blocks degrade to confidence=0.3 table-level only | Expected; report it in DWH_PARSE_REPORT.md; do not raise success rate gate above 70% for ETL layer |
-| Snowflake `SET`/`USE` statements cause parse noise | These produce `exp.Command` fallback nodes; they won't create false table edges but inflate parse_failed count |
-| Temp table chains: `CREATE TEMP TABLE x AS SELECT` → `INSERT INTO y SELECT FROM x` — x not in SchemaResolver | SchemaResolver's pass-1 DDL sniffer should register x; verify with a dedicated fixture before claiming ETL lineage works |
-| `ddl/changelogs/*.xml` changelog manifests mixed with `.sql` files | IndexerWalker already filters by `.sql` suffix; assert in test that xml files are not counted |
-| `sqlmesh/` directory is empty; SQLMesh model validation cannot be done | Phase 7 tests target `ddl/` and `etl/` only |
-| DWH path not available in CI | Guard all Phase 7 tests with `pytest.mark.skipif(not Path(DWH_PATH).exists(), ...)` |
-| KùzuDB single-writer lock conflicts if tests run in parallel | Use a per-test-session tmp_path for the DWH index database; never share with other test sessions |
-| 648 ETL files may be slow to index | Use `--timeout-per-file 30` (default); expect full index to take 2–5 minutes locally |
+| Snowflake dialect syntax in fixtures rejected by sqlglot | Validate each file with `sqlglot.parse(..., dialect="snowflake")` during Step 7.1; fix syntax before committing |
+| `tables_found` assertion off-by-one if a staging view is not indexed as a SqlTable node | KùzuDB schema counts CREATE TABLE DDL-defined tables and CREATE VIEW nodes; lower bound is 9 to allow one possible view/table collapse |
+| `fct_reviews` upstream chain too shallow for `analyze upstream` to return output | Ensure `fct_reviews.sql` JOINs `src_reviews` and `dim_listings_cleansed` by name, creating at least two SELECTS_FROM edges |
+| KùzuDB single-writer lock conflicts if tests run in parallel | Session-scoped `airbnb_indexed` fixture creates one DB per test session; do not use `pytest -n` with e2e tests |
+| `trace_column_lineage` returns empty without schema enrichment | Expected — assert no exception only, not non-empty lineage; column lineage degrades gracefully per finding 3.4 |
+
 
 ---
 
