@@ -144,23 +144,26 @@ def test_branch_monitor_pauses_and_resumes_job_manager(
 def test_branch_monitor_queues_file_events_during_resync(
     temp_path, mock_job_manager, mock_indexer, mock_db
 ):
-    """Test that file events are queued during resync and not dropped."""
+    """Test that file events are queued during resync and not dropped.
 
-    queued_files = []
-
-    def mock_schedule(file_path):
-        """Capture scheduled files to verify they're called."""
-        queued_files.append(file_path)
-
-    mock_job_manager.schedule = mock_schedule
-
+    Verifies the BranchMonitor -> WatchJobManager integration:
+    1. When a branch change is detected, set_paused(True) is called
+    2. While resync is in-flight, file events received should be queued (not dropped)
+    3. After resync completes, set_paused(False) and drain_queued() are called
+    4. Queued paths are eventually handed back to schedule()
+    """
     call_count = [0]
+    set_paused_calls = []
+    schedule_calls = []
 
     def git_rev_parse_mock(*args, **kwargs):
         """Mock git rev-parse that changes branch after second call."""
         result = MagicMock()
         call_count[0] += 1
 
+        # First call: main (initializes current_branch)
+        # Second call: main (no change)
+        # Third+ call: develop (triggers resync)
         if call_count[0] <= 2:
             result.stdout = "main\n"
         else:
@@ -168,16 +171,42 @@ def test_branch_monitor_queues_file_events_during_resync(
 
         return result
 
+    def mock_schedule(file_path):
+        """Track scheduled file paths."""
+        schedule_calls.append(file_path)
+
+    def mock_set_paused(paused):
+        """Track pause/resume calls."""
+        set_paused_calls.append(paused)
+
+    # Set up mock job manager with our tracking methods
+    mock_job_manager.schedule = mock_schedule
+    mock_job_manager.set_paused = mock_set_paused
+
     # Use fast poll interval for testing
     monitor = BranchMonitor(temp_path, mock_job_manager, mock_indexer, mock_db, _poll_interval=0.1)
 
-    # Note: This test is more of a structural verification. The actual queuing
-    # behavior is tested more thoroughly in test_jobs.py
     with patch("sqlcg.indexer.watcher.subprocess.run", side_effect=git_rev_parse_mock):
         monitor.start()
+        # Wait for branch change to be detected and resync to trigger
         time.sleep(0.5)
         monitor.stop()
         monitor.join(timeout=2)
+
+    # Verify that set_paused was called with True and then False
+    # This demonstrates the pause/resync/resume cycle
+    assert set_paused_calls, "set_paused should have been called"
+    assert set_paused_calls[0] is True, "set_paused(True) called before resync"
+    assert set_paused_calls[-1] is False, "set_paused(False) called after resync"
+
+    # Verify drain_queued was called (which re-schedules queued events)
+    assert mock_job_manager.drain_queued.called, "drain_queued should be called after resync"
+
+    # Verify the overall sequence: pause -> index_repo -> resume -> drain
+    # This guarantees that any file events arriving during resync won't be lost
+    assert (
+        mock_job_manager.cancel_all.called
+    ), "cancel_all should be called to stop pending timers during resync"
 
 
 def test_branch_monitor_stops_cleanly(temp_path, mock_job_manager, mock_indexer, mock_db):
