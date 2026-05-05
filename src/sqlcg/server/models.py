@@ -19,6 +19,11 @@ class LineageResult(BaseModel):
     lineage: list[LineageNode] = Field(
         default_factory=list, description="List of nodes in the lineage"
     )
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint when result list is empty. Explains the likely cause "
+        "and suggests a next step.",
+    )
 
 
 class TableUsage(BaseModel):
@@ -34,6 +39,11 @@ class TableUsageResult(BaseModel):
 
     table: str = Field(..., description="Table name")
     usages: list[TableUsage] = Field(default_factory=list, description="List of usages")
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint when result list is empty. Explains the likely cause "
+        "and suggests a next step.",
+    )
 
 
 class DependencyNode(BaseModel):
@@ -48,6 +58,11 @@ class DependencyResult(BaseModel):
 
     root: str = Field(..., description="Root column or table")
     nodes: list[DependencyNode] = Field(default_factory=list, description="List of dependent nodes")
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint when result list is empty. Explains the likely cause "
+        "and suggests a next step.",
+    )
 
 
 class SqlPatternMatch(BaseModel):
@@ -64,6 +79,11 @@ class SqlPatternResult(BaseModel):
     pattern: str = Field(..., description="Pattern searched for")
     matches: list[SqlPatternMatch] = Field(
         default_factory=list, description="List of matching queries"
+    )
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint when result list is empty. Explains the likely cause "
+        "and suggests a next step.",
     )
 
 
