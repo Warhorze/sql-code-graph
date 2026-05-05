@@ -81,3 +81,7 @@ class DialectRepoResult(BaseModel):
     repos: list[DialectRepo] = Field(
         default_factory=list, description="List of indexed repositories"
     )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Health warnings about the indexed graph state",
+    )
