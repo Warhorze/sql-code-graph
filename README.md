@@ -9,9 +9,18 @@ without reading every file.
 
 ## Quick start
 
+Choose one:
+
+**Permanent install** (recommended):
 ```bash
-pip install sql-code-graph        # or: uvx sql-code-graph (no install needed)
-sqlcg install                     # register MCP server in Claude Code
+uv tool install sql-code-graph    # Fast, managed, no isolation needed
+sqlcg install                     # Register MCP server in Claude Code
+```
+
+**One-shot try** (cold cache warning):
+```bash
+uvx sql-code-graph                # First run is slow (downloads deps)
+                                  # Subsequent runs use cache, ~1s startup
 ```
 
 Restart Claude Code, then inside your project ask:
@@ -22,6 +31,12 @@ Index my SQL files at ./sql --dialect snowflake
 
 That's it. The MCP tools are now available to Claude in every conversation
 for that project.
+
+### Workflow (3 steps)
+
+1. **Initialize**: `sqlcg db init`
+2. **Index**: `sqlcg index ./sql --dialect snowflake`
+3. **Keep fresh**: `sqlcg git install-hooks` (optional)
 
 ## Full setup (recommended)
 
