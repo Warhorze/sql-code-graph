@@ -10,12 +10,24 @@ the migration path for graph schema changes.
 
 ---
 
+## Code-vs-Plan Verification (2026-05-05)
+
+Before implementation, all tickets were cross-checked against the actual source tree. Three findings:
+
+| Ticket | Finding |
+|--------|---------|
+| T-00 | **New** — fixture directory migration required before any test-touching ticket can start |
+| T-04 | `KuzuBackend.transaction()` and `Neo4jBackend.transaction()` already implemented. **Remaining gap**: `init_schema()` DDL loop is not wrapped in a transaction — partial failure leaves a half-initialised schema |
+| T-05 | `resolve_pass2` try/except already implemented in `lineage/aggregator.py` lines 48–56. **Reduced to: add missing unit test only** |
+| T-06 | WARNING log, `col_lineage:{col}:{exc}` error append, and zero-confidence edge already implemented. **Remaining gap**: missing `logger.debug` at the `TODO: convert root to LineageEdge(s)` line. **Reduced to: one line + tests** |
+
 ## Summary
 
 This plan covers all open work from the ARCHITECTURE_REVIEW.md as of 2026-05-05. It groups 13
 ranked items from section 10.4 plus the three architectural improvements from section 4 (findings
-3.1, 3.2, 3.4) and the parser refactor from section 8.2 comment 7 into 12 discrete tickets.
-Dependencies are mapped explicitly. Each ticket is sized to fit in a single PR.
+3.1, 3.2, 3.4) and the parser refactor from section 8.2 comment 7 into 14 discrete tickets
+(including T-00 fixture migration). Dependencies are mapped explicitly. Each ticket is sized to
+fit in a single PR.
 
 ---
 
@@ -48,23 +60,70 @@ All open items from the architecture review:
 
 | Ticket | Title | Files Touched | Effort | Impact | Dependency | Blocks |
 |--------|-------|---------------|--------|--------|------------|--------|
+| T-00 | Migrate fixtures to dialect dirs + create test subdirs | `tests/fixtures/snowflake/`, `tests/unit/snowflake/`, `tests/integration/snowflake/` | XS | HIGH | INDEPENDENT | T-02, T-04, T-08, T-09, T-10, T-11 |
 | T-01 | Add QUICK START block to CLI help | `cli/main.py`, `server/exceptions.py`, `server/tools.py` | XS | CRITICAL | INDEPENDENT | NONE |
-| T-02 | Add db info health-check warnings | `cli/commands/db.py`, `server/models.py`, `server/tools.py` | XS | HIGH | INDEPENDENT | T-09 |
+| T-02 | Add db info health-check warnings | `cli/commands/db.py`, `server/models.py`, `server/tools.py` | XS | HIGH | DEPENDS ON T-00 | T-09 |
 | T-03 | Implement sqlcg uninstall command | `cli/commands/uninstall.py` (new), `cli/main.py` | S | HIGH | INDEPENDENT | NONE |
-| T-04 | Fix atomicity: implement transaction() in both backends | `core/kuzu_backend.py`, `core/neo4j_backend.py`, `core/graph_db.py` | S | HIGH | INDEPENDENT | NONE |
-| T-05 | Fix resolve_pass2 file re-open safety | `lineage/aggregator.py` | XS | HIGH | INDEPENDENT | NONE |
-| T-06 | Fix _extract_column_lineage exception recording | `parsers/base.py` | XS | HIGH | INDEPENDENT | T-10 |
+| T-04 | Wrap init_schema() in transaction (backends already done) | `core/kuzu_backend.py` | XS | HIGH | DEPENDS ON T-00 | NONE |
+| T-05 | Add missing resolve_pass2 unit test (code already done) | `tests/unit/test_aggregator.py` (new) | XS | HIGH | INDEPENDENT | NONE |
+| T-06 | Add logger.debug to lineage TODO + tests (rest already done) | `parsers/base.py` | XS | HIGH | INDEPENDENT | T-10 |
 | T-07 | Add hint field to empty result models | `server/models.py`, `server/tools.py` | S | HIGH | INDEPENDENT | NONE |
-| T-08 | Add index progress output and edges warning | `indexer/indexer.py`, `cli/commands/index.py` | S | HIGH | INDEPENDENT | T-09 |
-| T-09 | Introduce parse_quality breakdown | `parsers/base.py`, `indexer/indexer.py`, `cli/commands/db.py`, `cli/commands/index.py` | M | MEDIUM | DEPENDS ON T-06 | NONE |
-| T-10 | Verify and fix SELECTS_FROM edges for INSERT-SELECT | `indexer/indexer.py`, `parsers/base.py`, `parsers/ansi_parser.py` | M | HIGH | DEPENDS ON T-06 | NONE |
-| T-11 | Rewrite scripting-block DML extraction | `parsers/snowflake_parser.py` | M | HIGH | DEPENDS ON T-06 | NONE |
+| T-08 | Add index progress output and edges warning | `indexer/indexer.py`, `cli/commands/index.py` | S | HIGH | DEPENDS ON T-00 | T-09 |
+| T-09 | Introduce parse_quality breakdown | `parsers/base.py`, `indexer/indexer.py`, `cli/commands/db.py`, `cli/commands/index.py` | M | MEDIUM | DEPENDS ON T-06, T-00 | NONE |
+| T-10 | Verify and fix SELECTS_FROM edges for INSERT-SELECT | `indexer/indexer.py`, `parsers/base.py`, `parsers/ansi_parser.py` | M | HIGH | DEPENDS ON T-06, T-00 | NONE |
+| T-11 | Rewrite scripting-block DML extraction | `parsers/snowflake_parser.py` | M | HIGH | DEPENDS ON T-06, T-00 | NONE |
+| ~~T-12~~ | ~~Medallion-aware analyze unused + .sqlcg.toml write~~ | — | — | — | — | — |
 | T-13 | Add FN label and execute_cypher ratio to gain | `server/tools.py`, `metrics/store.py`, `cli/commands/gain.py` | S | MEDIUM | INDEPENDENT | NONE |
 | T-14 | Binary/package name note and uvx cold-start docs | `server/tools.py`, `cli/commands/mcp.py`, `README.md` | XS | LOW | INDEPENDENT | NONE |
 
 ---
 
 ## Ticket Specifications
+
+---
+
+### T-00 — Migrate fixtures to dialect dirs + create test subdirs
+
+**Source**: Code-vs-plan verification 2026-05-05 — structural prerequisite
+
+**Why this exists**: The plan references `tests/fixtures/snowflake/`, `tests/unit/snowflake/`,
+and `tests/integration/snowflake/` throughout. None of these exist. The existing synthetic
+fixtures live in `tests/fixtures/synthetic/`. This ticket creates the directory structure so
+every subsequent test-touching ticket can proceed without confusion.
+
+**What to do**:
+
+1. Create `tests/fixtures/snowflake/` and copy (not move — keep synthetic for backwards compat)
+   the three existing Snowflake-dialect fixtures there:
+   - `tests/fixtures/synthetic/base_tables.sql` → `tests/fixtures/snowflake/base_tables.sql`
+   - `tests/fixtures/synthetic/views.sql` → `tests/fixtures/snowflake/views.sql`
+   - `tests/fixtures/synthetic/reports.sql` → `tests/fixtures/snowflake/reports.sql`
+
+   Verify the SQL in each file is Snowflake-compatible (it is — they use standard DDL).
+   Leave the originals in `synthetic/` untouched so existing tests don't break.
+
+2. Create `tests/unit/snowflake/__init__.py` (empty) so pytest collects it.
+
+3. Create `tests/integration/snowflake/__init__.py` (empty) so pytest collects it.
+
+4. Create `tests/fixtures/bigquery/.gitkeep` to establish the folder structure for future
+   BigQuery dialect tests.
+
+5. Run the full test suite (`pytest`) and confirm zero regressions before merging.
+
+**Files affected**:
+- `tests/fixtures/snowflake/` (new dir + 3 copied files)
+- `tests/unit/snowflake/__init__.py` (new)
+- `tests/integration/snowflake/__init__.py` (new)
+- `tests/fixtures/bigquery/.gitkeep` (new)
+
+**Tests to add**: None — this ticket is pure structure. The definition of done is `pytest` passes.
+
+**Definition of done**:
+- `tests/fixtures/snowflake/base_tables.sql`, `views.sql`, `reports.sql` exist
+- `tests/unit/snowflake/__init__.py` and `tests/integration/snowflake/__init__.py` exist
+- `tests/fixtures/bigquery/.gitkeep` exists
+- Full test suite passes with zero regressions
 
 ---
 
@@ -245,54 +304,37 @@ Integration test (no graph backend needed — filesystem side effects only):
 
 ---
 
-### T-04 — Fix atomicity: implement transaction() in both backends
+### T-04 — Wrap init_schema() in transaction (backends already done)
 
 **Source**: ARCHITECTURE_REVIEW.md finding 3.1 (rank 1 in section 4, HIGH), 8.2 comment 4
 
-**What to do**:
+**Verified against code (2026-05-05)**:
+- `KuzuBackend.transaction()` — **already implemented** (lines 242–269, uses `BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK` via Cypher)
+- `Neo4jBackend.transaction()` — **already implemented** (lines 174–192, uses `session.begin_transaction()`)
+- `init_schema()` in `KuzuBackend` — **NOT wrapped** in a transaction. The DDL loop (lines 60–76) executes statements one by one with bare `self._conn.execute(stmt)`. A failure midway leaves a partial schema with no rollback.
 
-The current `GraphBackend.transaction()` base method in `core/graph_db.py` yields `self` and
-does nothing. Both concrete backends must implement real transactions.
+**Remaining gap only**:
 
-1. In `core/graph_db.py`, update the `transaction()` abstract method docstring to require
-   subclass override. Consider marking it `@abstractmethod` with a `contextmanager` that
-   subclasses must wrap.
+Wrap `KuzuBackend.init_schema()`'s DDL execution loop in `self.transaction()`:
 
-2. In `core/kuzu_backend.py`, implement `transaction()` using KùzuDB's connection-level API:
-   ```python
-   @contextmanager
-   def transaction(self):
-       self._conn.begin()
-       try:
-           yield self
-           self._conn.commit()
-       except Exception:
-           self._conn.rollback()
-           raise
-   ```
-   Verify the exact API method names against the installed `kuzu` package version.
+```python
+def init_schema(self) -> None:
+    # ... existing schema-exists check unchanged ...
+    with self.transaction():
+        for stmt in raw_statements:
+            if stmt.strip():
+                try:
+                    self._conn.execute(stmt)
+                    logger.debug(f"Executed DDL: {stmt[:50]}...")
+                except Exception as e:
+                    logger.error(f"DDL execution failed: {stmt[:50]}...: {e}")
+                    raise  # triggers ROLLBACK in transaction context manager
+```
 
-3. In `core/neo4j_backend.py`, implement `transaction()` using Neo4j's explicit transaction:
-   ```python
-   @contextmanager
-   def transaction(self):
-       with self._driver.session() as session:
-           with session.begin_transaction() as tx:
-               try:
-                   yield self
-                   tx.commit()
-               except Exception:
-                   tx.rollback()
-                   raise
-   ```
-
-4. In `core/kuzu_backend.py` `init_schema()`, wrap the entire DDL execution loop in a
-   transaction (finding 8.2 comment 4 — schema init should also be atomic).
+Also wrap the `MERGE (v:SchemaVersion ...)` call that follows inside the same transaction block.
 
 **Files affected**:
-- `src/sqlcg/core/graph_db.py` — `transaction()` docstring/contract
-- `src/sqlcg/core/kuzu_backend.py` — `transaction()` implementation, `init_schema()` wrap
-- `src/sqlcg/core/neo4j_backend.py` — `transaction()` implementation
+- `src/sqlcg/core/kuzu_backend.py` — `init_schema()` only
 
 **Tests to add**:
 
@@ -315,88 +357,61 @@ Integration tests (real SQL fixture → Indexer → KùzuDB → injected failure
 
 ---
 
-### T-05 — Fix resolve_pass2 file re-open safety
+### T-05 — Add missing resolve_pass2 unit test (code already done)
 
 **Source**: ARCHITECTURE_REVIEW.md finding 3.2 (rank 3 in section 4, HIGH)
 
-**What to do**:
+**Verified against code (2026-05-05)**:
+`lineage/aggregator.py` lines 48–56 already implement the full fix — `try/except (FileNotFoundError, OSError)`,
+WARNING log with `"resolve_pass2: cannot re-read %s (%s)"`, and returns `parsed` unchanged.
+The architecture review finding is **already resolved in code**. This ticket adds only the missing unit test.
 
-In `lineage/aggregator.py`, the `resolve_pass2` method re-reads the file from disk. If the
-file has been deleted, moved, or is unreadable between pass 1 and pass 2, it raises an
-unhandled `FileNotFoundError`.
-
-Wrap the `open()` call in `try/except (FileNotFoundError, OSError)` and return the pass-1
-`ParsedFile` unchanged on failure:
-
-```python
-def resolve_pass2(self, parser, parsed: ParsedFile) -> ParsedFile:
-    parser.schema_resolver.add_view_sources(self.sources)
-    try:
-        sql = Path(parsed.path).read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError) as exc:
-        logger.warning(
-            "resolve_pass2: cannot re-read %s (%s) — returning pass-1 result",
-            parsed.path,
-            exc,
-        )
-        return parsed
-    return parser.parse_file(parsed.path, sql)
-```
+**What to do**: Add `tests/unit/test_aggregator.py` with the caplog assertion that confirms the
+WARNING log path fires — this is not covered by the existing integration test.
 
 **Files affected**:
-- `src/sqlcg/lineage/aggregator.py` — `resolve_pass2()`
+- `tests/unit/test_aggregator.py` (new file — test only, no production code changes)
 
 **Tests to add**:
 
-Unit test (existing `test_cross_file_lineage.py` already covers this scenario — extend, do not duplicate):
-
 - `tests/unit/test_aggregator.py`:
-  - Scenario — deleted file during pass 2: write a temp file `tmp_path / "source.sql"` containing `CREATE TABLE raw_orders (id INT, amount DECIMAL);`; parse it with `get_parser(None, SchemaResolver())` and `parse_file()` to get `pass1_result`; register with `CrossFileAggregator.register_pass1(pass1_result)`; delete `tmp_path / "source.sql"` via `Path.unlink()`; call `aggregator.resolve_pass2(parser, pass1_result)` and capture the return value `result`; assert `result is pass1_result` (same object, not a new parse); assert `caplog` contains a WARNING entry with `"resolve_pass2"` and `"cannot re-read"` in the message.
-  - Assertion must use `caplog` at level `logging.WARNING`, not just check return value — confirming the log path is exercised.
-
-Integration test (real indexer path, volatile file — no graph backend needed):
-
-- This scenario is already covered by `tests/integration/test_cross_file_lineage.py::test_resolve_pass2_deleted_file`. No new integration test needed for T-05. The existing test uses `CrossFileAggregator` + real `parse_file()` + `Path.unlink()` — identical to the spec above.
+  - Scenario — deleted file during pass 2: write `tmp_path / "source.sql"` with `CREATE TABLE raw_orders (id INT, amount DECIMAL);`; parse with `get_parser(None, SchemaResolver())` to get `pass1_result`; register with `CrossFileAggregator.register_pass1(pass1_result)`; delete file via `Path.unlink()`; call `aggregator.resolve_pass2(parser, pass1_result)`; assert `result is pass1_result`; assert `caplog` at `logging.WARNING` contains `"resolve_pass2"` and `"cannot re-read"`.
+  - This test is the only deliverable. No production code changes.
 
 **Definition of done**:
-- A deleted or unreadable file during pass 2 logs a warning and returns the pass-1 result
-- No `FileNotFoundError` propagates to the caller
-- Unit test confirms the warning is emitted
+- `tests/unit/test_aggregator.py` exists and passes
+- `caplog` assertion confirms WARNING is emitted on missing file
 
 ---
 
-### T-06 — Fix _extract_column_lineage exception recording
+### T-06 — Add logger.debug to lineage TODO + tests (rest already done)
 
 **Source**: ARCHITECTURE_REVIEW.md finding 3.4 (rank 2 in section 4, HIGH), finding 10.C (amplification)
 
-**What to do**:
+**Verified against code (2026-05-05)**:
+All three items from the architecture review are **already implemented** in `parsers/base.py`:
+1. ✅ `except Exception as exc` around `sg_lineage()` — logs WARNING, appends `"col_lineage:{col_name}:{exc}"`, emits zero-confidence `LineageEdge`
+2. ✅ Outer `except Exception` — logs WARNING, appends `"col_lineage:statement:{exc}"`
+3. ❌ `# TODO: convert root to LineageEdge(s)` at line ~386 — `root` is obtained from `sg_lineage()` but silently discarded with `pass`. Missing `logger.debug`.
 
-The current `_extract_column_lineage` in `parsers/base.py` already logs warnings and appends
-to `ParsedFile.errors` (the architecture review found this to already be partially implemented
-in the code). However, the fix is incomplete: inspect the current implementation carefully and
-verify that:
+**Remaining gap — one line**:
 
-1. The `except Exception as exc` block around `sg_lineage()` call:
-   - Logs at WARNING with file path, column name, and exception
-   - Appends to `out.errors` as `f"col_lineage:{col_name}:{exc}"`
-   - Emits a zero-confidence `LineageEdge` placeholder
+Replace the `pass` at the TODO with:
+```python
+logger.debug(
+    "sg_lineage root obtained but conversion not yet implemented: file=%s col=%s",
+    path,
+    col_name,
+)
+```
 
-2. The outer `except Exception` block (entire statement failure):
-   - Logs at WARNING
-   - Appends to `out.errors` as `f"col_lineage:statement:{exc}"`
+This makes the "lineage extracted but not converted" case visible in DEBUG logs, which T-09's
+`parse_quality` breakdown will use to classify files as `TABLE_ONLY` vs `FULL`.
 
-3. The `# TODO: convert root to LineageEdge(s)` placeholder in the `SELECT` body path
-   is a known limitation (lineage conversion not yet implemented); add a `logger.debug`
-   when `root` is returned from `sg_lineage()` but is not yet converted.
-
-These are the only changes for this ticket. The full lineage-to-edge conversion is NOT in
-scope for this ticket (it is a separate feature requiring deeper design work).
-
-**Also**: the `parse_quality` breakdown (T-09) depends on T-06 being complete first because
-T-09 uses the error list populated by T-06 to determine quality categories.
+**Also**: `parse_quality` breakdown (T-09) depends on T-06 being complete so the debug signal exists.
 
 **Files affected**:
-- `src/sqlcg/parsers/base.py` — `_extract_column_lineage()` — verify all three points above
+- `src/sqlcg/parsers/base.py` — one line at the `TODO` site
 
 **Tests to add**:
 
