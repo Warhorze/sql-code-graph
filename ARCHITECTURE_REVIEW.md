@@ -1,7 +1,7 @@
 # Architecture Review — sql-code-graph (sqlcg)
 
 Blueprint version: v1.2 (May 2026)
-Review date: 2026-05-02
+Review date: 2026-05-02 (updated 2026-05-05)
 Reviewer agent: architect-reviewer
 
 ---
@@ -902,3 +902,436 @@ have the GitHub repository configured as a trusted publisher:
   This is enforced via `needs: test` in the workflow YAML.
 
 Full implementation spec: `plan/phase10_deployment.md`
+
+---
+
+## 10. GitHub Issues Review — v0.2.1 Feedback (2026-05-05)
+
+Review date: 2026-05-05
+Source: GitHub issues #5 and #6, Warhorze/sql-code-graph
+Tester environment: sqlcg 0.2.1, Snowflake dialect, 1457-file DWH corpus, WSL2/Linux, Claude Code MCP session
+
+Both issues are marked `[feedback]` and were filed by the repo owner after a real
+production session. They are high-signal because they reflect actual LLM-agent and
+end-user experience, not hypothetical concerns.
+
+---
+
+### 10.1 Issue #6 — No clean uninstall / opt-out path
+
+**Problem statement**: The tool installs side effects in three separate locations
+(`~/.claude/settings.json`, `~/.sqlcg/`, `.git/hooks/post-checkout`) with no
+corresponding removal command. A user who wants to remove the tool must discover and
+manually undo all three locations.
+
+**Architectural assessment**: The `sqlcg install` command was designed with symmetry in
+mind (Phase 10), but only the install direction was implemented. The three side-effect
+locations map directly to the three install operations:
+
+1. `sqlcg install` writes `mcpServers["sql-code-graph"]` to `~/.claude/settings.json`
+2. The user's KùzuDB lives at `~/.sqlcg/` (controlled by `SQLCG_DB_PATH` or the default
+   set in `config.py`)
+3. `sqlcg git install-hooks` writes `.git/hooks/post-checkout`
+
+A `sqlcg uninstall` command is the natural symmetric counterpart and follows the exact
+same pattern as `install.py`:
+
+- Remove `mcpServers["sql-code-graph"]` from `~/.claude/settings.json` using atomic
+  `.tmp` + `os.replace` write (same guard as install)
+- Delete `~/.sqlcg/` (or the path from `SQLCG_DB_PATH`) via `shutil.rmtree` with
+  a `--keep-db` flag to allow MCP deregistration without data loss
+- Remove the `# sqlcg post-checkout hook` sentinel block from `.git/hooks/post-checkout`
+  in the specified repo (or `Path.cwd()` by default); if the hook file becomes empty
+  after stripping, delete it
+
+**Risk**: LOW severity (no data is corrupted). HIGH usability impact — an unclean
+opt-out path erodes trust and makes the tool feel invasive.
+
+**New finding (10.A)**: The three side-effect locations are not documented anywhere in
+`--help` or the README. Even without `sqlcg uninstall`, documenting them explicitly
+would reduce user friction when opting out.
+
+---
+
+### 10.2 Issue #5 — LLM Agent Experience: Silent Failures and False Positives
+
+This is a compound issue with nine distinct sub-problems. Each is assessed separately
+below in order of severity.
+
+---
+
+#### 10.2.1 [CRITICAL] LLM cannot self-recover from package/binary name mismatch
+
+The PyPI package is `sql-code-graph`; the binary is `sqlcg`. When an LLM agent
+invokes the MCP server by its package name (`sql-code-graph`) it gets "executable not
+found" and cannot recover without human intervention.
+
+The `mcp setup` / `sqlcg install` JSON already writes the correct invocation
+(`uvx sql-code-graph` or `sqlcg`), but the LLM does not read its own MCP settings
+file — it relies on the MCP server's tool descriptions to understand how to invoke it.
+
+**Root cause**: No tool or `--help` output names the binary explicitly with context.
+The `list_dialects_and_repos` tool description could carry this hint, but currently
+does not.
+
+**Resolution**: Add a one-line note to the `sqlcg mcp setup` JSON output and to the
+`list_dialects_and_repos` / `index_repo` tool docstrings: "Binary is `sqlcg`; PyPI
+package is `sql-code-graph`." This is a docstring-only change with no code impact.
+
+---
+
+#### 10.2.2 [CRITICAL] No workflow order surfaced in `--help` or tools
+
+The required sequence (`db init` -> `index <path>` -> `git install-hooks`) is not
+implied by `--help`, `mcp setup`, or any tool description. During the test session
+the LLM jumped directly to `find`/`analyze` and received empty results for the entire
+session because `db init` and `index` were never run.
+
+The `watch` command currently has no initialization guard: it calls
+`backend.init_schema()` internally (correct), but `sqlcg watch` on an empty database
+with no index will start the watcher, produce no results, and give no indication that
+the database has zero content.
+
+**Resolution**:
+
+1. Add a `QUICK START` block to the top-level `--help` text in `cli/main.py`
+   (within the `Typer` `help=` parameter string), listing the three required steps
+   in order. `typer` renders this in the `--help` output verbatim.
+
+2. In every tool that calls `_assert_indexed()`, surface the error message as:
+   "No repos indexed. Run `sqlcg db init` then `sqlcg index <path>` first."
+   (The current `NotIndexedError` message already says this but uses the CLI form;
+   confirm it matches the actual binary name.)
+
+3. The `watch` command is fine architecturally — it calls `init_schema()` before
+   starting the observer — but it should print a warning if zero repos are indexed
+   after the initial full index: "Warning: 0 tables indexed. Check that the path
+   contains .sql files and the dialect is correct."
+
+---
+
+#### 10.2.3 [HIGH] `db info` gives no warning when `SqlColumn: 0`
+
+`db info` shows node counts for all labels including `SqlColumn`. When `SqlColumn: 0`,
+the `trace_column_lineage` and `get_downstream_dependencies` / `get_upstream_dependencies`
+tools are completely non-functional — they will always return empty results. The user
+cannot distinguish "column not found" from "column graph not built."
+
+The current `db info` implementation (in `db.py`) iterates all `NodeLabel` values and
+prints counts without any interpretation. A zero count on `SqlColumn` is printed
+identically to a non-zero count.
+
+**Resolution**: After printing counts, add a structured health check section to
+`db info` output:
+
+- If `SqlColumn == 0` and `SqlQuery > 0`: print a yellow warning: "Column lineage
+  not available. Tools `trace_column_lineage`, `get_downstream_dependencies`, and
+  `get_upstream_dependencies` will return empty results."
+- If `SqlQuery == 0` and `Repo > 0`: print a yellow warning: "No queries indexed.
+  Run `sqlcg index <path>` to populate the graph."
+- If `Repo == 0`: print a red error: "Database is empty. Run `sqlcg db init` and
+  `sqlcg index <path>` first."
+
+This is also relevant to the MCP server: `list_dialects_and_repos` could append
+a `warnings` field to its `DialectRepoResult` listing health status, so Claude
+can surface it proactively.
+
+---
+
+#### 10.2.4 [HIGH] `analyze unused` returns 100% false positives for external consumers
+
+`analyze unused` returned ~100 `IA_ANALYTICS` / `IA_TABLEAU` / `IA_BUSINESSOBJECTS`
+views as "unused" because these are consumer-facing views queried by Tableau and BI
+tools — external consumers with no SQL references within the indexed corpus.
+
+The current query in `analyze.py`:
+```
+MATCH (t:SqlTable) WHERE NOT (t)<-[:SELECTS_FROM]-() RETURN t.qualified
+```
+is logically correct for the closed-world assumption (only SQL files in the indexed
+corpus), but this assumption is never stated to the user.
+
+**Resolution**:
+
+1. Add a `--exclude-schema` flag to `analyze unused` that filters out tables whose
+   qualified name starts with the specified schema prefix. This allows users to exclude
+   known consumer schemas: `sqlcg analyze unused --exclude-schema IA_ANALYTICS`.
+
+2. Always print a caveat after results: "Note: results include tables not referenced
+   within the indexed files. Externally consumed tables (e.g., Tableau/BI views) will
+   appear as unused." This caveat should also appear in the MCP tool docstring for
+   `find_table_usages` and in the `analyze unused` `--help`.
+
+3. The same caveat applies to the MCP server's future `find_unused_tables` tool (if
+   planned).
+
+---
+
+#### 10.2.5 [HIGH] `analyze impact` vs `find pattern` return inconsistent results for the same table
+
+For table `BA.WTFV_VOORRAAD_DAGSTAND_IGDC`, `analyze impact` returned only DDL files
+while `find pattern` additionally found an ETL `INSERT INTO` in `etl/sql/fact/`. The
+two commands should return overlapping or identical results for this query.
+
+**Root cause analysis**: `analyze impact` uses the `SELECTS_FROM` relationship to find
+queries that reference the table. If the ETL `INSERT INTO` statement was indexed as a
+query with `sources` pointing to `BA.WTFV_VOORRAAD_DAGSTAND_IGDC` via a `SELECTS_FROM`
+edge, it would appear in both commands. The inconsistency suggests one of:
+
+(a) The ETL INSERT statement was not indexed with the correct `SELECTS_FROM` edges (the
+    parser did not extract table sources for it), or
+
+(b) The INSERT was indexed under a different table name/qualified form than the DDL
+    table node, causing the relationship to point to a different node.
+
+**Resolution**: This is a parser correctness issue, not a CLI design issue. The fix
+is to verify that `INSERT INTO ... SELECT FROM <table>` correctly emits a `SELECTS_FROM`
+edge from the `SqlQuery` node to the `SqlTable` node. Add a test fixture with a known
+INSERT-SELECT pattern and assert that `analyze impact` finds it. The diagnostic step
+is: run `execute_cypher("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable {qualified:
+'BA.WTFV_VOORRAAD_DAGSTAND_IGDC'}) RETURN q.id LIMIT 10")` and compare to
+`find pattern "WTFV_VOORRAAD_DAGSTAND_IGDC"`.
+
+New finding: **the impact/pattern inconsistency is a measurable regression test gap**.
+The `_upsert_parsed_file` path must create `SELECTS_FROM` edges for INSERT statements,
+not only SELECT statements. Verify this is handled.
+
+---
+
+#### 10.2.6 [MEDIUM] Feedback loop has no false-negative path
+
+`submit_feedback` only fires when there are results to rate. The most valuable signal —
+empty result when the user expected one — is never collected. In the test session,
+`trace_column_lineage` was called 7 times (all returning empty) and 0 feedback samples
+were collected.
+
+Additionally, `execute_cypher` was the #1 MCP tool with 15 calls vs
+`trace_column_lineage` at 7. A high `execute_cypher`/`high-level-tool` ratio is a
+proxy signal that the high-level tools are failing and the LLM is falling back to raw
+Cypher. This ratio is not surfaced in `sqlcg gain`.
+
+**Resolution**:
+
+1. In `trace_column_lineage`, `get_downstream_dependencies`, and
+   `get_upstream_dependencies`: when the result `lineage` / `nodes` list is empty,
+   include a `hint` field in the returned model: "If you expected results, check that
+   `db info` shows SqlColumn > 0. Submit feedback with `submit_feedback` tool if this
+   was a false negative."
+
+2. In `submit_feedback`, add a `FN` (false negative) label to the allowed set alongside
+   `TP` and `FP`. Currently only `TP` and `FP` are valid labels.
+
+3. In `sqlcg gain`, add a `execute_cypher / total_calls` ratio section. A ratio above
+   0.3 (more than 30% of calls are raw Cypher) is a signal that the high-level
+   abstractions are not working.
+
+---
+
+#### 10.2.7 [MEDIUM] Parser: `ALTER WAREHOUSE` and `CALL` produce noise
+
+`ALTER WAREHOUSE IDENTIFIER($var) SET WAREHOUSE_SIZE = 'X-Large'` is a standard
+Snowflake DDL rebuild pattern that fails to parse and falls back to `exp.Command`.
+`CALL MA.MSSPR_*()` stored procedure calls similarly produce noise.
+
+Both are non-DML, non-DDL utility statements. They should be stripped before DML
+extraction in `SnowflakeParser._parse_scripting_file` to eliminate the noise.
+
+**Resolution**: Add `ALTER WAREHOUSE` and `CALL` to a pre-filter regex in
+`SnowflakeParser` that strips these statements before the `_EMBEDDED_DML` extraction
+pass. This is a pure parser improvement with no schema or MCP impact. Log at DEBUG
+level (not WARNING) when these are stripped, so they do not appear in the 900KB of
+parse warnings reported in the test session.
+
+This is consistent with the existing finding 3.12 (`_EMBEDDED_DML` regex issues).
+
+---
+
+#### 10.2.8 [MEDIUM] Missing persistent index config (`.sqlcg.toml`)
+
+After a `db reset` or fresh clone there is no way to replay the index without
+remembering the original `sqlcg index <path> --dialect <dialect>` invocation. The
+git hook calls `sqlcg index --dialect auto --quiet` which reads `.sqlcg.toml` if it
+exists, but this file is never created by any `sqlcg` command.
+
+**Current state**: The `get_dialect()` helper in `config.py` reads `.sqlcg.toml`
+(via `[sqlcg] dialect = "..."`) if present, but `sqlcg index` never writes this file.
+A user must create `.sqlcg.toml` manually.
+
+**Resolution**: `sqlcg index <path> --dialect <dialect>` should write (or update) a
+`.sqlcg.toml` file at the root of the indexed path on first successful index. The
+write should be idempotent (do not overwrite if the file already exists with a matching
+dialect). This makes the git hook self-healing after a `db reset` — the hook will read
+the dialect from `.sqlcg.toml` without the user needing to remember the original
+invocation.
+
+Spec for `.sqlcg.toml`:
+```toml
+[sqlcg]
+path = "/absolute/path/to/repo"
+dialect = "snowflake"
+```
+
+The `path` field allows `sqlcg index` (with no arguments) to infer the target
+directory from the config file when run from the repo root.
+
+**Risk**: Low — no breaking changes. The file should be added to `.gitignore` templates
+in the README since it contains an absolute path that is machine-specific.
+
+---
+
+#### 10.2.9 [MEDIUM] No progress feedback during `sqlcg index`
+
+`sqlcg index` on 1457 files took ~17 seconds with zero stdout output until the final
+summary line appeared. The `edges: 0` signal (indicating the graph has no relationships
+and lineage tracing will return nothing) appeared only in the raw log, never surfaced
+in `db info`.
+
+**Resolution**:
+
+1. Add a simple periodic progress line to `Indexer.index_repo()`: print
+   `"INFO: indexed N/total files..."` every 100 files (or every 5 seconds on a timer).
+   Use `rich.progress` if available, or a plain `console.print` with carriage return.
+
+2. After indexing, if `lineage_edges_created == 0`, print a yellow warning to stdout
+   (not just the log): "Warning: 0 lineage edges created. Column-level lineage tracing
+   will not be available. Check parse errors above."
+
+3. Surface `lineage_edges_created` (renamed to `edges`) in `db info` as an explicit
+   field. A graph with zero edges cannot answer any lineage query, and this must be
+   immediately visible without reading the raw index log.
+
+---
+
+#### 10.2.10 [LOW] `uvx` cold-start is invisible (6.5 minutes with no output)
+
+The MCP server config (`"command": "uvx"`) means Claude Code pays a `uvx` download
+cost on first run (and potentially on each session if the `uvx` cache is cold). In
+the test session this took 6.5 minutes with zero output, indistinguishable from a hang.
+
+**Resolution**: Documentation-only change. The README `QUICK START` section should:
+- Recommend `uv tool install sql-code-graph` for persistent local installs
+- Reserve `uvx sql-code-graph` for one-shot tries
+- Note that first run will be slow due to package download
+- The `sqlcg install` confirmation message should note: "Using uvx — first MCP startup
+  may take several minutes on a cold cache. Run `uv tool install sql-code-graph` for
+  faster startup."
+
+---
+
+### 10.3 Cross-Cutting Findings from Issue Analysis
+
+**Finding 10.B — LLM agent is a first-class user of this tool but the tool was not designed for it**
+
+The issue session revealed a consistent pattern: the tool produces correct outputs but
+does not communicate machine-readable semantics about its own state. A human user who
+gets "No results" knows to check if the database was indexed. An LLM agent does not.
+Every tool that can return empty due to a missing prerequisite (unindexed graph, zero
+column nodes, schema mismatch) must include a `hint` field in the returned model so
+Claude can self-diagnose without falling back to `execute_cypher`.
+
+This is the root cause of the `execute_cypher`-dominance pattern (15 calls vs 7 for
+`trace_column_lineage`): Claude fell back to raw Cypher because the high-level tools
+returned empty with no explanation.
+
+**Action**: Add a `hint: str | None` field to `LineageResult`, `DependencyResult`,
+`TableUsageResult`, and `SqlPatternResult` models. Populate it when the result list
+is empty with a diagnostic string. This is a backward-compatible model extension
+(new optional field).
+
+**Finding 10.C — Index success rate is misleading**
+
+The index reported 100% success rate with 900KB of parse warnings and `SqlColumn: 0`.
+"Success" in the current codebase means "the file was processed without raising an
+unhandled exception." It does not mean "lineage was extracted." A file that falls back
+to `exp.Command` (scripting block) is counted as "success" even though it produced
+zero edges.
+
+This is related to finding 3.4 (bare `except Exception: continue`) — it means errors
+are swallowed and the success rate is a vanity metric.
+
+**Action**: Introduce a `parse_quality` metric in `ParsedFile`:
+- `full`: sqlglot parsed fully, column lineage extracted
+- `table_only`: tables extracted, column lineage not available (schema required or
+  `SELECT *`)
+- `scripting_fallback`: fell back to regex extraction, confidence 0.3
+- `failed`: unhandled exception, no lineage
+
+Report these four categories in the `index` summary line and in `db info`. This
+replaces "parse_errors" (which is binary) with a quality breakdown that accurately
+reflects what Claude can and cannot answer.
+
+---
+
+### 10.4 Prioritized Implementation Plan — Issues #5 and #6
+
+Ranked by impact (breadth of user pain) multiplied by implementation effort (inverse:
+low effort ranks higher).
+
+| Rank | Issue | Finding | File(s) | Action | Effort | Impact |
+|------|-------|---------|---------|--------|--------|--------|
+| 1 | #5.1 | 10.2.2 | `cli/main.py` | Add `QUICK START` block to top-level `--help` with ordered steps; update `NotIndexedError` message to include step hint | XS | CRITICAL |
+| 2 | #5.2 | 10.2.3 | `cli/commands/db.py` | Add health check interpretation to `db info` output (red/yellow warnings for empty Repo, zero SqlQuery, zero SqlColumn) | XS | HIGH |
+| 3 | #6 | 10.A, 10.1 | `cli/commands/uninstall.py` (new) | Implement `sqlcg uninstall`: remove MCP entry, delete `~/.sqlcg/`, strip git hook; `--keep-db` flag; register in `cli/main.py` | S | HIGH |
+| 4 | #5.2 | 10.2.9 | `indexer/indexer.py`, `cli/commands/index.py` | Add periodic progress output; surface `edges: 0` warning on stdout; add `edges` to `db info` | S | HIGH |
+| 5 | #5.2 | 10.B | `server/models.py`, `server/tools.py` | Add `hint: str | None` to `LineageResult`, `DependencyResult`, `TableUsageResult`; populate on empty returns with diagnostic message | S | HIGH |
+| 6 | #5.2 | 10.2.8 | `cli/commands/index.py`, `core/config.py` | Write `.sqlcg.toml` on successful index (idempotent); update `get_dialect()` to also read `path` from toml; allow `sqlcg index` with no args | S | MEDIUM |
+| 7 | #5.2 | 10.2.4 | `cli/commands/analyze.py` | Add `--exclude-schema` to `analyze unused`; always append closed-world caveat to output | S | MEDIUM |
+| 8 | #5.2 | 10.2.6 | `server/tools.py`, `metrics/store.py` | Add `FN` label to `submit_feedback`; add `execute_cypher` ratio to `sqlcg gain` output | S | MEDIUM |
+| 9 | #5.2 | 10.2.7 | `parsers/snowflake_parser.py` | Add pre-filter for `ALTER WAREHOUSE` and `CALL` statements in `_parse_scripting_file`; log at DEBUG not WARNING | XS | MEDIUM |
+| 10 | #5.2 | 10.2.5 | `indexer/indexer.py`, `parsers/base.py` | Verify `SELECTS_FROM` edges are created for INSERT-SELECT queries; add test fixture asserting `analyze impact` finds ETL INSERT | M | MEDIUM |
+| 11 | #5.2 | 10.C | `indexer/indexer.py`, `parsers/base.py`, `cli/commands/index.py` | Introduce `parse_quality` breakdown (full / table_only / scripting_fallback / failed); surface in index summary and `db info` | M | MEDIUM |
+| 12 | #5.2 | 10.2.1 | `server/tools.py`, `cli/commands/mcp.py` | Add binary/package name note to `mcp setup` output and `index_repo`/`list_dialects_and_repos` tool docstrings | XS | LOW |
+| 13 | #5.2 | 10.2.10 | `README.md` / install docs | Add `uv tool install` recommendation; note cold-start latency in `sqlcg install` confirmation message | XS | LOW |
+
+---
+
+### 10.5 Impact on Existing Architecture Review Sections
+
+**Finding 3.4 amplified (10.C)**: The bare `except Exception: continue` in
+`_extract_column_lineage` was already a HIGH finding. Issue #5 confirms its real-world
+consequence: a 1457-file corpus reports 100% success with `SqlColumn: 0`. This
+elevates finding 3.4 from a theoretical correctness concern to a confirmed user-visible
+failure mode. The `parse_quality` breakdown (rank 11 above) is the correct systemic fix.
+
+**Finding 5.2 (wizard.py unspec'd) is now confirmed scope creep risk**: The wizard
+was never mentioned in the test session. The LLM relied on `--help`. This confirms that
+the QUICK START in `--help` (rank 1 above) is the highest-value onboarding investment,
+not a GUI wizard.
+
+**`analyze unused` (finding 5.3 / JOINS) extended**: The `analyze unused` false positive
+issue (#5.3) confirms finding 5.3 from the original review — the graph uses a
+closed-world assumption that must be made explicit to users. The `--exclude-schema` flag
+and caveat text address this without changing the graph schema.
+
+**`analyze impact` vs `find pattern` inconsistency (10.2.5)** is a new finding not
+previously identified in this review. It points to a potential gap in `_upsert_parsed_file`:
+`SELECTS_FROM` edges may not be created for all query kinds that reference tables as
+sources. This requires a developer investigation before a fix can be scoped.
+
+---
+
+### 10.6 Open Questions from Issue Analysis
+
+The following questions require user input before implementation can begin:
+
+1. **`sqlcg uninstall` scope**: Should `sqlcg uninstall` prompt for confirmation before
+   deleting `~/.sqlcg/` (which may contain hours of indexed data), or should the
+   `--keep-db` flag be sufficient? Recommendation: require `--yes` flag for db deletion;
+   always prompt interactively if neither `--keep-db` nor `--yes` is passed.
+
+2. **`.sqlcg.toml` committing**: Should `.sqlcg.toml` be committed to the repository
+   (enabling team-wide dialect config) or gitignored (because it contains an absolute
+   path)? The `path` field makes it machine-specific; the `dialect` field is shareable.
+   Recommendation: split into `dialect`-only (committable) and `path`-only (gitignored),
+   or make `path` optional and resolve it as `cwd` when absent.
+
+3. **`FN` feedback label**: Adding `FN` (false negative) to `submit_feedback` changes
+   the MetricsStore schema. Confirm this is acceptable before implementation.
+
+4. **`analyze impact` vs `find pattern` inconsistency**: Is the expected behavior that
+   `analyze impact` finds ETL INSERT statements that use the table as a source? If yes,
+   this is a parser bug and should be ranked higher. If no (i.e., `analyze impact` is
+   intentionally DDL-only), the tool description must say so explicitly.
+
+These are recorded here for the architect-planner to resolve before the developer
+implements rank 3, 6, 8, and 10 above.

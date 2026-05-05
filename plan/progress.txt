@@ -1,14 +1,51 @@
 ## Current State
 
-agent: plan-reviewer
-task: Phase 10 — Deployment & PyPI Publishing
-plan: plan/phase10_deployment.md
-status: READY FOR IMPLEMENTATION (corrections applied)
-date: 2026-05-04
+agent: architect-reviewer
+task: GitHub issues #5 and #6 review + ARCHITECTURE_REVIEW.md Section 10
+plan: ARCHITECTURE_REVIEW.md Section 10 (no plan file; issues are post-v0.2.1 feedback)
+status: REVIEW COMPLETE — issues catalogued, prioritized, 4 open questions recorded
+date: 2026-05-05
 ---
 
 
 ## Handoff Log
+
+[2026-05-05] architect-reviewer — GitHub issues #5 and #6 review (v0.2.1 feedback session).
+  Summary: Reviewed both open issues in detail against the live codebase (v0.2.1).
+  Added ARCHITECTURE_REVIEW.md Section 10 with full analysis and prioritized implementation plan.
+
+  Issue #6 (uninstall): 1 finding (10.A — side-effect locations undocumented). Requires new
+  `sqlcg uninstall` command (src/sqlcg/cli/commands/uninstall.py). Symmetric counterpart to
+  install.py already in codebase. Scope: remove MCP entry, delete ~/.sqlcg/, strip git hook.
+
+  Issue #5 (LLM experience, silent failures, false positives): 9 sub-problems across 3 severity
+  levels. 3 cross-cutting findings (10.B LLM agent not first-class user; 10.C misleading success
+  rate; 10.2.5 analyze impact vs find pattern inconsistency).
+
+  13-item ranked implementation plan produced (Section 10.4), ordered by impact x effort.
+  Top 5 items (all XS-S effort, HIGH-CRITICAL impact):
+    1. QUICK START block in --help (cli/main.py) — XS effort, CRITICAL impact
+    2. db info health check warnings for zero SqlColumn/SqlQuery/Repo (cli/commands/db.py)
+    3. sqlcg uninstall command (new file) — S effort, HIGH impact
+    4. Progress output during index + edges: 0 warning (indexer/indexer.py, cli/commands/index.py)
+    5. hint field on empty MCP tool results (server/models.py, server/tools.py)
+
+  4 open questions for architect-planner before implementation:
+    Q1: sqlcg uninstall — confirm/interactive vs --yes/--keep-db flags
+    Q2: .sqlcg.toml committing policy (absolute path makes it machine-specific)
+    Q3: FN label for submit_feedback — schema change approval
+    Q4: analyze impact expected behavior for INSERT-SELECT (bug vs intentional DDL-only scope)
+
+  New findings added to review:
+    10.A — side-effect locations not documented anywhere
+    10.B — LLM agent is first-class user but tool was not designed for it
+    10.C — index success rate is a vanity metric (100% with SqlColumn: 0)
+
+  Amplified existing findings:
+    Finding 3.4 (bare except in _extract_column_lineage) — confirmed real-world consequence
+
+  Next step: architect-planner resolves 4 open questions (Section 10.6), then developer
+  implements Section 10.4 items in rank order.
 
 [2026-05-04] plan-reviewer — Phase 10 plan reviewed and corrected (Deployment & PyPI Publishing).
   agent: plan-reviewer
