@@ -10,6 +10,38 @@ the migration path for graph schema changes.
 
 ---
 
+## Recommended Implementation Order
+
+**Start here — unblock everything else first:**
+1. **T-00** (XS) — fixture dirs. Blocks 6 tickets. Do this before anything else.
+2. **T-06** (XS) — one `logger.debug` line. Blocks T-09, T-10, T-11. Do it the same day as T-00.
+
+After those two are merged, two parallel tracks open up:
+
+**Track A — user-facing quick wins (independent, high visibility):**
+3. **T-01** (XS) — QUICK START in `--help`. CRITICAL impact, zero dependencies.
+4. **T-02** (XS) — `db info` health warnings. Pairs naturally with T-01.
+5. **T-05** (XS) — caplog unit test. Small, test-only, clear it off.
+6. **T-07** (S) — `hint` field in result models. High LLM agent impact.
+7. **T-03** (S) — `sqlcg uninstall`. Self-contained, well-specced.
+8. **T-04** (XS) — wrap `init_schema()` in transaction. One code change.
+
+**Track B — parser correctness (sequential, order matters):**
+3. **T-10** (M) — verify and fix `SELECTS_FROM` edges for INSERT-SELECT. Fix the confirmed bug first since it affects T-11's test fixtures.
+4. **T-11** (M) — scripting-block DML extraction rewrite. Builds on T-10's fixtures.
+5. **T-09** (M) — `parse_quality` breakdown. Depends on T-06 signal; do after T-10/T-11 so quality scores are meaningful.
+6. **T-08** (S) — progress output + edges warning. Rounds out the index UX after quality is in.
+
+**Anytime (low effort, no deps):**
+- **T-13** (S) — FN label + `execute_cypher` ratio
+- **T-14** (XS) — docs/binary name note
+
+**Single developer**: T-00 → T-06 → T-01 → T-02 → T-07 → T-03 → T-04 → T-05 → T-10 → T-11 → T-09 → T-08 → T-13 → T-14
+
+**Two developers**: one takes Track A, the other takes Track B from T-10 onward — both start after T-00 and T-06 merge.
+
+---
+
 ## Code-vs-Plan Verification (2026-05-05)
 
 Before implementation, all tickets were cross-checked against the actual source tree. Three findings:
