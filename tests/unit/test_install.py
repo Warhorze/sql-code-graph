@@ -1,4 +1,4 @@
-"""Tests for sqlcg install command (Claude Code MCP registration)."""
+"""Tests for sqlcg install command and mcp setup --write (Claude Code MCP registration)."""
 
 import json
 from pathlib import Path
@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
+from sqlcg.cli.commands import mcp as mcp_commands
 from sqlcg.cli.main import app
 
 runner = CliRunner()
@@ -140,3 +141,37 @@ def test_survives_malformed_existing_json(fake_home: Path) -> None:
     assert result.exit_code == 0
     settings = json.loads(settings_path.read_text())
     assert "sql-code-graph" in settings["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# mcp setup --write
+# ---------------------------------------------------------------------------
+
+def test_mcp_setup_write_merges_into_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(json.dumps({"theme": "dark", "mcpServers": {"other": {}}}))
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with patch("shutil.which", return_value=None):
+        result = CliRunner().invoke(mcp_commands.app, ["setup", "--write"])
+
+    assert result.exit_code == 0
+    settings = json.loads(settings_path.read_text())
+    assert settings["theme"] == "dark"
+    assert "other" in settings["mcpServers"]
+    assert "sql-code-graph" in settings["mcpServers"]
+    assert settings["mcpServers"]["sql-code-graph"]["command"] == "sqlcg"
+
+
+def test_mcp_setup_write_does_not_write_mcp_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with patch("shutil.which", return_value=None):
+        CliRunner().invoke(mcp_commands.app, ["setup", "--write"])
+
+    assert not (tmp_path / ".claude" / "mcp.json").exists()
+    assert (tmp_path / ".claude" / "settings.json").exists()

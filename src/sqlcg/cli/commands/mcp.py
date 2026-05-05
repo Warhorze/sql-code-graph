@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import typer
@@ -10,15 +11,21 @@ from rich.console import Console
 app = typer.Typer(help="MCP server commands")
 console = Console()
 
-_ENTRY = {"command": "sqlcg", "args": ["mcp", "start"]}
 _SERVER_KEY = "sql-code-graph"
+
+
+def _server_entry() -> dict:
+    if shutil.which("uvx"):
+        return {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
+    return {"command": "sqlcg", "args": ["mcp", "start"]}
 
 
 @app.command("setup")
 def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
     """Print or write MCP server config JSON."""
+    entry = _server_entry()
     if print_only:
-        console.print_json(json.dumps({"mcpServers": {_SERVER_KEY: _ENTRY}}, indent=2))
+        console.print_json(json.dumps({"mcpServers": {_SERVER_KEY: entry}}, indent=2))
         return
 
     config_path = Path.home() / ".claude" / "settings.json"
@@ -30,7 +37,7 @@ def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
     else:
         settings = {}
 
-    settings.setdefault("mcpServers", {})[_SERVER_KEY] = _ENTRY
+    settings.setdefault("mcpServers", {})[_SERVER_KEY] = entry
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = config_path.with_suffix(".tmp")
