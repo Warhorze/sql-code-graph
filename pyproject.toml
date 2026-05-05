@@ -92,6 +92,7 @@ packages = ["src/sqlcg"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --strict-markers"
+python_files = ["test_*.py", "bench_*.py"]
 markers = [
     "unit: unit tests",
     "integration: integration tests",
