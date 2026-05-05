@@ -119,6 +119,35 @@ class TestKuzuBackendTransaction:
         )
         assert result[0]["name"] == "original"
 
+    def test_transaction_rollback_upsert(self):
+        """Test rollback on upsert failure within a transaction."""
+        # Create an in-memory backend and initialize schema
+        backend = KuzuBackend(":memory:")
+        backend.init_schema()
+
+        # Upsert a node and record the count
+        backend.upsert_node(NODE_TABLE, "table1", {"qualified": "table1"})
+
+        result = backend.run_read("MATCH (n) RETURN COUNT(n) AS count", {})
+        count_before = result[0]["count"]
+
+        # Open a transaction, upsert a node, and raise an exception
+        try:
+            with backend.transaction():
+                backend.upsert_node(NODE_TABLE, "table2", {"qualified": "table2"})
+                raise RuntimeError("Simulated failure during transaction")
+        except RuntimeError:
+            pass
+
+        # Verify the node count is unchanged (rollback occurred)
+        result = backend.run_read("MATCH (n) RETURN COUNT(n) AS count", {})
+        count_after = result[0]["count"]
+
+        assert count_after == count_before, (
+            f"Expected count to remain {count_before}, but got {count_after} after rollback"
+        )
+        backend.close()
+
 
 class TestKuzuBackendDeleteFile:
     """Test delete_nodes_for_file."""
