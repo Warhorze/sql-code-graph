@@ -276,6 +276,23 @@ Recommended resolution: Refactor `_classify` to use `match`/`case` (pure style, 
 Leave the string `kind` values but extract them into a `QueryKind` `StrEnum` in
 `parsers/base.py` or `core/schema.py` to eliminate magic string duplication.
 
+**Additional improvement from 10.2.7 research**: sqlglot exposes `exp.DML` as a base
+class covering `Insert`, `Update`, `Delete`, and `Merge`. The current `_classify`
+enumerates these individually, which caused `MERGE` to be missing from the original
+DML filter proposal (caught and fixed in 10.2.7). The `match`/`case` refactor should
+use `exp.DML` as a base branch to future-proof against new DML types sqlglot may add:
+
+```python
+case stmt if isinstance(stmt, exp.DML) and not isinstance(stmt, exp.Copy):
+    # handles Insert, Update, Delete, Merge — and any future exp.DML subclass
+    ...
+case exp.Select():
+    ...
+```
+
+This ensures `_classify` inherits coverage from sqlglot's own type hierarchy rather
+than requiring manual updates each time a new DML expression type is added.
+
 **Comment 8 — `parsers/base.py` line 263 and line 294: `_real_tables` and `_convert_table_expr_to_ref` use `elif`**
 
 Reviewer text: "same here match statements are much cleaner" / "match"
@@ -486,18 +503,28 @@ produces zero edges, which is indistinguishable from a column with no upstream s
 This directly undermines the "explicit failure mode inventory" strength described in
 section 2.4.
 
-### 3.5 [MEDIUM] `SnowflakeParser._parse_scripting_file` applies a file-level heuristic that can false-positive
+### 3.5 ~~[MEDIUM]~~ **RESOLVED** `SnowflakeParser._parse_scripting_file` applies a file-level heuristic that can false-positive
 
-The heuristic `if _SCRIPTING_BLOCK.search(sql): return self._parse_scripting_file()`
-matches any file containing the word `BEGIN`. This includes:
+> **Status: already fixed in code.** The token-aware `TokenType.BEGIN` check described
+> below is implemented in `_has_scripting_block()` (lines 79–85 of
+> `src/sqlcg/parsers/snowflake_parser.py`). This finding is closed.
 
-- Comments: `-- BEGIN transaction isolation block`
-- String literals: `SELECT 'BEGIN' AS status_label FROM t`
-- Legitimate `BEGIN TRANSACTION` in non-scripting contexts
+~~The heuristic `if _SCRIPTING_BLOCK.search(sql): return self._parse_scripting_file()`
+matches any file containing the word `BEGIN`. This includes:~~
 
-A false positive routes an entire file through the regex DML extractor, which sets
+~~- Comments: `-- BEGIN transaction isolation block`~~
+~~- String literals: `SELECT 'BEGIN' AS status_label FROM t`~~
+~~- Legitimate `BEGIN TRANSACTION` in non-scripting contexts~~
+
+~~A false positive routes an entire file through the regex DML extractor, which sets
 `parse_failed=True` and `confidence=0.3` on all statements and drops all column
-lineage. This degrades quality on files that are fully parseable.
+lineage. This degrades quality on files that are fully parseable.~~
+
+The implemented fix uses `sqlglot.tokens.Tokenizer.from_dialect("snowflake").tokenize(sql)`
+and checks for a `TokenType.BEGIN` token directly — string literals and comments are
+never tokenised as `BEGIN`, so false positives on `SELECT 'BEGIN' AS x` or
+`-- BEGIN block` are impossible. A regex fallback is retained only for the edge case
+where tokenisation itself raises an exception.
 
 ### 3.6 [MEDIUM] `QueryNode` is a mutable dataclass but `LineageEdge` is frozen — inconsistency
 
@@ -586,12 +613,12 @@ Ranking uses: **Impact** (correctness/stability consequence if unaddressed) x
 | 2 | 3.4 — `_extract_column_lineage` bare `except Exception: continue` | HIGH | Low | Log the exception at WARNING with column name and file path; append to `ParsedFile.errors`; set `confidence=0.0` on the affected edge slot |
 | 3 | 3.2 — `resolve_pass2` re-opens file without error handling | HIGH | Low | Wrap `open()` in `try/except (FileNotFoundError, OSError)`; log a warning and return the pass-1 `ParsedFile` unchanged |
 | 4 | 3.3 — `SchemaResolver.as_dict()` cache is not thread-safe | HIGH | Medium | Document the single-threaded assumption explicitly in the class docstring; if `jobs.py` uses threads, use `threading.Lock` around cache mutation and read, or switch to a per-parse-job `SchemaResolver` instance |
-| 5 | 3.5 — `BEGIN` heuristic false-positives on comments and string literals | MEDIUM | Low | Use a token-aware check: call `sqlglot.tokenize(sql, dialect="snowflake")` and look for a `TokenType.BEGIN` token that is not inside a string or comment, rather than a raw regex |
+| 5 | ~~3.5 — `BEGIN` heuristic false-positives~~ | ~~MEDIUM~~ | ~~Low~~ | **RESOLVED** — token-aware `TokenType.BEGIN` check already implemented in `_has_scripting_block()`. No action needed. |
 | 6 | 3.6 — `QueryNode` mutability inconsistency with frozen `LineageEdge` | MEDIUM | Low | Either add `frozen=True` to `QueryNode` and use `dataclasses.replace()` for pass-2 patching, or document the mutability contract explicitly in the class docstring |
 | 7 | 3.7 — No per-file timeout or SIGINT handling during indexing | MEDIUM | Medium | Add a configurable `--timeout-per-file` (default 30s) enforced via `concurrent.futures.ThreadPoolExecutor` with `future.result(timeout=N)`; handle `KeyboardInterrupt` in the walker loop to flush and exit cleanly |
 | 8 | 3.8 — `add_information_schema` is a silent no-op stub | MEDIUM | Low | Raise `NotImplementedError("--schema-from-info-schema is not yet implemented")` until the method is built; guard the CLI flag to surface this error immediately |
 | 9 | 3.10 — `acryl-datahub` upper bound missing on unstable module | LOW | Low | Change to `"acryl-datahub[sql-parsing]>=0.14.0,<0.15.0"` in `pyproject.toml` |
-| 10 | 3.12 — `_EMBEDDED_DML` regex greedy match across statement boundaries | LOW | Low | Add `re.MULTILINE`; test against a two-statement scripting block with no trailing semicolon on the last statement |
+| 10 | ~~3.12 — `_EMBEDDED_DML` regex greedy match across statement boundaries~~ | ~~LOW~~ | ~~Low~~ | **SUPERSEDED by 10.2.7** — the regex is being replaced entirely with a sqlglot tokenizer + `exp.DML` base class filter. Adding `re.MULTILINE` is no longer the fix. |
 | 11 | 3.9 — sqlglot upper bound `<31.0` too narrow | LOW | Low | Widen to `<32.0`; add CHANGELOG review step to CI upgrade process |
 | 12 | 3.11 — MCP tools lack explicit error documentation | LOW | Low | Add a `Raises` section to each tool docstring listing `NotIndexedError`, `InvalidColumnRef`, etc.; define a small custom exception hierarchy in `server/exceptions.py` |
 
@@ -744,11 +771,22 @@ Four capabilities are missing and each requires non-trivial work:
    pipeline execution order model, which is not representable in a static file walker.
 
 2. **Stored procedure body full parsing.** Snowflake `$$...$$` blocks and T-SQL
-   `BEGIN/END` bodies currently fall to regex extraction. A proper solution would
-   use sqlglot's `dialect="snowflake"` parser on the extracted body after stripping
-   the procedure wrapper. The blocker is that sqlglot classifies these as `exp.Command`
-   and does not expose a stored-procedure-body parser. This is blueprint Gap 5,
-   classified as a "design limitation" with "workaround only" resolution path.
+   `BEGIN/END` bodies currently fall to regex extraction. The blocker is
+   **dialect-specific** — this is not a uniform limitation:
+
+   - **Snowflake / Databricks**: sqlglot exposes the `$$...$$` body as an `exp.RawString`
+     node inside the `exp.Create` AST. The body is extractable, strippable of its
+     `BEGIN`/`END` wrapper, and re-parseable with the tokenizer + `exp.DML` filter
+     described in finding 10.2.7. This path is now viable and is part of the 10.2.7
+     implementation plan.
+   - **BigQuery**: sqlglot cannot fully parse `CREATE PROCEDURE ... BEGIN...END` for
+     BigQuery; the body lands as `exp.Command` inside `exp.Create`. For BigQuery, the
+     regex fallback (`_EMBEDDED_DML`) remains the only option. This is the true
+     "design limitation / workaround only" case.
+   - **T-SQL**: not yet verified — likely similar to BigQuery (body as `exp.Command`).
+
+   This is blueprint Gap 5. The Snowflake portion is now addressable via 10.2.7;
+   BigQuery procedure bodies remain a fundamental static-analysis limit.
 
 3. **COPY INTO column lineage.** Inferring column mapping from a stage file to a
    target table requires either an explicit column list in the COPY statement or an
@@ -1053,20 +1091,40 @@ corpus), but this assumption is never stated to the user.
 
 **Resolution**:
 
-1. Add a `--exclude-schema` flag to `analyze unused` that filters out tables whose
-   qualified name starts with the specified schema prefix. This allows users to exclude
-   known consumer schemas: `sqlcg analyze unused --exclude-schema IA_ANALYTICS`. 
+1. **Medallion-architecture-aware classification.** In a Bronze/Silver/Gold (medallion)
+   warehouse, tables at each layer have different "unused" semantics:
 
-WR: it needs to be very clear to the user what it is that they're doing when to exclude ? when not? agian this information should be past to the llm otherwise it is unclear. it might be usefull if you'd look at it from a medalion architectur perspective.
+   | Layer | Typical schema prefixes | Expected consumption pattern | "Unused" meaning |
+   |---|---|---|---|
+   | Bronze / Raw | `RAW_`, `STG_`, `STAGE_` | Loaded by COPY INTO / ELT jobs | Bug if unused — no ETL reads it |
+   | Silver / Intermediate | `INT_`, `PREP_`, `DWH_`, `BA_` | Read by ETL INSERT/MERGE | Bug if unused |
+   | Gold / Consumption | `DIM_`, `FACT_`, `MART_`, `IA_`, `RPT_` | Queried by BI tools externally | **Expected** — external consumers have no SQL in the corpus |
 
-2. Always print a caveat after results: "Note: results include tables not referenced
-   within the indexed files. Externally consumed tables (e.g., Tableau/BI views) will
-   appear as unused." This caveat should also appear in the MCP tool docstring for
-   `find_table_usages` and in the `analyze unused` `--help`.
+   `analyze unused` should tag each result with its inferred layer so the LLM can
+   distinguish "this Gold view has no SQL consumers — expected, BI queries it" from
+   "this Silver staging table has no SQL consumers — likely a dead table."
 
+   Implementation: after the Cypher query, classify each result by matching its schema
+   prefix against a configurable tier map (with sensible defaults). Surface the tier
+   in the CLI output column and in the MCP tool's result model. The MCP tool docstring
+   must explain the tier model so Claude can give informed recommendations without
+   the user needing to explain their naming conventions.
 
-3. The same caveat applies to the MCP server's future `find_unused_tables` tool (if
-   planned).
+2. Add a `--exclude-schema` flag to `analyze unused` for manual exclusion of known
+   consumer schemas. The flag description must explain **when to use it**: "Use to
+   exclude schemas whose tables are consumed externally (e.g., by BI tools or APIs)
+   and will always appear unused within the indexed SQL corpus."
+
+   The MCP tool version of this flag (if exposed) must carry the same explanation in
+   its parameter docstring so the LLM knows when to apply it autonomously.
+
+3. Always append a closed-world caveat to results: "Note: 'unused' means no SQL file
+   in the indexed corpus selects from this table. External consumers (Tableau, BI tools,
+   APIs) are not visible to this tool." This caveat must appear in: CLI output, MCP
+   tool docstring, and `analyze unused --help`.
+
+4. The same tier classification and caveat applies to the MCP server's future
+   `find_unused_tables` tool (if planned).
 
 ---
 
@@ -1339,7 +1397,7 @@ low effort ranks higher).
 | 6 | #5.2 | 10.2.8 | `cli/commands/index.py`, `core/config.py` | Write `.sqlcg.toml` on successful index (idempotent); update `get_dialect()` to also read `path` from toml; allow `sqlcg index` with no args | S | MEDIUM |
 | 7 | #5.2 | 10.2.4 | `cli/commands/analyze.py` | Add `--exclude-schema` to `analyze unused`; always append closed-world caveat to output | S | MEDIUM |
 | 8 | #5.2 | 10.2.6 | `server/tools.py`, `metrics/store.py` | Add `FN` label to `submit_feedback`; add `execute_cypher` ratio to `sqlcg gain` output | S | MEDIUM |
-| 9 | #5.2 | 10.2.7 | `parsers/snowflake_parser.py` | Add pre-filter for `ALTER WAREHOUSE` and `CALL` statements in `_parse_scripting_file`; log at DEBUG not WARNING | XS | MEDIUM |
+| 9 | #5.2 | 10.2.7 | `parsers/snowflake_parser.py` | Replace `_EMBEDDED_DML` regex with sqlglot tokenizer-split + `isinstance(stmt, (exp.DML, exp.Select)) and not isinstance(stmt, exp.Copy)` filter; handle Snowflake/Databricks procedure bodies via `exp.RawString` extraction; keep regex fallback for BigQuery `exp.Command` bodies; 3 test fixtures required | M | HIGH |
 | 10 | #5.2 | 10.2.5 | `indexer/indexer.py`, `parsers/base.py` | Verify `SELECTS_FROM` edges are created for INSERT-SELECT queries; add test fixture asserting `analyze impact` finds ETL INSERT — **elevated to HIGH (confirmed parser bug, see 10.6 Q4)** | M | HIGH |
 | 11 | #5.2 | 10.C | `indexer/indexer.py`, `parsers/base.py`, `cli/commands/index.py` | Introduce `parse_quality` breakdown (full / table_only / scripting_fallback / failed); surface in index summary and `db info` | M | MEDIUM |
 | 12 | #5.2 | 10.2.1 | `server/tools.py`, `cli/commands/mcp.py` | Add binary/package name note to `mcp setup` output and `index_repo`/`list_dialects_and_repos` tool docstrings | XS | LOW |
