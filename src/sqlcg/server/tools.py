@@ -330,7 +330,16 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
                 )
                 queue.append((node_id, depth + 1))
 
-    return LineageResult(column=table_col, lineage=lineage)
+    # Populate hint if result is empty
+    hint = None
+    if not lineage:
+        hint = (
+            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
+            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
+            "Submit feedback with submit_feedback tool if this was a false negative."
+        )
+
+    return LineageResult(column=table_col, lineage=lineage, hint=hint)
 
 
 @mcp.tool()
@@ -367,7 +376,16 @@ def find_table_usages(table_name: str) -> TableUsageResult:
             )
         )
 
-    return TableUsageResult(table=table_name, usages=usages)
+    # Populate hint if result is empty
+    hint = None
+    if not usages:
+        hint = (
+            "No usages found for this table. The table may not be referenced by any "
+            "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
+            "Run 'analyze impact <table>' from the CLI to cross-check."
+        )
+
+    return TableUsageResult(table=table_name, usages=usages, hint=hint)
 
 
 @mcp.tool()
@@ -429,7 +447,16 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
                 )
                 queue.append((node_id, depth + 1))
 
-    return DependencyResult(root=table_col, nodes=nodes)
+    # Populate hint if result is empty
+    hint = None
+    if not nodes:
+        hint = (
+            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
+            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
+            "Submit feedback with submit_feedback tool if this was a false negative."
+        )
+
+    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
@@ -491,7 +518,16 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
                 )
                 queue.append((node_id, depth + 1))
 
-    return DependencyResult(root=table_col, nodes=nodes)
+    # Populate hint if result is empty
+    hint = None
+    if not nodes:
+        hint = (
+            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
+            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
+            "Submit feedback with submit_feedback tool if this was a false negative."
+        )
+
+    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
@@ -529,7 +565,15 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
             )
         )
 
-    return SqlPatternResult(pattern=query, matches=matches)
+    # Populate hint if result is empty
+    hint = None
+    if not matches:
+        hint = (
+            "No matches found. Try a shorter or partial pattern. "
+            "Pattern matching is case-sensitive substring search."
+        )
+
+    return SqlPatternResult(pattern=query, matches=matches, hint=hint)
 
 
 @mcp.tool()
