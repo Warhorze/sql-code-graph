@@ -1,6 +1,7 @@
 """Configuration management for sqlcg."""
 
 import os
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -54,6 +55,28 @@ def get_db_path() -> Path:
         Path to the KùzuDB database file
     """
     return KuzuConfig.from_env().db_path
+
+
+def get_dialect(path: Path) -> str:
+    """Get the SQL dialect from .sqlcg.toml or fall back to snowflake.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        SQL dialect string (e.g., "snowflake", "bigquery", "postgres")
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            dialect = config.get("sqlcg", {}).get("dialect")
+            if dialect:
+                return dialect
+        except Exception:
+            pass
+    return "snowflake"
 
 
 def get_backend() -> "GraphBackend":
