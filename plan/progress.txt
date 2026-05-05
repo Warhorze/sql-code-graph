@@ -1,13 +1,35 @@
 ## Current State
 
-agent: plan-reviewer
-task: Phase 9 implementation review — Git-Aware Graph Freshness
-status: REVIEW COMPLETE
+agent: architect-planner
+task: Phase 10 — Deployment & PyPI Publishing
+status: PLAN COMPLETE — awaiting implementation
 date: 2026-05-04
 ---
 
 
 ## Handoff Log
+
+[2026-05-04] architect-planner — Phase 10 plan complete (Deployment & PyPI Publishing).
+  Summary: Created plan/phase10_deployment.md and added Section 9 to ARCHITECTURE_REVIEW.md.
+  Plan covers: pyproject.toml metadata fixes (author, [project.urls], commitizen version_files),
+  new sqlcg install command (src/sqlcg/cli/commands/install.py) with uvx detection, atomic
+  write, idempotency, --dry-run flag; fix to sqlcg mcp setup --write targeting
+  ~/.claude/settings.json; tag-triggered GitHub Actions publish workflow using OIDC trusted
+  publishing; exact release sequence via uvx commitizen bump.
+  Operational blocker: PyPI trusted publisher must be configured in PyPI UI before first v* tag.
+  Implementation order (lowest risk first):
+    1. pyproject.toml metadata
+    2. commitizen version_files
+    3. mcp setup --write fix
+    4. install.py (new file)
+    5. main.py registration
+    6. test_install.py (10+ tests)
+    7. publish.yml
+    8. PyPI UI trusted publisher setup (operational)
+    9. First release tag
+  No new runtime dependencies. All install logic is stdlib only.
+  Next step: developer implements steps 1-7 in order, then performs PyPI UI setup (step 8),
+  then cuts v0.1.0 tag (step 9).
 
 [2026-05-04] plan-reviewer — Phase 9 implementation review complete (Git-Aware Graph Freshness).
   agent: plan-reviewer
