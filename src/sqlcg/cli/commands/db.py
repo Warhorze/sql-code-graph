@@ -65,6 +65,43 @@ def db_info() -> None:
                 logger.error(f"Error getting count for {label}: {e}")
                 console.print(f"  [red]{label}: error[/red]")
 
+        # Health check section
+        repo_count_result = backend.run_read("MATCH (n:Repo) RETURN COUNT(n) AS count", {})
+        repo_count = repo_count_result[0]["count"] if repo_count_result else 0
+
+        if repo_count == 0:
+            console.print(  # noqa: E501
+                "[red]Database is empty. Run 'sqlcg db init' and 'sqlcg index <path>' first.[/red]"
+            )
+        else:
+            query_count_result = backend.run_read("MATCH (n:SqlQuery) RETURN COUNT(n) AS count", {})
+            query_count = query_count_result[0]["count"] if query_count_result else 0
+
+            if query_count == 0:
+                console.print(
+                    "[yellow]No queries indexed. Run 'sqlcg index <path>' to populate "
+                    "the graph.[/yellow]"
+                )
+            else:
+                col_count_result = backend.run_read(
+                    "MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {}
+                )
+                col_count = col_count_result[0]["count"] if col_count_result else 0
+
+                if col_count == 0:
+                    console.print(
+                        "[yellow]Column lineage not available. Tools trace_column_lineage, "
+                        "get_downstream_dependencies, and get_upstream_dependencies "
+                        "will return empty results.[/yellow]"
+                    )
+
+        # Print COLUMN_LINEAGE edges count
+        edges_result = backend.run_read(
+            "MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {}
+        )
+        edges_count = edges_result[0]["count"] if edges_result else 0
+        console.print(f"  COLUMN_LINEAGE edges: {edges_count}")
+
 
 @app.command("list-repos")
 def list_repos() -> None:

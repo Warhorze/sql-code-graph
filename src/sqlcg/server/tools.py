@@ -563,7 +563,14 @@ def list_dialects_and_repos() -> DialectRepoResult:
             )
         )
 
-    return DialectRepoResult(repos=repos)
+    # Check for health warnings
+    warnings: list[str] = []
+    col_count_result = db.run_read("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})
+    col_count = col_count_result[0]["count"] if col_count_result else 0
+    if col_count == 0:
+        warnings.append("SqlColumn count is 0: column lineage was not extracted")
+
+    return DialectRepoResult(repos=repos, warnings=warnings)
 
 
 @mcp.tool()
