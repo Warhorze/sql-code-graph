@@ -1,14 +1,53 @@
 ## Current State
 
 agent: architect-reviewer
-task: GitHub issues #5 and #6 review + ARCHITECTURE_REVIEW.md Section 10
-plan: ARCHITECTURE_REVIEW.md Section 10 (no plan file; issues are post-v0.2.1 feedback)
-status: REVIEW COMPLETE — issues catalogued, prioritized, 4 open questions recorded
+task: Resolve 4 open questions from Section 10.6 based on user comments on GitHub issues #5 and #6
+plan: ARCHITECTURE_REVIEW.md Section 10.6 (all four questions now resolved)
+status: RESOLVED — all open questions answered; implementation plan unblocked for ranks 3, 6, 8, 10
 date: 2026-05-05
 ---
 
 
 ## Handoff Log
+
+[2026-05-05] architect-reviewer — Resolved all 4 open questions from Section 10.6.
+  Summary: Read user comments on GitHub issues #5 and #6 plus inline annotations in
+  ARCHITECTURE_REVIEW.md Section 10.6. All four blocking questions resolved.
+
+  Q1 (sqlcg uninstall interaction model): RESOLVED.
+  - DB deletion requires an interactive prompt ("With this action you will drop the graph
+    database?") unless --force is passed, which skips the prompt and also deletes the
+    SQLite metrics store. --keep-db skips both prompt and deletion. DB deletion only
+    offered for local KùzuDB backends; Neo4j remote backends are never touched.
+  - Source: inline annotation in Section 10.6 + issue #6 comment by Warhorze:
+    "maybe also delete the database (graph + sqlite) when run with --force"
+
+  Q2 (.sqlcg.toml committing policy): RESOLVED.
+  - `path` field is optional, defaults to cwd when absent. File is therefore safe to
+    commit (no machine-specific absolute path). README should note that a manually-added
+    `path` key would be machine-specific. Spec updated in Section 10.6.
+  - Source: inline annotation "resolve as `cwd`"
+
+  Q3 (FN label for submit_feedback): RESOLVED.
+  - Yes, add FN as a valid label. No migration script needed; project has confirmed
+    no-backward-compatibility policy. Old TP/FP records remain valid.
+  - Source: inline annotation "yes"
+
+  Q4 (analyze impact scope — ETL INSERT or DDL-only): RESOLVED.
+  - analyze impact must include ETL INSERT-SELECT queries. Confirmed parser bug, not
+    intentional DDL-only scope. Elevated rank 10 from MEDIUM to HIGH in Section 10.4.
+  - Source: issue #5 description ("the two commands should return consistent results")
+
+  Additional policy recorded:
+  - No backward compatibility constraint ("WE DON'T NEED TO KEEP A VERSION, WE WILL
+    BREAK THINGS CAUSE THE PACKAGE IS LIVE"). Recorded as Section 10.7.
+
+  Updated files:
+  - ARCHITECTURE_REVIEW.md: Section 10.6 expanded with full resolution text for each
+    question; Section 10.7 added (policy note); Section 10.4 rank 10 elevated to HIGH.
+
+  All four implementation plan items (ranks 3, 6, 8, 10) are now unblocked.
+  Next step: architect-planner or developer can proceed with Section 10.4 rank order.
 
 [2026-05-05] architect-reviewer — GitHub issues #5 and #6 review (v0.2.1 feedback session).
   Summary: Reviewed both open issues in detail against the live codebase (v0.2.1).

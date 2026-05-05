@@ -1055,12 +1055,15 @@ corpus), but this assumption is never stated to the user.
 
 1. Add a `--exclude-schema` flag to `analyze unused` that filters out tables whose
    qualified name starts with the specified schema prefix. This allows users to exclude
-   known consumer schemas: `sqlcg analyze unused --exclude-schema IA_ANALYTICS`.
+   known consumer schemas: `sqlcg analyze unused --exclude-schema IA_ANALYTICS`. 
+
+WR: it needs to be very clear to the user what it is that they're doing when to exclude ? when not? agian this information should be past to the llm otherwise it is unclear. it might be usefull if you'd look at it from a medalion architectur perspective.
 
 2. Always print a caveat after results: "Note: results include tables not referenced
    within the indexed files. Externally consumed tables (e.g., Tableau/BI views) will
    appear as unused." This caveat should also appear in the MCP tool docstring for
    `find_table_usages` and in the `analyze unused` `--help`.
+
 
 3. The same caveat applies to the MCP server's future `find_unused_tables` tool (if
    planned).
@@ -1127,7 +1130,7 @@ Cypher. This ratio is not surfaced in `sqlcg gain`.
 
 ---
 
-#### 10.2.7 [MEDIUM] Parser: `ALTER WAREHOUSE` and `CALL` produce noise
+#### 10.2.7 [HIGH] Parser: `ALTER WAREHOUSE` and `CALL` produce noise
 
 `ALTER WAREHOUSE IDENTIFIER($var) SET WAREHOUSE_SIZE = 'X-Large'` is a standard
 Snowflake DDL rebuild pattern that fails to parse and falls back to `exp.Command`.
@@ -1143,6 +1146,8 @@ level (not WARNING) when these are stripped, so they do not appear in the 900KB 
 parse warnings reported in the test session.
 
 This is consistent with the existing finding 3.12 (`_EMBEDDED_DML` regex issues).
+
+WR: This needs more information, what other dml should we strip? only these? or what are other logical strips for different dialects? does sqlglot have something prebuild?
 
 ---
 
@@ -1179,7 +1184,7 @@ in the README since it contains an absolute path that is machine-specific.
 
 ---
 
-#### 10.2.9 [MEDIUM] No progress feedback during `sqlcg index`
+#### 10.2.9 [LOW] No progress feedback during `sqlcg index`
 
 `sqlcg index` on 1457 files took ~17 seconds with zero stdout output until the final
 summary line appeared. The `edges: 0` signal (indicating the graph has no relationships
@@ -1278,10 +1283,15 @@ low effort ranks higher).
 | 7 | #5.2 | 10.2.4 | `cli/commands/analyze.py` | Add `--exclude-schema` to `analyze unused`; always append closed-world caveat to output | S | MEDIUM |
 | 8 | #5.2 | 10.2.6 | `server/tools.py`, `metrics/store.py` | Add `FN` label to `submit_feedback`; add `execute_cypher` ratio to `sqlcg gain` output | S | MEDIUM |
 | 9 | #5.2 | 10.2.7 | `parsers/snowflake_parser.py` | Add pre-filter for `ALTER WAREHOUSE` and `CALL` statements in `_parse_scripting_file`; log at DEBUG not WARNING | XS | MEDIUM |
-| 10 | #5.2 | 10.2.5 | `indexer/indexer.py`, `parsers/base.py` | Verify `SELECTS_FROM` edges are created for INSERT-SELECT queries; add test fixture asserting `analyze impact` finds ETL INSERT | M | MEDIUM |
+| 10 | #5.2 | 10.2.5 | `indexer/indexer.py`, `parsers/base.py` | Verify `SELECTS_FROM` edges are created for INSERT-SELECT queries; add test fixture asserting `analyze impact` finds ETL INSERT — **elevated to HIGH (confirmed parser bug, see 10.6 Q4)** | M | HIGH |
 | 11 | #5.2 | 10.C | `indexer/indexer.py`, `parsers/base.py`, `cli/commands/index.py` | Introduce `parse_quality` breakdown (full / table_only / scripting_fallback / failed); surface in index summary and `db info` | M | MEDIUM |
 | 12 | #5.2 | 10.2.1 | `server/tools.py`, `cli/commands/mcp.py` | Add binary/package name note to `mcp setup` output and `index_repo`/`list_dialects_and_repos` tool docstrings | XS | LOW |
 | 13 | #5.2 | 10.2.10 | `README.md` / install docs | Add `uv tool install` recommendation; note cold-start latency in `sqlcg install` confirmation message | XS | LOW |
+
+Note (2026-05-05): Ranks 3, 6, 8, and 10 were blocked on open questions. All four
+are now resolved — see section 10.6. Rank 10 was elevated from MEDIUM to HIGH after
+the user confirmed that `analyze impact` must include ETL INSERT statements (confirmed
+parser bug, not a design constraint).
 
 ---
 
@@ -1310,28 +1320,121 @@ sources. This requires a developer investigation before a fix can be scoped.
 
 ---
 
-### 10.6 Open Questions from Issue Analysis
+### 10.6 Open Questions from Issue Analysis — RESOLVED (2026-05-05)
 
-The following questions require user input before implementation can begin:
+All four open questions were resolved by user comments on the GitHub issues.
 
-1. **`sqlcg uninstall` scope**: Should `sqlcg uninstall` prompt for confirmation before
-   deleting `~/.sqlcg/` (which may contain hours of indexed data), or should the
-   `--keep-db` flag be sufficient? Recommendation: require `--yes` flag for db deletion;
-   always prompt interactively if neither `--keep-db` nor `--yes` is passed.
+---
 
-2. **`.sqlcg.toml` committing**: Should `.sqlcg.toml` be committed to the repository
-   (enabling team-wide dialect config) or gitignored (because it contains an absolute
-   path)? The `path` field makes it machine-specific; the `dialect` field is shareable.
-   Recommendation: split into `dialect`-only (committable) and `path`-only (gitignored),
-   or make `path` optional and resolve it as `cwd` when absent.
+**Q1 — `sqlcg uninstall` interaction model: RESOLVED**
 
-3. **`FN` feedback label**: Adding `FN` (false negative) to `submit_feedback` changes
-   the MetricsStore schema. Confirm this is acceptable before implementation.
+Decision: prompt the user before deleting the graph database; support `--force` to
+skip the prompt. DB deletion is only offered when the database is local (KùzuDB
+embedded at `~/.sqlcg/` or `SQLCG_DB_PATH`). Neo4j remote backends are never
+deleted by `sqlcg uninstall` — only the MCP registration and git hook are removed.
 
-4. **`analyze impact` vs `find pattern` inconsistency**: Is the expected behavior that
-   `analyze impact` finds ETL INSERT statements that use the table as a source? If yes,
-   this is a parser bug and should be ranked higher. If no (i.e., `analyze impact` is
-   intentionally DDL-only), the tool description must say so explicitly.
+Concrete interaction contract for `cli/commands/uninstall.py`:
 
-These are recorded here for the architect-planner to resolve before the developer
-implements rank 3, 6, 8, and 10 above.
+- Step 1: always remove `mcpServers["sql-code-graph"]` from `~/.claude/settings.json`
+  (atomic `.tmp` + `os.replace`, same guard as install).
+- Step 2: if the active backend is local KùzuDB, prompt:
+  "This will delete the graph database at `<path>`. Continue? [y/N]"
+  If `--force` is passed, skip the prompt and proceed. If `--keep-db` is passed,
+  skip both prompt and deletion.
+- Step 3: remove the `# sqlcg post-checkout hook` sentinel block from
+  `.git/hooks/post-checkout` in `Path.cwd()` (or `--repo <path>`). Delete the hook
+  file if it becomes empty after stripping.
+- Print a confirmation line per step taken.
+
+The `--force` flag also deletes the SQLite metrics store (same `~/.sqlcg/` path)
+per the user's comment "maybe also delete the database (graph + sqlite) when run
+with --force."
+
+Impact on implementation plan: rank 3 (`uninstall.py`) spec is now complete. No
+further design questions.
+
+---
+
+**Q2 — `.sqlcg.toml` committing policy: RESOLVED**
+
+Decision: make `path` optional in `.sqlcg.toml`; resolve to `cwd` when absent.
+The file is therefore committable (no machine-specific absolute path).
+
+Revised spec for `.sqlcg.toml`:
+
+```toml
+[sqlcg]
+dialect = "snowflake"
+# path is optional; defaults to the directory containing this file (cwd at index time)
+```
+
+`sqlcg index <path> --dialect <dialect>` writes this file at the root of the indexed
+path. If `path` equals `cwd`, the `path` key is omitted entirely. `sqlcg index`
+with no arguments reads `.sqlcg.toml` from cwd and uses `dialect` from it; `path`
+defaults to cwd.
+
+The file should NOT be added to `.gitignore`. Teams can commit it to share the
+dialect config. The README should note that `.sqlcg.toml` without a `path` key is
+safe to commit; a `path` key (if the user adds one manually for a non-cwd root)
+is machine-specific and should be gitignored.
+
+Impact on implementation plan: rank 6 (`.sqlcg.toml` write) spec is now complete.
+
+---
+
+**Q3 — `FN` label for `submit_feedback`: RESOLVED**
+
+Decision: yes, add `FN` as a valid label. The MetricsStore schema change is
+acceptable — the project has a no-backward-compatibility policy ("WE DON'T NEED TO
+KEEP A VERSION, WE WILL BREAK THINGS CAUSE THE PACKAGE IS LIVE"). Schema migrations
+are handled by re-initialising the SQLite metrics store on startup if the schema
+version changes.
+
+Implementation note: add `FN` to the `FeedbackLabel` enum (or string literal set)
+in `metrics/store.py` and update the `submit_feedback` tool docstring and any
+validation that guards the label field. No migration script is needed — the store
+is a local append-only log; old records with `TP`/`FP` labels remain valid.
+
+Impact on implementation plan: rank 8 (`submit_feedback` `FN` label) is unblocked.
+
+---
+
+**Q4 — `analyze impact` expected scope: RESOLVED**
+
+Decision: `analyze impact` must include ETL INSERT statements that use the table as
+a source. The inconsistency reported in issue #5 ("`analyze impact` returned only
+DDL files while `find pattern` additionally found the ETL INSERT") is confirmed as a
+parser bug, not an intentional design constraint. The user's issue description states
+"the two commands should return consistent results."
+
+Implication: `analyze impact` is not DDL-only. Its scope is all `SqlQuery` nodes
+that reference the target table via `SELECTS_FROM` edges — SELECT, INSERT-SELECT,
+CTAS, MERGE, and UPDATE-FROM all qualify. The bug is that `_upsert_parsed_file` may
+not create `SELECTS_FROM` edges for INSERT statements. This must be verified and
+fixed.
+
+Priority escalation: the inconsistency (originally rank 10 in section 10.4) is now
+confirmed as a parser bug and should be treated as HIGH priority. Elevate to rank 4
+(tied with the `hint` field addition, rank 5). The regression test fixture
+(`tests/fixtures/synthetic/etl_chain.sql` or a new `insert_select_impact.sql`)
+is now a mandatory deliverable for the developer.
+
+---
+
+### 10.7 Policy Note — No Backward Compatibility Constraint
+
+The user confirmed: "WE DON'T NEED TO KEEP A VERSION, WE WILL BREAK THINGS CAUSE
+THE PACKAGE IS LIVE."
+
+This policy applies to: MetricsStore SQLite schema, KùzuDB graph schema, MCP tool
+response model shapes, `.sqlcg.toml` format, and the `pyproject.toml` dependency
+pins. Breaking changes between releases are acceptable without a deprecation cycle.
+The architect-reviewer notes this means:
+
+- Finding 3.6 (`QueryNode` mutability) can be fixed with `frozen=True` without a
+  migration path for serialised graph data (re-index is the migration).
+- The `FN` label schema change (Q3) needs no migration script.
+- The `parse_quality` breakdown (finding 10.C) can replace the existing `parse_errors`
+  field in `ParsedFile` without an adapter layer.
+- The `hint` field addition to result models (finding 10.B) can be non-optional if
+  desired, though keeping it `str | None` is still the cleaner design.
