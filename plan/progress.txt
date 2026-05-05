@@ -1,14 +1,53 @@
 ## Current State
 
-agent: architect-reviewer
-task: Resolve 4 open questions from Section 10.6 based on user comments on GitHub issues #5 and #6
-plan: ARCHITECTURE_REVIEW.md Section 10.6 (all four questions now resolved)
-status: RESOLVED — all open questions answered; implementation plan unblocked for ranks 3, 6, 8, 10
+agent: architect-planner
+task: Produce sprint_next.md — developer-ready implementation plan for all open work from ARCHITECTURE_REVIEW.md sections 10.1–10.2.10, 10.B, 10.C
+plan: plan/sprint_next.md
+status: COMPLETE — plan written and committed
 date: 2026-05-05
 ---
 
 
 ## Handoff Log
+
+[2026-05-05] architect-planner — Sprint next plan written (plan/sprint_next.md).
+  Summary: Produced a developer-ready implementation plan covering all open work from
+  ARCHITECTURE_REVIEW.md as of 2026-05-05. 14 tickets, T-01 through T-14, covering:
+
+  Architecture findings (section 4):
+    T-04 — transaction() atomicity (finding 3.1, HIGH)
+    T-05 — resolve_pass2 file re-open safety (finding 3.2, HIGH)
+    T-06 — _extract_column_lineage exception recording (finding 3.4, HIGH)
+
+  PR review (section 8.2 comment 7):
+    T-11 — _classify match/case + exp.DML refactor (combined with 10.2.7 rewrite)
+
+  Issue #6 remediation:
+    T-03 — sqlcg uninstall command (10.1, 10.A, 10.6 Q1)
+
+  Issue #5 remediation:
+    T-01 — QUICK START block + binary/package name note (10.2.2, 10.2.1)
+    T-02 — db info health-check warnings (10.2.3)
+    T-07 — hint field in empty result models (10.B)
+    T-08 — index progress output and edges warning (10.2.9)
+    T-09 — parse_quality breakdown (10.C)
+    T-10 — SELECTS_FROM edges for INSERT-SELECT (10.2.5, 10.6 Q4)
+    T-11 — scripting-block DML extraction rewrite (10.2.7)
+    T-12 — medallion-aware analyze unused + .sqlcg.toml write (10.2.4, 10.2.8, 10.6 Q2)
+    T-13 — FN label + execute_cypher ratio (10.2.6, 10.6 Q3)
+    T-14 — README cold-start docs (10.2.10)
+
+  Dependency mapping:
+    T-06 BLOCKS T-09, T-10, T-11 (must be done first)
+    T-02 BLOCKS T-09 (edges count additive)
+    All others INDEPENDENT
+
+  Skipped per review instructions:
+    Finding 3.5 — RESOLVED (token-aware BEGIN check already in code)
+    Finding 3.12 — SUPERSEDED by T-11 (regex replaced by tokenizer approach)
+
+  Next step: developers can pick up T-01, T-02, T-03, T-04, T-05, T-07, T-08, T-13, T-14
+  in parallel (all INDEPENDENT). T-06 should be prioritized in Week 2 to unblock T-09, T-10, T-11.
 
 [2026-05-05] architect-reviewer — Resolved all 4 open questions from Section 10.6.
   Summary: Read user comments on GitHub issues #5 and #6 plus inline annotations in
