@@ -1,13 +1,79 @@
 ## Current State
 
-agent: architect-planner
+agent: plan-reviewer
 task: Phase 10 — Deployment & PyPI Publishing
-status: PLAN COMPLETE — awaiting implementation
+plan: plan/phase10_deployment.md
+status: READY FOR IMPLEMENTATION (corrections applied)
 date: 2026-05-04
 ---
 
 
 ## Handoff Log
+
+[2026-05-04] plan-reviewer — Phase 10 plan reviewed and corrected (Deployment & PyPI Publishing).
+  agent: plan-reviewer
+  plan: plan/phase10_deployment.md
+  status: READY FOR IMPLEMENTATION
+
+  5 issues found and resolved in the plan:
+
+  BLOCKER 1 (publish.yml — reusable workflow call without workflow_call trigger):
+  The plan's publish.yml called `uses: ./.github/workflows/test.yml` but test.yml has
+  `on: [push, pull_request]` only. GitHub Actions requires a `workflow_call:` trigger in
+  test.yml for the `uses:` syntax to work. Without it the publish job fails immediately
+  with "does not define any reusable workflow." Fixed: Step 10.5.1 now specifies a
+  mandatory Part A that adds `workflow_call:` to test.yml before creating publish.yml.
+  Also added as BLOCKER A in the Blocking Questions section.
+
+  BLOCKER 2 (Blocking Questions section said "None"):
+  The plan's ## Blocking Questions section opened with "None. All required decisions are
+  resolved:" but then described a blocking pre-condition in the same paragraph. A developer
+  reading only the Blocking Questions section would miss both blockers. Fixed: section
+  rewritten to explicitly call out BLOCKER A (workflow_call trigger) and BLOCKER B
+  (PyPI trusted publisher pre-condition). Design decisions moved to a clearly labelled
+  sub-list.
+
+  DEVIATION (Step 10.1.2 referenced in Implementation Order Summary but had no body):
+  The Implementation Order Summary listed Step 10.1.2 (commitizen version_files) as step 2,
+  but there was no Step 10.1.2 section in the plan body — only Step 10.1.1. The version_files
+  change was described inside Step 10.6.1 (Release Process) instead. Fixed: added a proper
+  Step 10.1.2 section body after Step 10.1.1, with files affected, exact TOML, and acceptance
+  criterion. The version_files spec in Step 10.6.1 is kept as-is (it is still valid context).
+
+  WARNING (Tests 9 and 10 called mcp_setup() as a plain function):
+  Tests 9 and 10 specified calling `mcp_setup(print_only=False)` directly. In the actual
+  mcp.py, mcp_setup is a Typer command — calling it with a keyword arg bypasses Typer's
+  option parsing and injects the value via the Typer.Option default, which works in simple
+  cases but is not the correct testing pattern and would break if Typer adds validation.
+  Fixed: test descriptions updated to use `CliRunner().invoke(mcp.app, ["setup", "--write"])`.
+
+  MISSING (sys listed as stdlib import in Design > Dependencies but not used in install.py):
+  The Design section listed `sys` in the stdlib imports list but the install.py code snippet
+  does not import or use sys anywhere. Fixed: removed sys from the list.
+
+  Notes (no plan change):
+  - NOTE: The mcp setup --write acceptance criterion says "running it twice does not
+    duplicate the key" but the mcp.py step does not specify an idempotency check equivalent
+    to install.py's `existing.get("mcpServers", {}).get(SERVER_KEY) == entry`. This is
+    acceptable because the merge strategy `setdefault("mcpServers", {})[key] = entry`
+    is naturally idempotent (it overwrites the key with the same value). No change needed.
+  - NOTE: The GitHub Actions environment named "pypi" must also be created in the repo
+    settings (Settings > Environments) before the publish job will succeed. This is
+    mentioned in the workflow notes but could be added to BLOCKER B for completeness.
+    Not changed — it is already covered in Step 10.5.1's operational blocker block.
+
+  Next step: developer implements steps in order:
+    1. Step 10.1.1 — pyproject.toml author + [project.urls]
+    2. Step 10.1.2 — commitizen version_files
+    3. Step 10.2.1 — fix mcp setup --write
+    4. Step 10.3.1 — create install.py
+    5. Step 10.3.2 — register in main.py
+    6. Step 10.4.1 — write test_install.py (10 tests)
+    7. Step 10.5.1 Part A — add workflow_call to test.yml
+    7. Step 10.5.1 Part B — create publish.yml
+    8. BLOCKER B — configure PyPI trusted publisher in PyPI UI
+    9. Step 10.6 — cut v0.1.0 tag
+
 
 [2026-05-04] architect-planner — Phase 10 plan complete (Deployment & PyPI Publishing).
   Summary: Created plan/phase10_deployment.md and added Section 9 to ARCHITECTURE_REVIEW.md.
