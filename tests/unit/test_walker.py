@@ -32,6 +32,7 @@ def temp_sql_tree():
 # rglob fallback (use_git=False)
 # ---------------------------------------------------------------------------
 
+
 def test_walk_sql_files_yields_only_sql(temp_sql_tree):
     spec = load_ignore_spec(temp_sql_tree)
     files = list(walk_sql_files(temp_sql_tree, spec, use_git=False))
@@ -66,6 +67,7 @@ def test_walk_sql_files_empty_ignore_patterns(temp_sql_tree):
 # git mode (use_git=True, default)
 # ---------------------------------------------------------------------------
 
+
 def test_git_mode_returns_only_tracked_files(temp_sql_tree):
     """Only files returned by git ls-files are indexed."""
     tracked = ["queries.sql", "subdir/nested.sql"]
@@ -74,6 +76,7 @@ def test_git_mode_returns_only_tracked_files(temp_sql_tree):
         assert cmd == ["git", "ls-files", "--cached"]
         assert cwd == temp_sql_tree
         import subprocess as sp
+
         r = sp.CompletedProcess(cmd, 0)
         r.stdout = "\n".join(tracked) + "\n"
         r.stderr = ""
@@ -120,8 +123,9 @@ def test_git_mode_is_default(temp_sql_tree):
         assert cmd == ["git", "ls-files", "--cached"]
         assert cwd == temp_sql_tree
         import subprocess as sp
+
         r = sp.CompletedProcess(cmd, 0)
-        r.stdout = "queries.sql\n"
+        r.stdout = "\n".join(tracked) + "\n"
         r.stderr = ""
         return r
 

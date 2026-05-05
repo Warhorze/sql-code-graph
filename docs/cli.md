@@ -22,6 +22,7 @@ bash scripts/generate_cli_docs.sh
 | `find` | Search the graph |
 | `analyze` | Lineage analysis |
 | `mcp` | MCP server commands |
+| `git` | Git integration commands |
 
 ## `sqlcg`
 
@@ -50,11 +51,12 @@ Index SQL files in a directory.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --dialect, -d | TEXT | No | No |  | SQL dialect |
+| --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
 | --timeout-per-file | INTEGER | No | No | 30 | Timeout per file in seconds |
 | --no-ddl | BOOLEAN | No | No | False | Skip DDL statements (not yet fully implemented) |
 | --schema-from-info-schema | TEXT | No | No |  | (Not yet implemented) |
+| --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
 
 ## `sqlcg watch`
 
@@ -390,3 +392,34 @@ Start the MCP server.
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | _none_ |  |  |  |  |  |
+
+## `sqlcg git`
+
+```bash
+sqlcg git [OPTIONS] COMMAND [ARGS]...
+```
+
+Git integration commands
+
+### Subcommands
+
+| Subcommand | Description |
+| --- | --- |
+| `install-hooks` | Install git hooks for sqlcg integration. |
+
+## `sqlcg git install-hooks`
+
+```bash
+sqlcg git install-hooks [OPTIONS]
+```
+
+Install git hooks for sqlcg integration.
+
+Writes a post-checkout hook that triggers graph resync after branch switches.
+Idempotent: running multiple times produces one hook entry.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --repo, -r | PATH | No | No |  | Path to git repository (default: current directory) |
