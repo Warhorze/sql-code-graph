@@ -822,3 +822,83 @@ convert errors into silent incorrect behavior.
 The blueprint is implementation-ready for Phase 1 (data model freeze, `GraphBackend`
 ABC, single-file parser) with the caveat that the six open questions (particularly
 questions 1, 2, and 4) should be resolved before Phase 2 (cross-file indexer) begins.
+
+---
+
+## 9. Phase 10 — Deployment & PyPI Publishing
+
+Review date: 2026-05-04
+Author: architect-planner
+
+### 9.1 Goal
+
+`pip install sql-code-graph` (or `uvx sql-code-graph`) followed by `sqlcg install`
+registers the MCP server in Claude Code's `~/.claude/settings.json` with no manual
+JSON editing. Tag-triggered GitHub Actions workflow publishes to PyPI automatically.
+
+### 9.2 Architecture Decisions
+
+**Settings file target**: `~/.claude/settings.json` under the `mcpServers` key.
+This is the same file used by both Claude Desktop and Claude Code. The `mcp.json`
+path previously targeted by `mcp setup --write` was incorrect and is removed.
+
+**Command detection at install time**: `shutil.which("uvx")` determines which
+invocation is written to the settings file. If `uvx` is available, the entry uses
+`{"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}`. Otherwise it
+falls back to `{"command": "sqlcg", "args": ["mcp", "start"]}`.
+
+**Atomic write**: settings file is written via a `.tmp` sibling + `os.replace` to
+prevent data corruption if the process is interrupted.
+
+**Idempotency**: if the `sql-code-graph` key already exists in `mcpServers` with
+an identical value, the install command prints "Already configured" and exits 0
+without touching the file.
+
+**PyPI publishing**: OIDC trusted publishing via `pypa/gh-action-pypi-publish`.
+No long-lived API tokens stored in GitHub secrets. The publish job is gated behind
+the full test matrix (`needs: test`).
+
+**Version synchronisation**: commitizen `version_files` must include both
+`pyproject.toml:version` and `src/sqlcg/__init__.py:__version__`. A version bump
+via `uvx commitizen bump` updates both atomically.
+
+### 9.3 New Files
+
+| File | Purpose |
+|------|---------|
+| `src/sqlcg/cli/commands/install.py` | `sqlcg install` command implementation |
+| `tests/unit/test_install.py` | 10+ unit tests for install logic |
+| `.github/workflows/publish.yml` | Tag-triggered PyPI publish workflow |
+
+### 9.4 Modified Files
+
+| File | Change |
+|------|--------|
+| `pyproject.toml` | Author, `[project.urls]`, commitizen `version_files` |
+| `src/sqlcg/cli/commands/mcp.py` | Fix `--write` target path and merge strategy |
+| `src/sqlcg/cli/main.py` | Register `install_cmd` |
+
+### 9.5 Operational Pre-condition (Blocking)
+
+Before the `v*` tag can trigger a successful PyPI publish, the PyPI project must
+have the GitHub repository configured as a trusted publisher:
+
+1. Log in to https://pypi.org as `Warhorze`
+2. Navigate to Account Settings > Publishing
+3. Add publisher: owner=`Warhorze`, repo=`sql-code-graph`, workflow=`publish.yml`,
+   environment=`pypi`
+4. Perform the first publish locally via `uv publish --token <api-token>` to create
+   the project on PyPI (OIDC cannot create a new project, only publish to an existing one)
+5. From the second release onwards, tag-triggered OIDC publishing is fully automatic
+
+### 9.6 Constraints from Existing Architecture
+
+- No new runtime dependencies. All install logic uses stdlib (`json`, `os`,
+  `pathlib`, `shutil`).
+- The existing `typer` + `rich` stack is used for the install command, consistent
+  with all other CLI commands.
+- Unit tests use `tmp_path` exclusively; no test may write to `~/.claude/`.
+- The publish workflow must pass the full `test.yml` matrix before publishing.
+  This is enforced via `needs: test` in the workflow YAML.
+
+Full implementation spec: `plan/phase10_deployment.md`

@@ -17,3 +17,12 @@ jobs:
         run: uv run pyright
       - name: Lint
         run: uv run ruff check .
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --all-extras
+      - run: bash scripts/generate_cli_docs.sh
+      - run: git diff --exit-code -- docs/cli.md

@@ -5,7 +5,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from sqlcg.core.config import get_backend, get_db_path
+from sqlcg.core.config import get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
@@ -14,7 +14,7 @@ console = Console()
 def index_cmd(  # noqa: B008
     path: Path = typer.Argument(..., help="Directory to index"),  # noqa: B008
     dialect: str | None = typer.Option(  # noqa: B008
-        None, "--dialect", "-d", help="SQL dialect"
+        None, "--dialect", "-d", help="SQL dialect (or 'auto' to read from .sqlcg.toml)"
     ),
     dbt_manifest: Path | None = typer.Option(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"
@@ -28,6 +28,9 @@ def index_cmd(  # noqa: B008
     schema_from_info_schema: str | None = typer.Option(  # noqa: B008
         None, "--schema-from-info-schema", hidden=True, help="(Not yet implemented)"
     ),
+    quiet: bool = typer.Option(  # noqa: B008
+        False, "--quiet", "-q", help="Suppress summary console output"
+    ),
 ) -> None:
     """Index SQL files in a directory."""
     if schema_from_info_schema:
@@ -37,6 +40,10 @@ def index_cmd(  # noqa: B008
     # TODO: wire no_ddl through to the indexer once it supports the parameter
     if no_ddl:
         console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
+
+    # Resolve dialect: 'auto' reads from .sqlcg.toml, otherwise use provided value
+    if dialect == "auto":
+        dialect = get_dialect(path)
 
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,8 +83,10 @@ def index_cmd(  # noqa: B008
                 {},
             )
 
-        console.print(
-            f"[green]Indexed[/green] {summary['files_parsed']} files — "
-            f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
-            f"{summary['parse_errors']} errors"
-        )
+        # Print summary unless --quiet is specified
+        if not quiet:
+            console.print(
+                f"[green]Indexed[/green] {summary['files_parsed']} files — "
+                f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
+                f"{summary['parse_errors']} errors"
+            )
