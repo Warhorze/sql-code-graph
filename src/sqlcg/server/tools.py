@@ -689,25 +689,28 @@ def submit_feedback(
 
     **For Claude**: When a user says "that result was wrong" or "this is a
     false positive", call this tool with label="FP". When they confirm
-    "that's correct", call with label="TP". Use the query or pattern as
-    the 'query' argument and include any user feedback in the 'note'.
+    "that's correct", call with label="TP". When a tool should have
+    returned a result but got empty, call with label="FN" (false negative).
+    Use the query or pattern as the 'query' argument and include any user
+    feedback in the 'note'.
 
     Args:
         tool_name: Name of the tool being evaluated (e.g., "trace_column_lineage")
         query: The query or pattern that was evaluated
-        label: Feedback label: "TP" (true positive) or "FP" (false positive)
+        label: Feedback label: "TP" (true positive), "FP" (false positive), or
+               "FN" (false negative — expected a result but got empty)
         note: Optional user note (truncated to 500 chars)
 
     Returns:
         Dict with status: "recorded" or "skipped"
 
     Raises:
-        ValueError: If label is not "TP" or "FP"
+        ValueError: If label is not "TP", "FP", or "FN"
     """
     global _metrics
 
-    if label not in ("TP", "FP"):
-        raise ValueError(f"Invalid label: {label}. Must be 'TP' or 'FP'.")
+    if label not in ("TP", "FP", "FN"):
+        raise ValueError(f"Invalid label: {label}. Must be 'TP', 'FP', or 'FN'.")
 
     if _metrics is not None:
         try:
