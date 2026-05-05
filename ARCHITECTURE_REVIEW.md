@@ -1130,24 +1130,42 @@ Cypher. This ratio is not surfaced in `sqlcg gain`.
 
 ---
 
-#### 10.2.7 [HIGH] Parser: `ALTER WAREHOUSE` and `CALL` produce noise
+#### 10.2.7 [HIGH] Parser: noise statements in scripting blocks
 
 `ALTER WAREHOUSE IDENTIFIER($var) SET WAREHOUSE_SIZE = 'X-Large'` is a standard
 Snowflake DDL rebuild pattern that fails to parse and falls back to `exp.Command`.
-`CALL MA.MSSPR_*()` stored procedure calls similarly produce noise.
+`CALL MA.MSSPR_*()` stored procedure calls similarly produce noise. These were the
+two observed instances, but scripting blocks can contain many other non-DML statement
+types: `SET variable = value`, `LET x := y`, `EXECUTE IMMEDIATE`, `RETURN`, `RAISE`,
+`OPEN/FETCH/CLOSE` (cursor ops), `TRUNCATE TABLE`, and any `CREATE/DROP/ALTER` inside
+a block. Enumerating them per-dialect is a maintenance trap.
 
-Both are non-DML, non-DDL utility statements. They should be stripped before DML
-extraction in `SnowflakeParser._parse_scripting_file` to eliminate the noise.
+**Root cause**: `_EMBEDDED_DML` is a regex applied to the raw SQL text. It does not
+understand statement boundaries (semicolons inside string literals break it — finding
+3.12) and has no way to classify what it captures. Any statement fragment that leaks
+through gets handed to `sqlglot.parse()` and produces a noisy `exp.Command` error.
 
-**Resolution**: Add `ALTER WAREHOUSE` and `CALL` to a pre-filter regex in
-`SnowflakeParser` that strips these statements before the `_EMBEDDED_DML` extraction
-pass. This is a pure parser improvement with no schema or MCP impact. Log at DEBUG
-level (not WARNING) when these are stripped, so they do not appear in the 900KB of
-parse warnings reported in the test session.
+**Resolution**: Replace the `_EMBEDDED_DML` regex extraction with a two-step
+sqlglot-native approach in `SnowflakeParser._parse_scripting_file`:
 
-This is consistent with the existing finding 3.12 (`_EMBEDDED_DML` regex issues).
+1. **Split on statement boundaries** using `sqlglot.tokenize()` + semicolon tokens.
+   The tokenizer handles semicolons inside string literals correctly — no regex needed.
+2. **Classify each chunk** by calling `sqlglot.parse(chunk, dialect=...)` and
+   keeping only expressions that are instances of
+   `(exp.Select, exp.Insert, exp.Update, exp.Delete)`.
+   Everything else — `exp.Command`, `exp.AlterTable`, `exp.Use`, `exp.Command`,
+   stored-proc calls — is dropped and logged at DEBUG level, not WARNING.
 
-WR: This needs more information, what other dml should we strip? only these? or what are other logical strips for different dialects? does sqlglot have something prebuild?
+This approach is dialect-agnostic: `exp.Command` is sqlglot's universal "unrecognized
+statement" bucket, covering `ALTER WAREHOUSE`, `CALL`, `SET`, `LET`, `EXECUTE
+IMMEDIATE`, and any future Snowflake additions without requiring a dialect-specific
+enumeration. The same logic works unchanged for BigQuery, Databricks, and ANSI
+scripting blocks.
+
+**Files**: `src/sqlcg/parsers/snowflake_parser.py` — remove `_EMBEDDED_DML` regex,
+rewrite `_parse_scripting_file`. No schema or MCP impact. Add a test fixture with a
+scripting block containing at least one `ALTER WAREHOUSE`, one `CALL`, and one
+`INSERT INTO ... SELECT` to assert that only the INSERT is indexed.
 
 ---
 
