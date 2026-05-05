@@ -3,7 +3,19 @@
 import typer
 from dotenv import load_dotenv
 
-from sqlcg.cli.commands import analyze, db, find, gain, git, index, install, mcp, report, watch
+from sqlcg.cli.commands import (
+    analyze,
+    db,
+    find,
+    gain,
+    git,
+    index,
+    install,
+    mcp,
+    report,
+    uninstall,
+    watch,
+)
 
 help_text = """SQL code graph analyzer.
 
@@ -30,6 +42,7 @@ app.command("watch")(watch.watch_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)
 app.command("install")(install.install_cmd)
+app.command("uninstall")(uninstall.uninstall_cmd)
 
 
 @app.command()
