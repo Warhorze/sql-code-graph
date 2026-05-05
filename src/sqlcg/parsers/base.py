@@ -384,7 +384,12 @@ class SqlParser(ABC):
                         if root:
                             # Successfully extracted lineage
                             # TODO: convert root to LineageEdge(s)
-                            pass
+                            self._log.debug(
+                                "sg_lineage root obtained but conversion not yet "
+                                "implemented: file=%s col=%s",
+                                path,
+                                col_name,
+                            )
                     except Exception as exc:
                         self._log.warning(
                             "column lineage extraction failed: file=%s col=%s error=%s",
