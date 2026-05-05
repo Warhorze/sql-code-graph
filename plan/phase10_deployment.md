@@ -10,8 +10,10 @@ Claude Code's `~/.claude/settings.json` with zero manual JSON editing.
 
 ## Blocking Questions
 
-None. All required decisions are resolved:
+All design decisions are resolved. Two pre-conditions must be completed before
+implementation is done, listed here so a developer reading this section cannot miss them:
 
+**Design decisions resolved (no action required):**
 - PyPI package name: `sql-code-graph` (already in pyproject.toml, use it as-is)
 - Author identity: `Warhorze` / `rademakerwesley@gmail.com`
 - Install target: `~/.claude/settings.json` under `mcpServers` key
@@ -19,10 +21,16 @@ None. All required decisions are resolved:
 - Build backend: `hatchling` (already configured)
 - Publish mechanism: PyPI OIDC trusted publishing via `pypa/gh-action-pypi-publish`
 
-**One operational pre-condition (not a code blocker):**
-> Before the publish workflow can push to PyPI, the PyPI project must have the GitHub
-> repository configured as a trusted publisher in the PyPI UI. See Step 5 (Release
-> Process) for the exact setup sequence.
+**BLOCKER A — `test.yml` must add `workflow_call` trigger before Step 10.5.1 can work.**
+The existing `.github/workflows/test.yml` uses `on: [push, pull_request]` only.
+`publish.yml` calls it via `uses: ./.github/workflows/test.yml`, which requires a
+`workflow_call:` trigger in `test.yml`. Without it the publish workflow fails immediately
+with "does not define any reusable workflow". See Step 10.5.1 for the required change.
+
+**BLOCKER B — PyPI trusted publisher must be configured before pushing the first `v*` tag.**
+OIDC publishing requires the GitHub repository to be registered as a trusted publisher in
+the PyPI UI, and the project must already exist on PyPI (OIDC cannot create a new project).
+See Step 10.5.1 for the exact setup sequence.
 
 ---
 
@@ -109,7 +117,7 @@ mid-write.
 ### Dependencies
 
 No new runtime dependencies. All imports used in the install command are stdlib:
-`json`, `os`, `pathlib`, `shutil`, `sys`.
+`json`, `os`, `pathlib`, `shutil`.
 
 ---
 
@@ -149,6 +157,36 @@ Changelog = "https://github.com/Warhorze/sql-code-graph/blob/master/CHANGELOG.md
 Acceptance:
 - `uv build` completes without warnings about missing metadata
 - `python -c "import importlib.metadata; m=importlib.metadata.metadata('sql-code-graph'); print(m['Author-email'])"` prints `rademakerwesley@gmail.com`
+
+---
+
+**Step 10.1.2**: Add `version_files` to `[tool.commitizen]` in `pyproject.toml`
+
+Files affected:
+- `pyproject.toml`
+
+Add `version_files` to the existing `[tool.commitizen]` block so `uvx commitizen bump`
+updates both `pyproject.toml` and `src/sqlcg/__init__.py` atomically:
+
+```toml
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+version_provider = "pep621"
+tag_format = "v$version"
+update_changelog_on_bump = true
+version_files = [
+    "pyproject.toml:version",
+    "src/sqlcg/__init__.py:__version__",
+]
+```
+
+`src/sqlcg/__init__.py` already contains `__version__ = "0.1.0"` — commitizen matches on
+`__version__` and replaces the value in-place using the `version_files` pattern.
+
+Acceptance:
+- `uvx commitizen bump --dry-run` reports that it would update both `pyproject.toml` and
+  `src/sqlcg/__init__.py`
 
 ---
 
@@ -310,8 +348,8 @@ Test cases (all use `tmp_path` fixture; never touch real `~/.claude/`):
 6. `test_install_dry_run_no_file_created` — run with `--dry-run`; assert the file is not created
 7. `test_install_warns_on_missing_claude_dir` — point `SETTINGS_PATH` at a nonexistent parent; assert warning is printed but install proceeds
 8. `test_install_handles_invalid_json` — write `{invalid` to the settings file; assert install does not raise, writes a valid file
-9. `test_mcp_setup_write_merges_into_settings_json` — call `mcp_setup(print_only=False)` with monkeypatched `SETTINGS_PATH`; assert correct path written, existing keys preserved
-10. `test_mcp_setup_write_does_not_create_mcp_json` — after `mcp_setup(print_only=False)`, assert `~/.claude/mcp.json` does not exist (use tmp_path so this is safe)
+9. `test_mcp_setup_write_merges_into_settings_json` — invoke `mcp setup --write` via `typer.testing.CliRunner` with monkeypatched `SETTINGS_PATH` (pointing to `tmp_path/settings.json`); assert the file contains the `sql-code-graph` key and existing keys are preserved. Note: `mcp_setup` is a Typer command and cannot be called as a plain Python function with keyword arguments — use `CliRunner().invoke(mcp.app, ["setup", "--write"])`.
+10. `test_mcp_setup_write_does_not_create_mcp_json` — invoke `mcp setup --write` via `CliRunner` with monkeypatched `SETTINGS_PATH`; assert `tmp_path / ".claude" / "mcp.json"` does not exist.
 
 Minimum: 10 tests. All use `tmp_path`; none touch the real home directory.
 
@@ -319,7 +357,23 @@ Minimum: 10 tests. All use `tmp_path`; none touch the real home directory.
 
 ### Phase 10.5 — GitHub Actions publish workflow
 
-**Step 10.5.1**: Create `.github/workflows/publish.yml`
+**Step 10.5.1**: Two files are modified in this step.
+
+**Part A — Add `workflow_call` trigger to `.github/workflows/test.yml`**
+
+The current `test.yml` only has `on: [push, pull_request]`. Calling it from `publish.yml`
+via `uses:` requires a `workflow_call:` trigger. Add it:
+
+```yaml
+on:
+  push:
+  pull_request:
+  workflow_call:   # allows publish.yml to call this as a reusable workflow
+```
+
+No other changes to `test.yml` are needed.
+
+**Part B — Create `.github/workflows/publish.yml`**
 
 ```yaml
 name: Publish to PyPI
@@ -364,6 +418,8 @@ Notes on workflow design:
 - `id-token: write` permission is mandatory for the OIDC flow; it grants the workflow a
   short-lived token that PyPI verifies against the registered trusted publisher.
 - `uv build` produces `dist/sql_code_graph-*.whl` and `dist/sql_code_graph-*.tar.gz`.
+- The `workflow_call` trigger in `test.yml` must be added BEFORE pushing the first `v*` tag
+  or the publish job will fail immediately with "does not define any reusable workflow".
 
 **Blocker (operational, not a code change):**
 
@@ -506,6 +562,6 @@ Lowest risk first:
 4. **Step 10.3.1** — Create `install.py` (new file, no existing code changed)
 5. **Step 10.3.2** — Register in `main.py` (one import line + one command registration)
 6. **Step 10.4.1** — Write `test_install.py` (test-only, safe)
-7. **Step 10.5.1** — Create `publish.yml` (CI only, no code change)
+7. **Step 10.5.1** — Add `workflow_call` to `test.yml` + create `publish.yml` (CI only)
 8. **Operational pre-condition** — Configure PyPI trusted publisher in PyPI UI (before pushing v* tag)
 9. **Step 10.6** — Cut first release with `uvx commitizen bump && git push --tags`
