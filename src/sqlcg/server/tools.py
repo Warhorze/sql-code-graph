@@ -111,7 +111,9 @@ def _assert_indexed(db: GraphBackend) -> None:
     """
     rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
     if not rows or rows[0]["n"] == 0:
-        raise NotIndexedError("No repos have been indexed. Run `sqlcg index <path>` first.")
+        raise NotIndexedError(
+            "No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first."
+        )
 
 
 def _parse_column_ref(col_ref: str) -> tuple[str, str]:
@@ -189,6 +191,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
     untracked files, build artifacts, and node_modules are ignored
     automatically. Falls back to a full directory scan when git is
     unavailable.
+
+    Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
     Args:
         repo_path: Root directory path to index
@@ -532,6 +536,8 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
 @_timed_tool("list_dialects_and_repos")
 def list_dialects_and_repos() -> DialectRepoResult:
     """List all indexed repositories and their SQL dialects.
+
+    Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
     Returns:
         DialectRepoResult with list of repositories and their dialects

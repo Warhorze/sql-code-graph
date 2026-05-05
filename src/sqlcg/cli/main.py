@@ -5,7 +5,17 @@ from dotenv import load_dotenv
 
 from sqlcg.cli.commands import analyze, db, find, gain, git, index, install, mcp, report, watch
 
-app = typer.Typer(name="sqlcg", help="SQL code graph analyzer")
+help_text = """SQL code graph analyzer.
+
+QUICK START:
+  1. sqlcg db init
+  2. sqlcg index <path> --dialect snowflake
+  3. sqlcg git install-hooks
+
+Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
+"""
+
+app = typer.Typer(name="sqlcg", help=help_text)
 
 # Register subcommand groups
 app.add_typer(db.app, name="db")
