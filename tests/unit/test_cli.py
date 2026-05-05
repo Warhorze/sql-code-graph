@@ -6,14 +6,21 @@ import sys
 
 def test_cli_help():
     """Test that the CLI help works."""
+    import os
+    import re
+
+    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb", "FORCE_COLOR": "0"}
     result = subprocess.run(
         [sys.executable, "-m", "sqlcg", "--help"],
         capture_output=True,
         text=True,
+        env=env,
     )
-    # Help should exit with code 0
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
+    stdout = ansi.sub("", result.stdout)
+    stderr = ansi.sub("", result.stderr)
     assert result.returncode == 0
-    assert "--help" in result.stdout or "--help" in result.stderr
+    assert "--help" in stdout or "--help" in stderr
 
 
 def test_import_cli():
