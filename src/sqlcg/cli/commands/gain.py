@@ -104,6 +104,15 @@ def gain_cmd(
             """
         )
 
+        # Section E: execute_cypher ratio
+        execute_cypher_count_result = metrics.execute_query(
+            "SELECT COUNT(*) as count FROM tool_calls WHERE tool_name = 'execute_cypher'"
+        )
+        execute_cypher_count = execute_cypher_count_result[0][0] if execute_cypher_count_result else 0
+        execute_cypher_ratio = (
+            execute_cypher_count / total_calls if total_calls > 0 else 0
+        )
+
         if json_output:
             console.print(
                 json.dumps(
@@ -114,6 +123,7 @@ def gain_cmd(
                         "feedback_tp": tp_count,
                         "feedback_total": fb_total,
                         "top_tools": [{"name": row[0], "count": row[1]} for row in top_tools],
+                        "execute_cypher_ratio": round(execute_cypher_ratio, 2),
                     }
                 )
             )
@@ -157,6 +167,15 @@ def gain_cmd(
                 console.print("[bold cyan]D. Top Tools[/bold cyan]")
                 for i, (name, count) in enumerate(top_tools, 1):
                     console.print(f"  {i}. {name}: {count}")
+            console.print()
+
+            # Section E: execute_cypher ratio
+            console.print("[bold cyan]E. Raw Cypher Usage[/bold cyan]")
+            ratio_pct = execute_cypher_ratio * 100
+            if execute_cypher_ratio > 0.3:
+                console.print(f"  [yellow]execute_cypher: {ratio_pct:.1f}% (high raw-Cypher usage)[/yellow]")
+            else:
+                console.print(f"  execute_cypher: {ratio_pct:.1f}%")
             console.print()
 
         metrics.close()
