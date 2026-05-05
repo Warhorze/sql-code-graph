@@ -1,64 +1,60 @@
-"""Install command for sqlcg (e.g., git hooks, shell completions)."""
+"""Install sqlcg as an MCP server in Claude Code."""
 
-import subprocess
+import json
+import os
+import shutil
 from pathlib import Path
 
 import typer
 from rich.console import Console
 
-app = typer.Typer(help="Install sqlcg tools and hooks")
 console = Console()
 
+_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+_SERVER_KEY = "sql-code-graph"
 
-@app.command("hooks")
-def install_hooks() -> None:
-    """Install or verify git hooks for the current repository.
 
-    Creates a post-checkout hook that automatically runs `sqlcg index --dialect auto --quiet`
-    to keep the code graph in sync when switching branches.
-    """
-    try:
-        # Check if we're in a git repository
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            console.print("[red]Error:[/red] Not in a git repository")
-            raise typer.Exit(1)
+def install_cmd(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print config without writing"),
+) -> None:
+    """Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json)."""
+    if shutil.which("uvx"):
+        entry: dict = {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
+    else:
+        entry = {"command": "sqlcg", "args": ["mcp", "start"]}
 
-        git_dir = Path(result.stdout.strip())
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-
-        hook_path = hooks_dir / "post-checkout"
-        hook_sentinel = "# sqlcg post-checkout hook"
-
-        # Check if hook already contains sqlcg line
-        if hook_path.exists():
-            content = hook_path.read_text()
-            if hook_sentinel in content:
-                console.print("[green]✓[/green] sqlcg post-checkout hook already installed")
-                return
-
-            # Append to existing hook
-            if not content.endswith("\n"):
-                content += "\n"
-            content += f"\n{hook_sentinel}\nsqlcg index --dialect auto --quiet\n"
-        else:
-            # Create new hook
-            content = (
-                "#!/bin/bash\n"
-                f"{hook_sentinel}\n"
-                "sqlcg index --dialect auto --quiet\n"
+    settings_path = _SETTINGS_PATH
+    if settings_path.exists():
+        try:
+            settings: dict = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            console.print(
+                f"[yellow]Warning:[/yellow] {settings_path} contains invalid JSON — "
+                "mcpServers key will be added"
             )
+            settings = {}
+    else:
+        settings = {}
 
-        hook_path.write_text(content)
-        hook_path.chmod(0o755)
-        console.print("[green]✓[/green] sqlcg post-checkout hook installed")
+    mcp_servers: dict = settings.setdefault("mcpServers", {})
 
-    except Exception as e:
-        console.print(f"[red]Error installing hooks:[/red] {e}")
-        raise typer.Exit(1) from e
+    if mcp_servers.get(_SERVER_KEY) == entry:
+        console.print(f"[green]Already configured:[/green] {_SERVER_KEY} → {settings_path}")
+        return
+
+    mcp_servers[_SERVER_KEY] = entry
+
+    if dry_run:
+        console.print("[dim]--dry-run: would write:[/dim]")
+        console.print_json(json.dumps(settings, indent=2))
+        return
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    os.replace(tmp, settings_path)
+
+    cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
+    console.print(f"[green]Configured:[/green] {_SERVER_KEY} → {cmd_str}")
+    console.print(f"[dim]Written to {settings_path}[/dim]")
+    console.print("\nRestart Claude Code to pick up the new MCP server.")

@@ -1,6 +1,7 @@
 """MCP server commands."""
 
 import json
+import os
 from pathlib import Path
 
 import typer
@@ -9,29 +10,33 @@ from rich.console import Console
 app = typer.Typer(help="MCP server commands")
 console = Console()
 
+_ENTRY = {"command": "sqlcg", "args": ["mcp", "start"]}
+_SERVER_KEY = "sql-code-graph"
+
 
 @app.command("setup")
 def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
     """Print or write MCP server config JSON."""
-    config = {
-        "mcpServers": {
-            "sql-code-graph": {
-                "command": "sqlcg",
-                "args": ["mcp", "start"],
-            }
-        }
-    }
-    config_json = json.dumps(config, indent=2)
-
     if print_only:
-        # Print to stdout for manual use
-        console.print_json(config_json)
+        console.print_json(json.dumps({"mcpServers": {_SERVER_KEY: _ENTRY}}, indent=2))
+        return
+
+    config_path = Path.home() / ".claude" / "settings.json"
+    if config_path.exists():
+        try:
+            settings: dict = json.loads(config_path.read_text())
+        except json.JSONDecodeError:
+            settings = {}
     else:
-        # Write to ~/.claude/settings.json
-        config_path = Path.home() / ".claude" / "settings.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(config_json + "\n")
-        console.print(f"[green]Configuration written to[/green] {config_path}")
+        settings = {}
+
+    settings.setdefault("mcpServers", {})[_SERVER_KEY] = _ENTRY
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    os.replace(tmp, config_path)
+    console.print(f"[green]Configuration written to[/green] {config_path}")
 
 
 @app.command("start")

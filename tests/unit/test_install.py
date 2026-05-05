@@ -1,242 +1,142 @@
-"""Tests for sqlcg install command."""
+"""Tests for sqlcg install command (Claude Code MCP registration)."""
 
+import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
 
-
-@pytest.fixture
-def cli_runner() -> CliRunner:
-    """Provide a CLI runner for testing."""
-    return CliRunner()
+runner = CliRunner()
 
 
-class TestInstallHooks:
-    """Test suite for install hooks command."""
+@pytest.fixture()
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect Path.home() to tmp_path so tests never touch ~/.claude."""
+    monkeypatch.setattr(
+        "sqlcg.cli.commands.install._SETTINGS_PATH",
+        tmp_path / ".claude" / "settings.json",
+    )
+    return tmp_path
 
-    def test_install_hooks_creates_hook_file(self, cli_runner: CliRunner, tmp_path: Path) -> None:
-        """Test that install hooks creates a post-checkout hook file."""
-        # Mock git directory
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
 
-        with patch("subprocess.run") as mock_run:
-            # Mock successful git rev-parse
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
+# ---------------------------------------------------------------------------
+# uvx / pip command selection
+# ---------------------------------------------------------------------------
 
-            with patch(
-                "sqlcg.cli.commands.install.Path.cwd",
-                return_value=tmp_path,
-            ):
-                with patch(
-                    "sqlcg.cli.commands.install.Path.home",
-                    return_value=tmp_path,
-                ):
-                    # Create a git_dir in the mocked location
-                    actual_hook_dir = tmp_path / ".git" / "hooks"
-                    actual_hook_dir.mkdir(parents=True, exist_ok=True)
+def test_uses_uvx_when_available(fake_home: Path) -> None:
+    with patch("shutil.which", return_value="/usr/bin/uvx"):
+        result = runner.invoke(app, ["install"])
+    assert result.exit_code == 0
+    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
+    entry = settings["mcpServers"]["sql-code-graph"]
+    assert entry["command"] == "uvx"
+    assert entry["args"] == ["sql-code-graph", "mcp", "start"]
 
-                    result = cli_runner.invoke(app, ["install", "hooks"])
 
-        # Should succeed
-        assert result.exit_code == 0
-        assert "hook installed" in result.stdout
+def test_falls_back_to_sqlcg_when_no_uvx(fake_home: Path) -> None:
+    with patch("shutil.which", return_value=None):
+        result = runner.invoke(app, ["install"])
+    assert result.exit_code == 0
+    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
+    entry = settings["mcpServers"]["sql-code-graph"]
+    assert entry["command"] == "sqlcg"
+    assert entry["args"] == ["mcp", "start"]
 
-    def test_install_hooks_skips_if_already_installed(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that install hooks skips if hook already installed."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
 
-        hook_path = hooks_dir / "post-checkout"
-        hook_content = (
-            "#!/bin/bash\n"
-            "# sqlcg post-checkout hook\n"
-            "sqlcg index --dialect auto --quiet\n"
-        )
-        hook_path.write_text(hook_content)
-        hook_path.chmod(0o755)
+# ---------------------------------------------------------------------------
+# File creation and merging
+# ---------------------------------------------------------------------------
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
+def test_creates_settings_file_when_absent(fake_home: Path) -> None:
+    with patch("shutil.which", return_value=None):
+        result = runner.invoke(app, ["install"])
+    assert result.exit_code == 0
+    assert (fake_home / ".claude" / "settings.json").exists()
 
-            result = cli_runner.invoke(app, ["install", "hooks"])
 
-        # Should exit with code 0 and report hook already installed
-        assert result.exit_code == 0
-        assert "already installed" in result.stdout
+def test_creates_parent_directory_when_absent(fake_home: Path) -> None:
+    assert not (fake_home / ".claude").exists()
+    with patch("shutil.which", return_value=None):
+        runner.invoke(app, ["install"])
+    assert (fake_home / ".claude").is_dir()
 
-    def test_install_hooks_appends_to_existing_hook(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that install hooks appends to existing post-checkout hook."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
 
-        hook_path = hooks_dir / "post-checkout"
-        existing_content = "#!/bin/bash\n# Some other hook\necho 'existing'\n"
-        hook_path.write_text(existing_content)
-        hook_path.chmod(0o755)
+def test_merges_into_existing_settings(fake_home: Path) -> None:
+    settings_path = fake_home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(json.dumps({"theme": "dark", "otherKey": 42}) + "\n")
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
+    with patch("shutil.which", return_value=None):
+        runner.invoke(app, ["install"])
 
-            result = cli_runner.invoke(app, ["install", "hooks"])
+    settings = json.loads(settings_path.read_text())
+    assert settings["theme"] == "dark"
+    assert settings["otherKey"] == 42
+    assert "sql-code-graph" in settings["mcpServers"]
 
-        assert result.exit_code == 0
-        assert "hook installed" in result.stdout
-        content = hook_path.read_text()
-        assert "# sqlcg post-checkout hook" in content
-        assert "sqlcg index --dialect auto --quiet" in content
 
-    def test_install_hooks_not_in_git_repo(self, cli_runner: CliRunner) -> None:
-        """Test that install hooks fails when not in a git repository."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=128,  # git error code for not in repo
-                stdout="",
-            )
+def test_does_not_clobber_existing_mcp_servers(fake_home: Path) -> None:
+    settings_path = fake_home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    existing = {"mcpServers": {"other-tool": {"command": "other", "args": []}}}
+    settings_path.write_text(json.dumps(existing))
 
-            result = cli_runner.invoke(app, ["install", "hooks"])
+    with patch("shutil.which", return_value=None):
+        runner.invoke(app, ["install"])
 
-        assert result.exit_code == 1
-        assert "Not in a git repository" in result.stdout
+    settings = json.loads(settings_path.read_text())
+    assert "other-tool" in settings["mcpServers"]
+    assert "sql-code-graph" in settings["mcpServers"]
 
-    def test_install_hooks_sets_executable_permission(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that hook file is made executable."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
 
-        hook_path = hooks_dir / "post-checkout"
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
+def test_idempotent_uvx(fake_home: Path) -> None:
+    with patch("shutil.which", return_value="/usr/bin/uvx"):
+        runner.invoke(app, ["install"])
+        result = runner.invoke(app, ["install"])
+    assert result.exit_code == 0
+    assert "Already configured" in result.output
 
-            _ = cli_runner.invoke(app, ["install", "hooks"])
 
-        if hook_path.exists():
-            # Check that file is executable (mode & 0o111)
-            assert hook_path.stat().st_mode & 0o111
+def test_idempotent_does_not_duplicate_key(fake_home: Path) -> None:
+    with patch("shutil.which", return_value=None):
+        runner.invoke(app, ["install"])
+        runner.invoke(app, ["install"])
 
-    def test_install_hooks_error_handling(self, cli_runner: CliRunner) -> None:
-        """Test that install hooks handles errors gracefully."""
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = Exception("Test error")
+    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
+    keys = list(settings["mcpServers"].keys())
+    assert keys.count("sql-code-graph") == 1
 
-            result = cli_runner.invoke(app, ["install", "hooks"])
 
-        assert result.exit_code == 1
-        assert "Error installing hooks" in result.stdout
+# ---------------------------------------------------------------------------
+# --dry-run
+# ---------------------------------------------------------------------------
 
-    def test_install_hooks_sentinel_string(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that the exact sentinel string is used for idempotency."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
+def test_dry_run_prints_config_without_writing(fake_home: Path) -> None:
+    with patch("shutil.which", return_value=None):
+        result = runner.invoke(app, ["install", "--dry-run"])
+    assert result.exit_code == 0
+    assert not (fake_home / ".claude" / "settings.json").exists()
+    assert "sql-code-graph" in result.output
 
-        hook_path = hooks_dir / "post-checkout"
-        # Create a hook with a different comment
-        hook_path.write_text("#!/bin/bash\n# Different comment\necho 'test'\n")
-        hook_path.chmod(0o755)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
+# ---------------------------------------------------------------------------
+# Error resilience
+# ---------------------------------------------------------------------------
 
-            result = cli_runner.invoke(app, ["install", "hooks"])
+def test_survives_malformed_existing_json(fake_home: Path) -> None:
+    settings_path = fake_home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text("{ not valid json !!!")
 
-        # Should successfully append the hook
-        assert result.exit_code == 0
-        content = hook_path.read_text()
-        assert "# sqlcg post-checkout hook" in content
-        assert "# Different comment" in content
-
-    def test_install_hooks_idempotency(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that running install hooks twice is idempotent."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        hooks_dir = git_dir / "hooks"
-        hooks_dir.mkdir()
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
-
-            # First invocation
-            result1 = cli_runner.invoke(app, ["install", "hooks"])
-            assert result1.exit_code == 0
-
-            # Second invocation
-            result2 = cli_runner.invoke(app, ["install", "hooks"])
-            assert result2.exit_code == 0
-
-            # Should report hook already installed on second run
-            assert "already installed" in result2.stdout
-
-    def test_install_hooks_creates_parent_directories(
-        self,
-        cli_runner: CliRunner,
-        tmp_path: Path,
-    ) -> None:
-        """Test that install hooks creates parent directories if missing."""
-        git_dir = tmp_path / ".git"
-        git_dir.mkdir()
-        # Don't create hooks_dir explicitly
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=str(git_dir) + "\n",
-            )
-
-            result = cli_runner.invoke(app, ["install", "hooks"])
-
-        assert result.exit_code == 0
-        hooks_dir = git_dir / "hooks"
-        assert hooks_dir.exists()
+    with patch("shutil.which", return_value=None):
+        result = runner.invoke(app, ["install"])
+    assert result.exit_code == 0
+    settings = json.loads(settings_path.read_text())
+    assert "sql-code-graph" in settings["mcpServers"]
