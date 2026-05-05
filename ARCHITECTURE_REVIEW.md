@@ -1150,22 +1150,61 @@ sqlglot-native approach in `SnowflakeParser._parse_scripting_file`:
 
 1. **Split on statement boundaries** using `sqlglot.tokenize()` + semicolon tokens.
    The tokenizer handles semicolons inside string literals correctly — no regex needed.
-2. **Classify each chunk** by calling `sqlglot.parse(chunk, dialect=...)` and
-   keeping only expressions that are instances of
-   `(exp.Select, exp.Insert, exp.Update, exp.Delete)`.
-   Everything else — `exp.Command`, `exp.AlterTable`, `exp.Use`, `exp.Command`,
-   stored-proc calls — is dropped and logged at DEBUG level, not WARNING.
+2. **Classify each chunk** using sqlglot's built-in `exp.DML` base class:
 
-This approach is dialect-agnostic: `exp.Command` is sqlglot's universal "unrecognized
-statement" bucket, covering `ALTER WAREHOUSE`, `CALL`, `SET`, `LET`, `EXECUTE
-IMMEDIATE`, and any future Snowflake additions without requiring a dialect-specific
-enumeration. The same logic works unchanged for BigQuery, Databricks, and ANSI
-scripting blocks.
+   ```python
+   isinstance(stmt, (exp.DML, exp.Select)) and not isinstance(stmt, exp.Copy)
+   ```
+
+   `exp.DML` is a sqlglot base class that covers `Delete`, `Insert`, `Update`, and
+   `Merge` in a single isinstance check — no per-statement enumeration needed.
+   `exp.Select` is added separately (it inherits from `Query`, not `DML`).
+   `exp.Copy` (Snowflake `COPY INTO`) is excluded because its source is a file stage,
+   not a table — no table lineage to extract.
+   Everything else — `exp.Command`, `exp.DDL`, utility statements — is dropped and
+   logged at DEBUG level, not WARNING.
+
+**DML coverage after this fix:**
+
+| Statement | sqlglot type | Included |
+|---|---|---|
+| SELECT | `exp.Select` | Yes |
+| INSERT INTO … SELECT / VALUES | `exp.Insert` (via `exp.DML`) | Yes |
+| UPDATE | `exp.Update` (via `exp.DML`) | Yes |
+| DELETE | `exp.Delete` (via `exp.DML`) | Yes |
+| MERGE INTO | `exp.Merge` (via `exp.DML`) | Yes — was missing from original proposal |
+| COPY INTO (Snowflake) | `exp.Copy` (via `exp.DML`) | No — stage source, not a table |
+| CREATE TABLE AS SELECT | `exp.Create` (via `exp.DDL`) | Handled separately (see below) |
+| ALTER WAREHOUSE, CALL, SET, LET, … | `exp.Command` or specific DDL | Dropped at DEBUG |
+
+**CTAS**: `CREATE TABLE AS SELECT` produces `exp.Create`, not `exp.DML`. The existing
+`AnsiParser._parse_statement` already handles CTAS by detecting a SELECT inside a
+Create node. In the scripting-block path, pass `exp.Create` instances through to
+`_parse_statement` rather than dropping them — it will handle them or ignore them
+cleanly.
+
+**Procedure bodies — dialect differences:**
+
+The tokenizer approach above handles scripting-block files (non-procedure files with
+`BEGIN` blocks) correctly across all dialects. Procedure bodies are different:
+
+| Dialect | How sqlglot exposes the body | Extractable? |
+|---|---|---|
+| Snowflake | `exp.RawString` node inside `exp.Create` | Yes — extract, strip `BEGIN`/`END`, re-apply step 1–2 |
+| Databricks | `exp.RawString` (same `$$` delimiter) | Yes — same as Snowflake |
+| BigQuery | `exp.Command` inside `exp.Create` | No — body is opaque; regex fallback same as today |
+
+For Snowflake/Databricks: detect `exp.Create` nodes that contain an `exp.RawString`
+body, extract the string, strip the outer `BEGIN ... END` wrapper, then run the
+tokenizer-split + DML filter on the inner content recursively. For BigQuery: leave the
+current `_EMBEDDED_DML` regex path as a fallback for `exp.Command` bodies only — do
+not regress existing behaviour.
 
 **Files**: `src/sqlcg/parsers/snowflake_parser.py` — remove `_EMBEDDED_DML` regex,
-rewrite `_parse_scripting_file`. No schema or MCP impact. Add a test fixture with a
-scripting block containing at least one `ALTER WAREHOUSE`, one `CALL`, and one
-`INSERT INTO ... SELECT` to assert that only the INSERT is indexed.
+rewrite `_parse_scripting_file`. No schema or MCP impact. Test fixtures required:
+- Scripting block with `ALTER WAREHOUSE`, `CALL`, `MERGE INTO`, and `INSERT INTO … SELECT` — assert only MERGE and INSERT are indexed
+- Snowflake procedure with embedded DML — assert body DML is indexed
+- BigQuery procedure — assert existing regex fallback still extracts DML
 
 ---
 
