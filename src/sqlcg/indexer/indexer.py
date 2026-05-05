@@ -28,6 +28,7 @@ class Indexer:
         db: GraphBackend,
         dbt_manifest: Path | None = None,
         timeout_per_file: int = 30,
+        use_git: bool = True,
     ) -> dict:
         """Full two-pass index. Returns summary dict.
 
@@ -46,7 +47,7 @@ class Indexer:
         parser = get_parser(dialect, schema_resolver)
         aggregator = CrossFileAggregator()
 
-        files = list(walk_sql_files(path, spec))
+        files = list(walk_sql_files(path, spec, use_git=use_git))
         pass1_results: list[ParsedFile] = []
         parse_errors = 0
 
