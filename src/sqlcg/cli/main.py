@@ -12,13 +12,13 @@ app.add_typer(db.app, name="db")
 app.add_typer(find.app, name="find")
 app.add_typer(analyze.app, name="analyze")
 app.add_typer(mcp.app, name="mcp")
-app.add_typer(install.app, name="install")
 
 # Register single commands
 app.command("index")(index.index_cmd)
 app.command("watch")(watch.watch_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)
+app.command("install")(install.install_cmd)
 
 
 @app.command()

@@ -16,12 +16,12 @@ bash scripts/generate_cli_docs.sh
 | `watch` | Watch a directory and re-index on SQL file changes. |
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
+| `install` | Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json). |
 | `version` | Show version. |
 | `db` | Database management commands |
 | `find` | Search the graph |
 | `analyze` | Lineage analysis |
 | `mcp` | MCP server commands |
-| `install` | Install sqlcg tools and hooks |
 
 ## `sqlcg`
 
@@ -115,6 +115,20 @@ If no metrics database exists, prints a message and exits 0.
 | --- | --- | --- | --- | --- | --- |
 | --stdout | BOOLEAN | No | No | False | Print to stdout instead of file |
 | --output, -o | PATH | No | No |  | Output file path |
+
+## `sqlcg install`
+
+```bash
+sqlcg install [OPTIONS]
+```
+
+Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json).
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --dry-run | BOOLEAN | No | No | False | Print config without writing |
 
 ## `sqlcg version`
 
@@ -370,37 +384,6 @@ sqlcg mcp start [OPTIONS]
 ```
 
 Start the MCP server.
-
-### Options
-
-| Option | Type | Required | Repeatable | Default | Description |
-| --- | --- | --- | --- | --- | --- |
-| _none_ |  |  |  |  |  |
-
-## `sqlcg install`
-
-```bash
-sqlcg install [OPTIONS] COMMAND [ARGS]...
-```
-
-Install sqlcg tools and hooks
-
-### Subcommands
-
-| Subcommand | Description |
-| --- | --- |
-| `hooks` | Install or verify git hooks for the current repository. |
-
-## `sqlcg install hooks`
-
-```bash
-sqlcg install hooks [OPTIONS]
-```
-
-Install or verify git hooks for the current repository.
-
-Creates a post-checkout hook that automatically runs `sqlcg index --dialect auto --quiet`
-to keep the code graph in sync when switching branches.
 
 ### Options
 
