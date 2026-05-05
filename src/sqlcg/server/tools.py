@@ -8,6 +8,15 @@ from pathlib import Path
 from sqlcg.core.config import get_db_path
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.queries import (
+    FIND_TABLE_USAGES_QUERY,
+    GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_UPSTREAM_DEPENDENCIES_QUERY,
+    INDEX_REPO_FILES_QUERY,
+    LIST_DIALECTS_AND_REPOS_QUERY,
+    SEARCH_SQL_PATTERN_QUERY,
+    TRACE_COLUMN_LINEAGE_QUERY,
+)
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
@@ -219,12 +228,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
 
         # Create BELONGS_TO relationships from File nodes to Repo node
         # Query for all File nodes in this repo and link them to the Repo
-        files_query = """
-        MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix
-        RETURN f.path AS path
-        """
         repo_prefix = abs_path.rstrip("/") + "/"
-        file_rows = db.run_read(files_query, {"repo_prefix": repo_prefix})
+        file_rows = db.run_read(INDEX_REPO_FILES_QUERY, {"repo_prefix": repo_prefix})
         for row in file_rows:
             db.upsert_edge(
                 NodeLabel.FILE,
@@ -260,8 +265,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         raise
 
 
-@_timed_tool("trace_column_lineage")
 @mcp.tool()
+@_timed_tool("trace_column_lineage")
 def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
     """Trace upstream lineage of a column.
 
@@ -304,10 +309,7 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
 
         # Query for upstream columns (reverse direction)
         rows = db.run_read(
-            """
-            MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
-            RETURN src.id AS id, src.col_name AS col_name
-            """,
+            TRACE_COLUMN_LINEAGE_QUERY,
             {"id": current_id},
         )
 
@@ -327,8 +329,8 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
     return LineageResult(column=table_col, lineage=lineage)
 
 
-@_timed_tool("find_table_usages")
 @mcp.tool()
+@_timed_tool("find_table_usages")
 def find_table_usages(table_name: str) -> TableUsageResult:
     """Find all queries that use a given table.
 
@@ -347,10 +349,7 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     _assert_indexed(db)
 
     rows = db.run_read(
-        """
-        MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
-        RETURN f.path AS file, q.sql AS sql, q.kind AS kind
-        """,
+        FIND_TABLE_USAGES_QUERY,
         {"name": table_name},
     )
 
@@ -367,8 +366,8 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     return TableUsageResult(table=table_name, usages=usages)
 
 
-@_timed_tool("get_downstream_dependencies")
 @mcp.tool()
+@_timed_tool("get_downstream_dependencies")
 def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
     """Find all downstream dependencies of a column.
 
@@ -411,10 +410,7 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
 
         # Query for downstream columns (forward direction)
         rows = db.run_read(
-            """
-            MATCH (src:SqlColumn {id: $id})-[:COLUMN_LINEAGE]->(dst:SqlColumn)
-            RETURN dst.id AS id, dst.col_name AS col_name
-            """,
+            GET_DOWNSTREAM_DEPENDENCIES_QUERY,
             {"id": current_id},
         )
 
@@ -432,8 +428,8 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
     return DependencyResult(root=table_col, nodes=nodes)
 
 
-@_timed_tool("get_upstream_dependencies")
 @mcp.tool()
+@_timed_tool("get_upstream_dependencies")
 def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
     """Find all upstream dependencies of a column.
 
@@ -476,10 +472,7 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
 
         # Query for upstream columns (reverse direction)
         rows = db.run_read(
-            """
-            MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
-            RETURN src.id AS id, src.col_name AS col_name
-            """,
+            GET_UPSTREAM_DEPENDENCIES_QUERY,
             {"id": current_id},
         )
 
@@ -497,8 +490,8 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
     return DependencyResult(root=table_col, nodes=nodes)
 
 
-@_timed_tool("search_sql_pattern")
 @mcp.tool()
+@_timed_tool("search_sql_pattern")
 def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
     """Search for SQL patterns in indexed queries.
 
@@ -518,12 +511,7 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
     _assert_indexed(db)
 
     rows = db.run_read(
-        """
-        MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
-        WHERE contains(q.sql, $query)
-        RETURN f.path AS file, q.sql AS sql, q.kind AS kind
-        LIMIT $limit
-        """,
+        SEARCH_SQL_PATTERN_QUERY,
         {"query": query, "limit": limit},
     )
 
@@ -540,8 +528,8 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
     return SqlPatternResult(pattern=query, matches=matches)
 
 
-@_timed_tool("list_dialects_and_repos")
 @mcp.tool()
+@_timed_tool("list_dialects_and_repos")
 def list_dialects_and_repos() -> DialectRepoResult:
     """List all indexed repositories and their SQL dialects.
 
@@ -555,10 +543,7 @@ def list_dialects_and_repos() -> DialectRepoResult:
     _assert_indexed(db)
 
     rows = db.run_read(
-        """
-        MATCH (r:Repo)<-[:BELONGS_TO]-(f:File)
-        RETURN r.path AS path, r.name AS name, collect(DISTINCT f.dialect) AS dialects
-        """,
+        LIST_DIALECTS_AND_REPOS_QUERY,
         {},
     )
 
@@ -575,8 +560,8 @@ def list_dialects_and_repos() -> DialectRepoResult:
     return DialectRepoResult(repos=repos)
 
 
-@_timed_tool("execute_cypher")
 @mcp.tool()
+@_timed_tool("execute_cypher")
 def execute_cypher(query: str) -> list[dict]:
     """Execute a read-only Cypher query against the graph.
 
