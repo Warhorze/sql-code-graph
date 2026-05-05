@@ -9,7 +9,18 @@ description = "SQL code graph analyzer and lineage tracer"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
-authors = [{name = "Developer", email = "dev@example.com"}]
+authors = [{ name = "wesley", email = "rademakerwesley@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database",
+]
 dependencies = [
     "kuzu==0.11.3",
     "mcp>=1.27.0,<2.0",
@@ -27,6 +38,11 @@ dependencies = [
 neo4j = ["neo4j>=5.15.0"]
 dbt = ["dbt-core>=1.7"]
 snowflake = ["acryl-datahub>=0.14.0,<0.15.0"]
+
+[project.urls]
+Homepage = "https://github.com/Warhorze/sql-code-graph"
+Repository = "https://github.com/Warhorze/sql-code-graph"
+Issues = "https://github.com/Warhorze/sql-code-graph/issues"
 
 [project.scripts]
 sqlcg = "sqlcg.cli.main:main"
@@ -63,8 +79,8 @@ known-first-party = ["sqlcg"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
 version_provider = "pep621"
+changelog_file = "CHANGELOG.md"
 tag_format = "v$version"
 update_changelog_on_bump = true
 

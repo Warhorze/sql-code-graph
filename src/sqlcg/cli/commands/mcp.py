@@ -27,8 +27,8 @@ def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
         # Print to stdout for manual use
         console.print_json(config_json)
     else:
-        # Write to ~/.claude/mcp.json
-        config_path = Path.home() / ".claude" / "mcp.json"
+        # Write to ~/.claude/settings.json
+        config_path = Path.home() / ".claude" / "settings.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(config_json + "\n")
         console.print(f"[green]Configuration written to[/green] {config_path}")
