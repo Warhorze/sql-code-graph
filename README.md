@@ -37,6 +37,8 @@ sqlcg install
 # 4. Index your SQL repo
 sqlcg db init
 sqlcg index ./sql --dialect snowflake   # or: bigquery, postgres, ansi
+# Only git-tracked files are indexed by default — build artefacts,
+# node_modules, and .venv are ignored automatically.
 
 # 5. (Optional) Keep the graph fresh on branch switches
 cd /your/sql/repo
