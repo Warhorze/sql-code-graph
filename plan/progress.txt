@@ -1,9 +1,9 @@
 ## Current State
 
 agent: architect-planner
-task: Produce sprint_next.md — developer-ready implementation plan for all open work from ARCHITECTURE_REVIEW.md sections 10.1–10.2.10, 10.B, 10.C
+task: Expand Tests sections in sprint_next.md — add concrete integration test specs per user feedback (2026-05-05)
 plan: plan/sprint_next.md
-status: COMPLETE — plan written and committed
+status: COMPLETE — all 14 ticket Tests sections expanded with integration specs and committed
 date: 2026-05-05
 ---
 
@@ -48,6 +48,49 @@ date: 2026-05-05
 
   Next step: developers can pick up T-01, T-02, T-03, T-04, T-05, T-07, T-08, T-13, T-14
   in parallel (all INDEPENDENT). T-06 should be prioritized in Week 2 to unblock T-09, T-10, T-11.
+
+[2026-05-05] architect-planner — Expanded all 14 ticket Tests sections in sprint_next.md.
+  Summary: User feedback noted tests were not clearly defined, especially integration tests
+  for column lineage end-to-end. All 14 tickets now have:
+
+  Integration test philosophy applied:
+  - Full-stack tests: real SQL fixture → Indexer.index_repo() → real KùzuDB (in-memory) →
+    Cypher query or MCP tool result. No mocking of parser, graph backend, or lineage engine.
+  - Unit tests retained only for pure functions (string parsing, config loading, CLI output).
+  - Column lineage correctness: every lineage integration test asserts edge presence,
+    confidence score, AND exact edge count (no spurious extras).
+
+  New SQL fixtures specified (with exact SQL content):
+  - tests/fixtures/synthetic/insert_select_impact.sql — INSERT-SELECT SELECTS_FROM test (T-10)
+  - tests/fixtures/synthetic/etl_chain.sql — intra-file CTAS + INSERT multi-step chain (T-10)
+  - tests/fixtures/synthetic/snowflake_scripting_noise.sql — ALTER/CALL noise + MERGE/INSERT (T-11)
+  - tests/fixtures/synthetic/snowflake_procedure.sql — Snowflake $$ procedure body (T-11)
+  - tests/fixtures/synthetic/bigquery_procedure.sql — BigQuery procedure regex fallback (T-11)
+  - tests/fixtures/synthetic/star_select.sql — SELECT * confidence downgrade (T-11 matrix)
+  - tests/fixtures/synthetic/scripting_sample.sql — scripting block for parse_quality (T-09)
+
+  Column lineage SQL pattern matrix added to T-11:
+  - Simple SELECT with alias, SELECT *, INSERT-SELECT, MERGE WHEN MATCHED, CTAS,
+    multi-step intra-file temp table chain, Snowflake scripting INSERT.
+  - Each row specifies: fixture file, expected COLUMN_LINEAGE edge (src → dst),
+    expected confidence bound, expected exact edge count.
+  - Golden rule enforced: assert len(rows) == N (exact count), not just len(rows) >= 1.
+
+  Key integration test scenarios added per ticket:
+  - T-02: real KùzuDB after DDL-only index → db info health warning present
+  - T-04: injected upsert failure → node count unchanged (rollback confirmed)
+  - T-07: real empty-graph state → trace_column_lineage returns hint field
+  - T-08: real synthetic fixture index → "0 lineage edges" warning in CLI output
+  - T-09: mixed-quality fixture directory → quality counts sum to files_parsed exactly
+  - T-10: INSERT-SELECT → SELECTS_FROM edges: exact count == 2 (both JOIN sources)
+         CTAS chain → SELECTS_FROM edges: exact count == 3
+  - T-11: scripting block → parsed.statements count == 2 (MERGE + INSERT exactly)
+         procedure body → 1 INSERT, COLUMN_LINEAGE edges with confidence >= 0.5
+  - T-12: successful real index → .sqlcg.toml written and valid TOML; failed index → no toml
+  - T-13: real MetricsStore populated by real tool calls → ratio computed correctly
+
+  Next step: developers implement tickets in Week 1–3 order per plan. Integration tests
+  require new fixture files to be created before the test module can be written.
 
 [2026-05-05] architect-reviewer — Resolved all 4 open questions from Section 10.6.
   Summary: Read user comments on GitHub issues #5 and #6 plus inline annotations in

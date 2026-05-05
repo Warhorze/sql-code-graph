@@ -102,8 +102,16 @@ All open items from the architecture review:
 - `src/sqlcg/cli/commands/mcp.py` — setup output
 
 **Tests to add**:
-- `tests/unit/test_cli_help.py`: assert `sqlcg --help` output contains "QUICK START", "sqlcg db init", "sqlcg index", "sqlcg git install-hooks"
-- `tests/unit/test_exceptions.py`: assert `NotIndexedError` message contains "sqlcg db init" and "sqlcg index"
+
+Unit tests (pure string/output assertions, no graph):
+
+- `tests/unit/test_cli_help.py`: invoke the Typer app with `["--help"]` using `typer.testing.CliRunner`; assert the captured output contains `"QUICK START"`, `"sqlcg db init"`, `"sqlcg index"`, and `"sqlcg git install-hooks"` as substrings; assert they appear in that order (index of each string increases monotonically).
+- `tests/unit/test_exceptions.py`: instantiate `NotIndexedError` directly; assert `str(exc)` contains `"sqlcg db init"` and `"sqlcg index <path>"`.
+
+Integration tests (no graph backend needed — CLI string output only):
+
+- Fixture: none required (help text is static).
+- Scenario: `CliRunner.invoke(app, ["--help"])` → assert exit code 0 and the three step numbers `"1."`, `"2."`, `"3."` appear in the output, confirming the ordered block is present and not truncated by Typer line-wrapping.
 
 **Definition of done**:
 - `sqlcg --help` displays the QUICK START block with all three steps in order
@@ -141,10 +149,20 @@ All open items from the architecture review:
 - `src/sqlcg/server/tools.py` — `list_dialects_and_repos()` warnings population
 
 **Tests to add**:
-- `tests/unit/test_db_info.py`: with a mock backend returning zero counts for each label,
-  assert the correct warning string is printed
-- `tests/unit/test_tools.py`: assert `list_dialects_and_repos()` populates `warnings`
-  when `SqlColumn == 0`
+
+Unit tests (mock backend, no graph):
+
+- `tests/unit/test_db_info.py`:
+  - Scenario A — empty database: mock backend `run_read` to return `[{"label": "Repo", "count": 0}]` for all labels; invoke `db_info` via `CliRunner`; assert stdout contains `"Database is empty"` and the word `"error"` or red ANSI prefix.
+  - Scenario B — no column lineage: mock backend returning `Repo=1`, `SqlQuery=10`, `SqlColumn=0`; invoke `db_info`; assert stdout contains `"Column lineage not available"` and names `trace_column_lineage` in the warning.
+  - Scenario C — healthy: mock backend returning `Repo=1`, `SqlQuery=10`, `SqlColumn=50`; invoke `db_info`; assert no warning lines.
+- `tests/unit/test_tools.py`: mock backend with `SqlColumn` count query returning `[{"count": 0}]`; call `list_dialects_and_repos()`; assert `result.warnings` is a non-empty list and the first item contains `"SqlColumn"`.
+
+Integration tests (real KùzuDB in-memory, real SQL fixture → Indexer → graph → tool call):
+
+- Fixture: `tests/fixtures/synthetic/base_tables.sql` (already exists — creates `customers`, `orders`, `products`, `order_items`).
+- Scenario — db_info after indexing DDL-only corpus: index `base_tables.sql` using `Indexer.index_repo()` into an in-memory KùzuDB; call `db.run_read("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})` and assert it returns `[{"count": 0}]`; then call the `db info` CLI command and assert the yellow column-lineage warning appears in captured output.
+- Assertion detail: `result.output` must contain `"Column lineage not available"` exactly once; must NOT contain `"Database is empty"` (Repo node was created).
 
 **Definition of done**:
 - `sqlcg db info` on an empty database prints a red "Database is empty" message
@@ -203,15 +221,21 @@ app.command("uninstall")(uninstall.uninstall_cmd)
 - `src/sqlcg/cli/main.py` — add import and register
 
 **Tests to add**:
+
+Unit tests (all use `tmp_path`, no side effects on `~/.claude/` or `~/.sqlcg/`):
+
 - `tests/unit/test_uninstall.py`:
-  - MCP entry removal: write a fake settings.json with the key, call `uninstall_cmd`, assert key gone
-  - MCP entry missing: call `uninstall_cmd` on settings.json without the key, assert no error
-  - `--keep-db`: assert DB path is not deleted
-  - `--force`: assert DB path and metrics store are deleted without prompt
-  - Git hook removal: write a fake `.git/hooks/post-checkout` with the sentinel block,
-    assert the block is stripped; if no other content remains, assert file is deleted
-  - Git hook file absent: assert no error
-  - All tests use `tmp_path` — no test may write to `~/.claude/` or `~/.sqlcg/`
+  - Scenario A — MCP entry removal: write a `tmp_path / "settings.json"` containing `{"mcpServers": {"sql-code-graph": {"command": "sqlcg"}}}`, patch `SETTINGS_PATH` constant to point at that file, invoke `uninstall_cmd` via `CliRunner`; assert the resulting JSON file does not contain the `"sql-code-graph"` key and the remaining JSON is valid; assert stdout contains `"Removed MCP registration"`.
+  - Scenario B — MCP entry already absent: write settings.json with `{"mcpServers": {}}`, invoke `uninstall_cmd`; assert exit code 0 and stdout contains `"already removed"`.
+  - Scenario C — `--keep-db` flag: create a `tmp_path / "db"` directory, set `SQLCG_DB_PATH` env var to that path, invoke `uninstall_cmd --keep-db`; assert the directory still exists after the call.
+  - Scenario D — `--force` flag: create `tmp_path / "db"` directory and `tmp_path / "metrics.db"` file; invoke `uninstall_cmd --force`; assert neither path exists after the call and no prompt was shown (confirm by asserting no `"Continue?"` in stdout).
+  - Scenario E — git hook stripping: write `tmp_path / ".git" / "hooks" / "post-checkout"` containing the sentinel block followed by other content; invoke `uninstall_cmd --repo tmp_path`; assert the sentinel block is absent in the file and the remaining non-sentinel content is preserved.
+  - Scenario F — git hook file becomes empty after stripping: write the hook file containing only the sentinel block; invoke `uninstall_cmd --repo tmp_path`; assert the hook file no longer exists.
+  - Scenario G — git hook file absent: invoke `uninstall_cmd --repo tmp_path` where `.git/hooks/post-checkout` does not exist; assert exit code 0 and stdout contains `"No git hook found"`.
+
+Integration test (no graph backend needed — filesystem side effects only):
+
+- Not required for T-03. All scenarios are pure filesystem operations; the unit tests above with `tmp_path` constitute full integration coverage for this ticket. No KùzuDB is involved.
 
 **Definition of done**:
 - `sqlcg uninstall` removes the MCP registration, prompts for DB deletion, removes git hook
@@ -272,10 +296,18 @@ does nothing. Both concrete backends must implement real transactions.
 - `src/sqlcg/core/neo4j_backend.py` — `transaction()` implementation
 
 **Tests to add**:
-- `tests/unit/test_kuzu_backend.py`: inject a failure mid-index (raise inside `_upsert_parsed_file`),
-  assert the graph is in the pre-delete state (no orphaned nodes)
-- `tests/unit/test_transaction.py`: test that a failed `transaction()` rolls back by verifying
-  node count before and after a failed upsert sequence
+
+Unit tests (KùzuDB in-memory — no real SQL files needed):
+
+- `tests/unit/test_kuzu_backend.py`:
+  - Scenario — rollback on upsert failure: open an in-memory `KuzuBackend`; call `init_schema()`; upsert one `File` node and one `SqlTable` node via `upsert_node()`; record node count via `run_read("MATCH (n) RETURN COUNT(n) AS count", {})`; open a `db.transaction()` context manager, call `upsert_node()` to add a second `SqlTable`, then raise `RuntimeError` inside the context; assert that after the exception, node count equals the pre-transaction value (the second `SqlTable` was rolled back).
+  - Scenario — commit on success: open a transaction, upsert one node, exit cleanly (no exception); assert node count increased by 1.
+
+Integration tests (real SQL fixture → Indexer → KùzuDB → injected failure → graph state assertion):
+
+- `tests/integration/test_indexer_to_graph.py` (extend existing file):
+  - Scenario — mid-index failure leaves graph consistent: index `tests/fixtures/synthetic/base_tables.sql` into an in-memory KùzuDB to establish a baseline; record node count `N_before`; patch `KuzuBackend.upsert_node` to raise `RuntimeError` on the second call; attempt `indexer.reindex_file(base_tables_path, db, dialect=None)` inside a `try/except`; assert `db.run_read("MATCH (n) RETURN COUNT(n) AS count", {})` returns `[{"count": N_before}]` — no orphaned nodes from the partial re-index.
+  - Assert exact count: `assert result[0]["count"] == N_before` (not `>= 0` — the count must not change).
 
 **Definition of done**:
 - `KuzuBackend.transaction()` and `Neo4jBackend.transaction()` are real transaction wrappers
@@ -316,8 +348,16 @@ def resolve_pass2(self, parser, parsed: ParsedFile) -> ParsedFile:
 - `src/sqlcg/lineage/aggregator.py` — `resolve_pass2()`
 
 **Tests to add**:
-- `tests/unit/test_aggregator.py`: create a temp file, run pass 1, delete the file, call
-  `resolve_pass2`, assert it returns the pass-1 result and logs a warning (use `caplog`)
+
+Unit test (existing `test_cross_file_lineage.py` already covers this scenario — extend, do not duplicate):
+
+- `tests/unit/test_aggregator.py`:
+  - Scenario — deleted file during pass 2: write a temp file `tmp_path / "source.sql"` containing `CREATE TABLE raw_orders (id INT, amount DECIMAL);`; parse it with `get_parser(None, SchemaResolver())` and `parse_file()` to get `pass1_result`; register with `CrossFileAggregator.register_pass1(pass1_result)`; delete `tmp_path / "source.sql"` via `Path.unlink()`; call `aggregator.resolve_pass2(parser, pass1_result)` and capture the return value `result`; assert `result is pass1_result` (same object, not a new parse); assert `caplog` contains a WARNING entry with `"resolve_pass2"` and `"cannot re-read"` in the message.
+  - Assertion must use `caplog` at level `logging.WARNING`, not just check return value — confirming the log path is exercised.
+
+Integration test (real indexer path, volatile file — no graph backend needed):
+
+- This scenario is already covered by `tests/integration/test_cross_file_lineage.py::test_resolve_pass2_deleted_file`. No new integration test needed for T-05. The existing test uses `CrossFileAggregator` + real `parse_file()` + `Path.unlink()` — identical to the spec above.
 
 **Definition of done**:
 - A deleted or unreadable file during pass 2 logs a warning and returns the pass-1 result
@@ -360,9 +400,15 @@ T-09 uses the error list populated by T-06 to determine quality categories.
 - `src/sqlcg/parsers/base.py` — `_extract_column_lineage()` — verify all three points above
 
 **Tests to add**:
-- `tests/unit/test_base_parser.py`: call `_extract_column_lineage` with a statement that
-  causes `sg_lineage` to raise; assert `out.errors` is non-empty, the log warning is emitted,
-  and a zero-confidence edge is in the returned list
+
+Unit tests (pure parser — no graph backend):
+
+- `tests/unit/test_base_parser.py`:
+  - Scenario — sg_lineage exception recorded: construct a minimal `exp.Select` AST node (via `sqlglot.parse_one("SELECT bad_col FROM t")`); patch `sqlglot.lineage.lineage` (the `sg_lineage` function imported inside `_extract_column_lineage`) to raise `ValueError("mock lineage failure")`; call `_extract_column_lineage(out, stmt, schema=None, col_name="bad_col")` directly on an `AnsiParser` instance; assert `out.errors` contains an entry matching `"col_lineage:bad_col:mock lineage failure"`; assert `caplog` contains a WARNING message with `"bad_col"` and `"mock lineage failure"`; assert the returned edge list contains exactly one `LineageEdge` with `confidence == 0.0`.
+  - Assertion on the zero-confidence edge: `assert edges[0].confidence == 0.0` — not `edges[0].confidence < 0.1`. Must be exactly zero.
+  - Scenario — outer statement exception recorded: patch `_extract_column_lineage` to raise during the outer try block (e.g. by passing a non-`exp.Select` node that causes a TypeError); assert `out.errors` contains an entry matching `"col_lineage:statement:"`.
+
+Integration test: none required for T-06. Exception recording is a pure parser behaviour; correctness is fully observable from `ParsedFile.errors` without a graph backend.
 
 **Definition of done**:
 - Column lineage failures append to `ParsedFile.errors` with a structured key
@@ -410,8 +456,20 @@ T-09 uses the error list populated by T-06 to determine quality categories.
 - `src/sqlcg/server/tools.py` — populate `hint` in four tools on empty result
 
 **Tests to add**:
-- `tests/unit/test_tools_hints.py`: mock backend to return empty rows for each tool;
-  assert `result.hint is not None` and contains the expected diagnostic phrase
+
+Unit tests (mock backend — no graph):
+
+- `tests/unit/test_tools_hints.py`:
+  - Scenario A — `trace_column_lineage` empty result: patch `KuzuBackend.run_read` to return `[]`; call `trace_column_lineage("orders.amount")`; assert `result.hint is not None`; assert `"SqlColumn"` in `result.hint`; assert `result.lineage == []`.
+  - Scenario B — `trace_column_lineage` non-empty result: patch `run_read` to return one row `{"id": "raw_orders.amount", "col_name": "amount"}`; assert `result.hint is None`.
+  - Scenario C — `find_table_usages` empty: patch `run_read` to return `[]`; assert `result.hint` contains `"BI tools"` or `"analyze impact"`.
+  - Scenario D — `search_sql_pattern` empty: patch `run_read` to return `[]`; assert `result.hint` contains `"case-sensitive"`.
+  - Each scenario must assert the exact presence/absence of `hint` — not just `result.hint is not None` but that the expected diagnostic keyword from the spec is in the string.
+
+Integration test (real KùzuDB + real indexer — hint field appears on genuinely empty graph):
+
+- Scenario: create an in-memory KùzuDB; call `init_schema()` without indexing any files; call `trace_column_lineage("orders.amount")` against the real backend (bypassing the `_assert_indexed` guard by inserting at least one `Repo` node manually via `db.upsert_node("Repo", {"path": "/tmp/fake", "name": "fake"})`); assert `result.lineage == []` and `result.hint` is not None and contains `"SqlColumn"`.
+- This confirms hint is populated from a real empty-graph state, not a mocked one.
 
 **Definition of done**:
 - `LineageResult`, `DependencyResult`, `TableUsageResult`, `SqlPatternResult` all have `hint: str | None`
@@ -453,10 +511,20 @@ T-09 uses the error list populated by T-06 to determine quality categories.
 - `src/sqlcg/cli/commands/db.py` — `COLUMN_LINEAGE edges` count line
 
 **Tests to add**:
-- `tests/unit/test_indexer_progress.py`: call `index_repo` with a mock progress callback,
-  assert the callback is called with `(100, total)` after 100 files
-- `tests/unit/test_index_cmd.py`: assert `edges=0` warning is printed on stdout when
-  `lineage_edges_created == 0`
+
+Unit tests (mock callback, no real graph):
+
+- `tests/unit/test_indexer_progress.py`:
+  - Scenario — callback invoked at 100-file boundary: create 105 tiny `.sql` files in `tmp_path` (each containing a single `SELECT 1`); index them into an in-memory KùzuDB with a `progress_callback` that records all `(current, total)` tuples; assert the callback was called at least once with `current == 100` (or the next boundary below total if fewer than 200 files).
+  - Assertion: `assert any(c == 100 for c, t in calls)` where `calls` is the list of `(current, total)` tuples passed to the callback.
+- `tests/unit/test_index_cmd.py`:
+  - Scenario — zero edges warning on stdout: patch `Indexer.index_repo` to return `{"files_parsed": 5, "parse_errors": 0, "tables_found": 3, "lineage_edges_created": 0}`; invoke `index_cmd` via `CliRunner` with a `tmp_path` argument; assert `"0 lineage edges"` or `"Warning"` appears in `result.output`; assert exit code is 0 (it is a warning, not an error).
+  - Scenario — no warning when edges > 0: patch `index_repo` to return `lineage_edges_created=5`; assert `"Warning"` does NOT appear in output related to lineage edges.
+
+Integration test (real indexer → real KùzuDB → CLI output):
+
+- Scenario: index `tests/fixtures/synthetic/base_tables.sql` (DDL only, no DML → zero lineage edges); capture CLI output; assert `result.output` contains `"0 lineage edges"` warning and `"COLUMN_LINEAGE edges: 0"` in the `db info` output after re-running `db info`. These two assertions span both `index_cmd` and `db_info` and confirm the warning propagates through the full stack.
+- Assertion is on exact substring: `assert "lineage_edges_created" not in result.output` (the raw key must not leak); `assert "0 lineage edges" in result.output` (the rendered warning must appear).
 
 **Definition of done**:
 - `sqlcg index` on 1457 files prints progress every 100 files
@@ -525,9 +593,29 @@ T-09 uses the error list populated by T-06 to determine quality categories.
 - `src/sqlcg/cli/commands/db.py` — query and display parsing_mode distribution
 
 **Tests to add**:
-- `tests/unit/test_parse_quality.py`: parse a scripting file, assert `parse_quality == SCRIPTING_FALLBACK`
-- `tests/unit/test_indexer_quality.py`: index a fixture directory with mixed files, assert
-  quality counts match expected values in the returned summary dict
+
+Unit tests (parser layer — no graph):
+
+- `tests/unit/test_parse_quality.py`:
+  - Scenario — scripting fallback: read `tests/benchmarks/golden_corpus/snowflake/scripting_block.sql`; parse it with `SnowflakeParser`; assert `parsed.parse_quality == ParseQuality.SCRIPTING_FALLBACK`.
+  - Scenario — failed parse: construct a `ParsedFile` that has a simulated unhandled exception recorded; assert the quality is set to `ParseQuality.FAILED` (simulate by calling `Indexer._handle_parse_failure()` or setting the field directly in a test double).
+  - Scenario — table_only default: parse `tests/fixtures/synthetic/base_tables.sql` (pure DDL); assert `parsed.parse_quality == ParseQuality.TABLE_ONLY` (no column lineage extracted from DDL-only).
+
+Integration tests (real SQL fixture → Indexer → summary dict → quality breakdown):
+
+- `tests/unit/test_indexer_quality.py` (named unit but actually integration — exercises Indexer + KùzuDB):
+  - Fixture contents: use `tests/fixtures/synthetic/` which has `base_tables.sql` (DDL → TABLE_ONLY), `views.sql` (CREATE VIEW → TABLE_ONLY), `reports.sql` (SELECT → TABLE_ONLY or FULL if lineage extracted).
+  - Add `tests/fixtures/synthetic/scripting_sample.sql` (new fixture, content below) to introduce a SCRIPTING_FALLBACK file.
+  - Fixture `tests/fixtures/synthetic/scripting_sample.sql`:
+    ```sql
+    -- Snowflake scripting block sample for parse_quality testing
+    BEGIN
+      INSERT INTO dwh.target SELECT id, amount FROM raw.source;
+      CALL my_proc();
+    END;
+    ```
+  - Index the full `tests/fixtures/synthetic/` directory with dialect `"snowflake"` into an in-memory KùzuDB; assert `summary["quality"]["scripting_fallback"] >= 1` (the new scripting file); assert `summary["quality"]["full"] + summary["quality"]["table_only"] + summary["quality"]["scripting_fallback"] + summary["quality"]["failed"] == summary["files_parsed"]` (quality counts sum to total files); assert `summary["quality"]` key exists in the return dict.
+  - Exact assertion: `assert sum(summary["quality"].values()) == summary["files_parsed"]` — this is the golden rule for the quality breakdown.
 
 **Definition of done**:
 - `ParseQuality` enum exists in `parsers/base.py`
@@ -591,11 +679,68 @@ appears in results.
 - `tests/unit/test_insert_select_impact.py` (new)
 
 **Tests to add**:
-- Index `insert_select_impact.sql`, run the graph query for `SELECTS_FROM` edges,
-  assert `source_schema.source_table` is a target of a `SELECTS_FROM` edge
-- Also add an intra-file multi-step ETL fixture as described in section 6.5:
-  `tests/fixtures/synthetic/etl_chain.sql` with a CTAS followed by INSERT-SELECT,
-  assert that both table references appear as `SELECTS_FROM` targets
+
+New SQL fixtures required:
+
+1. `tests/fixtures/synthetic/insert_select_impact.sql` (exact content):
+   ```sql
+   -- Fixture: INSERT-SELECT for SELECTS_FROM edge verification (T-10)
+   INSERT INTO dwh.target_table
+   SELECT t.col_a, c.col_b
+   FROM source_schema.source_table t
+   JOIN ref_schema.dim_customers c ON t.id = c.id;
+   ```
+
+2. `tests/fixtures/synthetic/etl_chain.sql` (exact content):
+   ```sql
+   -- Fixture: intra-file multi-step ETL chain (T-10)
+   CREATE TABLE stage_orders AS
+   SELECT id, customer_id, amount
+   FROM raw.orders;
+
+   INSERT INTO dwh.orders
+   SELECT o.id, o.customer_id, c.name, o.amount
+   FROM stage_orders o
+   JOIN raw.customers c ON o.customer_id = c.id;
+   ```
+
+Column lineage SQL pattern matrix (all patterns must be covered by fixtures in T-10):
+
+| Pattern | Fixture file | Expected SELECTS_FROM source table | Expected edge count |
+|---------|-------------|-------------------------------------|---------------------|
+| Simple INSERT-SELECT | `insert_select_impact.sql` | `source_schema.source_table` | >= 1 SELECTS_FROM edge |
+| Multi-step intra-file CTAS + INSERT | `etl_chain.sql` | `raw.orders` and `raw.customers` | >= 2 SELECTS_FROM edges |
+
+Integration tests (full stack: fixture → Indexer → real KùzuDB → Cypher query):
+
+- `tests/integration/test_indexer_to_graph.py` (extend):
+
+  **Scenario 1 — INSERT-SELECT emits SELECTS_FROM edge**:
+  - Index only `insert_select_impact.sql` into in-memory KùzuDB.
+  - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) WHERE t.qualified CONTAINS 'source_table' RETURN q.id AS qid, t.qualified AS tbl", {})`.
+  - Assert `len(rows) >= 1`.
+  - Assert `rows[0]["tbl"]` contains `"source_table"` (case-insensitive tolerated via `lower()`).
+  - Assert `len(rows) <= 2` — at most one SELECTS_FROM edge per source table per query (no duplicates from JOIN expansion).
+  - **Golden rule**: exact edge count assertion: `assert len(rows) == 2` (source_table + dim_customers — both JOIN sources must produce edges).
+
+  **Scenario 2 — CTAS produces SELECTS_FROM edge to its source**:
+  - Index only `etl_chain.sql`.
+  - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) RETURN t.qualified AS tbl ORDER BY tbl", {})`.
+  - Assert result contains a row with `tbl` matching `"raw.orders"` (or `"orders"` depending on qualification).
+  - Assert result contains a row with `tbl` matching `"raw.customers"`.
+  - Assert `len(rows) == 3`: CTAS reads `raw.orders`; INSERT reads `stage_orders` and `raw.customers`. Total = 3 distinct SELECTS_FROM edges.
+  - **Golden rule**: `assert len(rows) == 3` — not `>= 2`. Spurious extra edges must not be present.
+
+  **Scenario 3 — analyze impact finds the INSERT file**:
+  - Index `insert_select_impact.sql`.
+  - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) WHERE t.qualified CONTAINS 'source_table' RETURN q.id", {})`.
+  - Assert `len(rows) >= 1`. This is the graph-level equivalent of `analyze impact source_schema.source_table` returning the INSERT file.
+
+  **Scenario 4 — find_table_usages and analyze impact consistency**:
+  - Index `insert_select_impact.sql`.
+  - Run `FIND_TABLE_USAGES_QUERY` with `name="source_table"`.
+  - Assert `len(usages) >= 1` and `usages[0]["kind"] == "INSERT"`.
+  - This confirms `find_table_usages` and `analyze impact` return consistent results for the same table.
 
 **Definition of done**:
 - `analyze impact <table>` returns the INSERT file when the table is a source in an INSERT-SELECT
@@ -721,12 +866,129 @@ Rename `_parse_scripting_file` internals; the public signature stays the same.
   Expected: existing regex fallback still extracts the INSERT.
 
 **Tests to add**:
-- `tests/unit/test_snowflake_scripting.py`: parse `snowflake_scripting_noise.sql`, assert
-  only MERGE and INSERT appear in `parsed.statements`, ALTER and CALL are absent
-- `tests/unit/test_snowflake_procedure.py`: parse `snowflake_procedure.sql`, assert
-  INSERT is extracted from the procedure body
-- `tests/unit/test_bigquery_fallback.py`: parse `bigquery_procedure.sql` with BigQuery
-  dialect, assert INSERT is extracted via regex fallback
+
+New SQL fixtures required:
+
+1. `tests/fixtures/synthetic/snowflake_scripting_noise.sql` (exact content):
+   ```sql
+   -- Fixture: Snowflake scripting block with DML and noise statements (T-11)
+   BEGIN
+     ALTER WAREHOUSE IDENTIFIER($my_wh) SET WAREHOUSE_SIZE = 'X-Large';
+     CALL MA.MSSPR_UPDATE_STATS();
+     MERGE INTO dwh.target t
+     USING raw.source s ON t.id = s.id
+     WHEN MATCHED THEN UPDATE SET t.amount = s.amount
+     WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount);
+     INSERT INTO dwh.audit_log
+     SELECT id, CURRENT_TIMESTAMP() AS ts, 'merge_done' AS event
+     FROM dwh.target;
+   END;
+   ```
+
+2. `tests/fixtures/synthetic/snowflake_procedure.sql` (exact content):
+   ```sql
+   -- Fixture: Snowflake procedure with embedded DML (T-11)
+   CREATE OR REPLACE PROCEDURE etl.load_orders()
+   RETURNS VARCHAR
+   LANGUAGE SQL
+   AS $$
+   BEGIN
+     INSERT INTO dwh.orders (id, customer_id, amount)
+     SELECT id, customer_id, amount
+     FROM raw.orders
+     WHERE processed = FALSE;
+   END
+   $$;
+   ```
+
+3. `tests/fixtures/synthetic/bigquery_procedure.sql` (exact content):
+   ```sql
+   -- Fixture: BigQuery procedure body (T-11 — regex fallback path)
+   CREATE OR REPLACE PROCEDURE etl.load_orders()
+   BEGIN
+     INSERT INTO dwh.orders (id, customer_id, amount)
+     SELECT id, customer_id, amount
+     FROM raw.orders
+     WHERE processed = FALSE;
+   END;
+   ```
+
+Column lineage SQL pattern matrix for T-11 (scripting-block DML extraction):
+
+| Pattern | Fixture | Expected statement kinds in `parsed.statements` | Expected absent kinds |
+|---------|---------|--------------------------------------------------|----------------------|
+| MERGE inside scripting block | `snowflake_scripting_noise.sql` | `MERGE` | `ALTER`, `CALL` |
+| INSERT inside scripting block | `snowflake_scripting_noise.sql` | `INSERT` | `ALTER`, `CALL` |
+| Procedure body INSERT (Snowflake `$$`) | `snowflake_procedure.sql` | `INSERT` | `CREATE_PROCEDURE` body as opaque node |
+| BigQuery procedure body INSERT | `bigquery_procedure.sql` | `INSERT` via regex fallback | none |
+
+Unit tests (parser layer — no graph backend):
+
+- `tests/unit/test_snowflake_scripting.py`:
+  - Scenario — noise statements dropped: parse `snowflake_scripting_noise.sql` with `SnowflakeParser`; collect `[stmt.kind for stmt in parsed.statements]`; assert `"MERGE"` in kinds; assert `"INSERT"` in kinds; assert `"ALTER"` not in kinds; assert `"CALL"` not in kinds; assert `"UNKNOWN"` not in kinds (no `exp.Command` noise leaked through).
+  - **Exact count assertion (golden rule)**: `assert len(parsed.statements) == 2` — exactly one MERGE and one INSERT, no spurious extras.
+  - Scenario — no spurious WARNING log: assert `caplog` at WARNING level is empty (ALTER and CALL must be logged at DEBUG, not WARNING).
+
+- `tests/unit/test_snowflake_procedure.py`:
+  - Scenario — INSERT extracted from `$$` body: parse `snowflake_procedure.sql` with `SnowflakeParser`; assert `len(parsed.statements) == 1`; assert `parsed.statements[0].kind == "INSERT"`; assert `parsed.statements[0].sources` contains a reference to `raw.orders`.
+  - **Exact count assertion**: `assert len(parsed.statements) == 1` — the `CREATE PROCEDURE` wrapper must not appear as a second statement.
+
+- `tests/unit/test_bigquery_fallback.py`:
+  - Scenario — regex fallback extracts INSERT: parse `bigquery_procedure.sql` with `BigQueryParser` (dialect `"bigquery"`); assert `len(parsed.statements) >= 1`; assert any statement has `kind == "INSERT"`.
+  - Regression assertion: compare result count to parsing the same fixture with the old regex path (snapshot the count before the T-11 rewrite and assert it does not decrease).
+
+Integration tests (full stack: fixture → Indexer → real KùzuDB → graph query):
+
+- `tests/integration/test_dialect_matrix.py` (extend existing):
+
+  **Scenario — scripting block MERGE and INSERT both create SELECTS_FROM edges**:
+  - Index `snowflake_scripting_noise.sql` with dialect `"snowflake"` into in-memory KùzuDB.
+  - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) RETURN q.kind AS kind, t.qualified AS tbl ORDER BY kind", {})`.
+  - Assert result contains a row with `kind == "MERGE"` and `tbl` matching `raw.source`.
+  - Assert result contains a row with `kind == "INSERT"` and `tbl` matching `dwh.target`.
+  - **Exact edge count (golden rule)**: `assert len(rows) == 2` — one SELECTS_FROM edge per source-reading statement; the ALTER and CALL must not create any edges.
+
+  **Scenario — procedure body INSERT creates SELECTS_FROM edge**:
+  - Index `snowflake_procedure.sql` with dialect `"snowflake"`.
+  - Run: `db.run_read("MATCH (q:SqlQuery {kind: 'INSERT'})-[:SELECTS_FROM]->(t:SqlTable) RETURN t.qualified AS tbl", {})`.
+  - Assert `len(rows) == 1`; assert `rows[0]["tbl"]` contains `"raw.orders"`.
+
+  **Scenario — column lineage matrix for scripting-block patterns** (full column lineage end-to-end):
+
+  This is the hardest correctness test. It requires that after T-10 and T-11 are both complete, column-level `COLUMN_LINEAGE` edges are present in the graph for scripting-block DML. The following matrix applies:
+
+  | SQL Pattern | Fixture | Expected COLUMN_LINEAGE edge | Expected confidence | Expected exact edge count |
+  |-------------|---------|------------------------------|---------------------|--------------------------|
+  | Simple SELECT with alias | `views.sql` (`amount AS total`) | `orders.amount` → `customer_orders.total` | >= 0.7 | 1 |
+  | SELECT * (no schema) | add `tests/fixtures/synthetic/star_select.sql` | `orders.*` → confidence downgrade | <= 0.3 | 0 explicit edges (no column expansion without schema) |
+  | INSERT INTO ... SELECT | `insert_select_impact.sql` | `source_schema.source_table.col_a` → `dwh.target_table.col_a` | >= 0.7 | 2 (col_a and col_b) |
+  | MERGE INTO WHEN MATCHED UPDATE | `snowflake_scripting_noise.sql` | `raw.source.amount` → `dwh.target.amount` | >= 0.5 | 1 |
+  | CTAS | `etl_chain.sql` | `raw.orders.id` → `stage_orders.id` | >= 0.7 | 3 (id, customer_id, amount) |
+  | Multi-step intra-file temp table | `etl_chain.sql` | `raw.orders.amount` → `dwh.orders.amount` (through stage_orders) | >= 0.5 | >= 1 |
+  | Snowflake scripting INSERT | `snowflake_procedure.sql` | `raw.orders.id` → `dwh.orders.id` | >= 0.5 | 3 (id, customer_id, amount) |
+
+  For each row in the matrix, add an assertion in `tests/integration/test_dialect_matrix.py`:
+  ```python
+  # Example for INSERT INTO ... SELECT (col_a)
+  rows = db.run_read(
+      "MATCH (src:SqlColumn {id: $src_id})-[e:COLUMN_LINEAGE]->(dst:SqlColumn {id: $dst_id}) "
+      "RETURN e.confidence AS conf",
+      {"src_id": "source_schema.source_table.col_a", "dst_id": "dwh.target_table.col_a"}
+  )
+  assert len(rows) == 1, f"Expected 1 edge, got {len(rows)}"
+  assert rows[0]["conf"] >= 0.7, f"Expected confidence >= 0.7, got {rows[0]['conf']}"
+  ```
+  Repeat this pattern for each matrix row. The `SELECT *` row must assert `len(rows) == 0` (no expansion without schema) and that `parse_quality == TABLE_ONLY` or the edge has `confidence <= 0.3`.
+
+  **New fixture required**:
+  `tests/fixtures/synthetic/star_select.sql` (exact content):
+  ```sql
+  -- Fixture: SELECT * confidence downgrade test (T-11 column lineage matrix)
+  INSERT INTO dwh.star_target
+  SELECT *
+  FROM raw.source_wide;
+  ```
+  Expected: after indexing with dialect `"snowflake"`, graph has zero `COLUMN_LINEAGE` edges for this file (no column expansion without DDL schema) OR one edge per column with `confidence <= 0.3` if schema is known. Assert `len(lineage_rows) == 0` when no DDL for `raw.source_wide` is indexed.
 
 **Definition of done**:
 - `ALTER WAREHOUSE`, `CALL`, `SET`, `LET`, `RETURN`, and other non-DML statements are
@@ -811,16 +1073,24 @@ The file is safe to commit.
 - `src/sqlcg/cli/commands/index.py` — `.sqlcg.toml` write, optional path argument
 
 **Tests to add**:
+
+Unit tests (mock backend, no graph):
+
 - `tests/unit/test_analyze_unused.py`:
-  - Mock backend returning a mix of `DIM_PRODUCT`, `BA_ORDERS`, `RAW_EVENTS` as unused tables
-  - Assert the Rich table output contains `gold`, `silver`, `bronze` tier labels
-  - Assert `--exclude-schema IA` filters out `IA_` tables
-  - Assert the caveat line appears in output
+  - Scenario A — tier classification: mock `KuzuBackend.run_read` to return `[{"qualified": "DIM_PRODUCT"}, {"qualified": "BA_ORDERS"}, {"qualified": "RAW_EVENTS"}, {"qualified": "IA_ANALYTICS"}]` for the unused-tables Cypher query; invoke `analyze unused` via `CliRunner`; assert captured output contains `"gold"` adjacent to `"DIM_PRODUCT"`, `"silver"` adjacent to `"BA_ORDERS"`, `"bronze"` adjacent to `"RAW_EVENTS"`.
+  - Scenario B — `--exclude-schema IA` filter: same mock; invoke with `["unused", "--exclude-schema", "IA"]`; assert `"IA_ANALYTICS"` does NOT appear in output; assert the other three tables DO appear.
+  - Scenario C — caveat line: for any invocation, assert output contains `"External consumers"` or `"not visible to this tool"` as a substring.
+  - Scenario D — tier column present: assert the Rich table contains a header column named `"tier"` (check for `"tier"` in output before the first data row).
+
 - `tests/unit/test_sqlcg_toml.py`:
-  - Run `index_cmd` with a tmp_path target, assert `.sqlcg.toml` is written with the correct dialect
-  - Run `index_cmd` again, assert the file is not overwritten if content matches
-  - Run `index_cmd` with no path argument in a dir containing `.sqlcg.toml`, assert it
-    uses the dialect from the file
+  - Scenario A — toml written on first index: patch `Indexer.index_repo` to return a successful summary; invoke `index_cmd` with `[str(tmp_path), "--dialect", "snowflake"]` via `CliRunner`; assert `(tmp_path / ".sqlcg.toml").exists()`; assert `(tmp_path / ".sqlcg.toml").read_text()` contains `'dialect = "snowflake"'` and does NOT contain `"path ="`.
+  - Scenario B — toml not overwritten on second index with same dialect: write `.sqlcg.toml` manually with `dialect = "snowflake"`; record `mtime` before; invoke `index_cmd` again; assert `mtime` unchanged (file not rewritten).
+  - Scenario C — toml read when no path argument: write `(tmp_path / ".sqlcg.toml").write_text('[sqlcg]\ndialect = "postgres"\n')`; invoke `index_cmd` with no path argument from `tmp_path` as cwd (use `CliRunner(mix_stderr=False)` with `env={"PWD": str(tmp_path)}`); assert `Indexer.index_repo` was called with `dialect="postgres"`.
+
+Integration tests (real Indexer → real KùzuDB → filesystem):
+
+- Scenario — toml written after successful real index: index `tests/fixtures/synthetic/` with `dialect="ansi"` into in-memory KùzuDB via `index_cmd` with `tmp_path` copy of the fixtures; assert `(tmp_path / ".sqlcg.toml").read_text()` contains `'dialect = "ansi"'`; confirm the file is valid TOML by parsing it with `tomllib.loads()` and asserting `config["sqlcg"]["dialect"] == "ansi"`.
+- Scenario — no toml written on failed index: patch `Indexer.index_repo` to raise `RuntimeError`; invoke `index_cmd`; assert `.sqlcg.toml` does not exist (toml write is conditional on success).
 
 **Definition of done**:
 - `analyze unused` output includes a `tier` column and the closed-world caveat
@@ -867,8 +1137,23 @@ The file is safe to commit.
 - `src/sqlcg/cli/commands/gain.py` — Section E, execute_cypher ratio
 
 **Tests to add**:
-- `tests/unit/test_submit_feedback.py`: assert `submit_feedback("trace_column_lineage", "t.col", "FN")` does not raise; assert `"TP"`, `"FP"`, `"FN"` are all valid; assert `"XX"` raises `ValueError`
-- `tests/unit/test_gain_ratio.py`: mock MetricsStore with 15 `execute_cypher` calls and 5 `trace_column_lineage` calls (ratio = 0.75), assert the warning string is printed; mock with 2 `execute_cypher` calls and 18 others (ratio = 0.1), assert no warning
+
+Unit tests:
+
+- `tests/unit/test_submit_feedback.py`:
+  - Scenario A — FN label accepted: call `submit_feedback("trace_column_lineage", "orders.amount", "FN")` with a real `MetricsStore` in `tmp_path`; assert no exception is raised; assert the stored record's `label` field equals `"FN"` when queried back via `store.get_recent(n=1)`.
+  - Scenario B — TP and FP still valid: assert `submit_feedback(..., "TP")` and `submit_feedback(..., "FP")` do not raise.
+  - Scenario C — invalid label raises: assert `submit_feedback(..., "XX")` raises `ValueError`; assert `"FN"` appears in the `ValueError` message (the error must list all three valid labels so the user knows FN is an option).
+  - Assertion on stored label: `assert records[0].label == "FN"` — not just "no exception"; the label must round-trip through the store.
+
+- `tests/unit/test_gain_ratio.py`:
+  - Scenario A — ratio above 0.3 triggers warning: populate a real `MetricsStore` in `tmp_path` with 15 `execute_cypher` rows and 5 `trace_column_lineage` rows; invoke `gain_cmd` via `CliRunner`; assert output contains `"execute_cypher"` ratio section; assert the ratio `0.75` or `75%` appears in output; assert a warning phrase containing `"raw-Cypher"` or `"high"` appears.
+  - Scenario B — ratio at or below 0.3 shows no warning: populate store with 2 `execute_cypher` and 18 `trace_column_lineage` rows; invoke `gain_cmd`; assert the ratio `0.10` or `10%` appears; assert `"high"` warning does NOT appear in the ratio section.
+  - Scenario C — zero calls: populate store with zero rows; invoke `gain_cmd`; assert no division-by-zero exception; assert ratio section shows `0%` or `"No calls recorded"`.
+
+Integration test (real MetricsStore populated by real tool calls):
+
+- Scenario: use the real `MetricsStore` writing to `tmp_path / "metrics.db"`; call `trace_column_lineage("orders.amount")` 5 times and `execute_cypher("MATCH (n) RETURN n")` 2 times against a real in-memory KùzuDB (ignore the result); invoke `gain_cmd`; assert the output ratio is `"28%"` or `0.28` (2/7 rounded). This confirms the ratio is computed from actual `_timed_tool` decorators, not from a mock.
 
 **Definition of done**:
 - `submit_feedback` accepts `"FN"` as a valid label
@@ -900,8 +1185,15 @@ and MCP setup output. T-14 covers the README documentation-only changes that are
 - `src/sqlcg/cli/commands/install.py` — uvx confirmation message
 
 **Tests to add**:
-- `tests/unit/test_install_message.py`: assert the install_cmd output contains the uvx warning
-  when `shutil.which("uvx")` returns a path (mock `shutil.which`)
+
+Unit tests:
+
+- `tests/unit/test_install_message.py`:
+  - Scenario A — uvx available: patch `shutil.which("uvx")` to return `"/usr/bin/uvx"`; invoke `install_cmd` via `CliRunner` with a `tmp_path / "settings.json"` target; assert captured output contains `"cold cache"` or `"first MCP startup"` as a substring; assert the settings JSON written uses `"command": "uvx"`.
+  - Scenario B — uvx not available: patch `shutil.which("uvx")` to return `None`; invoke `install_cmd`; assert `"cold cache"` does NOT appear in output; assert the settings JSON uses `"command": "sqlcg"`.
+  - Each scenario must assert the exact JSON key written, not just the output message: parse `settings.json` with `json.loads()` and assert `config["mcpServers"]["sql-code-graph"]["command"]` equals `"uvx"` or `"sqlcg"` respectively.
+
+Integration test: none required for T-14. All behaviour is in string output and filesystem writes; the unit scenarios above with `tmp_path` constitute full coverage.
 
 **Definition of done**:
 - README QUICK START section recommends `uv tool install` over `uvx` for regular use
