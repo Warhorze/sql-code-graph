@@ -59,7 +59,6 @@ All open items from the architecture review:
 | T-09 | Introduce parse_quality breakdown | `parsers/base.py`, `indexer/indexer.py`, `cli/commands/db.py`, `cli/commands/index.py` | M | MEDIUM | DEPENDS ON T-06 | NONE |
 | T-10 | Verify and fix SELECTS_FROM edges for INSERT-SELECT | `indexer/indexer.py`, `parsers/base.py`, `parsers/ansi_parser.py` | M | HIGH | DEPENDS ON T-06 | NONE |
 | T-11 | Rewrite scripting-block DML extraction | `parsers/snowflake_parser.py` | M | HIGH | DEPENDS ON T-06 | NONE |
-| T-12 | Medallion-aware analyze unused + .sqlcg.toml write | `cli/commands/analyze.py`, `cli/commands/index.py`, `core/config.py` | S | MEDIUM | INDEPENDENT | NONE |
 | T-13 | Add FN label and execute_cypher ratio to gain | `server/tools.py`, `metrics/store.py`, `cli/commands/gain.py` | S | MEDIUM | INDEPENDENT | NONE |
 | T-14 | Binary/package name note and uvx cold-start docs | `server/tools.py`, `cli/commands/mcp.py`, `README.md` | XS | LOW | INDEPENDENT | NONE |
 
@@ -160,7 +159,7 @@ Unit tests (mock backend, no graph):
 
 Integration tests (real KùzuDB in-memory, real SQL fixture → Indexer → graph → tool call):
 
-- Fixture: `tests/fixtures/synthetic/base_tables.sql` (already exists — creates `customers`, `orders`, `products`, `order_items`).
+- Fixture: `tests/fixtures/snowflake/base_tables.sql` (already exists — creates `customers`, `orders`, `products`, `order_items`).
 - Scenario — db_info after indexing DDL-only corpus: index `base_tables.sql` using `Indexer.index_repo()` into an in-memory KùzuDB; call `db.run_read("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})` and assert it returns `[{"count": 0}]`; then call the `db info` CLI command and assert the yellow column-lineage warning appears in captured output.
 - Assertion detail: `result.output` must contain `"Column lineage not available"` exactly once; must NOT contain `"Database is empty"` (Repo node was created).
 
@@ -306,7 +305,7 @@ Unit tests (KùzuDB in-memory — no real SQL files needed):
 Integration tests (real SQL fixture → Indexer → KùzuDB → injected failure → graph state assertion):
 
 - `tests/integration/test_indexer_to_graph.py` (extend existing file):
-  - Scenario — mid-index failure leaves graph consistent: index `tests/fixtures/synthetic/base_tables.sql` into an in-memory KùzuDB to establish a baseline; record node count `N_before`; patch `KuzuBackend.upsert_node` to raise `RuntimeError` on the second call; attempt `indexer.reindex_file(base_tables_path, db, dialect=None)` inside a `try/except`; assert `db.run_read("MATCH (n) RETURN COUNT(n) AS count", {})` returns `[{"count": N_before}]` — no orphaned nodes from the partial re-index.
+  - Scenario — mid-index failure leaves graph consistent: index `tests/fixtures/snowflake/base_tables.sql` into an in-memory KùzuDB to establish a baseline; record node count `N_before`; patch `KuzuBackend.upsert_node` to raise `RuntimeError` on the second call; attempt `indexer.reindex_file(base_tables_path, db, dialect=None)` inside a `try/except`; assert `db.run_read("MATCH (n) RETURN COUNT(n) AS count", {})` returns `[{"count": N_before}]` — no orphaned nodes from the partial re-index.
   - Assert exact count: `assert result[0]["count"] == N_before` (not `>= 0` — the count must not change).
 
 **Definition of done**:
@@ -523,7 +522,7 @@ Unit tests (mock callback, no real graph):
 
 Integration test (real indexer → real KùzuDB → CLI output):
 
-- Scenario: index `tests/fixtures/synthetic/base_tables.sql` (DDL only, no DML → zero lineage edges); capture CLI output; assert `result.output` contains `"0 lineage edges"` warning and `"COLUMN_LINEAGE edges: 0"` in the `db info` output after re-running `db info`. These two assertions span both `index_cmd` and `db_info` and confirm the warning propagates through the full stack.
+- Scenario: index `tests/fixtures/snowflake/base_tables.sql` (DDL only, no DML → zero lineage edges); capture CLI output; assert `result.output` contains `"0 lineage edges"` warning and `"COLUMN_LINEAGE edges: 0"` in the `db info` output after re-running `db info`. These two assertions span both `index_cmd` and `db_info` and confirm the warning propagates through the full stack.
 - Assertion is on exact substring: `assert "lineage_edges_created" not in result.output` (the raw key must not leak); `assert "0 lineage edges" in result.output` (the rendered warning must appear).
 
 **Definition of done**:
@@ -599,14 +598,14 @@ Unit tests (parser layer — no graph):
 - `tests/unit/test_parse_quality.py`:
   - Scenario — scripting fallback: read `tests/benchmarks/golden_corpus/snowflake/scripting_block.sql`; parse it with `SnowflakeParser`; assert `parsed.parse_quality == ParseQuality.SCRIPTING_FALLBACK`.
   - Scenario — failed parse: construct a `ParsedFile` that has a simulated unhandled exception recorded; assert the quality is set to `ParseQuality.FAILED` (simulate by calling `Indexer._handle_parse_failure()` or setting the field directly in a test double).
-  - Scenario — table_only default: parse `tests/fixtures/synthetic/base_tables.sql` (pure DDL); assert `parsed.parse_quality == ParseQuality.TABLE_ONLY` (no column lineage extracted from DDL-only).
+  - Scenario — table_only default: parse `tests/fixtures/snowflake/base_tables.sql` (pure DDL); assert `parsed.parse_quality == ParseQuality.TABLE_ONLY` (no column lineage extracted from DDL-only).
 
 Integration tests (real SQL fixture → Indexer → summary dict → quality breakdown):
 
 - `tests/unit/test_indexer_quality.py` (named unit but actually integration — exercises Indexer + KùzuDB):
-  - Fixture contents: use `tests/fixtures/synthetic/` which has `base_tables.sql` (DDL → TABLE_ONLY), `views.sql` (CREATE VIEW → TABLE_ONLY), `reports.sql` (SELECT → TABLE_ONLY or FULL if lineage extracted).
-  - Add `tests/fixtures/synthetic/scripting_sample.sql` (new fixture, content below) to introduce a SCRIPTING_FALLBACK file.
-  - Fixture `tests/fixtures/synthetic/scripting_sample.sql`:
+  - Fixture contents: use `tests/fixtures/snowflake/` which has `base_tables.sql` (DDL → TABLE_ONLY), `views.sql` (CREATE VIEW → TABLE_ONLY), `reports.sql` (SELECT → TABLE_ONLY or FULL if lineage extracted).
+  - Add `tests/fixtures/snowflake/scripting_sample.sql` (new fixture, content below) to introduce a SCRIPTING_FALLBACK file.
+  - Fixture `tests/fixtures/snowflake/scripting_sample.sql`:
     ```sql
     -- Snowflake scripting block sample for parse_quality testing
     BEGIN
@@ -614,7 +613,7 @@ Integration tests (real SQL fixture → Indexer → summary dict → quality bre
       CALL my_proc();
     END;
     ```
-  - Index the full `tests/fixtures/synthetic/` directory with dialect `"snowflake"` into an in-memory KùzuDB; assert `summary["quality"]["scripting_fallback"] >= 1` (the new scripting file); assert `summary["quality"]["full"] + summary["quality"]["table_only"] + summary["quality"]["scripting_fallback"] + summary["quality"]["failed"] == summary["files_parsed"]` (quality counts sum to total files); assert `summary["quality"]` key exists in the return dict.
+  - Index the full `tests/fixtures/snowflake/` directory with dialect `"snowflake"` into an in-memory KùzuDB; assert `summary["quality"]["scripting_fallback"] >= 1` (the new scripting file); assert `summary["quality"]["full"] + summary["quality"]["table_only"] + summary["quality"]["scripting_fallback"] + summary["quality"]["failed"] == summary["files_parsed"]` (quality counts sum to total files); assert `summary["quality"]` key exists in the return dict.
   - Exact assertion: `assert sum(summary["quality"].values()) == summary["files_parsed"]` — this is the golden rule for the quality breakdown.
 
 **Definition of done**:
@@ -643,7 +642,7 @@ edges for INSERT statements, or in the parser not extracting `sources` for INSER
 
 1. Index a test fixture containing:
    ```sql
-   -- tests/fixtures/synthetic/insert_select_impact.sql
+   -- tests/fixtures/snowflake/insert_select_impact.sql
    INSERT INTO dwh.target_table
    SELECT t.col_a, c.col_b
    FROM source_schema.source_table t
@@ -669,20 +668,20 @@ edges for INSERT statements, or in the parser not extracting `sources` for INSER
   is the correct relationship for INSERT-SELECT (it is — `SELECTS_FROM` means "this query
   reads from this table", not "this query selects from").
 
-**Mandatory deliverable**: the test fixture `tests/fixtures/synthetic/insert_select_impact.sql`
+**Mandatory deliverable**: the test fixture `tests/fixtures/snowflake/insert_select_impact.sql`
 and a test that calls `analyze impact` on the indexed fixture and asserts the INSERT file
 appears in results.
 
 **Files affected** (expected, pending investigation):
 - `src/sqlcg/parsers/ansi_parser.py` — INSERT source extraction
-- `tests/fixtures/synthetic/insert_select_impact.sql` (new)
+- `tests/fixtures/snowflake/insert_select_impact.sql` (new)
 - `tests/unit/test_insert_select_impact.py` (new)
 
 **Tests to add**:
 
 New SQL fixtures required:
 
-1. `tests/fixtures/synthetic/insert_select_impact.sql` (exact content):
+1. `tests/fixtures/snowflake/insert_select_impact.sql` (exact content):
    ```sql
    -- Fixture: INSERT-SELECT for SELECTS_FROM edge verification (T-10)
    INSERT INTO dwh.target_table
@@ -691,7 +690,7 @@ New SQL fixtures required:
    JOIN ref_schema.dim_customers c ON t.id = c.id;
    ```
 
-2. `tests/fixtures/synthetic/etl_chain.sql` (exact content):
+2. `tests/fixtures/snowflake/etl_chain.sql` (exact content):
    ```sql
    -- Fixture: intra-file multi-step ETL chain (T-10)
    CREATE TABLE stage_orders AS
@@ -708,15 +707,15 @@ Column lineage SQL pattern matrix (all patterns must be covered by fixtures in T
 
 | Pattern | Fixture file | Expected SELECTS_FROM source table | Expected edge count |
 |---------|-------------|-------------------------------------|---------------------|
-| Simple INSERT-SELECT | `insert_select_impact.sql` | `source_schema.source_table` | >= 1 SELECTS_FROM edge |
-| Multi-step intra-file CTAS + INSERT | `etl_chain.sql` | `raw.orders` and `raw.customers` | >= 2 SELECTS_FROM edges |
+| Simple INSERT-SELECT | `tests/fixtures/snowflake/insert_select_impact.sql` | `source_schema.source_table` | >= 1 SELECTS_FROM edge |
+| Multi-step intra-file CTAS + INSERT | `tests/fixtures/snowflake/etl_chain.sql` | `raw.orders` and `raw.customers` | >= 2 SELECTS_FROM edges |
 
 Integration tests (full stack: fixture → Indexer → real KùzuDB → Cypher query):
 
 - `tests/integration/test_indexer_to_graph.py` (extend):
 
   **Scenario 1 — INSERT-SELECT emits SELECTS_FROM edge**:
-  - Index only `insert_select_impact.sql` into in-memory KùzuDB.
+  - Index only `tests/fixtures/snowflake/insert_select_impact.sql` into in-memory KùzuDB.
   - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) WHERE t.qualified CONTAINS 'source_table' RETURN q.id AS qid, t.qualified AS tbl", {})`.
   - Assert `len(rows) >= 1`.
   - Assert `rows[0]["tbl"]` contains `"source_table"` (case-insensitive tolerated via `lower()`).
@@ -724,7 +723,7 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → Cypher q
   - **Golden rule**: exact edge count assertion: `assert len(rows) == 2` (source_table + dim_customers — both JOIN sources must produce edges).
 
   **Scenario 2 — CTAS produces SELECTS_FROM edge to its source**:
-  - Index only `etl_chain.sql`.
+  - Index only `tests/fixtures/snowflake/etl_chain.sql`.
   - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) RETURN t.qualified AS tbl ORDER BY tbl", {})`.
   - Assert result contains a row with `tbl` matching `"raw.orders"` (or `"orders"` depending on qualification).
   - Assert result contains a row with `tbl` matching `"raw.customers"`.
@@ -732,12 +731,12 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → Cypher q
   - **Golden rule**: `assert len(rows) == 3` — not `>= 2`. Spurious extra edges must not be present.
 
   **Scenario 3 — analyze impact finds the INSERT file**:
-  - Index `insert_select_impact.sql`.
+  - Index `tests/fixtures/snowflake/insert_select_impact.sql`.
   - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) WHERE t.qualified CONTAINS 'source_table' RETURN q.id", {})`.
   - Assert `len(rows) >= 1`. This is the graph-level equivalent of `analyze impact source_schema.source_table` returning the INSERT file.
 
   **Scenario 4 — find_table_usages and analyze impact consistency**:
-  - Index `insert_select_impact.sql`.
+  - Index `tests/fixtures/snowflake/insert_select_impact.sql`.
   - Run `FIND_TABLE_USAGES_QUERY` with `name="source_table"`.
   - Assert `len(usages) >= 1` and `usages[0]["kind"] == "INSERT"`.
   - This confirms `find_table_usages` and `analyze impact` return consistent results for the same table.
@@ -745,7 +744,7 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → Cypher q
 **Definition of done**:
 - `analyze impact <table>` returns the INSERT file when the table is a source in an INSERT-SELECT
 - `find pattern <table>` and `analyze impact <table>` return consistent (overlapping) results for the same table
-- `tests/fixtures/synthetic/insert_select_impact.sql` exists with the fixture SQL
+- `tests/fixtures/snowflake/insert_select_impact.sql` exists with the fixture SQL
 - Tests pass
 
 ---
@@ -854,38 +853,50 @@ Rename `_parse_scripting_file` internals; the public signature stays the same.
 - `src/sqlcg/parsers/snowflake_parser.py` — rewrite `_parse_scripting_file`, add `_split_statements`, `_extract_procedure_body`, `_is_indexable`; keep `_EMBEDDED_DML` for BigQuery fallback only
 
 **Test fixtures to add**:
-- `tests/fixtures/synthetic/snowflake_scripting_noise.sql`:
-  A scripting block with `ALTER WAREHOUSE IDENTIFIER($var) SET WAREHOUSE_SIZE = 'X-Large'`,
-  `CALL MA.MSSPR_UPDATE()`, `MERGE INTO target USING source ON ...`, `INSERT INTO t SELECT ...`.
-  Expected: only MERGE and INSERT are indexed; ALTER and CALL are dropped at DEBUG.
-- `tests/fixtures/synthetic/snowflake_procedure.sql`:
+- `tests/fixtures/snowflake/scripting_noise.sql`:
+  A scripting block with `ALTER WAREHOUSE`, `CALL`, `TRUNCATE TABLE` (all noise),
+  followed by two DML statements that must pass: `INSERT INTO ... SELECT` (x2).
+  Expected: only the two INSERTs are indexed; the three noise statements are dropped at DEBUG.
+- `tests/fixtures/snowflake/procedure.sql`:
   `CREATE OR REPLACE PROCEDURE my_proc() AS $$ BEGIN INSERT INTO t SELECT ... END $$`.
-  Expected: INSERT inside the body is indexed.
-- `tests/fixtures/synthetic/bigquery_procedure.sql`:
-  `CREATE PROCEDURE my_proc() BEGIN INSERT INTO t SELECT ... END`.
-  Expected: existing regex fallback still extracts the INSERT.
+  Expected: INSERT inside the `$$` body is indexed.
+
+**Deferred (other dialects)**:
+- BigQuery procedure fixture (`tests/fixtures/bigquery/procedure.sql`) — deferred until
+  BigQuery-specific issues are filed. The BigQuery regex fallback must not regress, but
+  its integration test is out of scope for this sprint.
 
 **Tests to add**:
 
 New SQL fixtures required:
 
-1. `tests/fixtures/synthetic/snowflake_scripting_noise.sql` (exact content):
+1. `tests/fixtures/snowflake/scripting_noise.sql` (exact content):
    ```sql
    -- Fixture: Snowflake scripting block with DML and noise statements (T-11)
+   -- ALTER WAREHOUSE → exp.Command → DROPPED (not exp.DML)
+   -- CALL           → exp.Command → DROPPED
+   -- TRUNCATE TABLE → exp.Truncate (DDL) → DROPPED (not exp.DML)
+   -- INSERT INTO    → exp.Insert (exp.DML subclass) → PASSES
    BEGIN
      ALTER WAREHOUSE IDENTIFIER($my_wh) SET WAREHOUSE_SIZE = 'X-Large';
      CALL MA.MSSPR_UPDATE_STATS();
-     MERGE INTO dwh.target t
-     USING raw.source s ON t.id = s.id
-     WHEN MATCHED THEN UPDATE SET t.amount = s.amount
-     WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount);
-     INSERT INTO dwh.audit_log
-     SELECT id, CURRENT_TIMESTAMP() AS ts, 'merge_done' AS event
-     FROM dwh.target;
+     TRUNCATE TABLE staging.temp_load;
+     INSERT INTO dwh.target (id, amount)
+     SELECT id, amount
+     FROM raw.source
+     WHERE active = TRUE;
+     INSERT INTO dwh.audit_log (id, ts, event)
+     SELECT id, CURRENT_TIMESTAMP() AS ts, 'load_done' AS event
+     FROM raw.source;
    END;
    ```
+   **Assertions**:
+   - `assert len(parsed.statements) == 2` — exactly the two INSERTs, nothing else
+   - `assert all(s.kind == "INSERT" for s in parsed.statements)`
+   - `caplog` at WARNING level must be empty — ALTER WAREHOUSE, CALL, and TRUNCATE
+     must be logged at DEBUG only
 
-2. `tests/fixtures/synthetic/snowflake_procedure.sql` (exact content):
+2. `tests/fixtures/snowflake/procedure.sql` (exact content):
    ```sql
    -- Fixture: Snowflake procedure with embedded DML (T-11)
    CREATE OR REPLACE PROCEDURE etl.load_orders()
@@ -900,58 +911,66 @@ New SQL fixtures required:
    END
    $$;
    ```
+   **Assertions**:
+   - `assert len(parsed.statements) == 1`
+   - `assert parsed.statements[0].kind == "INSERT"`
+   - `assert "raw.orders" in [str(s) for s in parsed.statements[0].sources]`
+   - The `CREATE PROCEDURE` wrapper must not appear as a second statement
 
-3. `tests/fixtures/synthetic/bigquery_procedure.sql` (exact content):
-   ```sql
-   -- Fixture: BigQuery procedure body (T-11 — regex fallback path)
-   CREATE OR REPLACE PROCEDURE etl.load_orders()
-   BEGIN
-     INSERT INTO dwh.orders (id, customer_id, amount)
-     SELECT id, customer_id, amount
-     FROM raw.orders
-     WHERE processed = FALSE;
-   END;
-   ```
+**Deferred fixtures (other dialects)**:
+- `tests/fixtures/bigquery/procedure.sql` — BigQuery procedure body via regex fallback.
+  Deferred until BigQuery issues are filed. Folder structure `tests/fixtures/bigquery/`
+  should be created empty with a `.gitkeep` so the pattern is established.
 
 Column lineage SQL pattern matrix for T-11 (scripting-block DML extraction):
 
 | Pattern | Fixture | Expected statement kinds in `parsed.statements` | Expected absent kinds |
 |---------|---------|--------------------------------------------------|----------------------|
-| MERGE inside scripting block | `snowflake_scripting_noise.sql` | `MERGE` | `ALTER`, `CALL` |
-| INSERT inside scripting block | `snowflake_scripting_noise.sql` | `INSERT` | `ALTER`, `CALL` |
-| Procedure body INSERT (Snowflake `$$`) | `snowflake_procedure.sql` | `INSERT` | `CREATE_PROCEDURE` body as opaque node |
-| BigQuery procedure body INSERT | `bigquery_procedure.sql` | `INSERT` via regex fallback | none |
+| MERGE inside scripting block | `tests/fixtures/snowflake/scripting_noise.sql` | `MERGE` | `ALTER`, `CALL`, `TRUNCATE` |
+| INSERT inside scripting block | `tests/fixtures/snowflake/scripting_noise.sql` | `INSERT` | `ALTER`, `CALL`, `TRUNCATE` |
+| Procedure body INSERT (Snowflake `$$`) | `tests/fixtures/snowflake/procedure.sql` | `INSERT` | `CREATE_PROCEDURE` body as opaque node |
+| BigQuery procedure body INSERT | `tests/fixtures/bigquery/procedure.sql` (deferred) | — | — |
 
-Unit tests (parser layer — no graph backend):
+Unit tests (parser layer — no graph backend, Snowflake only this sprint):
 
-- `tests/unit/test_snowflake_scripting.py`:
-  - Scenario — noise statements dropped: parse `snowflake_scripting_noise.sql` with `SnowflakeParser`; collect `[stmt.kind for stmt in parsed.statements]`; assert `"MERGE"` in kinds; assert `"INSERT"` in kinds; assert `"ALTER"` not in kinds; assert `"CALL"` not in kinds; assert `"UNKNOWN"` not in kinds (no `exp.Command` noise leaked through).
-  - **Exact count assertion (golden rule)**: `assert len(parsed.statements) == 2` — exactly one MERGE and one INSERT, no spurious extras.
-  - Scenario — no spurious WARNING log: assert `caplog` at WARNING level is empty (ALTER and CALL must be logged at DEBUG, not WARNING).
+- `tests/unit/snowflake/test_scripting_noise.py`:
+  - Scenario — noise dropped, DML passes: parse `tests/fixtures/snowflake/scripting_noise.sql`
+    with `SnowflakeParser`; assert `len(parsed.statements) == 2`; assert all kinds are `"INSERT"`;
+    assert `"UNKNOWN"` not in kinds (no `exp.Command` noise leaked through).
+  - Scenario — no WARNING logs for noise: assert `caplog` at `logging.WARNING` level is empty.
+    ALTER WAREHOUSE, CALL, and TRUNCATE must each appear in a DEBUG-level record only.
 
-- `tests/unit/test_snowflake_procedure.py`:
-  - Scenario — INSERT extracted from `$$` body: parse `snowflake_procedure.sql` with `SnowflakeParser`; assert `len(parsed.statements) == 1`; assert `parsed.statements[0].kind == "INSERT"`; assert `parsed.statements[0].sources` contains a reference to `raw.orders`.
-  - **Exact count assertion**: `assert len(parsed.statements) == 1` — the `CREATE PROCEDURE` wrapper must not appear as a second statement.
+- `tests/unit/snowflake/test_procedure.py`:
+  - Scenario — INSERT extracted from `$$` body: parse `tests/fixtures/snowflake/procedure.sql`
+    with `SnowflakeParser`; assert `len(parsed.statements) == 1`;
+    assert `parsed.statements[0].kind == "INSERT"`;
+    assert `parsed.statements[0].sources` contains a reference to `raw.orders`.
+  - **Exact count**: `assert len(parsed.statements) == 1` — CREATE PROCEDURE wrapper must not appear.
 
-- `tests/unit/test_bigquery_fallback.py`:
-  - Scenario — regex fallback extracts INSERT: parse `bigquery_procedure.sql` with `BigQueryParser` (dialect `"bigquery"`); assert `len(parsed.statements) >= 1`; assert any statement has `kind == "INSERT"`.
-  - Regression assertion: compare result count to parsing the same fixture with the old regex path (snapshot the count before the T-11 rewrite and assert it does not decrease).
+**Deferred unit tests (other dialects)**:
+- `tests/unit/bigquery/test_procedure_fallback.py` — deferred until BigQuery issues filed.
+  Note: the existing regex fallback must not regress. A snapshot regression test against the
+  old regex path should be added as part of T-11 to guard this, even if the BigQuery
+  integration test is deferred. This can live in `tests/unit/test_snowflake_parser.py` as
+  a backward-compatibility assertion on the fallback code path.
 
-Integration tests (full stack: fixture → Indexer → real KùzuDB → graph query):
+Integration tests (full stack: fixture → Indexer → real KùzuDB → graph query, Snowflake only this sprint):
 
-- `tests/integration/test_dialect_matrix.py` (extend existing):
+- `tests/integration/snowflake/test_scripting_block.py` (new file):
 
-  **Scenario — scripting block MERGE and INSERT both create SELECTS_FROM edges**:
-  - Index `snowflake_scripting_noise.sql` with dialect `"snowflake"` into in-memory KùzuDB.
+  **Scenario — scripting block INSERTs create SELECTS_FROM edges, noise does not**:
+  - Index `tests/fixtures/snowflake/scripting_noise.sql` with dialect `"snowflake"` into in-memory KùzuDB.
   - Run: `db.run_read("MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) RETURN q.kind AS kind, t.qualified AS tbl ORDER BY kind", {})`.
-  - Assert result contains a row with `kind == "MERGE"` and `tbl` matching `raw.source`.
-  - Assert result contains a row with `kind == "INSERT"` and `tbl` matching `dwh.target`.
-  - **Exact edge count (golden rule)**: `assert len(rows) == 2` — one SELECTS_FROM edge per source-reading statement; the ALTER and CALL must not create any edges.
+  - Assert all rows have `kind == "INSERT"` — TRUNCATE, CALL, ALTER must not create any query nodes.
+  - **Exact edge count (golden rule)**: `assert len(rows) == 2` — one SELECTS_FROM per INSERT; the three noise statements must produce zero edges.
 
   **Scenario — procedure body INSERT creates SELECTS_FROM edge**:
-  - Index `snowflake_procedure.sql` with dialect `"snowflake"`.
+  - Index `tests/fixtures/snowflake/procedure.sql` with dialect `"snowflake"`.
   - Run: `db.run_read("MATCH (q:SqlQuery {kind: 'INSERT'})-[:SELECTS_FROM]->(t:SqlTable) RETURN t.qualified AS tbl", {})`.
   - Assert `len(rows) == 1`; assert `rows[0]["tbl"]` contains `"raw.orders"`.
+
+**Deferred integration tests (other dialects)**:
+- `tests/integration/bigquery/` — deferred until BigQuery issues filed.
 
   **Scenario — column lineage matrix for scripting-block patterns** (full column lineage end-to-end):
 
@@ -960,14 +979,14 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → graph qu
   | SQL Pattern | Fixture | Expected COLUMN_LINEAGE edge | Expected confidence | Expected exact edge count |
   |-------------|---------|------------------------------|---------------------|--------------------------|
   | Simple SELECT with alias | `views.sql` (`amount AS total`) | `orders.amount` → `customer_orders.total` | >= 0.7 | 1 |
-  | SELECT * (no schema) | add `tests/fixtures/synthetic/star_select.sql` | `orders.*` → confidence downgrade | <= 0.3 | 0 explicit edges (no column expansion without schema) |
-  | INSERT INTO ... SELECT | `insert_select_impact.sql` | `source_schema.source_table.col_a` → `dwh.target_table.col_a` | >= 0.7 | 2 (col_a and col_b) |
-  | MERGE INTO WHEN MATCHED UPDATE | `snowflake_scripting_noise.sql` | `raw.source.amount` → `dwh.target.amount` | >= 0.5 | 1 |
-  | CTAS | `etl_chain.sql` | `raw.orders.id` → `stage_orders.id` | >= 0.7 | 3 (id, customer_id, amount) |
-  | Multi-step intra-file temp table | `etl_chain.sql` | `raw.orders.amount` → `dwh.orders.amount` (through stage_orders) | >= 0.5 | >= 1 |
-  | Snowflake scripting INSERT | `snowflake_procedure.sql` | `raw.orders.id` → `dwh.orders.id` | >= 0.5 | 3 (id, customer_id, amount) |
+  | SELECT * (no schema) | `tests/fixtures/snowflake/star_select.sql` (new) | `orders.*` → confidence downgrade | <= 0.3 | 0 explicit edges (no column expansion without schema) |
+  | INSERT INTO ... SELECT | `tests/fixtures/snowflake/insert_select_impact.sql` | `source_schema.source_table.col_a` → `dwh.target_table.col_a` | >= 0.7 | 2 (col_a and col_b) |
+  | MERGE INTO WHEN MATCHED UPDATE | `tests/fixtures/snowflake/scripting_noise.sql` | `raw.source.amount` → `dwh.target.amount` | >= 0.5 | 1 |
+  | CTAS | `tests/fixtures/snowflake/etl_chain.sql` | `raw.orders.id` → `stage_orders.id` | >= 0.7 | 3 (id, customer_id, amount) |
+  | Multi-step intra-file temp table | `tests/fixtures/snowflake/etl_chain.sql` | `raw.orders.amount` → `dwh.orders.amount` (through stage_orders) | >= 0.5 | >= 1 |
+  | Snowflake scripting INSERT | `tests/fixtures/snowflake/procedure.sql` | `raw.orders.id` → `dwh.orders.id` | >= 0.5 | 3 (id, customer_id, amount) |
 
-  For each row in the matrix, add an assertion in `tests/integration/test_dialect_matrix.py`:
+  For each row in the matrix, add an assertion in `tests/integration/snowflake/test_dialect_matrix.py` (Snowflake scenarios only this sprint; file is structured to accept future dialect rows):
   ```python
   # Example for INSERT INTO ... SELECT (col_a)
   rows = db.run_read(
@@ -981,7 +1000,7 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → graph qu
   Repeat this pattern for each matrix row. The `SELECT *` row must assert `len(rows) == 0` (no expansion without schema) and that `parse_quality == TABLE_ONLY` or the edge has `confidence <= 0.3`.
 
   **New fixture required**:
-  `tests/fixtures/synthetic/star_select.sql` (exact content):
+  `tests/fixtures/snowflake/star_select.sql` (exact content):
   ```sql
   -- Fixture: SELECT * confidence downgrade test (T-11 column lineage matrix)
   INSERT INTO dwh.star_target
@@ -993,110 +1012,14 @@ Integration tests (full stack: fixture → Indexer → real KùzuDB → graph qu
 **Definition of done**:
 - `ALTER WAREHOUSE`, `CALL`, `SET`, `LET`, `RETURN`, and other non-DML statements are
   dropped at DEBUG level, not WARNING, and do not appear in `parsed.statements`
-- `MERGE INTO` and `INSERT INTO ... SELECT` inside scripting blocks are indexed
+- `ALTER WAREHOUSE`, `CALL`, `TRUNCATE TABLE`, and other non-DML statements are dropped
+  at DEBUG level, not WARNING, and do not appear in `parsed.statements`
+- `INSERT INTO ... SELECT` inside scripting blocks is indexed (passes via `exp.Insert ⊂ exp.DML`)
 - Snowflake procedure bodies (via `$$...$$`) have their DML extracted and indexed
 - BigQuery `exp.Command` bodies continue to use the regex fallback (no regression)
-- All three test fixtures produce the expected `parsed.statements` contents
-
----
-
-### T-12 — Medallion-aware analyze unused and .sqlcg.toml write
-
-**Source**: ARCHITECTURE_REVIEW.md 10.2.4 (rank 7, MEDIUM), 10.2.8 (rank 6, MEDIUM), 10.6 Q2
-
-**What to do**:
-
-This ticket combines two items that both touch `cli/commands/analyze.py` and
-`cli/commands/index.py` / `core/config.py` without overlapping change sets. Combining avoids
-a merge conflict on `index.py`.
-
-**Part A — Medallion-aware analyze unused** (10.2.4):
-
-1. In `cli/commands/analyze.py` `unused()`:
-   - Add `--exclude-schema` option: `exclude_schema: list[str] = typer.Option([], "--exclude-schema", help="Exclude tables in these schemas (e.g. IA_, RPT_). Use for schemas consumed externally by BI tools or APIs.")`
-   - After fetching results, classify each `qualified` name by tier using a configurable
-     default tier map:
-
-     ```python
-     _GOLD_PREFIXES = ("DIM_", "FACT_", "MART_", "IA_", "RPT_", "ODS_")
-     _SILVER_PREFIXES = ("INT_", "PREP_", "DWH_", "BA_")
-     _BRONZE_PREFIXES = ("RAW_", "STG_", "STAGE_", "LAND_")
-
-     def _infer_tier(qualified: str) -> str:
-         name = qualified.split(".")[-1].upper()
-         if any(name.startswith(p) for p in _GOLD_PREFIXES):
-             return "gold"
-         if any(name.startswith(p) for p in _SILVER_PREFIXES):
-             return "silver"
-         if any(name.startswith(p) for p in _BRONZE_PREFIXES):
-             return "bronze"
-         return "unknown"
-     ```
-
-   - Filter out rows where the schema component (the part before the final `.`) matches any
-     `--exclude-schema` value (case-insensitive prefix match).
-   - Add a `tier` column to the Rich table output.
-   - Always append this caveat line after the table:
-     "Note: 'unused' means no SQL file in the indexed corpus selects from this table.
-      External consumers (Tableau, BI tools, APIs) are not visible to this tool."
-
-2. Update the `analyze unused --help` text to explain the tier model and when to use
-   `--exclude-schema`.
-
-**Part B — Write .sqlcg.toml on successful index** (10.2.8 / 10.6 Q2):
-
-Resolved spec from 10.6 Q2: `path` is optional in `.sqlcg.toml`. If `path == cwd`, omit it.
-The file is safe to commit.
-
-1. In `cli/commands/index.py` `index_cmd()`, after a successful index, write `.sqlcg.toml`
-   to the root of the indexed path if it does not already exist with the same dialect:
-
-   ```python
-   config_path = path / ".sqlcg.toml"
-   new_content = f'[sqlcg]\ndialect = "{dialect}"\n'
-   if not config_path.exists() or config_path.read_text() != new_content:
-       config_path.write_text(new_content)
-   ```
-
-   Do not write a `path` key (per Q2 resolution — defaults to cwd).
-
-2. In `core/config.py` `get_dialect()`, the existing implementation already reads
-   `.sqlcg.toml`. No change needed for the read path.
-
-3. In `cli/commands/index.py`, allow `path` argument to be optional: if not provided and
-   `.sqlcg.toml` exists in `cwd`, use `cwd` as the path and read the dialect from the toml.
-   The `path` argument should default to `None` and resolve to `Path.cwd()` when absent and
-   `.sqlcg.toml` is present. If both are absent, print an error and exit 1.
-
-**Files affected**:
-- `src/sqlcg/cli/commands/analyze.py` — `unused()` tier classification, `--exclude-schema`, caveat
-- `src/sqlcg/cli/commands/index.py` — `.sqlcg.toml` write, optional path argument
-
-**Tests to add**:
-
-Unit tests (mock backend, no graph):
-
-- `tests/unit/test_analyze_unused.py`:
-  - Scenario A — tier classification: mock `KuzuBackend.run_read` to return `[{"qualified": "DIM_PRODUCT"}, {"qualified": "BA_ORDERS"}, {"qualified": "RAW_EVENTS"}, {"qualified": "IA_ANALYTICS"}]` for the unused-tables Cypher query; invoke `analyze unused` via `CliRunner`; assert captured output contains `"gold"` adjacent to `"DIM_PRODUCT"`, `"silver"` adjacent to `"BA_ORDERS"`, `"bronze"` adjacent to `"RAW_EVENTS"`.
-  - Scenario B — `--exclude-schema IA` filter: same mock; invoke with `["unused", "--exclude-schema", "IA"]`; assert `"IA_ANALYTICS"` does NOT appear in output; assert the other three tables DO appear.
-  - Scenario C — caveat line: for any invocation, assert output contains `"External consumers"` or `"not visible to this tool"` as a substring.
-  - Scenario D — tier column present: assert the Rich table contains a header column named `"tier"` (check for `"tier"` in output before the first data row).
-
-- `tests/unit/test_sqlcg_toml.py`:
-  - Scenario A — toml written on first index: patch `Indexer.index_repo` to return a successful summary; invoke `index_cmd` with `[str(tmp_path), "--dialect", "snowflake"]` via `CliRunner`; assert `(tmp_path / ".sqlcg.toml").exists()`; assert `(tmp_path / ".sqlcg.toml").read_text()` contains `'dialect = "snowflake"'` and does NOT contain `"path ="`.
-  - Scenario B — toml not overwritten on second index with same dialect: write `.sqlcg.toml` manually with `dialect = "snowflake"`; record `mtime` before; invoke `index_cmd` again; assert `mtime` unchanged (file not rewritten).
-  - Scenario C — toml read when no path argument: write `(tmp_path / ".sqlcg.toml").write_text('[sqlcg]\ndialect = "postgres"\n')`; invoke `index_cmd` with no path argument from `tmp_path` as cwd (use `CliRunner(mix_stderr=False)` with `env={"PWD": str(tmp_path)}`); assert `Indexer.index_repo` was called with `dialect="postgres"`.
-
-Integration tests (real Indexer → real KùzuDB → filesystem):
-
-- Scenario — toml written after successful real index: index `tests/fixtures/synthetic/` with `dialect="ansi"` into in-memory KùzuDB via `index_cmd` with `tmp_path` copy of the fixtures; assert `(tmp_path / ".sqlcg.toml").read_text()` contains `'dialect = "ansi"'`; confirm the file is valid TOML by parsing it with `tomllib.loads()` and asserting `config["sqlcg"]["dialect"] == "ansi"`.
-- Scenario — no toml written on failed index: patch `Indexer.index_repo` to raise `RuntimeError`; invoke `index_cmd`; assert `.sqlcg.toml` does not exist (toml write is conditional on success).
-
-**Definition of done**:
-- `analyze unused` output includes a `tier` column and the closed-world caveat
-- `--exclude-schema` filters results by schema prefix
-- `sqlcg index` writes `.sqlcg.toml` after a successful index (idempotent)
-- `sqlcg index` with no path argument uses `.sqlcg.toml` from cwd
+- `tests/fixtures/snowflake/scripting_noise.sql` and `tests/fixtures/snowflake/procedure.sql`
+  produce the exact expected `parsed.statements` counts
+- `tests/fixtures/bigquery/` directory exists with `.gitkeep` (structure established for future tests)
 
 ---
 
