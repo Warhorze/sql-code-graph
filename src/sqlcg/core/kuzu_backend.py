@@ -65,26 +65,28 @@ class KuzuBackend(GraphBackend):
                     raw_statements.append(" ".join(current))
                     current = []
 
-        # Execute each statement
-        for stmt in raw_statements:
-            if stmt.strip():
-                try:
-                    self._conn.execute(stmt)
-                    logger.debug(f"Executed DDL: {stmt[:50]}...")
-                except Exception as e:
-                    logger.error(f"DDL execution failed: {stmt[:50]}...: {e}")
-                    raise
+        # Execute all DDL statements and schema version in a transaction
+        with self.transaction():
+            # Execute each statement
+            for stmt in raw_statements:
+                if stmt.strip():
+                    try:
+                        self._conn.execute(stmt)
+                        logger.debug(f"Executed DDL: {stmt[:50]}...")
+                    except Exception as e:
+                        logger.error(f"DDL execution failed: {stmt[:50]}...: {e}")
+                        raise
 
-        # Upsert the schema version
-        try:
-            self._conn.execute(
-                "MERGE (v:SchemaVersion {version: $v})",
-                {"v": SCHEMA_VERSION},
-            )
-            logger.debug(f"Wrote schema version: {SCHEMA_VERSION}")
-        except Exception as e:
-            logger.error(f"Failed to write schema version: {e}")
-            raise
+            # Upsert the schema version
+            try:
+                self._conn.execute(
+                    "MERGE (v:SchemaVersion {version: $v})",
+                    {"v": SCHEMA_VERSION},
+                )
+                logger.debug(f"Wrote schema version: {SCHEMA_VERSION}")
+            except Exception as e:
+                logger.error(f"Failed to write schema version: {e}")
+                raise
 
     def upsert_node(self, label: str, key: str, properties: dict[str, Any]) -> None:
         """Upsert a node with the given label and properties.
