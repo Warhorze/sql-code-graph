@@ -43,6 +43,7 @@ snowflake = ["acryl-datahub>=0.14.0,<0.15.0"]
 Homepage = "https://github.com/Warhorze/sql-code-graph"
 Repository = "https://github.com/Warhorze/sql-code-graph"
 Issues = "https://github.com/Warhorze/sql-code-graph/issues"
+Changelog = "https://github.com/Warhorze/sql-code-graph/blob/master/CHANGELOG.md"
 
 [project.scripts]
 sqlcg = "sqlcg.cli.main:main"
@@ -80,6 +81,7 @@ known-first-party = ["sqlcg"]
 [tool.commitizen]
 name = "cz_conventional_commits"
 version_provider = "pep621"
+version_files = ["src/sqlcg/__init__.py:__version__"]
 changelog_file = "CHANGELOG.md"
 tag_format = "v$version"
 update_changelog_on_bump = true
