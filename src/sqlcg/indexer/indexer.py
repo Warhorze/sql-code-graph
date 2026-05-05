@@ -1,5 +1,6 @@
 """Main indexer orchestrating parsing and graph persistence."""
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
