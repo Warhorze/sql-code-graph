@@ -282,7 +282,13 @@ class TestAirbnbParseReport:
                 {},
             )
 
-            errored_files = [r.get("path", "") for r in (errors_result or [])]
+            repo_root = Path(__file__).parent.parent.parent
+            errored_files = [
+                str(Path(r.get("path", "")).relative_to(repo_root))
+                if Path(r.get("path", "")).is_absolute()
+                else r.get("path", "")
+                for r in (errors_result or [])
+            ]
 
             # Generate report
             report_lines = [
