@@ -38,6 +38,9 @@ class Indexer:
             db: GraphBackend instance
             dbt_manifest: Optional path to dbt manifest.json
             timeout_per_file: Timeout in seconds per file (0 = no timeout)
+            use_git: When True (default), use git ls-files to restrict
+                indexing to tracked files; falls back to rglob when git
+                is unavailable or the directory is not a git repository.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found, lineage_edges_created

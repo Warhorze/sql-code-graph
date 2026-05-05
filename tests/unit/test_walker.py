@@ -71,6 +71,8 @@ def test_git_mode_returns_only_tracked_files(temp_sql_tree):
     tracked = ["queries.sql", "subdir/nested.sql"]
 
     def fake_run(cmd, cwd, capture_output, text, check):
+        assert cmd == ["git", "ls-files", "--cached"]
+        assert cwd == temp_sql_tree
         import subprocess as sp
         r = sp.CompletedProcess(cmd, 0)
         r.stdout = "\n".join(tracked) + "\n"
@@ -115,6 +117,8 @@ def test_git_mode_is_default(temp_sql_tree):
     tracked = ["queries.sql"]
 
     def fake_run(cmd, cwd, capture_output, text, check):
+        assert cmd == ["git", "ls-files", "--cached"]
+        assert cwd == temp_sql_tree
         import subprocess as sp
         r = sp.CompletedProcess(cmd, 0)
         r.stdout = "queries.sql\n"

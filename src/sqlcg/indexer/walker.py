@@ -20,7 +20,7 @@ def _git_sql_files(root: Path) -> list[Path] | None:
             check=True,
         )
         return [root / f for f in result.stdout.splitlines() if f.endswith(".sql")]
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, OSError):
         return None
 
 

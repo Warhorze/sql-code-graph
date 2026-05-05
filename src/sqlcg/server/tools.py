@@ -175,7 +175,11 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
     """Index a repository of SQL files.
 
     Parses SQL files, extracts table and column definitions, and builds
-    lineage edges. Results are persisted to the graph database.
+    lineage edges. Results are persisted to the graph database. Only
+    git-tracked files are indexed when the directory is a git repo —
+    untracked files, build artifacts, and node_modules are ignored
+    automatically. Falls back to a full directory scan when git is
+    unavailable.
 
     Args:
         repo_path: Root directory path to index
