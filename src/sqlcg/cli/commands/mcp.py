@@ -44,6 +44,7 @@ def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
     tmp.write_text(json.dumps(settings, indent=2) + "\n")
     os.replace(tmp, config_path)
     console.print(f"[green]Configuration written to[/green] {config_path}")
+    console.print("Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.")
 
 
 @app.command("start")
