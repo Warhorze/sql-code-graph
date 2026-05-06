@@ -9,17 +9,6 @@ from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.registry import get_parser
 
-# Column lineage extraction is not yet implemented (ARCHITECTURE_REVIEW.md §11.2):
-#   Bug 1 — _extract_column_lineage never called in _parse_statement (ansi_parser.py:140)
-#   Bug 2 — sg_lineage → LineageEdge conversion is a TODO (base.py:396)
-_LINEAGE_NOT_IMPLEMENTED = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "column_lineage always empty until both wiring gaps in ARCHITECTURE_REVIEW §11.2 "
-        "are fixed. Remove this mark once the bugs are resolved."
-    ),
-)
-
 
 @pytest.fixture
 def temp_sql_files():
@@ -90,7 +79,6 @@ def test_cross_file_view_resolution(temp_sql_files):
         assert not any("cannot re-read" in e for e in result.errors)
 
 
-@_LINEAGE_NOT_IMPLEMENTED
 def test_view_pass2_emits_column_lineage_edges(temp_sql_files):
     """After pass-2 resolution, the view query must carry column lineage edges.
 
@@ -112,12 +100,8 @@ def test_view_pass2_emits_column_lineage_edges(temp_sql_files):
     pass2_results = [aggregator.resolve_pass2(parser, p) for p in pass1_results]
 
     # views.sql defines customer_orders — find its result
-    view_result = next(
-        r for r in pass2_results if "views" in r.path.name
-    )
-    view_stmt = next(
-        s for s in view_result.statements if s.kind == "CREATE_VIEW"
-    )
+    view_result = next(r for r in pass2_results if "views" in r.path.name)
+    view_stmt = next(s for s in view_result.statements if s.kind == "CREATE_VIEW")
     assert len(view_stmt.column_lineage) > 0, (
         "CREATE VIEW customer_orders AS SELECT c.id, c.name, o.id … "
         "must emit at least one LineageEdge per projected column."

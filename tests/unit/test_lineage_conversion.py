@@ -1,13 +1,12 @@
 """Unit tests for P-03: LineageNode to LineageEdge conversion."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import LineageEdge, ColumnRef, TableRef
 
 
 class TestLineageNodeToEdges:
@@ -54,9 +53,7 @@ class TestLineageNodeToEdges:
         mock_node.source = None
 
         result = parser._lineage_node_to_table_ref(mock_node)
-        assert result is None, (
-            f"Expected None for node with None source, got {result}"
-        )
+        assert result is None, f"Expected None for node with None source, got {result}"
 
     def test_lineage_node_to_edges_cycle_guard(self):
         """Guard: _lineage_node_to_edges handles cycles without infinite loop."""
@@ -84,6 +81,7 @@ class TestLineageNodeToEdges:
             edges = parser._lineage_node_to_edges(
                 mock_node_a,
                 dst_col_name="output_col",
+                dst_table=None,
                 path=Path("test.sql"),
                 out=out,
             )
