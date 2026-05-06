@@ -1,14 +1,40 @@
 ## Current State
 
-agent: architect-planner
-task: Write sprint_v0.3.1.md — postmortem-driven plan covering findings 11.1–11.5
+agent: developer
+task: Implement sprint_v0.3.1 tickets P-01 through P-06
 plan: plan/sprint_v0.3.1.md
-status: COMPLETE — plan written and committed
+status: COMPLETE — PR #14 opened and ready for review
 date: 2026-05-06
+pr: https://github.com/Warhorze/sql-code-graph/pull/14
 ---
 
 
 ## Handoff Log
+
+[2026-05-06] developer — Sprint v0.3.1 implementation complete (PR #14 opened).
+  Summary: Implemented all six tickets from sprint_v0.3.1:
+
+  P-04 + P-06 — Install/uninstall fixes (1-2 lines each)
+    Prefer local sqlcg over uvx; fix uninstall DB path fallback
+
+  P-05 — Progress callback + lock error messaging
+    Wire progress output from index_cmd to indexer; catch KuzuDB lock errors with PID hint
+
+  P-01 + P-02 — Per-file commits + column lineage wiring (combined, critical)
+    Restructure index_repo for flat memory usage; add --buffer-pool-size flag
+    Remove hardcoded column_lineage = []; wire _extract_column_lineage call
+
+  P-03 — LineageNode → LineageEdge tree-walking conversion
+    Implement _lineage_node_to_edges and _lineage_node_to_table_ref helpers
+    Thread dst_table parameter through call stack; remove TODO from happy path
+
+  Test results: 235 passed, 1 xfailed (expected)
+  All sprint-level acceptance criteria met
+
+  Branch: feat/v0.3.1-postmortem
+  PR: https://github.com/Warhorze/sql-code-graph/pull/14
+
+  Next step: code review via PR; plan-compliance check by architect-planner
 
 [2026-05-05] architect-planner — Sprint next plan written (plan/sprint_next.md).
   Summary: Produced a developer-ready implementation plan covering all open work from
