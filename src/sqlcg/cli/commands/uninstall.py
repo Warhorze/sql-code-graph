@@ -198,13 +198,10 @@ def _step3_remove_git_hook(repo_path: Path) -> None:
 
 def _get_db_path() -> str | None:
     """Get the configured database path from environment or default."""
-    db_path = os.getenv("SQLCG_DB_PATH")
-    if db_path:
-        return db_path
+    from sqlcg.core.config import KuzuConfig
 
-    # Default path for kuzu
-    default_path = str(Path.home() / ".sqlcg" / "kuzu.db")
-    return default_path if Path(default_path).exists() else None
+    db_path = str(KuzuConfig.from_env().db_path)
+    return db_path if Path(db_path).exists() else None
 
 
 def _is_kuzu_backend(db_path: str) -> bool:
