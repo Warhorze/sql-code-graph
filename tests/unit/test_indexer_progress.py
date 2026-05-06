@@ -38,7 +38,7 @@ def test_progress_callback_invoked_at_100_file_boundary():
 
         # Index the repo with progress callback
         indexer = Indexer()
-        result = indexer.index_repo(
+        indexer.index_repo(
             temp_path,
             dialect=None,
             db=mock_backend,
@@ -54,5 +54,5 @@ def test_progress_callback_invoked_at_100_file_boundary():
             f"Progress callback should be invoked at 100-file boundary. Got calls: {callback_calls}"
 
         # Verify total is correct
-        for current, total in callback_calls:
+        for _current, total in callback_calls:
             assert total == 105, f"Total should be 105, got {total}"

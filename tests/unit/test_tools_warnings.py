@@ -33,4 +33,6 @@ def test_list_dialects_and_repos_warns_on_zero_sql_columns():
         # Verify warnings are non-empty
         assert result.warnings, "Expected warnings to be non-empty"
         # Verify first warning mentions SqlColumn
-        assert "SqlColumn" in result.warnings[0],             f"Expected first warning to mention 'SqlColumn', got: {result.warnings[0]}"
+        assert "SqlColumn" in result.warnings[0], (
+            f"Expected first warning to mention 'SqlColumn', got: {result.warnings[0]}"
+        )

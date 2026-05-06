@@ -7,7 +7,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
-from sqlcg.parsers.base import ParseQuality, ParsedFile, QueryNode, SqlParser, TableRef
+from sqlcg.parsers.base import ParsedFile, ParseQuality, QueryNode, SqlParser, TableRef
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 

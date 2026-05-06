@@ -6,7 +6,6 @@ source table. This is correct behavior - the source table is accessed
 via SELECT within the INSERT statement.
 """
 
-from pathlib import Path
 
 import pytest
 
@@ -63,7 +62,8 @@ class TestInsertSelectEdges:
     def test_insert_target_created_as_node(self, indexed_db):
         """Verify INSERT target table is created as a node."""
         rows = indexed_db.run_read(
-            "MATCH (t:SqlTable) WHERE t.qualified CONTAINS 'target_table' RETURN t.qualified AS qualified",
+            "MATCH (t:SqlTable) WHERE t.qualified CONTAINS 'target_table' "
+            "RETURN t.qualified AS qualified",
             {}
         )
         assert len(rows) >= 1, \

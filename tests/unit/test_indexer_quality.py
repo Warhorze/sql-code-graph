@@ -5,12 +5,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from sqlcg.indexer.indexer import Indexer
-from sqlcg.parsers.base import ParseQuality
 
 
 def test_failed_parse_gets_failed_quality():
     """Test that a file that fails to parse gets ParseQuality.FAILED.
-    
+
     When indexer encounters an exception during parsing, it should create
     a ParsedFile with parse_quality=FAILED and add it to results.
     """
@@ -72,12 +71,12 @@ def test_quality_distribution_in_summary():
         # Verify quality breakdown is in result
         assert "quality" in result, "Result should include quality breakdown"
         quality = result["quality"]
-        
+
         # Quality should have these keys
         expected_keys = {"full", "table_only", "scripting_fallback", "failed"}
         assert set(quality.keys()) == expected_keys, \
             f"Expected keys {expected_keys}, got {set(quality.keys())}"
-        
+
         # Counts should be non-negative integers
         for key, count in quality.items():
             assert isinstance(count, int) and count >= 0, \

@@ -18,7 +18,7 @@ def test_fn_label_accepted():
             )
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
-            raise AssertionError("FN label should be accepted")
+            raise AssertionError("FN label should be accepted") from None
 
 
 def test_tp_and_fp_still_valid():
@@ -33,7 +33,7 @@ def test_tp_and_fp_still_valid():
             )
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
-            raise AssertionError("TP label should be accepted")
+            raise AssertionError("TP label should be accepted") from None
 
         # Test FP
         try:
@@ -44,7 +44,7 @@ def test_tp_and_fp_still_valid():
             )
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
-            raise AssertionError("FP label should be accepted")
+            raise AssertionError("FP label should be accepted") from None
 
 
 def test_invalid_label_raises_error_mentioning_fn():
