@@ -1,10 +1,10 @@
 ## Current State
 
 agent: architect-planner
-task: Expand Tests sections in sprint_next.md — add concrete integration test specs per user feedback (2026-05-05)
-plan: plan/sprint_next.md
-status: COMPLETE — all 14 ticket Tests sections expanded with integration specs and committed
-date: 2026-05-05
+task: Write sprint_v0.3.1.md — postmortem-driven plan covering findings 11.1–11.5
+plan: plan/sprint_v0.3.1.md
+status: COMPLETE — plan written and committed
+date: 2026-05-06
 ---
 
 
@@ -48,6 +48,36 @@ date: 2026-05-05
 
   Next step: developers can pick up T-01, T-02, T-03, T-04, T-05, T-07, T-08, T-13, T-14
   in parallel (all INDEPENDENT). T-06 should be prioritized in Week 2 to unblock T-09, T-10, T-11.
+
+[2026-05-06] architect-planner — Sprint v0.3.1 plan written (plan/sprint_v0.3.1.md).
+  Summary: Postmortem-driven plan covering all five findings from the v0.3.0 live session
+  (ARCHITECTURE_REVIEW.md section 11). Six tickets across four PRs:
+
+  P-04 + P-06 (one PR, XS+XS):
+    P-04 — sqlcg install priority inversion fix (finding 11.3, HIGH)
+    P-06 — sqlcg uninstall DB path fallback fix (finding 11.5, MEDIUM)
+
+  P-05 (S):
+    P-05a — Wire progress_callback from index_cmd to indexer (finding 11.4a, HIGH)
+    P-05b — KuzuDB lock error caught and re-raised with PID hint (finding 11.4b, HIGH)
+
+  P-01 + P-02 (one PR, M+XS):
+    P-01 — Per-file commit boundary in index_repo + --buffer-pool-size flag (finding 11.1, CRITICAL)
+    P-02 — Wire _extract_column_lineage call in _parse_statement (finding 11.2a, CRITICAL)
+
+  P-03 (M, after P-02 merges):
+    P-03 — LineageNode → LineageEdge tree-walking conversion (finding 11.2b, CRITICAL)
+
+  Recommended order: P-04+P-06 → P-05 → P-01+P-02 → P-03
+
+  Key correctness checks embedded in plan:
+    - Code-vs-plan verification table confirms all 7 gaps against actual source
+    - Wiring checklist table for all 5 tickets
+    - Sprint-level acceptance criteria (8 items)
+    - Regression guard test: test_column_lineage_edges_nonzero_after_index (must not be xfail)
+
+  Next step: developers pick up P-04+P-06 first (combined, XS effort, no risk).
+  P-01+P-02 is the highest-risk PR — run full test suite after merge.
 
 [2026-05-05] architect-planner — Expanded all 14 ticket Tests sections in sprint_next.md.
   Summary: User feedback noted tests were not clearly defined, especially integration tests
