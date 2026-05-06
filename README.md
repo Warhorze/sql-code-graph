@@ -83,6 +83,7 @@ are available and when to use them:
 ```markdown
 ## SQL lineage
 This project uses sql-code-graph. MCP tools are available:
+- `db_info` — check graph health and parse quality before running lineage queries
 - `index_repo` — index or re-index a directory of SQL files
 - `find_table_usages` — find all queries that read a table
 - `trace_column_lineage` — trace where a column's value comes from
@@ -128,8 +129,14 @@ Check `sqlcg db info` for the parsing mode distribution across all indexed queri
 | `get_upstream_dependencies(table_col)` | Full upstream dependency chain |
 | `get_downstream_dependencies(table_col)` | Full downstream dependency chain |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
-| `list_dialects_and_repos()` | List indexed repos and dialects |
+| `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
+| `db_info()` | Graph health, node counts, parse quality breakdown, warnings |
 | `execute_cypher(query)` | Raw Cypher query against the graph |
+
+> **LLM agent tip**: call `db_info()` before lineage queries to check that
+> `SqlColumn > 0` and `warnings` is empty. If `parse_quality["scripting_block"]`
+> is high, column lineage will be limited for those files — use table-level tools
+> (`find_table_usages`, `get_*_dependencies`) instead.
 
 ## CLI reference
 

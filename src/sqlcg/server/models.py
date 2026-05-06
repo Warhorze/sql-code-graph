@@ -101,7 +101,27 @@ class DialectRepoResult(BaseModel):
     repos: list[DialectRepo] = Field(
         default_factory=list, description="List of indexed repositories"
     )
+
+
+class DbInfoResult(BaseModel):
+    """Result of db_info tool — graph health and parse quality diagnostics."""
+
+    schema_version: str = Field(..., description="Graph schema version")
+    node_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Node counts per label (Repo, SqlTable, SqlQuery, SqlColumn, SqlFile)",
+    )
+    column_lineage_edges: int = Field(
+        0, description="Number of COLUMN_LINEAGE edges in the graph"
+    )
+    parse_quality: dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Query count by parsing_mode: 'sqlglot' = standard path, "
+            "'scripting_block' = tokenizer fallback (column lineage limited)"
+        ),
+    )
     warnings: list[str] = Field(
         default_factory=list,
-        description="Health warnings about the indexed graph state",
+        description="Health warnings. Empty means the graph is in a healthy state.",
     )
