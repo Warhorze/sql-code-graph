@@ -121,3 +121,56 @@ class TestT01ErrorPropagation:
         # Verify parse succeeded and statements were added
         assert len(parsed.statements) == 1
         assert parsed.statements[0].kind == "SELECT"
+
+
+class TestT02StarColumnSkip:
+    """T-02: Test star column skip in _extract_column_lineage."""
+
+    def test_qualified_star_produces_skip_marker(self):
+        """Test that qualified star (base.*) is skipped with error marker.
+
+        Parse CREATE TEMP TABLE tmp_b AS SELECT base.*, 1 AS x FROM tmp_a base
+        Assert:
+        - parsed.errors contains one entry starting with col_lineage_skip:star:base
+        - No entry starts with col_lineage:
+        (Note: column x won't produce edges until T-03 adds sources_map)
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+
+        sql = "CREATE TEMP TABLE tmp_b AS SELECT base.*, 1 AS x FROM tmp_a base"
+        parsed = parser.parse_file(Path("test.sql"), sql)
+
+        skip_errors = [e for e in parsed.errors if e.startswith("col_lineage_skip:star:")]
+        col_lineage_errors = [e for e in parsed.errors if e.startswith("col_lineage:")]
+
+        assert len(skip_errors) >= 1, f"Expected skip marker, got errors: {parsed.errors}"
+        assert skip_errors[0].startswith("col_lineage_skip:star:base"), (
+            f"Expected qualified star marker, got: {skip_errors}"
+        )
+        assert col_lineage_errors == [], (
+            f"Star should not cause col_lineage error, got: {col_lineage_errors}"
+        )
+
+    def test_unqualified_star_produces_skip_marker(self):
+        """Test that unqualified star (*) is skipped with error marker.
+
+        Parse SELECT * FROM t
+        Assert:
+        - parsed.errors contains one entry starting with col_lineage_skip:star:
+        - No exception raised
+        - No column lineage edges (star cannot be resolved)
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+
+        sql = "SELECT * FROM t"
+        parsed = parser.parse_file(Path("test.sql"), sql)
+
+        skip_errors = [e for e in parsed.errors if e.startswith("col_lineage_skip:star:")]
+        col_lineage_errors = [e for e in parsed.errors if e.startswith("col_lineage:")]
+
+        assert len(skip_errors) >= 1, f"Expected skip marker, got errors: {parsed.errors}"
+        assert col_lineage_errors == [], (
+            f"Star should not cause col_lineage error, got: {col_lineage_errors}"
+        )
