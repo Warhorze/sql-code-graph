@@ -579,12 +579,18 @@ def search_sql_pattern(query: str, limit: int = 20) -> SqlPatternResult:
 @mcp.tool()
 @_timed_tool("list_dialects_and_repos")
 def list_dialects_and_repos() -> DialectRepoResult:
-    """List all indexed repositories and their SQL dialects.
+    """List all indexed repositories, their SQL dialects, and parse quality warnings.
 
     Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
+    The `warnings` field in the response carries parse quality signals:
+    - SqlColumn count 0 → parse quality is TABLE_ONLY or lower for all files;
+      trace_column_lineage and dependency tools will return empty results.
+    - Scripting fallback > 20% → column lineage incomplete for those files.
+    Run `sqlcg gain` for a full parse quality breakdown by mode.
+
     Returns:
-        DialectRepoResult with list of repositories and their dialects
+        DialectRepoResult with list of repositories and parse health warnings
 
     Raises:
         NotIndexedError: If no repos have been indexed
@@ -612,7 +618,29 @@ def list_dialects_and_repos() -> DialectRepoResult:
     col_count_result = db.run_read("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})
     col_count = col_count_result[0]["count"] if col_count_result else 0
     if col_count == 0:
-        warnings.append("SqlColumn count is 0: column lineage was not extracted")
+        warnings.append(
+            "SqlColumn count is 0: column lineage was not extracted — "
+            "trace_column_lineage and dependency tools will return empty results. "
+            "Parse quality is TABLE_ONLY or lower for all files."
+        )
+    else:
+        query_count_result = db.run_read(
+            "MATCH (n:SqlQuery) RETURN COUNT(n) AS count", {}
+        )
+        query_count = query_count_result[0]["count"] if query_count_result else 0
+        scripting_result = db.run_read(
+            "MATCH (q:SqlQuery {parsing_mode: 'scripting_block'}) RETURN COUNT(q) AS count",
+            {},
+        )
+        scripting_count = scripting_result[0]["count"] if scripting_result else 0
+        if query_count > 0 and scripting_count > 0:
+            pct = round(100 * scripting_count / query_count)
+            if pct > 20:
+                warnings.append(
+                    f"{pct}% of queries used scripting-block fallback "
+                    "(parse quality SCRIPTING_FALLBACK): column lineage may be "
+                    "incomplete for those files. Run 'sqlcg gain' for details."
+                )
 
     return DialectRepoResult(repos=repos, warnings=warnings)
 

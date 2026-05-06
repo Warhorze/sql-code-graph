@@ -19,7 +19,10 @@ class TestGainRatio:
             def execute_query_side_effect(query, params=None):
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[15]]
-                elif "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query:
+                elif (
+                    "COUNT(*) as count FROM tool_calls" in query
+                    and "WHERE timestamp" not in query
+                ):
                     return [[20]]
                 elif "index_runs" in query:
                     return []
@@ -37,7 +40,7 @@ class TestGainRatio:
                 mock_path.exists.return_value = True
                 MockPath.return_value = mock_path
 
-                with patch("sqlcg.cli.commands.gain.console") as mock_console:
+                with patch("sqlcg.cli.commands.gain.console"):
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -51,7 +54,10 @@ class TestGainRatio:
             def execute_query_side_effect(query, params=None):
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[2]]
-                elif "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query:
+                elif (
+                    "COUNT(*) as count FROM tool_calls" in query
+                    and "WHERE timestamp" not in query
+                ):
                     return [[20]]
                 elif "index_runs" in query:
                     return []
@@ -69,7 +75,7 @@ class TestGainRatio:
                 mock_path.exists.return_value = True
                 MockPath.return_value = mock_path
 
-                with patch("sqlcg.cli.commands.gain.console") as mock_console:
+                with patch("sqlcg.cli.commands.gain.console"):
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -82,7 +88,10 @@ class TestGainRatio:
             def execute_query_side_effect(query, params=None):
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[0]]
-                elif "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query:
+                elif (
+                    "COUNT(*) as count FROM tool_calls" in query
+                    and "WHERE timestamp" not in query
+                ):
                     return [[0]]
                 elif "index_runs" in query:
                     return []
@@ -103,4 +112,6 @@ class TestGainRatio:
                 try:
                     gain_cmd(_metrics_path=mock_path)
                 except ZeroDivisionError:
-                    raise AssertionError("Should not raise ZeroDivisionError with zero calls")
+                    raise AssertionError(
+                        "Should not raise ZeroDivisionError with zero calls"
+                    ) from None

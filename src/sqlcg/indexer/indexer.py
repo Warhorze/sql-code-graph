@@ -11,7 +11,7 @@ from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
-from sqlcg.parsers.base import ParseQuality, ParsedFile
+from sqlcg.parsers.base import ParsedFile
 from sqlcg.parsers.registry import get_parser
 from sqlcg.utils.ignore import load_ignore_spec
 from sqlcg.utils.logging import getLogger

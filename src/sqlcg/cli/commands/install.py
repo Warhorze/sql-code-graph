@@ -47,7 +47,7 @@ def install_cmd(
 
     mcp_servers[_SERVER_KEY] = entry
 
-    if dry_run:
+    if dry_run is True:
         console.print("[dim]--dry-run: would write:[/dim]")
         console.print_json(json.dumps(settings, indent=2))
         return

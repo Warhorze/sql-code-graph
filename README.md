@@ -94,6 +94,30 @@ This project uses sql-code-graph. MCP tools are available:
 The MCP server works without this — Claude can discover the tools on its own —
 but the CLAUDE.md snippet ensures they get used proactively.
 
+## Parse quality
+
+After indexing, `sqlcg gain` shows a **parse quality breakdown** that tells you how
+much column-level lineage was extracted:
+
+| Quality | Meaning | Tools affected |
+|---|---|---|
+| `FULL` | Column-level lineage extracted | All tools work |
+| `TABLE_ONLY` | Table edges only — no column lineage | `trace_column_lineage`, `get_*_dependencies` return empty |
+| `SCRIPTING_FALLBACK` | sqlglot fell back to raw command node | Partial table edges; column lineage unavailable |
+| `FAILED` | File failed to parse entirely | File invisible to all queries |
+
+Quality is shown per-file after `sqlcg index` and in `sqlcg gain` Section F.
+`list_dialects_and_repos()` warns when scripting fallback exceeds 20% of queries.
+
+**What causes TABLE_ONLY?** Mostly `SELECT *` — sqlglot can't trace column names through
+a wildcard. Alias those selects to get FULL coverage.
+
+**What causes SCRIPTING_FALLBACK?** Snowflake `$$` procedure bodies or `BEGIN…END` scripting
+blocks. sqlglot parses the block as a raw `Command` node and extracts DML via tokenizer
+fallback. Table edges are usually correct; column edges are not.
+
+Check `sqlcg db info` for the parsing mode distribution across all indexed queries.
+
 ## MCP tools reference
 
 | Tool | Description |

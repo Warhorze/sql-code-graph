@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from sqlcg.core.config import get_backend
 from sqlcg.metrics import store as metrics_module
 from sqlcg.utils.logging import getLogger
 
@@ -29,6 +30,13 @@ def gain_cmd(
     - Section B: Parse success trend (last 5 index runs)
     - Section C: True positive feedback rate (if ≥5 samples)
     - Section D: Top 3 most-called tools
+    - Section E: execute_cypher ratio (high ratio = LLM falling back to raw Cypher)
+    - Section F: Parse quality breakdown from graph (FULL / TABLE_ONLY / SCRIPTING_FALLBACK)
+
+    Parse quality legend:
+      FULL              — column-level lineage extracted; all tools work
+      TABLE_ONLY        — table edges only; trace_column_lineage returns empty
+      SCRIPTING_FALLBACK— sqlglot fell back to Command node; partial table edges only
 
     All metrics are opt-in via SQLCG_METRICS environment variable.
     If no metrics have been collected, shows a message and exits 0.
@@ -119,20 +127,35 @@ def gain_cmd(
             execute_cypher_count / total_calls if total_calls > 0 else 0
         )
 
-        if json_output:
-            console.print(
-                json.dumps(
-                    {
-                        "total_calls": total_calls,
-                        "last_7d_calls": last_7d_calls,
-                        "index_runs": len(index_runs),
-                        "feedback_tp": tp_count,
-                        "feedback_total": fb_total,
-                        "top_tools": [{"name": row[0], "count": row[1]} for row in top_tools],
-                        "execute_cypher_ratio": round(execute_cypher_ratio, 2),
-                    }
+        # Section F: parse quality from graph
+        parse_quality: dict[str, int] | None = None
+        try:
+            with get_backend() as backend:
+                mode_rows = backend.run_read(
+                    "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
+                    " COUNT(q) AS cnt ORDER BY cnt DESC",
+                    {},
                 )
-            )
+                if mode_rows and "mode" in mode_rows[0]:
+                    parse_quality = {
+                        str(r["mode"]): int(r["cnt"]) for r in mode_rows
+                    }
+        except Exception:
+            pass  # graph not available — skip quality section
+
+        if json_output:
+            payload: dict = {
+                "total_calls": total_calls,
+                "last_7d_calls": last_7d_calls,
+                "index_runs": len(index_runs),
+                "feedback_tp": tp_count,
+                "feedback_total": fb_total,
+                "top_tools": [{"name": row[0], "count": row[1]} for row in top_tools],
+                "execute_cypher_ratio": round(execute_cypher_ratio, 2),
+            }
+            if parse_quality is not None:
+                payload["parse_quality"] = parse_quality
+            console.print(json.dumps(payload))
         else:
             # Human-readable output
             console.print("\n[bold]SQL Code Graph Metrics[/bold]")
@@ -187,6 +210,26 @@ def gain_cmd(
             else:
                 console.print(f"  execute_cypher: {ratio_pct:.1f}%")
             console.print()
+
+            # Section F: parse quality from graph
+            if parse_quality:
+                console.print("[bold cyan]F. Parse Quality[/bold cyan]")
+                total_q = sum(parse_quality.values())
+                for mode, cnt in sorted(parse_quality.items()):
+                    pct = 100 * cnt / total_q if total_q else 0
+                    label = {
+                        "sqlglot": "standard (FULL/TABLE_ONLY)",
+                        "scripting_block": "scripting fallback",
+                    }.get(mode, mode)
+                    console.print(f"  {label}: {cnt} ({pct:.0f}%)")
+                scripting = parse_quality.get("scripting_block", 0)
+                scripting_pct = 100 * scripting / total_q if total_q else 0
+                if scripting_pct > 20:
+                    console.print(
+                        f"  [yellow]{scripting_pct:.0f}% scripting fallback — "
+                        "column lineage limited for those files[/yellow]"
+                    )
+                console.print()
 
         metrics.close()
 

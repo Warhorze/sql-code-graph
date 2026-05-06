@@ -8,7 +8,7 @@ import sqlglot
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import ParseQuality, ParsedFile
+from sqlcg.parsers.base import ParsedFile, ParseQuality
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 
