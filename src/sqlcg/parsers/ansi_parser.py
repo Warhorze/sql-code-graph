@@ -59,6 +59,16 @@ class AnsiParser(SqlParser):
                 out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
                 break
 
+        # Build scope for all statements at once to avoid O(N) traversals
+        from sqlglot.optimizer.scope import build_scope
+
+        file_scopes: list[Any] = []
+        for stmt in statements:
+            try:
+                file_scopes.append(build_scope(stmt) if stmt is not None else None)
+            except Exception:
+                file_scopes.append(None)
+
         # Initialize sources_map to accumulate temp table definitions
         sources_map: dict[str, Any] = {}
 
@@ -68,7 +78,10 @@ class AnsiParser(SqlParser):
                 continue
 
             try:
-                query_node = self._parse_statement(stmt, path, stmt_index, out, sources_map)
+                scope = file_scopes[stmt_index] if stmt_index < len(file_scopes) else None
+                query_node = self._parse_statement(
+                    stmt, path, stmt_index, out, sources_map, scope=scope
+                )
                 out.statements.append(query_node)
 
                 # Register CTAS bodies in sources_map for downstream temp table references
@@ -107,6 +120,7 @@ class AnsiParser(SqlParser):
         stmt_index: int,
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
+        scope: Any = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -116,6 +130,7 @@ class AnsiParser(SqlParser):
             stmt_index: Statement index in the file
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
+            scope: Pre-built sqlglot Scope for the statement (optional optimization)
 
         Returns:
             QueryNode with extracted metadata
@@ -138,9 +153,13 @@ class AnsiParser(SqlParser):
 
         # Try to extract table references using scope analysis
         try:
-            from sqlglot.optimizer.scope import build_scope
+            # Use pre-built scope if provided, otherwise build it here (fallback)
+            root_scope = scope
+            if root_scope is None:
+                from sqlglot.optimizer.scope import build_scope
 
-            root_scope = build_scope(stmt)
+                root_scope = build_scope(stmt)
+
             if root_scope:
                 sources = self._real_tables(root_scope)
             else:
