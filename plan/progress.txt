@@ -1,15 +1,33 @@
 ## Current State
 
-agent: developer
-task: Implement sprint_v0.3.1 tickets P-01 through P-06
-plan: plan/sprint_v0.3.1.md
-status: COMPLETE — PR #14 opened and ready for review
+agent: architect-planner
+task: parsing-errors-experiment — design diagnostic research plan
+plan: plan/parsing_errors_experiment.md
+status: COMPLETE — plan written; idle for developer Q&A and compliance check
 date: 2026-05-06
-pr: https://github.com/Warhorze/sql-code-graph/pull/14
 ---
 
 
 ## Handoff Log
+
+[2026-05-06] architect-planner — parsing-errors-experiment plan complete.
+  Plan: plan/parsing_errors_experiment.md
+  Summary:
+    - Researched sqlglot lineage() API (sources=, schema=, scope=, Node fields)
+    - Confirmed E1 (alias_col_ref) is likely eliminated by P-03
+    - Confirmed schema= dict format (lists) is compatible with sqlglot Schema
+    - Identified E8 (no edges from root/subquery source) as probable dominant failure
+    - Designed scripts/collect_parse_errors.py: CLI, per-file pipeline, output format
+    - Defined 8 error categories (E1-E8) with taxonomy
+    - Set execution steps (Steps 1-6) with commands and pass criteria
+    - Identified 5-min constraint may need revision to 10 min; added --max-files mitigation
+    - Deferred all fixes — experiment ends at documented findings
+  Next steps:
+    1. Developer writes scripts/collect_parse_errors.py per plan design section
+    2. Developer runs Steps 3-5 against /home/ignwrad/Projects/dwh corpus
+    3. Developer says "finished" → architect-planner runs compliance check
+    4. architect-reviewer reads results and writes ARCHITECTURE_REVIEW.md §12
+    5. sprint-planner converts §12 into follow-on sprint tickets
 
 [2026-05-06] developer — Sprint v0.3.1 implementation complete (PR #14 opened).
   Summary: Implemented all six tickets from sprint_v0.3.1:
