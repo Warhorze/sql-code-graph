@@ -18,10 +18,13 @@ def install_cmd(
     dry_run: bool = typer.Option(False, "--dry-run", help="Print config without writing"),
 ) -> None:
     """Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json)."""
-    if shutil.which("uvx"):
-        entry: dict = {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
+    if shutil.which("sqlcg"):
+        entry: dict = {"command": "sqlcg", "args": ["mcp", "start"]}
+    elif shutil.which("uvx"):
+        entry = {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
     else:
-        entry = {"command": "sqlcg", "args": ["mcp", "start"]}
+        console.print("[red]Error:[/red] Neither 'sqlcg' nor 'uvx' found on PATH.")
+        raise typer.Exit(1)
 
     settings_path = _SETTINGS_PATH
     if settings_path.exists():
@@ -38,12 +41,22 @@ def install_cmd(
 
     mcp_servers: dict = settings.setdefault("mcpServers", {})
 
-    if mcp_servers.get(_SERVER_KEY) == entry:
+    existing_entry = mcp_servers.get(_SERVER_KEY)
+    if existing_entry == entry:
         cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
-        console.print(
-            f"[green]Already configured:[/green] {_SERVER_KEY} → {cmd_str}"
-        )
+        console.print(f"[green]Already configured:[/green] {_SERVER_KEY} → {cmd_str}")
         return
+
+    # Print upgrade notice if switching from uvx to sqlcg
+    if (
+        existing_entry
+        and existing_entry.get("command") == "uvx"
+        and entry.get("command") == "sqlcg"
+    ):
+        console.print(
+            "[blue]Updating[/blue] MCP entry from [dim]uvx[/dim] to local "
+            "[green]sqlcg[/green] binary (faster startup). Writing…"
+        )
 
     mcp_servers[_SERVER_KEY] = entry
 
@@ -65,7 +78,7 @@ def install_cmd(
     console.print(f"[dim]Written to {settings_path}[/dim]")
 
     # Note about cold cache if uvx was chosen
-    if entry['command'] == 'uvx':
+    if entry.get("command") == "uvx":
         console.print(
             "[yellow]Note:[/yellow] First startup downloads dependencies (~30s). "
             "Subsequent restarts use cache (~1s)."
