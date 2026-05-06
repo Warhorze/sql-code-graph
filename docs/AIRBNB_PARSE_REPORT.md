@@ -32,9 +32,9 @@
 
 ## Files with Scope-Building Failures
 (Note: These are syntactically valid SQL files where sqlglot's scope builder failed. Typically CREATE TABLE DDL without SELECT clauses.)
-- /home/ignwrad/Projects/sql-code-graph/tests/fixtures/airbnb/raw_reviews.sql
-- /home/ignwrad/Projects/sql-code-graph/tests/fixtures/airbnb/raw_listings.sql
-- /home/ignwrad/Projects/sql-code-graph/tests/fixtures/airbnb/raw_hosts.sql
+- tests/fixtures/airbnb/raw_reviews.sql
+- tests/fixtures/airbnb/raw_listings.sql
+- tests/fixtures/airbnb/raw_hosts.sql
 
 ## Table and Lineage Counts
 - Tables Found: 10
