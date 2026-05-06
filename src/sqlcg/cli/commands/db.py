@@ -107,8 +107,7 @@ def db_info() -> None:
             "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC", {}
         )
         if mode_rows:
-            console.print("
-  Parsing mode distribution:")
+            console.print("\n  Parsing mode distribution:")
             for row in mode_rows:
                 console.print(f"    {row['mode']}: {row['cnt']}")
 
