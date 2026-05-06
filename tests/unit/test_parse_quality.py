@@ -1,7 +1,7 @@
 """Unit tests for ParseQuality assignment (T-09)."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
