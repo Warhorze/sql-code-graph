@@ -102,6 +102,16 @@ def db_info() -> None:
         edges_count = edges_result[0]["count"] if edges_result else 0
         console.print(f"  COLUMN_LINEAGE edges: {edges_count}")
 
+        # Print parsing mode distribution
+        mode_rows = backend.run_read(
+            "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC", {}
+        )
+        if mode_rows:
+            console.print("
+  Parsing mode distribution:")
+            for row in mode_rows:
+                console.print(f"    {row['mode']}: {row['cnt']}")
+
 
 @app.command("list-repos")
 def list_repos() -> None:
