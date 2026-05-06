@@ -9,12 +9,16 @@ from sqlcg.cli.commands.install import install_cmd
 
 
 def test_uvx_available_shows_cold_cache_message():
-    """Test that uvx available triggers cold cache startup time message (T-14)."""
+    """Test that uvx-only (no sqlcg) triggers cold cache startup time message (T-14)."""
     CliRunner()
 
-    with patch("sqlcg.cli.commands.install.shutil.which") as mock_which:
-        mock_which.return_value = "/usr/bin/uvx"  # uvx is available
+    def which_impl(cmd: str):
+        # Only uvx is available, sqlcg is not
+        if cmd == "uvx":
+            return "/usr/bin/uvx"
+        return None
 
+    with patch("sqlcg.cli.commands.install.shutil.which", side_effect=which_impl):
         with patch("sqlcg.cli.commands.install.Path"):
             mock_settings_path = MagicMock(spec=Path)
             mock_settings_path.exists.return_value = False
@@ -43,9 +47,13 @@ def test_uvx_not_available_no_cold_cache_message():
     """Test that when uvx not available, sqlcg command is used without cold cache warning (T-14)."""
     CliRunner()
 
-    with patch("sqlcg.cli.commands.install.shutil.which") as mock_which:
-        mock_which.return_value = None  # uvx is NOT available
+    def which_impl(cmd: str):
+        # Only sqlcg is available, uvx is not
+        if cmd == "sqlcg":
+            return "/usr/local/bin/sqlcg"
+        return None
 
+    with patch("sqlcg.cli.commands.install.shutil.which", side_effect=which_impl):
         with patch("sqlcg.cli.commands.install.Path"):
             mock_settings_path = MagicMock(spec=Path)
             mock_settings_path.exists.return_value = False
