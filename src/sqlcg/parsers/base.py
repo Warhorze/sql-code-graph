@@ -471,7 +471,14 @@ class SqlParser(ABC):
 
             # Extract output columns
             for col_expr in col_expressions:
-                col_name = col_expr.alias if col_expr.alias else str(col_expr)
+                if col_expr.alias:
+                    col_name = col_expr.alias
+                elif isinstance(col_expr, exp.Column):
+                    col_name = col_expr.name
+                else:
+                    # Expression with no resolvable name (e.g. ROUND(...), CAST(...))
+                    # — sg_lineage requires a plain column name, skip these
+                    continue
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
                 if schema:
