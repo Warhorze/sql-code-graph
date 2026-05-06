@@ -59,14 +59,29 @@ class AnsiParser(SqlParser):
                 out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
                 break
 
+        # Initialize sources_map to accumulate temp table definitions
+        sources_map: dict[str, Any] = {}
+
         # Process each statement
         for stmt_index, stmt in enumerate(statements):
             if stmt is None:
                 continue
 
             try:
-                query_node = self._parse_statement(stmt, path, stmt_index, out)
+                query_node = self._parse_statement(stmt, path, stmt_index, out, sources_map)
                 out.statements.append(query_node)
+
+                # Register CTAS bodies in sources_map for downstream temp table references
+                if isinstance(stmt, exp.Create):
+                    # Unwrap Subquery wrapper: CREATE TABLE t AS (SELECT ...) has
+                    # stmt.expression = exp.Subquery, not exp.Select directly
+                    _expr = stmt.expression
+                    if isinstance(_expr, exp.Subquery):
+                        _expr = _expr.this
+                    if isinstance(_expr, exp.Select) and query_node.target:
+                        target_name = (query_node.target.name or "").lower()
+                        if target_name:
+                            sources_map[target_name] = _expr
 
                 # Track defined and referenced tables
                 if query_node.kind in ("CREATE_TABLE", "CREATE_VIEW"):
@@ -86,7 +101,12 @@ class AnsiParser(SqlParser):
         return out
 
     def _parse_statement(
-        self, stmt: Any, path: Path, stmt_index: int, out: ParsedFile
+        self,
+        stmt: Any,
+        path: Path,
+        stmt_index: int,
+        out: ParsedFile,
+        sources_map: dict[str, Any] | None = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -95,6 +115,7 @@ class AnsiParser(SqlParser):
             path: Path to the source file
             stmt_index: Statement index in the file
             out: ParsedFile object to append errors to
+            sources_map: Map of temp table names to SELECT bodies for resolution
 
         Returns:
             QueryNode with extracted metadata
@@ -139,7 +160,9 @@ class AnsiParser(SqlParser):
 
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
-        column_lineage = self._extract_column_lineage(stmt, path, out, schema, dst_table=target)
+        column_lineage = self._extract_column_lineage(
+            stmt, path, out, schema, dst_table=target, sources=sources_map
+        )
 
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)

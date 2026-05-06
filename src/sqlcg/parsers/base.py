@@ -425,6 +425,7 @@ class SqlParser(ABC):
         out: ParsedFile,
         schema: dict,
         dst_table: "TableRef | None" = None,
+        sources: dict[str, Any] | None = None,
     ) -> list[LineageEdge]:
         """Extract column-level lineage with structured error recording.
 
@@ -439,6 +440,8 @@ class SqlParser(ABC):
             path: Path to the source file
             out: ParsedFile object to append errors to
             schema: Schema dict from _schema.as_dict()
+            dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
+            sources: Map of table names to SELECT bodies for temp table resolution
 
         Returns:
             List of LineageEdge objects
@@ -526,7 +529,9 @@ class SqlParser(ABC):
                         continue
 
                 try:
-                    root = sg_lineage(col_name, body, schema=schema, dialect=self.DIALECT)
+                    root = sg_lineage(
+                        col_name, body, schema=schema, sources=sources or {}, dialect=self.DIALECT
+                    )
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
                         new_edges = self._lineage_node_to_edges(
