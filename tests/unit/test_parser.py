@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.registry import get_parser
 
@@ -153,16 +151,8 @@ class TestAnsiParser:
 
 
 class TestColumnLineage:
-    """Column lineage extraction — currently unimplemented (see ARCHITECTURE_REVIEW.md 11.2)."""
+    """Column lineage extraction (ARCHITECTURE_REVIEW.md 11.2 fixed)."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Bug 1: _extract_column_lineage is never called — ansi_parser.py:140 hardcodes "
-            "column_lineage = []. Bug 2: sg_lineage → LineageEdge conversion is a TODO in "
-            "base.py:396. Remove xfail once both are fixed."
-        ),
-    )
     def test_create_view_populates_column_lineage(self):
         """Parsing a CREATE VIEW AS SELECT must produce column lineage edges."""
         sql = "CREATE VIEW v AS SELECT a, b FROM t;"
@@ -174,13 +164,6 @@ class TestColumnLineage:
             "The parser is not wiring _extract_column_lineage."
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Bug 1: _extract_column_lineage is never called — ansi_parser.py:140 hardcodes "
-            "column_lineage = []. Remove xfail once both wiring gaps in 11.2 are closed."
-        ),
-    )
     def test_insert_select_populates_column_lineage(self):
         """INSERT … SELECT must produce column lineage edges for each projected column."""
         sql = "INSERT INTO dst SELECT id, name FROM src;"
