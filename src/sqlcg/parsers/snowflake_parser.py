@@ -8,7 +8,7 @@ import sqlglot
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import ParsedFile
+from sqlcg.parsers.base import ParseQuality, ParsedFile
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 
@@ -95,6 +95,7 @@ class SnowflakeParser(AnsiParser):
             ParsedFile with extracted DML statements
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
+        out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
         # Extract DML statements using regex

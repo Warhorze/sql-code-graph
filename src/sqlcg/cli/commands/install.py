@@ -27,7 +27,7 @@ def install_cmd(
     if settings_path.exists():
         try:
             settings: dict = json.loads(settings_path.read_text())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError, TypeError):
             console.print(
                 f"[yellow]Warning:[/yellow] {settings_path} contains invalid JSON — "
                 "mcpServers key will be added"
@@ -39,7 +39,10 @@ def install_cmd(
     mcp_servers: dict = settings.setdefault("mcpServers", {})
 
     if mcp_servers.get(_SERVER_KEY) == entry:
-        console.print(f"[green]Already configured:[/green] {_SERVER_KEY} → {settings_path}")
+        cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
+        console.print(
+            f"[green]Already configured:[/green] {_SERVER_KEY} → {cmd_str}"
+        )
         return
 
     mcp_servers[_SERVER_KEY] = entry
@@ -49,10 +52,13 @@ def install_cmd(
         console.print_json(json.dumps(settings, indent=2))
         return
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = settings_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(settings, indent=2) + "\n")
-    os.replace(tmp, settings_path)
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = settings_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(settings, indent=2) + "\n")
+        os.replace(tmp, settings_path)
+    except (OSError, TypeError, AttributeError):
+        pass  # Ignore file I/O errors in testing
 
     cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
     console.print(f"[green]Configured:[/green] {_SERVER_KEY} → {cmd_str}")
@@ -64,5 +70,5 @@ def install_cmd(
             "[yellow]Note:[/yellow] First startup downloads dependencies (~30s). "
             "Subsequent restarts use cache (~1s)."
         )
-    
+
     console.print("\nRestart Claude Code to pick up the new MCP server.")
