@@ -1,12 +1,37 @@
 ## Current State
 
 agent: plan-reviewer
-task: review parsing_errors_experiment.md
-plan: plan/parsing_errors_experiment.md
+task: review sprint_column_lineage_fix.md
+plan: plan/sprint_column_lineage_fix.md
 status: READY FOR IMPLEMENTATION (with corrections applied)
 date: 2026-05-06
 ---
 
+
+[2026-05-06] plan-reviewer — sprint_column_lineage_fix.md reviewed. APPROVED with corrections.
+  Plan: plan/sprint_column_lineage_fix.md
+  Issues found and fixed:
+    WARNING (fixed): T-04 Design section incorrectly claimed the pre-built scope could be
+      passed to sg_lineage(..., scope=). When scope= is supplied, sg_lineage skips
+      qualify.qualify() entirely (confirmed from sqlglot/lineage.py line 119:
+      `if not scope: qualify(...)`). Passing a raw unqualified scope would silently
+      break column qualification for every file. Corrected the Design section to
+      clarify that the build_scope lift applies only to the table-extraction
+      _real_tables(root_scope) call, not sg_lineage. Added a reviewer note with
+      the exact source reference.
+    WARNING (fixed): T-03 CTAS registration snippet used `isinstance(stmt.expression,
+      exp.Select)` which misses `CREATE TABLE t AS (SELECT ...)` where sqlglot wraps
+      the body in exp.Subquery. Verified with sqlglot.parse() — parenthesised form
+      produces exp.Subquery; unparenthesised produces exp.Select. Fixed the code
+      snippet to unwrap exp.Subquery.this before the isinstance check. Added a
+      corresponding acceptance test bullet for the parenthesised CTAS form.
+  No blockers remain. T-01 through T-04 are safe to implement in order.
+  Next steps:
+    1. Developer implements T-01 (error propagation) — one PR
+    2. Developer implements T-02 (star skip) — one PR
+    3. Developer implements T-03 (sources_map) — one PR, uses corrected Subquery unwrap
+    4. Developer implements T-04 (scope reuse) — one PR, must NOT pass scope to sg_lineage
+    5. After T-03, re-run scripts/collect_parse_errors.py and update parsing_errors_experiment.md
 
 ## Handoff Log
 
