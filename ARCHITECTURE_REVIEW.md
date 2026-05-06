@@ -1,7 +1,7 @@
 # Architecture Review — sql-code-graph (sqlcg)
 
 Blueprint version: v1.2 (May 2026)
-Review date: 2026-05-02 (updated 2026-05-05)
+Review date: 2026-05-02 (updated 2026-05-06)
 Reviewer agent: architect-reviewer
 
 ---
@@ -1553,3 +1553,217 @@ The architect-reviewer notes this means:
   field in `ParsedFile` without an adapter layer.
 - The `hint` field addition to result models (finding 10.B) can be non-optional if
   desired, though keeping it `str | None` is still the cleaner design.
+
+---
+
+## 11. v0.3.0 Live Session Findings (2026-05-06)
+
+Review date: 2026-05-06
+Source: Live Claude Code session — full DWH corpus (Snowflake, ~1200 SQL files, WSL2/Linux, 3.8 GiB RAM)
+Version: sqlcg 0.3.0 (installed via `uv tool install sql-code-graph`)
+
+This section records new findings from a v0.3.0 test session. The session attempted
+to index the full DWH corpus, trace `OMLOOPSNELHEID` column lineage via the MCP
+server, and test the new `sqlcg uninstall` command. GitHub issues #10–#13 were filed
+from this session.
+
+---
+
+### 11.1 [CRITICAL] KuzuDB OOM during edge building blocks large repo indexing
+
+**Observed behaviour**: `sqlcg index` on the full DWH corpus (~1200 files) OOMs mid-run
+with `RuntimeError: Buffer manager exception: Unable to allocate memory! The buffer pool
+is full and no memory could be freed!`. The error occurs during the edge upsert phase
+(`SELECTS_FROM`, `COLUMN_LINEAGE` edges), not during parsing. It is reproducible even
+after reducing `buffer_pool_size` to 512 MB.
+
+**Root cause**: KuzuDB's default `buffer_pool_size` is ~80% of system RAM (~3 GiB on
+this machine). Edge accumulation exhausts the buffer before it is flushed to disk
+because the current indexer batches all edges for the entire corpus before writing.
+There is no per-file commit boundary.
+
+**Workaround applied**: patched `KuzuBackend.__init__` in `site-packages` to pass
+`buffer_pool_size=512 * 1024 * 1024`. This is not acceptable as a user-facing solution.
+
+**Resolution**:
+
+1. **Expose `--buffer-pool-size` CLI flag** (quick fix, low effort). Add to `sqlcg db init`
+   and persist in `.sqlcg.toml` or an env var so subsequent commands use the same value.
+
+2. **Per-file commit pattern** (proper fix, medium effort). The `sqlcg watch` watchdog
+   already processes one file at a time — the `index_repo` loop should use the same
+   per-file pipeline:
+   ```python
+   for file in discover_sql_files(path):
+       process_file(file, dialect, backend)   # same fn the watcher calls
+       backend.commit()                        # flush edges to disk per file
+   ```
+   This unifies the two code paths, eliminates OOM regardless of corpus size, and makes
+   memory usage predictable and flat.
+
+3. **Optional `--batch-size N`** as a middle ground: commit every N files. Allows
+   tuning the memory/speed tradeoff without requiring per-file commits everywhere.
+
+**Interaction with finding 3.1** (transaction no-op): per-file commits also address
+the atomicity gap — each file either commits fully or is rolled back, keeping the graph
+consistent without requiring the entire corpus to succeed.
+
+**Filed as**: GitHub issue #10.
+
+---
+
+### 11.2 [CRITICAL] 0 COLUMN_LINEAGE edges even on small subsets — possible v0.3.0 regression
+
+**Observed behaviour**: `sqlcg index etl/sql/fact --dialect snowflake` (184 files) completed
+without OOM and reported `Indexed 184 files — 307 tables, 0 edges, 16 errors`. `db info`
+confirmed `SqlColumn: 0` and `COLUMN_LINEAGE edges: 0`. Column lineage tools return empty.
+
+**Significance**: In v0.2.1 (section 10), `SqlColumn: 0` was observed on the full 1457-file
+corpus and attributed to the bare `except Exception: continue` in `_extract_column_lineage`
+(finding 3.4). In v0.3.0 this reproduces on a 184-file subset with no OOM — the absence of
+column nodes is not caused by memory pressure. Either:
+
+(a) Finding 3.4 was not fixed in v0.3.0 and `_extract_column_lineage` silently swallows all
+    exceptions for every file, or
+(b) A v0.3.0 regression broke the column extraction path.
+
+**Diagnosis step**: run `execute_cypher("MATCH (c:SqlColumn) RETURN COUNT(c)")` and compare
+to `MATCH (q:SqlQuery) RETURN COUNT(q)`. If `SqlQuery > 0` and `SqlColumn == 0` after a
+full-success index, finding 3.4 is confirmed as the live root cause.
+
+**Resolution**: Same as finding 3.4 (section 4, rank 2) — replace bare `except Exception:
+continue` with structured logging + `ParsedFile.errors` append + `confidence=0.0`. The
+`parse_quality` breakdown from finding 10.C (section 10.3) is the systemic fix.
+
+**Priority escalation**: finding 3.4 was already HIGH. This session confirms column lineage
+is completely non-functional in production — elevate to CRITICAL. No user-visible value
+is delivered by the column lineage feature until this is fixed.
+
+---
+
+### 11.3 [HIGH] MCP server not connected in active session — `sqlcg install` idempotency too strict
+
+**Observed behaviour**: The MCP server was registered in `~/.claude/settings.json` with
+`{"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}` from a prior session.
+After upgrading to `uv tool install sql-code-graph` (v0.3.0), running `sqlcg install`
+printed "Already configured" and left the stale `uvx` entry unchanged. The MCP tools
+were not available in the Claude Code session because the `uvx` invocation used a
+different (older) cached version.
+
+**Root cause**: `sqlcg install` checks `mcpServers["sql-code-graph"]` for existence only,
+not for correctness. If the registered command changes (e.g. `uvx` → `sqlcg` after a
+`uv tool install`), the stale entry is silently retained.
+
+**Resolution**: `sqlcg install` should compare the existing entry against the ideal entry
+computed by `shutil.which("sqlcg")` / `shutil.which("uvx")`. If they differ, prompt:
+"MCP entry exists but points to `uvx`. Update to use local `sqlcg` binary? [Y/n]" and
+update atomically. Add `--force` to skip the prompt and always overwrite.
+
+**Related to section 9.2** (command detection at install time): the detection logic is
+correct but is only run on first install, not on re-runs. Apply it on every `sqlcg install`
+call.
+
+---
+
+### 11.4 [HIGH] No observable progress or lock context during indexing
+
+**Observed behaviour**: During a ~4-minute indexing run (before OOM), no stdout output was
+produced. Attempting `sqlcg db info` in a separate terminal returned:
+`RuntimeError: IO exception: Could not set lock on file: /home/ignwrad/.sqlcg/graph.db`.
+The only way to determine that indexing was still running was `lsof ~/.sqlcg/graph.db`.
+
+**Two distinct gaps**:
+
+1. **No progress during `sqlcg index`**: `rich.progress` is already a dependency —
+   a file-count progress bar costs ~10 lines of code. This is finding 10.2.9 confirmed
+   again at higher urgency.
+
+2. **Lock error gives no useful context**: the KuzuDB lock exception should be caught
+   in `get_backend()` and re-raised as: "Database is locked — another sqlcg process
+   (PID NNN) is running. Wait for it to finish or kill it with `kill NNN`." The PID
+   can be obtained from the lock file or via `lsof`.
+
+**Resolution**: Both are independent fixes in `kuzu_backend.py` and `indexer.py`.
+The lock-aware message should be added alongside the `buffer_pool_size` fix (section 11.1)
+as it affects the same `KuzuBackend.__init__` path.
+
+**Filed as**: GitHub issue #13 (stdout noise/progress), and the lock-aware message is a
+new sub-finding not previously tracked.
+
+---
+
+### 11.5 [MEDIUM] `sqlcg uninstall` leaves DB at default path (v0.3.0 implementation gap)
+
+**Observed behaviour**: `sqlcg uninstall` printed "Removed MCP registration" and "No
+database configured" but left `~/.sqlcg/graph.db` (50 MB) on disk.
+
+**Root cause**: `uninstall.py` only checks `SQLCG_DB_PATH` env var. When unset it
+reports "No database configured" rather than falling back to `KuzuConfig().db_path`
+(the hardcoded default `~/.sqlcg/graph.db`).
+
+**Resolution**: Fall back to `KuzuConfig().db_path` when `SQLCG_DB_PATH` is absent.
+The prompt/`--force`/`--keep-db` interaction model is already fully specified in
+section 10.6 Q1. The implementation simply needs to apply it to the default path.
+
+**Status**: `sqlcg uninstall` command exists (resolves the core ask of issue #6) but
+this gap means issue #6 remains open.
+
+**Filed as**: GitHub issue #11.
+
+---
+
+### 11.6 Column lineage result via grep fallback — `OMLOOPSNELHEID`
+
+Because MCP column lineage was non-functional (sections 11.1–11.2), the session
+fell back to grep. The result is recorded here for completeness.
+
+**`OMLOOPSNELHEID` is an intermediate calculation — not persisted to any BA table or IA view.**
+
+Location: `etl/sql/dim/wtdh_artikel.sql` lines 2741 and 2772.
+
+Formula (two variants):
+- `tmp_berekening_bestaande_artikelen` (line 2741): `AFZET / GEMIDDELDE_VRD` (existing articles, 13-period rolling window). Sources: `tmp_afzet_bestaande_artikelen` ← sales data; `tmp_artikelen_voorraad` + `DA.TTGMD_OPSLAG` ← average stock.
+- `tmp_berekening_segment` (line 2772): `GEMIDDELDE_SEGMENT_AFZET / GEMIDDELDE_VRD_SEGMENT` (segment fallback).
+
+Both temp tables feed `tmp_opslag_berekend` (UNION), but only `KOSTEN_PER_VERKOCHT_WEB_ARTIKEL`
+is carried forward — `OMLOOPSNELHEID` is dropped after the union and never written to
+`BA.WTDH_ARTIKEL` or any DDL column.
+
+The file `ddl/changelogs/IA-DATAPRODUCTS/AGG_GMROI_OS_WEEK_SEGMENT_FORMULE_VOORRAADLOCATIE.sql`
+references "Omloopsnelheid" only in a comment (`-- GMROI en Omloopsnelheid`) — it computes
+GMROI/omloopsnelheid inline from `IA_SEMANTIC` views without a named column.
+
+**Relevance to ETL lineage gap (section 6)**: this is a concrete example of the
+intra-file temp table chain described in section 6.3 — `OMLOOPSNELHEID` is computed in
+a temp table and used (as a divisor) two lines later, but because column lineage through
+temp tables is untracked, `sqlcg` would not have been able to trace it even with fully
+functional column lineage.
+
+---
+
+### 11.7 Updated Open Issues Summary (2026-05-06)
+
+| Issue | Title | Status | Notes |
+|-------|-------|--------|-------|
+| #5 | LLM agent experience, silent failures | Open | Column lineage still 0 in v0.3.0; quick-start block added ✅ |
+| #6 | No clean uninstall / opt-out path | Open | `sqlcg uninstall` added ✅; DB not removed ❌ — see #11 |
+| #10 | OOM during indexing | Open | New — v0.3.0, full DWH corpus |
+| #11 | Uninstall leaves `~/.sqlcg/` | Open | New — v0.3.0 implementation gap |
+| #12 | `find table` case-sensitivity | Open | New — extracted from #9 |
+| #13 | Index warnings to stdout | Open | New — extracted from #9 |
+
+Issue #9 (session summary) closed 2026-05-06 — actionable items extracted to #12 and #13.
+
+---
+
+### 11.8 Updated Implementation Plan — v0.3.0 Priorities
+
+Additions and escalations relative to section 10.4:
+
+| Rank | Finding | Action | Effort | Priority |
+|------|---------|--------|--------|----------|
+| 0 | 11.2 — 0 column edges in v0.3.0 | Diagnose `_extract_column_lineage` exception swallowing; fix finding 3.4 | XS–S | **CRITICAL** |
+| 1 | 11.1 — OOM during edge building | Add `--buffer-pool-size` flag; implement per-file commit pattern in `index_repo`; unify with watchdog pipeline | M | HIGH |
+| 2 | 11.3 — stale MCP entry not updated | `sqlcg install` should compare existing vs ideal entry and prompt to update | XS | HIGH |
+| 3 | 11.4 — no progress + lock error context | `rich.progress` in `index_repo`; lock-aware error message in `get_backend()` | S | HIGH |
+| 4 | 11.5 — uninstall ignores default DB path | Fall back to `KuzuConfig().db_path` in `uninstall.py` | XS | MEDIUM |
