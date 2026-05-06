@@ -9,9 +9,18 @@ without reading every file.
 
 ## Quick start
 
+Choose one:
+
+**Permanent install** (recommended):
 ```bash
-pip install sql-code-graph        # or: uvx sql-code-graph (no install needed)
-sqlcg install                     # register MCP server in Claude Code
+uv tool install sql-code-graph    # Fast, managed, no isolation needed
+sqlcg install                     # Register MCP server in Claude Code
+```
+
+**One-shot try** (cold cache warning):
+```bash
+uvx sql-code-graph                # First run is slow (downloads deps)
+                                  # Subsequent runs use cache, ~1s startup
 ```
 
 Restart Claude Code, then inside your project ask:
@@ -22,6 +31,12 @@ Index my SQL files at ./sql --dialect snowflake
 
 That's it. The MCP tools are now available to Claude in every conversation
 for that project.
+
+### Workflow (3 steps)
+
+1. **Initialize**: `sqlcg db init`
+2. **Index**: `sqlcg index ./sql --dialect snowflake`
+3. **Keep fresh**: `sqlcg git install-hooks` (optional)
 
 ## Full setup (recommended)
 
@@ -68,6 +83,7 @@ are available and when to use them:
 ```markdown
 ## SQL lineage
 This project uses sql-code-graph. MCP tools are available:
+- `db_info` — check graph health and parse quality before running lineage queries
 - `index_repo` — index or re-index a directory of SQL files
 - `find_table_usages` — find all queries that read a table
 - `trace_column_lineage` — trace where a column's value comes from
@@ -79,6 +95,30 @@ This project uses sql-code-graph. MCP tools are available:
 The MCP server works without this — Claude can discover the tools on its own —
 but the CLAUDE.md snippet ensures they get used proactively.
 
+## Parse quality
+
+After indexing, `sqlcg gain` shows a **parse quality breakdown** that tells you how
+much column-level lineage was extracted:
+
+| Quality | Meaning | Tools affected |
+|---|---|---|
+| `FULL` | Column-level lineage extracted | All tools work |
+| `TABLE_ONLY` | Table edges only — no column lineage | `trace_column_lineage`, `get_*_dependencies` return empty |
+| `SCRIPTING_FALLBACK` | sqlglot fell back to raw command node | Partial table edges; column lineage unavailable |
+| `FAILED` | File failed to parse entirely | File invisible to all queries |
+
+Quality is shown per-file after `sqlcg index` and in `sqlcg gain` Section F.
+`list_dialects_and_repos()` warns when scripting fallback exceeds 20% of queries.
+
+**What causes TABLE_ONLY?** Mostly `SELECT *` — sqlglot can't trace column names through
+a wildcard. Alias those selects to get FULL coverage.
+
+**What causes SCRIPTING_FALLBACK?** Snowflake `$$` procedure bodies or `BEGIN…END` scripting
+blocks. sqlglot parses the block as a raw `Command` node and extracts DML via tokenizer
+fallback. Table edges are usually correct; column edges are not.
+
+Check `sqlcg db info` for the parsing mode distribution across all indexed queries.
+
 ## MCP tools reference
 
 | Tool | Description |
@@ -89,8 +129,14 @@ but the CLAUDE.md snippet ensures they get used proactively.
 | `get_upstream_dependencies(table_col)` | Full upstream dependency chain |
 | `get_downstream_dependencies(table_col)` | Full downstream dependency chain |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
-| `list_dialects_and_repos()` | List indexed repos and dialects |
+| `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
+| `db_info()` | Graph health, node counts, parse quality breakdown, warnings |
 | `execute_cypher(query)` | Raw Cypher query against the graph |
+
+> **LLM agent tip**: call `db_info()` before lineage queries to check that
+> `SqlColumn > 0` and `warnings` is empty. If `parse_quality["scripting_block"]`
+> is high, column lineage will be limited for those files — use table-level tools
+> (`find_table_usages`, `get_*_dependencies`) instead.
 
 ## CLI reference
 

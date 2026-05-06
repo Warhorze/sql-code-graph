@@ -17,6 +17,7 @@ bash scripts/generate_cli_docs.sh
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
 | `install` | Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json). |
+| `uninstall` | Uninstall sqlcg from Claude Code and optionally clean up resources. |
 | `version` | Show version. |
 | `db` | Database management commands |
 | `find` | Search the graph |
@@ -30,7 +31,14 @@ bash scripts/generate_cli_docs.sh
 sqlcg [OPTIONS] COMMAND [ARGS]...
 ```
 
-SQL code graph analyzer
+SQL code graph analyzer.
+
+QUICK START:
+  1. sqlcg db init
+  2. sqlcg index <path> --dialect snowflake
+  3. sqlcg git install-hooks
+
+Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
 ### Global Options
 
@@ -85,6 +93,13 @@ Displays:
 - Section B: Parse success trend (last 5 index runs)
 - Section C: True positive feedback rate (if ≥5 samples)
 - Section D: Top 3 most-called tools
+- Section E: execute_cypher ratio (high ratio = LLM falling back to raw Cypher)
+- Section F: Parse quality breakdown from graph (FULL / TABLE_ONLY / SCRIPTING_FALLBACK)
+
+Parse quality legend:
+  FULL              — column-level lineage extracted; all tools work
+  TABLE_ONLY        — table edges only; trace_column_lineage returns empty
+  SCRIPTING_FALLBACK— sqlglot fell back to Command node; partial table edges only
 
 All metrics are opt-in via SQLCG_METRICS environment variable.
 If no metrics have been collected, shows a message and exits 0.
@@ -131,6 +146,26 @@ Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json).
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --dry-run | BOOLEAN | No | No | False | Print config without writing |
+
+## `sqlcg uninstall`
+
+```bash
+sqlcg uninstall [OPTIONS]
+```
+
+Uninstall sqlcg from Claude Code and optionally clean up resources.
+
+Step 1: Remove MCP registration from ~/.claude/settings.json
+Step 2: Optionally delete the KùzuDB graph database
+Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --keep-db | BOOLEAN | No | No | False | Skip database deletion |
+| --force | BOOLEAN | No | No | False | Delete database without prompting; also delete metrics store |
+| --repo | PATH | No | No |  | Repository path for git hook removal (default: current directory) |
 
 ## `sqlcg version`
 

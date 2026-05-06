@@ -17,10 +17,12 @@ from sqlcg.core.queries import (
     SEARCH_SQL_PATTERN_QUERY,
     TRACE_COLUMN_LINEAGE_QUERY,
 )
+from sqlcg.core.schema import NodeLabel
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
+    DbInfoResult,
     DependencyNode,
     DependencyResult,
     DialectRepo,
@@ -583,6 +585,9 @@ def list_dialects_and_repos() -> DialectRepoResult:
 
     Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
+    Returns the catalogue of what has been indexed. For health and parse quality
+    information use `db_info()` instead.
+
     Returns:
         DialectRepoResult with list of repositories and their dialects
 
@@ -592,10 +597,7 @@ def list_dialects_and_repos() -> DialectRepoResult:
     db = _get_backend()
     _assert_indexed(db)
 
-    rows = db.run_read(
-        LIST_DIALECTS_AND_REPOS_QUERY,
-        {},
-    )
+    rows = db.run_read(LIST_DIALECTS_AND_REPOS_QUERY, {})
 
     repos: list[DialectRepo] = []
     for row in rows:
@@ -607,14 +609,85 @@ def list_dialects_and_repos() -> DialectRepoResult:
             )
         )
 
-    # Check for health warnings
-    warnings: list[str] = []
-    col_count_result = db.run_read("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})
-    col_count = col_count_result[0]["count"] if col_count_result else 0
-    if col_count == 0:
-        warnings.append("SqlColumn count is 0: column lineage was not extracted")
+    return DialectRepoResult(repos=repos)
 
-    return DialectRepoResult(repos=repos, warnings=warnings)
+
+@_timed_tool("db_info")
+def db_info() -> DbInfoResult:
+    """Return graph health and parse quality diagnostics.
+
+    Use this tool to understand the current state of the indexed graph before
+    running lineage queries. Key signals:
+
+    - `node_counts["SqlColumn"] == 0` → column lineage was not extracted;
+      trace_column_lineage and dependency tools will return empty results.
+    - `parse_quality["scripting_block"]` high → Snowflake/BigQuery scripting
+      blocks were parsed via tokenizer fallback; column lineage limited for
+      those files. Table-level lineage is still available.
+    - `warnings` list — empty means the graph is healthy.
+
+    Parse quality legend (parsing_mode per SqlQuery node):
+      sqlglot          — standard path; column lineage available if extracted
+      scripting_block  — tokenizer fallback; column lineage unavailable
+
+    Returns:
+        DbInfoResult with schema version, node counts, parse quality, and warnings
+    """
+    db = _get_backend()
+
+    schema_version = db.get_schema_version() or "unknown"
+
+    node_counts: dict[str, int] = {}
+    for label in NodeLabel:
+        result = db.run_read(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
+        node_counts[str(label)] = result[0]["count"] if result else 0
+
+    edges_result = db.run_read(
+        "MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {}
+    )
+    column_lineage_edges = edges_result[0]["count"] if edges_result else 0
+
+    mode_rows = db.run_read(
+        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
+        " COUNT(q) AS cnt ORDER BY cnt DESC",
+        {},
+    )
+    parse_quality: dict[str, int] = {}
+    if mode_rows and "mode" in mode_rows[0]:
+        parse_quality = {str(r["mode"]): int(r["cnt"]) for r in mode_rows}
+
+    warnings: list[str] = []
+    if node_counts.get("Repo", 0) == 0:
+        warnings.append(
+            "Database is empty. Run 'sqlcg db init' then 'sqlcg index <path>'."
+        )
+    elif node_counts.get("SqlQuery", 0) == 0:
+        warnings.append(
+            "No queries indexed. Run 'sqlcg index <path>' to populate the graph."
+        )
+    elif node_counts.get("SqlColumn", 0) == 0:
+        warnings.append(
+            "SqlColumn count is 0 — column lineage was not extracted. "
+            "trace_column_lineage and dependency tools will return empty results."
+        )
+
+    total_queries = sum(parse_quality.values())
+    scripting_count = parse_quality.get("scripting_block", 0)
+    if total_queries > 0 and scripting_count > 0:
+        pct = round(100 * scripting_count / total_queries)
+        if pct > 20:
+            warnings.append(
+                f"{pct}% of queries used scripting-block fallback — "
+                "column lineage may be incomplete for those files."
+            )
+
+    return DbInfoResult(
+        schema_version=schema_version,
+        node_counts=node_counts,
+        column_lineage_edges=column_lineage_edges,
+        parse_quality=parse_quality,
+        warnings=warnings,
+    )
 
 
 @mcp.tool()
@@ -689,25 +762,28 @@ def submit_feedback(
 
     **For Claude**: When a user says "that result was wrong" or "this is a
     false positive", call this tool with label="FP". When they confirm
-    "that's correct", call with label="TP". Use the query or pattern as
-    the 'query' argument and include any user feedback in the 'note'.
+    "that's correct", call with label="TP". When a tool should have
+    returned a result but got empty, call with label="FN" (false negative).
+    Use the query or pattern as the 'query' argument and include any user
+    feedback in the 'note'.
 
     Args:
         tool_name: Name of the tool being evaluated (e.g., "trace_column_lineage")
         query: The query or pattern that was evaluated
-        label: Feedback label: "TP" (true positive) or "FP" (false positive)
+        label: Feedback label: "TP" (true positive), "FP" (false positive), or
+               "FN" (false negative — expected a result but got empty)
         note: Optional user note (truncated to 500 chars)
 
     Returns:
         Dict with status: "recorded" or "skipped"
 
     Raises:
-        ValueError: If label is not "TP" or "FP"
+        ValueError: If label is not "TP", "FP", or "FN"
     """
     global _metrics
 
-    if label not in ("TP", "FP"):
-        raise ValueError(f"Invalid label: {label}. Must be 'TP' or 'FP'.")
+    if label not in ("TP", "FP", "FN"):
+        raise ValueError(f"Invalid label: {label}. Must be 'TP', 'FP', or 'FN'.")
 
     if _metrics is not None:
         try:

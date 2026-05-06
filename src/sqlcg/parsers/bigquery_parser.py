@@ -4,7 +4,7 @@ from pathlib import Path
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import ParsedFile
+from sqlcg.parsers.base import ParsedFile, ParseQuality
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 
@@ -43,8 +43,8 @@ class BigQueryParser(AnsiParser):
         # Check for scripting blocks
         if self._has_scripting_block(sql):
             logger.info("BigQuery scripting block detected in %s, marking as parse_failed", path)
-            # Scripting blocks are not fully parseable; mark as parse_failed
             out = ParsedFile(path=path, dialect=self.DIALECT)
+            out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
             out.errors.append("parse_mode:scripting_block")
             return out
 
