@@ -24,6 +24,15 @@ class QueryKind(StrEnum):
     OTHER = "OTHER"
 
 
+class ParseQuality(StrEnum):
+    """File-level parse quality assessment."""
+
+    FULL = "FULL"
+    TABLE_ONLY = "TABLE_ONLY"
+    SCRIPTING_FALLBACK = "SCRIPTING_FALLBACK"
+    FAILED = "FAILED"
+
+
 @dataclass(frozen=True)
 class TableRef:
     """A reference to a table (immutable).
@@ -162,6 +171,7 @@ class ParsedFile:
         defined_tables: List of TableRef for tables defined in this file
         referenced_tables: List of TableRef for tables referenced in this file
         errors: List of error messages encountered during parsing
+        parse_quality: File-level quality assessment
     """
 
     path: Path
@@ -170,6 +180,7 @@ class ParsedFile:
     defined_tables: list[TableRef] = field(default_factory=list)
     referenced_tables: list[TableRef] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    parse_quality: ParseQuality = ParseQuality.TABLE_ONLY
 
     @property
     def path_str(self) -> str:

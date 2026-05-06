@@ -10,17 +10,16 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.indexer.indexer import Indexer
 
 
 @pytest.fixture
 def indexed_db(tmp_path):
     """Create an indexed database with a simple INSERT-SELECT scenario."""
-    from sqlcg.cli.commands.db import init_db
-
     # Initialize a test database
-    db = init_db()
+    db = KuzuBackend(":memory:")
+    db.init_schema()
 
     # Create a SQL file with INSERT-SELECT
     sql_file = tmp_path / "dml.sql"

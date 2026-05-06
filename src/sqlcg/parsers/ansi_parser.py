@@ -7,7 +7,7 @@ import sqlglot
 import sqlglot.expressions as exp
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
-from sqlcg.parsers.base import ParsedFile, QueryNode, SqlParser, TableRef
+from sqlcg.parsers.base import ParseQuality, ParsedFile, QueryNode, SqlParser, TableRef
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 
@@ -50,7 +50,14 @@ class AnsiParser(SqlParser):
         except Exception as exc:
             logger.warning("Failed to parse file %s: %s", path, exc)
             out.errors.append(f"parse_error:{exc}")
+            out.parse_quality = ParseQuality.FAILED
             return out
+
+        # Check for scripting fallback
+        for stmt in statements:
+            if stmt is not None and isinstance(stmt, exp.Command):
+                out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
+                break
 
         # Process each statement
         for stmt_index, stmt in enumerate(statements):
@@ -67,6 +74,10 @@ class AnsiParser(SqlParser):
                         out.defined_tables.append(query_node.target)
 
                 out.referenced_tables.extend(query_node.sources)
+
+                # Upgrade to FULL if column lineage exists
+                if query_node.column_lineage:
+                    out.parse_quality = ParseQuality.FULL
 
             except Exception as exc:
                 logger.warning("Failed to process statement %d in %s: %s", stmt_index, path, exc)
@@ -118,6 +129,12 @@ class AnsiParser(SqlParser):
             )
             sources = self._fallback_table_scan(stmt)
             parse_failed = True
+
+        # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
+        if target:
+            sources = [
+                src for src in sources if src.full_id != target.full_id
+            ]
 
         # Extract column lineage (currently minimal implementation)
         column_lineage = []

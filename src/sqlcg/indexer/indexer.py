@@ -11,7 +11,7 @@ from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
-from sqlcg.parsers.base import ParsedFile
+from sqlcg.parsers.base import ParseQuality, ParsedFile
 from sqlcg.parsers.registry import get_parser
 from sqlcg.utils.ignore import load_ignore_spec
 from sqlcg.utils.logging import getLogger
@@ -30,6 +30,7 @@ class Indexer:
         dbt_manifest: Path | None = None,
         timeout_per_file: int = 30,
         use_git: bool = True,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict:
         """Full two-pass index. Returns summary dict.
 
@@ -42,9 +43,11 @@ class Indexer:
             use_git: When True (default), use git ls-files to restrict
                 indexing to tracked files; falls back to rglob when git
                 is unavailable or the directory is not a git repository.
+            progress_callback: Optional callback(n, total) invoked every 100 files
 
         Returns:
-            Dict with keys: files_parsed, parse_errors, tables_found, lineage_edges_created
+            Dict with keys: files_parsed, parse_errors, tables_found,
+            lineage_edges_created, quality
         """
         spec = load_ignore_spec(path)
         schema_resolver = SchemaResolver(dialect=dialect)
@@ -54,9 +57,10 @@ class Indexer:
         files = list(walk_sql_files(path, spec, use_git=use_git))
         pass1_results: list[ParsedFile] = []
         parse_errors = 0
+        total_files = len(files)
 
         # Pass 1: parse all files
-        for file_path in files:
+        for i, file_path in enumerate(files, 1):
             try:
                 sql = file_path.read_text(encoding="utf-8")
                 parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
@@ -70,6 +74,10 @@ class Indexer:
             except Exception as exc:
                 logger.warning("Failed to parse %s: %s", file_path, exc)
                 parse_errors += 1
+
+            # Invoke progress callback every 100 files
+            if progress_callback is not None and i % 100 == 0:
+                progress_callback(i, total_files)
 
         # Optional: load dbt manifest
         if dbt_manifest:
@@ -87,19 +95,28 @@ class Indexer:
                 logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
                 pass2_results.append(parsed)
 
-        # Upsert all results
+        # Upsert all results and count quality distribution
         tables_found = 0
         lineage_edges = 0
+        quality_counts = {
+            "full": 0,
+            "table_only": 0,
+            "scripting_fallback": 0,
+            "failed": 0,
+        }
         for parsed in pass2_results:
             counts = self._upsert_parsed_file(parsed, db)
             tables_found += counts["tables"]
             lineage_edges += counts["edges"]
+            quality_key = parsed.parse_quality.value.lower()
+            quality_counts[quality_key] += 1
 
         return {
             "files_parsed": len(pass2_results),
             "parse_errors": parse_errors,
             "tables_found": tables_found,
             "lineage_edges_created": lineage_edges,
+            "quality": quality_counts,
         }
 
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:

@@ -90,3 +90,8 @@ def index_cmd(  # noqa: B008
                 f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
                 f"{summary['parse_errors']} errors"
             )
+            if summary.get("lineage_edges_created", 0) == 0:
+                console.print(
+                    "[yellow]Warning: 0 lineage edges extracted — column lineage "
+                    "unavailable.[/yellow]"
+                )

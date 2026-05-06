@@ -49,7 +49,7 @@ def test_progress_callback_invoked_at_100_file_boundary():
         assert len(callback_calls) >= 1, "Progress callback should be invoked at least once"
 
         # Check that at least one call records reaching exactly 100 files
-        current_values = [c[0] for c, t in callback_calls]
+        current_values = [c for c, t in callback_calls]
         assert any(c == 100 for c in current_values), \
             f"Progress callback should be invoked at 100-file boundary. Got calls: {callback_calls}"
 
