@@ -135,7 +135,7 @@ The diagnostic script must classify every error into exactly one of these catego
 | `E3` | `command_fallback` | sqlglot emits `"contains unsupported syntax. Falling back to parsing as 'Command'"` warning | `ALTER DYNAMIC TABLE` |
 | `E4` | `parse_failure` | sqlglot raises during `parse_one()` or `transpile()` — full file parse failure | `Expecting (. Line 7, Col: 30` |
 | `E5` | `lineage_other` | `sg_lineage()` raises any exception not covered by E1 | `SqlglotError: Cannot build lineage, sql must be SELECT` |
-| `E6` | `schema_mismatch` | Column extracted from SELECT is not in schema dict (low-confidence edge emitted) | `col_name not in table_cols` |
+| `E6` | `schema_mismatch` | Column extracted from SELECT is not in schema dict (low-confidence edge emitted) — **always 0 when schema={}** | `col_name not in table_cols` |
 | `E7` | `tree_walk_fail` | `_lineage_node_to_edges` raises during tree traversal | Exception inside `_walk()` |
 | `E8` | `no_edges_from_root` | `sg_lineage()` returns a root but `_lineage_node_to_edges` returns empty list | Root has no resolvable leaf sources |
 
@@ -281,8 +281,11 @@ may deviate and document it.
 ```python
 from sqlcg.parsers.snowflake_parser import SnowflakeParser
 from sqlcg.parsers.ansi_parser import AnsiParser
+from sqlcg.lineage.schema_resolver import SchemaResolver
 
-parser = SnowflakeParser() if dialect == "snowflake" else AnsiParser()
+# SqlParser.__init__ requires a SchemaResolver; pass an empty one (no schema loaded)
+_resolver = SchemaResolver(dialect=dialect if dialect != "ansi" else None)
+parser = SnowflakeParser(_resolver) if dialect == "snowflake" else AnsiParser(_resolver)
 ```
 
 **Capture the `Command` fallback warning** by redirecting sqlglot's logger:
@@ -306,8 +309,19 @@ logging.getLogger("sqlglot").addHandler(handler)
 
 **Reuse the same column extraction logic as `_extract_column_lineage` in `base.py`**.
 Do not duplicate it — call `parser._extract_column_lineage(stmt, path, out, schema={})`.
-Then separately tally the error codes from `out.errors`. This ensures the script measures
-real production behaviour, not a parallel reimplementation.
+Then tally error categories by scanning `out.errors` for the string prefixes that
+`_extract_column_lineage` writes (all entries are free-form strings, not structured codes):
+
+- **E5** (lineage_other): entries with prefix `col_lineage:<col>:` where message does
+  NOT contain `tree_walk`
+- **E7** (tree_walk_fail): entries with prefix `col_lineage:tree_walk:<col>:`
+- **E8** (no_edges_from_root): NOT written to `out.errors` by production code — detect
+  directly in the script by checking `if root and not new_edges` after calling
+  `_lineage_node_to_edges`; do not try to infer E8 from error strings
+- **E1 vs E5 disambiguation**: check if the exception message contains
+  `'Cannot find column'` AND the col_name contains `.`; E1 only if both are true
+
+This ensures the script measures real production behaviour, not a parallel reimplementation.
 
 **Count E3 separately** from `out.errors` because `Command` fallbacks are sqlglot log
 warnings, not exceptions. They appear before the statement is even handed to the parser.

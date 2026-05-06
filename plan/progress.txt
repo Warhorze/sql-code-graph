@@ -1,14 +1,30 @@
 ## Current State
 
-agent: architect-planner
-task: parsing-errors-experiment — design diagnostic research plan
+agent: plan-reviewer
+task: review parsing_errors_experiment.md
 plan: plan/parsing_errors_experiment.md
-status: COMPLETE — plan written; idle for developer Q&A and compliance check
+status: READY FOR IMPLEMENTATION (with corrections applied)
 date: 2026-05-06
 ---
 
 
 ## Handoff Log
+
+[2026-05-06] plan-reviewer — parsing_errors_experiment.md reviewed. APPROVED with corrections.
+  Plan: plan/parsing_errors_experiment.md
+  Issues found and fixed:
+    BLOCKER (fixed): Parser construction snippet showed SnowflakeParser() with no args.
+      SqlParser.__init__ requires SchemaResolver. Fixed to pass SchemaResolver(dialect=...).
+    WARNING (fixed): "tally error codes from out.errors" was ambiguous — out.errors contains
+      free-form strings, not structured codes. Added exact prefix matching rules:
+      E5 = col_lineage:<col>: (no tree_walk); E7 = col_lineage:tree_walk:<col>:;
+      E8 = detected in script directly (not in out.errors); E1 vs E5 = substring check.
+    NOTE (fixed): E6 taxonomy row clarified — always 0 when schema={} due to if schema: guard.
+  No blockers remain. Plan is ready for developer implementation.
+  Next steps:
+    1. Developer writes scripts/collect_parse_errors.py per corrected Design section
+    2. Developer runs Step 3 (200-file validation), then Step 4 (full corpus)
+    3. architect-planner runs compliance check after developer finishes
 
 [2026-05-06] architect-planner — parsing-errors-experiment plan complete.
   Plan: plan/parsing_errors_experiment.md
@@ -397,6 +413,22 @@ date: 2026-05-06
 
 ## Handoff Log
 
+[2026-05-06] plan-reviewer — parsing_errors_experiment.md reviewed. APPROVED with corrections.
+  Plan: plan/parsing_errors_experiment.md
+  Issues found and fixed:
+    BLOCKER (fixed): Parser construction snippet showed SnowflakeParser() with no args.
+      SqlParser.__init__ requires SchemaResolver. Fixed to pass SchemaResolver(dialect=...).
+    WARNING (fixed): "tally error codes from out.errors" was ambiguous — out.errors contains
+      free-form strings, not structured codes. Added exact prefix matching rules:
+      E5 = col_lineage:<col>: (no tree_walk); E7 = col_lineage:tree_walk:<col>:;
+      E8 = detected in script directly (not in out.errors); E1 vs E5 = substring check.
+    NOTE (fixed): E6 taxonomy row clarified — always 0 when schema={} due to if schema: guard.
+  No blockers remain. Plan is ready for developer implementation.
+  Next steps:
+    1. Developer writes scripts/collect_parse_errors.py per corrected Design section
+    2. Developer runs Step 3 (200-file validation), then Step 4 (full corpus)
+    3. architect-planner runs compliance check after developer finishes
+
 [2026-05-04] developer — Completed Phase 8 implementation (Metrics and Feedback Layer).
   Status: COMPLETE — All Phase 8 steps delivered with comprehensive observability layer
   Branch: feat/phase-8-9-metrics-git-integration
@@ -672,6 +704,22 @@ date: 2026-05-06
   Next step: Ready for code review and merge to master.
 
 ## Handoff Log
+
+[2026-05-06] plan-reviewer — parsing_errors_experiment.md reviewed. APPROVED with corrections.
+  Plan: plan/parsing_errors_experiment.md
+  Issues found and fixed:
+    BLOCKER (fixed): Parser construction snippet showed SnowflakeParser() with no args.
+      SqlParser.__init__ requires SchemaResolver. Fixed to pass SchemaResolver(dialect=...).
+    WARNING (fixed): "tally error codes from out.errors" was ambiguous — out.errors contains
+      free-form strings, not structured codes. Added exact prefix matching rules:
+      E5 = col_lineage:<col>: (no tree_walk); E7 = col_lineage:tree_walk:<col>:;
+      E8 = detected in script directly (not in out.errors); E1 vs E5 = substring check.
+    NOTE (fixed): E6 taxonomy row clarified — always 0 when schema={} due to if schema: guard.
+  No blockers remain. Plan is ready for developer implementation.
+  Next steps:
+    1. Developer writes scripts/collect_parse_errors.py per corrected Design section
+    2. Developer runs Step 3 (200-file validation), then Step 4 (full corpus)
+    3. architect-planner runs compliance check after developer finishes
 
 [2026-05-02] architect-reviewer — Started initial architecture review of plan/blueprint.md (v1.2).
   Summary: Reviewed the full SQL-CGC blueprint. Produced ARCHITECTURE_REVIEW.md covering
