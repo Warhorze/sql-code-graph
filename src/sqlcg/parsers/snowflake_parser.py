@@ -8,7 +8,7 @@ import sqlglot
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import ParsedFile
+from sqlcg.parsers.base import ParsedFile, ParseQuality
 from sqlcg.parsers.registry import register
 from sqlcg.utils.logging import getLogger
 
@@ -21,7 +21,7 @@ _SCRIPTING_BLOCK = re.compile(r"\bBEGIN\b", re.IGNORECASE)
 # Regex for extracting DML statements from scripting blocks.
 # Does not handle ';' inside string literals — tokenizer-based extraction deferred to v2.
 _EMBEDDED_DML = re.compile(
-    r"(SELECT\s+.+?(?=;|\Z)|INSERT\s+INTO.+?(?=;|\Z)|UPDATE\s+.+?(?=;|\Z)|DELETE\s+.+?(?=;|\Z))",
+    r"(SELECT\s+.+?(?=;|\Z)|INSERT\s+INTO.+?(?=;|\Z)|UPDATE\s+.+?(?=;|\Z)|DELETE\s+.+?(?=;|\Z)|MERGE\s+INTO.+?(?=;|\Z))",
     re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
 
@@ -95,6 +95,7 @@ class SnowflakeParser(AnsiParser):
             ParsedFile with extracted DML statements
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
+        out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
         # Extract DML statements using regex

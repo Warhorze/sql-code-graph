@@ -1,5 +1,7 @@
 """Unit tests for hint fields in result models (T-07)."""
 
+# Integration test (real KuzuDB -> hint field) deferred - see plan T-07
+
 from unittest.mock import MagicMock, patch
 
 from sqlcg.server.tools import (

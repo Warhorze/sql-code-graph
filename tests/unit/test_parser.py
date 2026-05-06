@@ -133,7 +133,13 @@ class TestAnsiParser:
         assert "catalog" in sources[0].full_id or sources[0].catalog is not None
 
     def test_parse_insert_select(self):
-        """Test parsing INSERT ... SELECT."""
+        """Test parsing INSERT ... SELECT (T-10 investigation outcome).
+
+        Investigation conclusion: INSERT-SELECT statements correctly create
+        SELECTS_FROM edges from the INSERT query to the source table.
+        This is expected behavior - the source table IS being selected from
+        within the INSERT statement\'s SELECT clause.
+        """
         sql = "INSERT INTO archive SELECT * FROM users WHERE created < DATE '2020-01-01';"
         parser = get_parser(None, SchemaResolver())
         result = parser.parse_file(Path("test.sql"), sql)

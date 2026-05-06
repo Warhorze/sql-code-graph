@@ -169,7 +169,7 @@ class TestSubmitFeedbackTool:
         from sqlcg.server.tools import submit_feedback
 
         with pytest.raises(ValueError, match="Invalid label"):
-            submit_feedback("tool", "query", "FN")
+            submit_feedback("tool", "query", "INVALID")
 
     def test_submit_feedback_note_truncated(self, tmp_path):
         """Note longer than 500 characters is truncated."""
