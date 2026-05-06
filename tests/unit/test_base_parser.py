@@ -4,6 +4,8 @@ import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sqlglot import parse_one
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -66,37 +68,32 @@ class TestExtractColumnLineageExceptions:
         # The method should handle the exception gracefully
         assert isinstance(edges, list)
 
-    def test_logger_debug_on_sg_lineage_root(self, caplog):
-        """Test debug log when sg_lineage root is obtained but conversion is not yet implemented."""
-        # Set up caplog to capture at DEBUG level
-        caplog.set_level(logging.DEBUG)
-
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Bug 2 (ARCHITECTURE_REVIEW §11.2): sg_lineage → LineageEdge conversion is a "
+            "TODO in base.py:396. _extract_column_lineage returns [] on the success path. "
+            "Remove xfail once the conversion is implemented."
+        ),
+    )
+    def test_sg_lineage_success_returns_edges(self):
+        """When sg_lineage returns a root node, edges must be emitted — not an empty list."""
         schema = SchemaResolver()
         parser = AnsiParser(schema)
 
-        # Explicitly set the parser's logger to DEBUG level
-        parser._log.setLevel(logging.DEBUG)
-
-        # Parse a statement with a column
         stmt = parse_one("SELECT col1 FROM t")
         out = ParsedFile(path=Path("test.sql"), dialect=None)
 
-        # Mock sg_lineage to return a non-None root (truthy value)
         with patch("sqlglot.lineage.lineage") as mock_sg_lineage:
-            # Return a non-None root object
             mock_root = MagicMock()
             mock_sg_lineage.return_value = mock_root
 
-            # Call _extract_column_lineage
-            parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=None)
+            edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=None)
 
-            # Check all records in caplog
-            all_messages = [r.message for r in caplog.records]
-            debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
-
-            assert any(
-                "sg_lineage root obtained but conversion not yet implemented" in record.message
-                and "file=test.sql" in record.message
-                and "col=col1" in record.message
-                for record in debug_records
-            ), f"Expected debug log not found. Got all records: {all_messages}"
+        assert len(edges) > 0, (
+            "Expected at least one LineageEdge when sg_lineage succeeds, got none. "
+            "The TODO at base.py:396 must convert the root node to LineageEdge objects."
+        )
+        assert all(e.confidence > 0.0 for e in edges), (
+            "Edges from a successful sg_lineage call must have confidence > 0."
+        )

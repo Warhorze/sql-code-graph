@@ -16,8 +16,10 @@ their primary task**. This eliminates context-window startup costs between roles
 - The **architect-planner** stays idle so the developer can ask plan questions during
   implementation and so the planner can perform the plan-compliance check when the
   developer is done.
+- The **sprint-planner** stays idle for the same reason — it owns compliance for
+  sprint plans it produced.
 
-Handoffs between phases are signals ("I am done, ask planner"), not context restarts.
+Handoffs between phases are signals ("finished"), not context restarts.
 
 ---
 
@@ -47,14 +49,23 @@ Handoffs between phases are signals ("I am done, ask planner"), not context rest
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  PHASE 2: PLANNING                                                           │
 │                                                                              │
-│  ┌─────────────────────┐         ┌─────────────────┐                         │
-│  │  architect-planner  │ ──▶     │  plan-reviewer  │ ──▶ plan/<feature>.md   │
-│  └─────────────────────┘         └─────────────────┘     (reviewed)          │
-│             │ [IDLE — available for developer Q&A + plan-compliance check]   │
-└─────────────┼────────────────────────────────────────────────────────────────┘
-              │ ▲ developer may ask questions        │ plan-compliance check
-              │ │                                    ▼ (when dev says "finished")
-              ▼ │
+│  Single feature?                   Sprint / postmortem findings?             │
+│                                                                              │
+│  ┌─────────────────────┐           ┌─────────────────────┐                  │
+│  │  architect-planner  │           │   sprint-planner    │                  │
+│  │  plan/<feature>.md  │           │  plan/sprint_X.md   │                  │
+│  └──────────┬──────────┘           └──────────┬──────────┘                  │
+│             │                                 │                              │
+│             └──────────────┬──────────────────┘                              │
+│                            ▼                                                 │
+│                  ┌─────────────────┐                                         │
+│                  │  plan-reviewer  │  (pre-implementation gate)              │
+│                  └────────┬────────┘                                         │
+│                           │                                                  │
+│  [Planner IDLE — Q&A + plan-compliance check when dev says "finished"]      │
+└───────────────────────────┼──────────────────────────────────────────────────┘
+                            │
+                            ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  PHASE 3: IMPLEMENTATION                                                     │
 │                                                                              │
@@ -90,7 +101,14 @@ ARTIFACTS FLOW:
 ARCHITECTURE_REVIEW.md ◀──────────────────────────────────────────────┐
         │                                                             │
         ▼                                                             │
-plan/<feature>.md ──▶ implementation ──▶ PR ──▶ merge ──▶ (may update)┘
+plan/<feature>.md  ─┐                                                 │
+plan/sprint_X.md  ──┴──▶ implementation ──▶ PR ──▶ merge ──▶ (may update)┘
+
+
+PLAN COMPLIANCE OWNERSHIP:
+───────────────────────────
+architect-planner  owns compliance for  plan/<feature>.md
+sprint-planner     owns compliance for  plan/sprint_*.md
 
 
 PROGRESS TRACKING:
@@ -121,7 +139,7 @@ Each agent should:
 
 ### 1. Architect Reviewer
 
-#### Architect Reviewer Purpose
+#### Purpose
 
 - Maintain `ARCHITECTURE_REVIEW.md`
 - Use `git diff` to get user input
@@ -130,11 +148,11 @@ Each agent should:
 - Answer Q&A and incorporate user suggestions
 - Commit updates
 
-#### Architect Reviewer Idle Behaviour
+#### Idle Behaviour
 
 After completing `ARCHITECTURE_REVIEW.md`, the architect-reviewer **stays idle**.
-The architect-planner may ask clarifying questions at any point during planning
-without restarting the architect-reviewer from scratch.
+The architect-planner or sprint-planner may ask clarifying questions at any point
+during planning without restarting the reviewer from scratch.
 
 **Role**: `architect-reviewer`
 
@@ -142,9 +160,18 @@ without restarting the architect-reviewer from scratch.
 
 ## Phase 2 — Planning
 
-### 2. Architect Planner
+There are two planners. Choose based on scope:
 
-#### Architect Planner Purpose
+| Scope | Use |
+|-------|-----|
+| One feature, one PR | `architect-planner` |
+| Multiple findings, multiple tickets, multiple PRs | `sprint-planner` |
+
+---
+
+### 2a. Architect Planner (single feature)
+
+#### Purpose
 
 - User selects a feature to plan
 - Read `ARCHITECTURE_REVIEW.md` as constraints and context
@@ -153,44 +180,79 @@ without restarting the architect-reviewer from scratch.
 - Create or update `plan/<feature-name>.md`
 - Commit the plan
 
-#### Architect Planner Idle Behaviour
+#### Idle Behaviour
 
 After the plan is reviewed and committed, the architect-planner **stays idle**.
 It serves two functions during implementation:
 
 1. **Q&A**: Answer developer questions about plan intent without requiring a new
-   planner invocation (and without the developer reading the full plan cold).
+   invocation.
 2. **Plan-compliance check**: When the developer says **"finished"**, the planner
-   reviews whether the implementation matches the plan. This is a semantic check
-   only — does the code do what the plan described? Not a code-quality review.
-   The planner documents the result in `plan/<feature>.md` under a
-   `## Plan Compliance` section and marks it `PASS` or `FAIL [reason]`.
+   reviews whether the implementation matches the plan. Semantic check only — does
+   the code do what the plan described? Documents the result in `plan/<feature>.md`
+   under `## Plan Compliance — YYYY-MM-DD` as `PASS` or `FAIL [reason]`.
 
 **Role**: `architect-planner`
 
-### 3. Plan Reviewer (Pre-implementation gate)
+---
 
-#### Plan Reviewer Purpose
+### 2b. Sprint Planner (multi-ticket sprint)
+
+#### Purpose
+
+- Input: a set of findings (postmortem, backlog, architecture review section)
+- Cross-checks each finding against the actual source tree before writing tickets
+- Groups findings into tickets — combines where files overlap, splits where effort differs
+- Orders tickets by dependency and risk into a recommended PR sequence
+- Writes full ticket specs with root cause, wiring verification, test scenarios,
+  and acceptance criteria checkboxes
+- Produces a sprint-level regression guard test and wiring checklist table
+- Creates `plan/sprint_<name>.md` and commits it
+
+#### Idle Behaviour
+
+After the sprint plan is committed, the sprint-planner **stays idle**.
+It serves the same two functions as the architect-planner, but for sprint plans:
+
+1. **Q&A**: Answer developer questions about ticket intent, PR grouping rationale,
+   or wiring decisions.
+2. **Plan-compliance check**: When the developer says **"finished"** for a ticket or PR,
+   the sprint-planner checks:
+   - Each acceptance criterion in the ticket spec
+   - Wiring: call site exists (grep), no TODO in happy path, constants align with config
+   - Regression guard test is present and not marked `xfail`
+   - Documents `## Plan Compliance — YYYY-MM-DD — <ticket ID>` as `PASS` or `FAIL [reason]`
+
+The sprint-planner does **not** check code quality — that is the code-reviewer's job.
+
+**Role**: `sprint-planner`
+
+---
+
+### 3. Plan Reviewer (pre-implementation gate)
+
+#### Purpose
 
 - Review the plan like a code review
-- Use `git diff`
-- Catch missing steps, ordering issues, FastAPI/Python risks
+- Catch missing steps, ordering issues, FastAPI/Python risks before implementation
 - Fix and tighten the plan
 - Commit corrections
 
+Applies to plans produced by both architect-planner and sprint-planner.
+
 **Role**: `plan-reviewer`
 
-At this point, the plan is implementation-ready and the planner enters idle mode.
+At this point the plan is implementation-ready and the producing planner enters idle mode.
 
 ---
 
 ## Phase 3 — Implementation (Iterative)
 
-### 4. Developer / Implementer
+### 4. Developer
 
-#### Developer Purpose
+#### Purpose
 
-- Read `ARCHITECTURE_REVIEW.md` and `plan/<feature>.md`
+- Read `ARCHITECTURE_REVIEW.md` and the relevant plan file
 - Create a feature branch
 - Implement in incremental commits
 - Add tests using the existing framework
@@ -199,45 +261,50 @@ At this point, the plan is implementation-ready and the planner enters idle mode
 - Ask the idle planner questions when plan intent is unclear — do not guess
 - Say **"finished"** when all plan steps are implemented and the PR is ready
 
-#### Developer Escalation — Hand Back to Planner
+Before opening a PR, the developer completes the **Wiring Checklist** in the sprint plan
+(if working from a sprint plan). The checklist pre-populated by the sprint-planner must
+be answered with grep evidence, not assumptions.
 
-The developer may **stop work and hand back to the architect-planner** when:
+#### Escalation — Hand Back to Planner
+
+Stop work and escalate to the producing planner when:
 
 - A plan step conflicts with the existing implementation in a way that makes it
-  unworkable (e.g. the plan assumes a function or field that does not exist)
-- Following the plan would require touching significantly more code than described,
-  indicating a design gap
+  unworkable (plan assumes a function or field that does not exist)
+- Following the plan requires touching significantly more code than described
 - The plan produces flaky or incorrect behaviour that cannot be fixed without
   redesigning the approach
 
-When escalating, the developer must:
+When escalating:
 
 1. Stop without committing broken or half-finished code
-2. Add a `## Escalation — [reason]` section to `plan/<feature>.md` documenting
-   exactly what was tried, what broke, and why the plan needs revision
-3. Update `plan/progress.txt` with status `escalated-to-planner` and a clear
-   description of the blocker
-4. Hand off to the architect-planner to revise the plan before resuming
+2. Add `## Escalation — <reason>` to the plan file
+3. Update `plan/progress.txt` with `status: escalated-to-planner`
+4. Hand off to the planner to revise before resuming
 
-**Rule**: escalate early. Do not work around a broken plan with hacks — surface
-the problem so the plan can be fixed properly.
+**Rule**: escalate early. Do not work around a broken plan.
 
 **Role**: `developer`
 
 ---
 
-## Planner Plan-Compliance Check (between Phase 3 and Phase 4)
+## Plan-Compliance Check (between Phase 3 and Phase 4)
 
-When the developer says **"finished"**, the idle planner performs a plan-compliance
-check:
+When the developer says **"finished"**, the idle planner that produced the plan
+performs the compliance check:
 
-- Read the final diff / commits against each step in `plan/<feature>.md`
-- Verify each step was implemented as described (semantic check only — no code quality)
-- Document the result in `plan/<feature>.md` under `## Plan Compliance`:
-  - `PASS` — all steps implemented as planned (deviations are documented)
-  - `FAIL [reason]` — a step was skipped or implemented contrary to the plan
+| Plan type | Compliance checked by |
+|-----------|----------------------|
+| `plan/<feature>.md` | `architect-planner` |
+| `plan/sprint_*.md` | `sprint-planner` |
 
-If `FAIL`, the developer must address the gap before the PR moves to code review.
+The sprint-planner's check is stricter — it additionally verifies:
+- Every new method/callback has a confirmed call site (grep evidence)
+- No `# TODO` remains in the happy path of any ticket
+- Path/constant values match the config module, not a hardcoded string
+- The sprint-level regression guard test is present and not marked `xfail`
+
+If `FAIL`, the developer addresses the gap before the PR moves to code review.
 
 ---
 
@@ -245,28 +312,29 @@ If `FAIL`, the developer must address the gap before the PR moves to code review
 
 ### 5. Code Reviewer
 
-#### Code Reviewer Purpose
+#### Purpose
 
-The code reviewer focuses on **code quality** — not plan compliance (that was the
-planner's job) and not architecture (that is the architect-reviewer's job).
+Focuses on **code quality** — not plan compliance (planner's job) and not
+architecture (architect-reviewer's job).
 
 Responsibilities:
 
 - Review the open PR for correctness, security, and maintainability
-- Verify that tests exist for the changed behaviour and that they pass **for the
-  right reasons** — not just that `pytest` is green, but that the test assertions
-  match the described behaviour
-- Flag code issues: naming, duplication, unsafe patterns, missing edge cases
-- For each issue found, classify it:
-  - **REVIEWER REMARK** — the plan was ambiguous; developer followed it reasonably;
+- Verify tests exist for changed behaviour and pass **for the right reasons** —
+  not just `pytest` green, but assertions match the described behaviour and would
+  catch a regression if the code were reverted
+- Verify at least one test asserts observable output (non-empty list, specific
+  value) — not just exception handling or log messages
+- Check wiring: every new method is called from a production call site; no `# TODO`
+  in the happy path; callbacks are passed, not just defined; path constants align
+  across modules
+- For each issue, classify as:
+  - **REVIEWER REMARK** — plan was ambiguous; developer implemented reasonably;
     fix the plan, then ask developer to fix the code
-  - **DEVELOPER REMARK** — plan was clear; developer deviated or introduced a bug;
-    developer fixes it
+  - **DEVELOPER REMARK** — plan was clear; developer deviated or introduced a bug
 - Request changes or approve
 
-The code reviewer does **not** re-check plan compliance — that was already done by
-the planner. If a plan-compliance gap surfaces during code review, flag it as a
-`REVIEWER REMARK` and hand back to the planner.
+Does **not** re-check plan compliance — that was already done by the planner.
 
 **Role**: `code-reviewer`
 
@@ -279,16 +347,14 @@ Phases 3 and 4 repeat (with the planner staying idle throughout) until:
 - Plan compliance: PASS
 - Review comments resolved
 - Plan deviations (if any) documented
-- Tests are passing for the right reasons
-- PR is approved and merged
+- Tests pass for the right reasons
+- PR approved and merged
 
 ---
 
 ## Utility Roles
 
 ### API Documenter
-
-#### API Documenter Purpose
 
 - Improve FastAPI OpenAPI output and developer docs
 - Add explicit `responses={...}` for non-implicit errors
@@ -297,7 +363,7 @@ Phases 3 and 4 repeat (with the planner staying idle throughout) until:
 
 **Role**: `api-documenter`
 
-Use this role during or after implementation when API documentation needs attention.
+Use during or after implementation when API documentation needs attention.
 
 ---
 
@@ -307,6 +373,7 @@ You explicitly invoke roles. Examples:
 
 - "Run the architect reviewer and update `ARCHITECTURE_REVIEW.md`."
 - "Plan feature X using the architect planner."
+- "Plan the next sprint from the postmortem findings using the sprint planner."
 - "Review the plan like a code review and fix issues."
 - "Implement the plan — ask the planner if anything is unclear, say finished when done."
 - "Run the code reviewer on the PR."
@@ -320,11 +387,11 @@ Claude does not guess the next step — you choose the role.
 Before implementation:
 
 ```text
-[ ] Plan reviewed and committed
+[ ] Plan produced (architect-planner or sprint-planner)
+[ ] Plan reviewed (plan-reviewer)
 [ ] Open questions resolved
-[ ] Acceptance criteria defined
-[ ] Test strategy defined
-[ ] Planner is idle and available for developer Q&A
+[ ] Acceptance criteria defined and testable
+[ ] Wiring checklist pre-populated (sprint plans)
+[ ] Regression guard test specified (sprint plans)
+[ ] Producing planner is idle and available for developer Q&A
 ```
-
-This prevents starting work on incomplete plans.

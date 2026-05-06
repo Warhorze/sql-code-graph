@@ -86,8 +86,24 @@ and tell the user to run the planner compliance check first.
 - Tests pass **for the right reasons**: assertions match the described behaviour,
   not just `pytest` green — verify the test would catch a regression if the code
   were reverted
+- At least one test asserts the feature's **observable output** (non-empty list,
+  specific field value, side effect). Tests that only cover exception handling,
+  log messages, or placeholder debug statements are insufficient — they can pass
+  even when the feature delivers nothing
 - Uses the existing test framework (pytest, fixtures, mocks)
 - CI expectations met (ruff/mypy/pytest/pre-commit)
+
+### Wiring & Integration
+
+- Every new method or callback has a **call site in production code** — grep for it.
+  A method defined but never called is a silent no-op.
+- No `# TODO` in the **happy/success path** of any new feature. A TODO in the
+  success branch means the feature was shipped incomplete. This is a critical issue.
+- **Callbacks and parameters** added to a lower-level function (e.g., `progress_callback`
+  in `indexer.py`) are actually passed by the higher-level caller (e.g., `index_cmd`).
+- **Path and constant alignment**: fallback paths, default filenames, and DB paths are
+  consistent with the values defined in the config/schema module. Flag any hardcoded
+  string that duplicates a constant defined elsewhere — the two can drift.
 
 ### Performance
 

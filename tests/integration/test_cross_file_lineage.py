@@ -9,6 +9,17 @@ from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.registry import get_parser
 
+# Column lineage extraction is not yet implemented (ARCHITECTURE_REVIEW.md §11.2):
+#   Bug 1 — _extract_column_lineage never called in _parse_statement (ansi_parser.py:140)
+#   Bug 2 — sg_lineage → LineageEdge conversion is a TODO (base.py:396)
+_LINEAGE_NOT_IMPLEMENTED = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "column_lineage always empty until both wiring gaps in ARCHITECTURE_REVIEW §11.2 "
+        "are fixed. Remove this mark once the bugs are resolved."
+    ),
+)
+
 
 @pytest.fixture
 def temp_sql_files():
@@ -77,6 +88,40 @@ def test_cross_file_view_resolution(temp_sql_files):
     for result in pass2_results:
         # Should not have any file I/O errors
         assert not any("cannot re-read" in e for e in result.errors)
+
+
+@_LINEAGE_NOT_IMPLEMENTED
+def test_view_pass2_emits_column_lineage_edges(temp_sql_files):
+    """After pass-2 resolution, the view query must carry column lineage edges.
+
+    customer_orders selects c.id, c.name, o.id→order_id from two source tables.
+    Each projected column must appear as a LineageEdge in the resolved QueryNode.
+    """
+    schema_resolver = SchemaResolver(dialect=None)
+    parser = get_parser(None, schema_resolver)
+    aggregator = CrossFileAggregator()
+
+    files = sorted(temp_sql_files.glob("*.sql"))
+    pass1_results = []
+    for file_path in files:
+        sql = file_path.read_text(encoding="utf-8")
+        parsed = parser.parse_file(file_path, sql)
+        aggregator.register_pass1(parsed)
+        pass1_results.append(parsed)
+
+    pass2_results = [aggregator.resolve_pass2(parser, p) for p in pass1_results]
+
+    # views.sql defines customer_orders — find its result
+    view_result = next(
+        r for r in pass2_results if "views" in r.path.name
+    )
+    view_stmt = next(
+        s for s in view_result.statements if s.kind == "CREATE_VIEW"
+    )
+    assert len(view_stmt.column_lineage) > 0, (
+        "CREATE VIEW customer_orders AS SELECT c.id, c.name, o.id … "
+        "must emit at least one LineageEdge per projected column."
+    )
 
 
 def test_resolve_pass2_deleted_file(temp_sql_files):
