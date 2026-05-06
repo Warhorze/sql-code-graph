@@ -52,18 +52,22 @@ def _find_lock_holder(db_path: str) -> str:
 class KuzuBackend(GraphBackend):
     """KùzuDB implementation of the graph database backend."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, buffer_pool_size_mb: int = 0):
         """Initialize KùzuDB backend.
 
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
+            buffer_pool_size_mb: Buffer pool size in MB (0 = use KuzuDB default)
 
         Raises:
             RuntimeError: If the database is locked or cannot be opened.
         """
         self._db_path = db_path
         try:
-            self._db = kuzu.database.Database(db_path)
+            kwargs = {}
+            if buffer_pool_size_mb > 0:
+                kwargs["buffer_pool_size"] = buffer_pool_size_mb * 1024 * 1024
+            self._db = kuzu.database.Database(db_path, **kwargs)
         except RuntimeError as exc:
             if "Could not set lock" in str(exc) or "lock" in str(exc).lower():
                 # Attempt to find the holding PID via lsof
