@@ -132,14 +132,14 @@ class AnsiParser(SqlParser):
 
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
         if target:
-            sources = [
-                src for src in sources if src.full_id != target.full_id
-            ]
+            sources = [src for src in sources if src.full_id != target.full_id]
 
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
         out_temp = ParsedFile(path=path, dialect=self.DIALECT)
-        column_lineage = self._extract_column_lineage(stmt, path, out_temp, schema)
+        column_lineage = self._extract_column_lineage(
+            stmt, path, out_temp, schema, dst_table=target
+        )
 
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)
