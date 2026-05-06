@@ -66,7 +66,35 @@ def index_cmd(  # noqa: B008
 
         # Index the repository
         indexer = Indexer()
-        summary = indexer.index_repo(path, dialect, backend, dbt_manifest, timeout_per_file)
+
+        # Determine total files for progress callback
+        from sqlcg.utils.ignore import load_ignore_spec
+        from sqlcg.indexer.walker import walk_sql_files
+
+        spec = load_ignore_spec(path)
+        files = list(walk_sql_files(path, spec, use_git=True))
+        total_files = len(files)
+
+        # Define progress callback
+        def _make_progress_callback(total: int):
+            """Create a progress callback that prints progress every 100 files.
+
+            The callback is only invoked every 100 files, so with fewer than 100 files
+            in the repository, no progress line is printed.
+            """
+            def callback(n: int, total_n: int) -> None:
+                console.print(f"\r  Indexed {n}/{total_n} files...", end="", highlight=False)
+            return callback
+
+        summary = indexer.index_repo(
+            path,
+            dialect,
+            backend,
+            dbt_manifest,
+            timeout_per_file,
+            progress_callback=_make_progress_callback(total_files),
+        )
+        console.print()  # newline after carriage return progress line
 
         # Connect files to repo
         from sqlcg.core.schema import RelType

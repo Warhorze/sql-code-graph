@@ -23,6 +23,32 @@ from sqlcg.utils.logging import getLogger
 logger = getLogger(__name__)
 
 
+def _find_lock_holder(db_path: str) -> str:
+    """Return a human-readable PID string for the process holding the DB lock.
+
+    Uses lsof on Linux/macOS. Returns a descriptive fallback if lsof is
+    unavailable or returns no results.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("lsof"):
+        return "PID unknown (lsof not available)"
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", db_path],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        pids = result.stdout.strip().split()
+        if pids:
+            return f"PID {', '.join(pids)}"
+    except Exception:
+        pass
+    return "PID unknown"
+
+
 class KuzuBackend(GraphBackend):
     """KùzuDB implementation of the graph database backend."""
 
@@ -31,9 +57,25 @@ class KuzuBackend(GraphBackend):
 
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
+
+        Raises:
+            RuntimeError: If the database is locked or cannot be opened.
         """
         self._db_path = db_path
-        self._db = kuzu.database.Database(db_path)
+        try:
+            self._db = kuzu.database.Database(db_path)
+        except RuntimeError as exc:
+            if "Could not set lock" in str(exc) or "lock" in str(exc).lower():
+                # Attempt to find the holding PID via lsof
+                pid_hint = _find_lock_holder(db_path)
+                pid_str = pid_hint.split()[-1] if pid_hint else "<PID>"
+                msg = (
+                    f"Database is locked — another sqlcg process is running "
+                    f"({pid_hint}). "
+                    f"Wait for it to finish or kill it with: kill {pid_str}"
+                )
+                raise RuntimeError(msg) from exc
+            raise
         self._conn = kuzu.Connection(self._db)
         self._in_transaction = False
 
