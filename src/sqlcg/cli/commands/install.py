@@ -57,4 +57,12 @@ def install_cmd(
     cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
     console.print(f"[green]Configured:[/green] {_SERVER_KEY} → {cmd_str}")
     console.print(f"[dim]Written to {settings_path}[/dim]")
+
+    # Note about cold cache if uvx was chosen
+    if entry['command'] == 'uvx':
+        console.print(
+            "[yellow]Note:[/yellow] First startup downloads dependencies (~30s). "
+            "Subsequent restarts use cache (~1s)."
+        )
+    
     console.print("\nRestart Claude Code to pick up the new MCP server.")
