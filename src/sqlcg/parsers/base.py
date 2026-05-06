@@ -323,6 +323,98 @@ class SqlParser(ABC):
                     return TableRef(name=name)
                 return None
 
+    def _lineage_node_to_edges(
+        self,
+        root: Any,
+        dst_col_name: str,
+        path: Path,
+        out: ParsedFile,
+    ) -> list[LineageEdge]:
+        """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
+
+        sqlglot.lineage.Node has attributes:
+        - name: column name at this node
+        - source: upstream source expression (usually a Table node)
+        - downstream: list of child Node objects (columns this node feeds)
+
+        Each leaf in the tree represents a source column. The walk stops at
+        nodes whose source is a Table (a real table reference, not a CTE alias).
+
+        Args:
+            root: The LineageNode returned by sg_lineage()
+            dst_col_name: The output column name (destination)
+            path: Source file path (for error recording)
+            out: ParsedFile for error recording
+
+        Returns:
+            List of LineageEdge objects (may be empty if tree is malformed)
+        """
+        import sqlglot.expressions as exp
+
+        edges: list[LineageEdge] = []
+        visited: set[int] = set()  # guard against cycles
+
+        def _walk(node: Any) -> None:
+            if id(node) in visited:
+                return
+            visited.add(id(node))
+
+            # If this node has downstream nodes, recurse
+            if hasattr(node, "downstream") and node.downstream:
+                for child in node.downstream:
+                    _walk(child)
+            else:
+                # Leaf node — extract the source table and column
+                try:
+                    src_table_ref = self._lineage_node_to_table_ref(node)
+                    if src_table_ref is None:
+                        return
+                    src_col_name = (
+                        node.name.split(".")[-1] if hasattr(node, "name") and node.name else dst_col_name
+                    )
+                    edges.append(
+                        LineageEdge(
+                            src=ColumnRef(src_table_ref, src_col_name),
+                            dst=ColumnRef(TableRef(name="<output>"), dst_col_name),
+                            transform="SELECT",
+                            confidence=0.9,
+                        )
+                    )
+                except Exception as exc:
+                    out.errors.append(f"col_lineage:tree_walk:{dst_col_name}:{exc}")
+                    self._log.warning(
+                        "LineageNode walk failed: file=%s col=%s error=%s",
+                        path,
+                        dst_col_name,
+                        exc,
+                    )
+
+        _walk(root)
+        return edges
+
+    def _lineage_node_to_table_ref(self, node: Any) -> "TableRef | None":
+        """Extract a TableRef from a sqlglot LineageNode's source attribute.
+
+        Args:
+            node: sqlglot.lineage.Node instance
+
+        Returns:
+            TableRef if source is a real Table, None for subqueries or CTEs
+        """
+        import sqlglot.expressions as exp
+
+        source = getattr(node, "source", None)
+        if source is None:
+            return None
+        if isinstance(source, exp.Table):
+            return TableRef(
+                catalog=source.catalog if hasattr(source, "catalog") else None,
+                db=source.db if hasattr(source, "db") else None,
+                name=source.name if hasattr(source, "name") else str(source),
+            )
+        # Subquery or CTE — return None (cannot resolve to a concrete table)
+        return None
+
     def _extract_column_lineage(
         self, stmt: Any, path: Path, out: ParsedFile, schema: dict
     ) -> list[LineageEdge]:
@@ -393,14 +485,21 @@ class SqlParser(ABC):
                     try:
                         root = sg_lineage(col_name, body, schema=schema, dialect=self.DIALECT)
                         if root:
-                            # Successfully extracted lineage
-                            # TODO: convert root to LineageEdge(s)
-                            self._log.debug(
-                                "sg_lineage root obtained but conversion not yet "
-                                "implemented: file=%s col=%s",
-                                path,
-                                col_name,
+                            # Successfully extracted lineage — walk tree and emit edges
+                            new_edges = self._lineage_node_to_edges(
+                                root,
+                                dst_col_name=col_name,
+                                path=path,
+                                out=out,
                             )
+                            edges.extend(new_edges)
+                            if not new_edges:
+                                self._log.debug(
+                                    "sg_lineage returned root but no edges emitted: "
+                                    "file=%s col=%s",
+                                    path,
+                                    col_name,
+                                )
                     except Exception as exc:
                         self._log.warning(
                             "column lineage extraction failed: file=%s col=%s error=%s",
