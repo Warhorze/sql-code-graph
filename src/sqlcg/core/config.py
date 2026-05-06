@@ -15,6 +15,10 @@ class KuzuConfig(BaseModel):
     """Configuration for KùzuDB backend."""
 
     db_path: Path = Field(default_factory=lambda: Path.home() / ".sqlcg" / "graph.db")
+    buffer_pool_size_mb: int = Field(
+        default=0,
+        description="KuzuDB buffer pool size in MB (0 = use KuzuDB default)",
+    )
 
     @classmethod
     def from_env(cls) -> "KuzuConfig":
@@ -24,7 +28,11 @@ class KuzuConfig(BaseModel):
             KuzuConfig instance with environment-overridden values if present.
         """
         env_path = os.getenv("SQLCG_DB_PATH")
-        return cls(db_path=Path(env_path)) if env_path else cls()
+        env_buf = os.getenv("SQLCG_BUFFER_POOL_MB")
+        return cls(
+            db_path=Path(env_path) if env_path else Path.home() / ".sqlcg" / "graph.db",
+            buffer_pool_size_mb=int(env_buf) if env_buf else 0,
+        )
 
 
 class Neo4jConfig(BaseModel):
@@ -94,7 +102,10 @@ def get_backend() -> "GraphBackend":
         from sqlcg.core.kuzu_backend import KuzuBackend
 
         kuzu_cfg = KuzuConfig.from_env()
-        return KuzuBackend(str(kuzu_cfg.db_path))
+        return KuzuBackend(
+            str(kuzu_cfg.db_path),
+            buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
+        )
     elif backend_type == "neo4j":
         from sqlcg.core.neo4j_backend import Neo4jBackend
 

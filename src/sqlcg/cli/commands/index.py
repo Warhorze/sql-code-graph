@@ -1,5 +1,6 @@
 """Index command for scanning and indexing SQL files."""
 
+import os
 from pathlib import Path
 
 import typer
@@ -22,6 +23,12 @@ def index_cmd(  # noqa: B008
     timeout_per_file: int = typer.Option(  # noqa: B008
         30, "--timeout-per-file", help="Timeout per file in seconds"
     ),
+    buffer_pool_size: int = typer.Option(  # noqa: B008
+        0,
+        "--buffer-pool-size",
+        help="KuzuDB buffer pool size in MB (0 = default). "
+        "Set to 256-512 on memory-constrained machines.",
+    ),
     no_ddl: bool = typer.Option(  # noqa: B008
         False, "--no-ddl", help="Skip DDL statements (not yet fully implemented)"
     ),
@@ -40,6 +47,10 @@ def index_cmd(  # noqa: B008
     # TODO: wire no_ddl through to the indexer once it supports the parameter
     if no_ddl:
         console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
+
+    # Set buffer pool size via env var if specified
+    if buffer_pool_size > 0:
+        os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
 
     # Resolve dialect: 'auto' reads from .sqlcg.toml, otherwise use provided value
     if dialect == "auto":

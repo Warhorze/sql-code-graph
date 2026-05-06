@@ -1,5 +1,6 @@
 """Database management commands."""
 
+import os
 import shutil
 
 import typer
@@ -16,8 +17,18 @@ console = Console()
 
 
 @app.command("init")
-def db_init() -> None:
+def db_init(
+    buffer_pool_size: int = typer.Option(
+        0,
+        "--buffer-pool-size",
+        help="KuzuDB buffer pool size in MB (0 = default). "
+        "Set to 256-512 on memory-constrained machines.",
+    ),
+) -> None:
     """Initialise the graph database (idempotent)."""
+    if buffer_pool_size > 0:
+        os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
+
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with get_backend() as backend:
