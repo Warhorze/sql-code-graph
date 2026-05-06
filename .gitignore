@@ -59,3 +59,6 @@ build/
 
 # Database files
 *.kuzu/
+
+# Local-only e2e tests that reference private corpora — never commit
+tests/e2e/test_dwh_e2e.py
