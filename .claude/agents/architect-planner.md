@@ -98,6 +98,27 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Risks and Mitigations
 ```
 
+## Code-vs-Plan Verification
+
+When verifying a ticket against the actual source tree, go beyond "does the function
+exist?" — check these four things:
+
+1. **Called, not just defined**: if a ticket says "implement X", verify X is called
+   from its intended call site. A function defined but never invoked is a zero-value
+   delivery. Use `grep` on the call site, not just on the definition.
+2. **No TODO in the happy path**: if the success branch of the feature contains a
+   `# TODO`, the feature is incomplete regardless of whether tests pass. Flag this
+   as a planning gap or a stop condition — do not reduce the ticket to "add a log line"
+   and ship the stub.
+3. **Scope smell — "one line" tickets on TODO sites**: if a code-vs-plan check
+   concludes a ticket reduces to "add one line" at a `# TODO`, investigate why the
+   TODO is there. The TODO may indicate the underlying feature was never implemented,
+   not that the feature is nearly done.
+4. **Cross-module constant alignment**: when the plan references a fallback path,
+   default filename, or config value, verify it against the module that owns that
+   constant (e.g., the config class). Document the exact value in the plan so the
+   developer cannot guess.
+
 ## Idle Behaviour
 
 After the plan is reviewed and committed, **stay idle and remain available**.

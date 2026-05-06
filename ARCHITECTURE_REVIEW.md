@@ -1610,6 +1610,17 @@ consistent without requiring the entire corpus to succeed.
 
 **Filed as**: GitHub issue #10.
 
+**Retrospective — sloppy or out of control?**
+The OOM trigger (KuzuDB's 80%-RAM default buffer pool) is library behaviour and outside
+our control. Everything else is on us. The `sqlcg watch` command already processes one file
+at a time with implicit per-file flush; `index_repo` was written separately and accumulated
+all edges with no commit boundary. Two code paths doing the same job with opposite memory
+models is an architectural inconsistency that should have been caught in review. Additionally,
+the `progress_callback` parameter was implemented in `indexer.py` (lines 79-80) but never
+wired up in `cli/commands/index.py` — the scaffolding was there, the last connection was not
+made. A basic end-to-end smoke test on a corpus of even 200 files would have surfaced both
+the OOM and the missing progress output before shipping.
+
 ---
 
 ### 11.2 [CRITICAL] 0 COLUMN_LINEAGE edges even on small subsets — possible v0.3.0 regression
@@ -1618,26 +1629,54 @@ consistent without requiring the entire corpus to succeed.
 without OOM and reported `Indexed 184 files — 307 tables, 0 edges, 16 errors`. `db info`
 confirmed `SqlColumn: 0` and `COLUMN_LINEAGE edges: 0`. Column lineage tools return empty.
 
-**Significance**: In v0.2.1 (section 10), `SqlColumn: 0` was observed on the full 1457-file
-corpus and attributed to the bare `except Exception: continue` in `_extract_column_lineage`
-(finding 3.4). In v0.3.0 this reproduces on a 184-file subset with no OOM — the absence of
-column nodes is not caused by memory pressure. Either:
+**Root cause confirmed (2026-05-06 postmortem)**: finding 3.4 is NOT the live cause. Code
+inspection revealed two independent wiring gaps:
 
-(a) Finding 3.4 was not fixed in v0.3.0 and `_extract_column_lineage` silently swallows all
-    exceptions for every file, or
-(b) A v0.3.0 regression broke the column extraction path.
+1. **`_extract_column_lineage` is never called.** `AnsiParser._parse_statement`
+   (`ansi_parser.py:140`) hardcodes `column_lineage = []` and never invokes
+   `_extract_column_lineage`. Every `QueryNode` leaves the parser with an empty list
+   regardless of SQL content. The indexer loop at `indexer.py:265` is correct but has
+   nothing to iterate.
 
-**Diagnosis step**: run `execute_cypher("MATCH (c:SqlColumn) RETURN COUNT(c)")` and compare
-to `MATCH (q:SqlQuery) RETURN COUNT(q)`. If `SqlQuery > 0` and `SqlColumn == 0` after a
-full-success index, finding 3.4 is confirmed as the live root cause.
+2. **The sqlglot → LineageEdge conversion is a TODO.** Inside `_extract_column_lineage`
+   (`base.py:396-403`), when `sg_lineage()` returns a root node the code logs a debug
+   message and stops — `# TODO: convert root to LineageEdge(s)`. Even if bug 1 were
+   fixed, `_extract_column_lineage` would still return an empty list on the happy path.
 
-**Resolution**: Same as finding 3.4 (section 4, rank 2) — replace bare `except Exception:
-continue` with structured logging + `ParsedFile.errors` append + `confidence=0.0`. The
-`parse_quality` breakdown from finding 10.C (section 10.3) is the systemic fix.
+**Why tests stayed green**: the integration test (`test_cross_file_lineage.py`) only
+asserts that source tables are registered and that no file-I/O errors occur. It never
+checks that any `QueryNode.column_lineage` is non-empty. The unit tests in
+`test_base_parser.py` call `_extract_column_lineage` directly (bypassing bug 1) and
+only cover error-handling paths and the TODO log message — not the success path.
+`test_parser.py` parses views and selects but never asserts `column_lineage` is populated.
 
-**Priority escalation**: finding 3.4 was already HIGH. This session confirms column lineage
-is completely non-functional in production — elevate to CRITICAL. No user-visible value
-is delivered by the column lineage feature until this is fixed.
+**Resolution**:
+
+1. Wire the call: in `_parse_statement`, replace `column_lineage = []` with
+   `column_lineage = self._extract_column_lineage(stmt, path, out, schema)`.
+
+2. Implement the conversion: in `_extract_column_lineage`, after `sg_lineage()` returns
+   a root, walk the lineage tree and emit `LineageEdge` objects mapping each source
+   column to its destination column.
+
+3. Add regression tests that assert `column_lineage` is non-empty after parsing a
+   `CREATE VIEW AS SELECT` with explicit column aliases (marked `xfail` until fixed).
+
+**Priority escalation**: column lineage is completely non-functional in production.
+The feature has never emitted a single `COLUMN_LINEAGE` edge. Elevate to CRITICAL.
+
+**Retrospective — sloppy or out of control?**
+Entirely sloppy. Both bugs are wiring mistakes in code we own. The sprint plan (T-06)
+already knew about the TODO and reduced the task to "add one logger.debug line" — meaning
+the developer saw the TODO, decided it was a minor observability gap, and did not recognise
+that the method itself is never called. This is the most consequential failure mode: the
+feature looked finished because the scaffolding compiled and the tests passed, but zero
+user-visible value was delivered. The core mistake was writing tests that covered error
+paths and placeholder log messages instead of the observable output. A single assertion —
+`assert len(stmt.column_lineage) > 0` after parsing a one-line `CREATE VIEW AS SELECT` —
+would have caught both bugs before the first commit. The principle here: never ship a
+feature with a TODO in the happy path, and always write at least one test that asserts
+the feature's actual output, not just its exception handling.
 
 ---
 
@@ -1650,18 +1689,33 @@ printed "Already configured" and left the stale `uvx` entry unchanged. The MCP t
 were not available in the Claude Code session because the `uvx` invocation used a
 different (older) cached version.
 
-**Root cause**: `sqlcg install` checks `mcpServers["sql-code-graph"]` for existence only,
-not for correctness. If the registered command changes (e.g. `uvx` → `sqlcg` after a
-`uv tool install`), the stale entry is silently retained.
+**Root cause** (corrected): `install.py:41` does perform a full content comparison
+(`if mcp_servers.get(_SERVER_KEY) == entry`), not an existence-only check. The actual
+bug is in the entry computation: when `uvx` is on PATH, the ideal entry is always set to
+`{"command": "uvx", …}` regardless of whether `sqlcg` is also installed locally. After
+`uv tool install sql-code-graph`, both `uvx` and `sqlcg` are on PATH, so the computed
+ideal entry is still uvx — which matches the stale uvx entry — and "Already configured"
+is printed. The entry is correct in the narrow sense (uvx still works) but suboptimal:
+it uses a cached version rather than the freshly installed one.
 
-**Resolution**: `sqlcg install` should compare the existing entry against the ideal entry
-computed by `shutil.which("sqlcg")` / `shutil.which("uvx")`. If they differ, prompt:
-"MCP entry exists but points to `uvx`. Update to use local `sqlcg` binary? [Y/n]" and
-update atomically. Add `--force` to skip the prompt and always overwrite.
+**Resolution**: Invert the priority — prefer the locally-installed `sqlcg` binary over
+`uvx` when both are available. The detection order should be: `shutil.which("sqlcg")` →
+`shutil.which("uvx")` → error. If the installed entry uses uvx but `sqlcg` is now
+available locally, prompt: "Updating MCP entry from `uvx` to local `sqlcg` binary for
+faster startup. Continue? [Y/n]". Add `--force` to skip the prompt.
 
 **Related to section 9.2** (command detection at install time): the detection logic is
-correct but is only run on first install, not on re-runs. Apply it on every `sqlcg install`
-call.
+correct but the priority order is wrong. Fix the priority; apply on every `sqlcg install`
+call, not just first-run.
+
+**Retrospective — sloppy or out of control?**
+Sloppy. The architecture review's original root cause ("existence-only check") was itself
+wrong — a reminder that diagnosis written during a live session should be verified against
+the code. The real issue is a one-line priority inversion: `uvx` should fall below `sqlcg`
+in the preference order. The developer thought about idempotency (content equality check)
+but did not think through the upgrade scenario where both binaries are present. A unit test
+covering "reinstall after `uv tool install`" — asserting the entry switches from uvx to
+sqlcg — would have caught this. The fix and the test are each one line of logic.
 
 ---
 
@@ -1690,6 +1744,16 @@ as it affects the same `KuzuBackend.__init__` path.
 **Filed as**: GitHub issue #13 (stdout noise/progress), and the lock-aware message is a
 new sub-finding not previously tracked.
 
+**Retrospective — sloppy or out of control?**
+Mixed. The lock error message is library-controlled text — out of control. Catching it and
+re-raising with a user-friendly message is purely within our control and was not done.
+The progress gap is a direct repeat of the 11.2 pattern: `indexer.py` already accepts a
+`progress_callback` parameter (lines 33 and 79-80) and calls it every 100 files. The CLI
+command (`cli/commands/index.py`) never passes a callback — the last connection was not
+made. Progress was planned in T-08 but T-08 was not shipped in v0.3.0. Running the tool
+once against any non-trivial corpus (even 50 files) would have surfaced both the silent
+stdout and the unhelpful lock error before shipping.
+
 ---
 
 ### 11.5 [MEDIUM] `sqlcg uninstall` leaves DB at default path (v0.3.0 implementation gap)
@@ -1701,14 +1765,24 @@ database configured" but left `~/.sqlcg/graph.db` (50 MB) on disk.
 reports "No database configured" rather than falling back to `KuzuConfig().db_path`
 (the hardcoded default `~/.sqlcg/graph.db`).
 
-**Resolution**: Fall back to `KuzuConfig().db_path` when `SQLCG_DB_PATH` is absent.
-The prompt/`--force`/`--keep-db` interaction model is already fully specified in
-section 10.6 Q1. The implementation simply needs to apply it to the default path.
+**Resolution**: `_get_db_path()` in `uninstall.py:206` falls back to
+`~/.sqlcg/kuzu.db` but `KuzuConfig.db_path` defaults to `~/.sqlcg/graph.db`
+(config.py:17). Align the fallback to use `KuzuConfig.from_env().db_path` rather than a
+hardcoded string, so the two modules cannot drift again.
 
 **Status**: `sqlcg uninstall` command exists (resolves the core ask of issue #6) but
 this gap means issue #6 remains open.
 
 **Filed as**: GitHub issue #11.
+
+**Retrospective — sloppy or out of control?**
+Entirely sloppy. The T-03 spec explicitly said "fall back to `KuzuConfig().db_path`";
+the implementation instead hardcodes a path string that doesn't match what the config
+module produces. This is a copy-paste error between two files in the same codebase —
+the developer wrote `"kuzu.db"` where they should have called the config. A single unit
+test with no env var set — asserting that `sqlcg uninstall` prompts to delete
+`~/.sqlcg/graph.db` — would have caught it immediately. The correct fix is one line:
+replace the hardcoded string with `str(KuzuConfig.from_env().db_path)`.
 
 ---
 

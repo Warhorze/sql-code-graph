@@ -94,6 +94,24 @@ When addressing review comments:
 - Stable API contracts (Pydantic models, backward compatibility)
 - No secrets in code or logs; validate inputs and enforce limits
 
+## Wiring Checklist (before opening PR)
+
+Run through this before marking work done:
+
+1. **Call site exists**: every new function/method is actually called from at least one
+   production call site. Writing a method and leaving the call site as `result = []` is
+   a silent no-op — check with `grep`.
+2. **No TODO in the happy path**: a `# TODO` inside the success branch of a feature means
+   the feature delivers no value. Either implement it or do not ship the feature.
+3. **Callbacks and hooks are passed**: if you add a `progress_callback` parameter to a
+   function, verify the CLI/caller actually passes one. Implemented ≠ wired.
+4. **Path/constant alignment**: when a fallback path references a filename or default,
+   verify it matches the constant defined in the config or schema module. Never hardcode
+   a path string when a config object already owns that value.
+5. **Tests assert output, not just structure**: at least one test must assert that the
+   feature produces observable output (e.g., non-empty list, specific field value). Tests
+   that only cover exception handling or log messages are insufficient on their own.
+
 ## MUST NOT
 
 - Implement features not in the approved plan
@@ -103,6 +121,8 @@ When addressing review comments:
 - Force-push or rewrite git history
 - Continue after 3 review iterations without escalating
 - Modify plan files except in the `### Deviations` section
+- Ship a feature whose happy path contains a `# TODO` — either implement or escalate
+- Write tests that only cover error handling for a feature that has not yet delivered output
 
 ## Stop Conditions
 
