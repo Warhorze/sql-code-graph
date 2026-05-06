@@ -77,7 +77,7 @@ class TestTraceColumnLineage:
         """Test that trace_column_lineage raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             trace_column_lineage("orders.id")
 
     def test_trace_column_lineage_invalid_format_raises(self, indexed_graph):
@@ -102,7 +102,7 @@ class TestFindTableUsages:
         """Test that find_table_usages raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             find_table_usages("orders")
 
     def test_find_table_usages_returns_result(self, indexed_graph):
@@ -119,7 +119,7 @@ class TestGetDownstreamDependencies:
         """Test that get_downstream_dependencies raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             get_downstream_dependencies("orders.id")
 
     def test_get_downstream_dependencies_returns_result(self, indexed_graph):
@@ -136,7 +136,7 @@ class TestGetUpstreamDependencies:
         """Test that get_upstream_dependencies raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             get_upstream_dependencies("orders.id")
 
     def test_get_upstream_dependencies_returns_result(self, indexed_graph):
@@ -153,7 +153,7 @@ class TestSearchSqlPattern:
         """Test that search_sql_pattern raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             search_sql_pattern("SELECT")
 
     def test_search_sql_pattern_returns_result(self, indexed_graph):
@@ -170,7 +170,7 @@ class TestListDialectsAndRepos:
         """Test that list_dialects_and_repos raises NotIndexedError on empty graph."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
-        with pytest.raises(NotIndexedError, match="No repos have been indexed"):
+        with pytest.raises(NotIndexedError, match="No repos indexed"):
             list_dialects_and_repos()
 
     def test_list_dialects_and_repos_returns_result(self, indexed_graph):
