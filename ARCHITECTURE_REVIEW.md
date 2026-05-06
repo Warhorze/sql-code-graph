@@ -1841,3 +1841,14 @@ Additions and escalations relative to section 10.4:
 | 2 | 11.3 — stale MCP entry not updated | `sqlcg install` should compare existing vs ideal entry and prompt to update | XS | HIGH |
 | 3 | 11.4 — no progress + lock error context | `rich.progress` in `index_repo`; lock-aware error message in `get_backend()` | S | HIGH |
 | 4 | 11.5 — uninstall ignores default DB path | Fall back to `KuzuConfig().db_path` in `uninstall.py` | XS | MEDIUM |
+
+
+
+add version flag to cli   ╭─ Error ──────────────────────────────────────────────────────────────────────╮
+│ No such option: --version                                                    │
+╰────────────────────────────────────
+--reset is ambiguous, we should give use something like `--drop` some that explains the user how serious there action is 
+
+this command should default to writing to a log file to much output is generated
+
+sqlcg index /home/ignwrad/Projects/dwh --dialect ansi --buffer-pool-size 256 2>&1

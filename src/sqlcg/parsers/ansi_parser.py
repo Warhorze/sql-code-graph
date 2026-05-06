@@ -65,7 +65,7 @@ class AnsiParser(SqlParser):
                 continue
 
             try:
-                query_node = self._parse_statement(stmt, path, stmt_index)
+                query_node = self._parse_statement(stmt, path, stmt_index, out)
                 out.statements.append(query_node)
 
                 # Track defined and referenced tables
@@ -85,13 +85,16 @@ class AnsiParser(SqlParser):
 
         return out
 
-    def _parse_statement(self, stmt: Any, path: Path, stmt_index: int) -> QueryNode:
+    def _parse_statement(
+        self, stmt: Any, path: Path, stmt_index: int, out: ParsedFile
+    ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
         Args:
             stmt: sqlglot AST node
             path: Path to the source file
             stmt_index: Statement index in the file
+            out: ParsedFile object to append errors to
 
         Returns:
             QueryNode with extracted metadata
@@ -136,10 +139,7 @@ class AnsiParser(SqlParser):
 
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
-        out_temp = ParsedFile(path=path, dialect=self.DIALECT)
-        column_lineage = self._extract_column_lineage(
-            stmt, path, out_temp, schema, dst_table=target
-        )
+        column_lineage = self._extract_column_lineage(stmt, path, out, schema, dst_table=target)
 
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)

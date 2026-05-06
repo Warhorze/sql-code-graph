@@ -117,7 +117,7 @@ class SnowflakeParser(AnsiParser):
                     try:
                         # Call parent's _parse_statement method
                         query_node: Any = AnsiParser._parse_statement(  # type: ignore
-                            self, stmt, path, stmt_index
+                            self, stmt, path, stmt_index, out
                         )
                         # Mark as parse_failed since we're in scripting mode
                         query_node.parse_failed = True

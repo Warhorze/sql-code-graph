@@ -1,0 +1,134 @@
+{
+  "run_date": "2026-05-06T21:26:20.905684",
+  "corpus_dir": "/home/ignwrad/Projects/dwh",
+  "dialect": "snowflake",
+  "total_files": 200,
+  "total_statements": 1478,
+  "total_columns_processed": 291,
+  "runtime_seconds": 43.0,
+  "error_summary": {
+    "E1": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E2": {
+      "count": 283,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_INKOOPPRIJS_HISTORIE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_INKOOP_ORDER.sql"
+      ],
+      "example_messages": [
+        "*",
+        "*",
+        "*",
+        "99999",
+        "CURRENT_TIMESTAMP()"
+      ]
+    },
+    "E3": {
+      "count": 156,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_KLANT.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_FACTUUR.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_FACTUUR.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_ONTVANGST.sql"
+      ],
+      "example_messages": [
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-small'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-small'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'."
+      ]
+    },
+    "E4": {
+      "count": 1,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDH_CONTRACT.sql"
+      ],
+      "example_messages": [
+        "Expecting ). Line 7, Col: 37.\n  e tabel WTDH_WERKNEMER\n\nCREATE TABLE BA.WTDH_CONTRACT IF NOT EXISTS\n..."
+      ]
+    },
+    "E5": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E6": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E7": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E8": {
+      "count": 8,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql"
+      ],
+      "example_messages": [
+        "col=dn_formule_code root has no leaf sources",
+        "col=da_formule_nummer root has no leaf sources",
+        "col=da_formule_naam root has no leaf sources",
+        "col=da_formule_land_code root has no leaf sources",
+        "col=da_formule_land_naam root has no leaf sources"
+      ]
+    }
+  },
+  "success_edges": 0,
+  "files_with_success": 0,
+  "files_ok": 68,
+  "files_degraded": 131,
+  "files_failed": 1,
+  "slow_files": [
+    {
+      "file": "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+      "elapsed_seconds": 13.78,
+      "statement_count": 45
+    },
+    {
+      "file": "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+      "elapsed_seconds": 14.13,
+      "statement_count": 41
+    },
+    {
+      "file": "ddl/changelogs/BA-TABLES/WTDH_BOUWMARKT.sql",
+      "elapsed_seconds": 1.43,
+      "statement_count": 18
+    },
+    {
+      "file": "ddl/changelogs/BA-VIEWS/WTDA_ARTIKEL.sql",
+      "elapsed_seconds": 4.36,
+      "statement_count": 3
+    }
+  ],
+  "per_file_timing_p50_ms": 3.9,
+  "per_file_timing_p95_ms": 383.3,
+  "per_file_timing_p99_ms": 13689.2
+}

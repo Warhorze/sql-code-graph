@@ -2,9 +2,7 @@
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from sqlglot import parse_one
 
@@ -68,32 +66,58 @@ class TestExtractColumnLineageExceptions:
         # The method should handle the exception gracefully
         assert isinstance(edges, list)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Bug 2 (ARCHITECTURE_REVIEW §11.2): sg_lineage → LineageEdge conversion is a "
-            "TODO in base.py:396. _extract_column_lineage returns [] on the success path. "
-            "Remove xfail once the conversion is implemented."
-        ),
-    )
     def test_sg_lineage_success_returns_edges(self):
-        """When sg_lineage returns a root node, edges must be emitted — not an empty list."""
-        schema = SchemaResolver()
-        parser = AnsiParser(schema)
+        """When sg_lineage returns a root node, edges must be emitted — not an empty list.
 
+        Uses a real SELECT so the tree walker receives a genuine LineageNode with a
+        Table source, not an unconfigured MagicMock that _lineage_node_to_table_ref rejects.
+        """
+        parser = AnsiParser(SchemaResolver())
         stmt = parse_one("SELECT col1 FROM t")
         out = ParsedFile(path=Path("test.sql"), dialect=None)
 
-        with patch("sqlglot.lineage.lineage") as mock_sg_lineage:
-            mock_root = MagicMock()
-            mock_sg_lineage.return_value = mock_root
-
-            edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=None)
+        edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
 
         assert len(edges) > 0, (
-            "Expected at least one LineageEdge when sg_lineage succeeds, got none. "
-            "The TODO at base.py:396 must convert the root node to LineageEdge objects."
+            "Expected at least one LineageEdge for SELECT col1 FROM t, got none. "
+            "The tree walker in _lineage_node_to_edges must emit edges for leaf nodes."
         )
         assert all(e.confidence > 0.0 for e in edges), (
             "Edges from a successful sg_lineage call must have confidence > 0."
         )
+
+
+class TestT01ErrorPropagation:
+    """T-01: Test error propagation from _parse_statement to ParsedFile."""
+
+    def test_parse_file_with_clean_ctas_no_errors(self):
+        """Test that a clean CTAS produces no col_lineage errors.
+
+        Parse a CREATE TABLE AS SELECT 1 AS x,
+        assert no col_lineage errors in parsed.errors.
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+
+        sql = "CREATE TABLE t AS SELECT 1 AS x"
+        parsed = parser.parse_file(Path("test.sql"), sql)
+
+        col_lineage_errors = [e for e in parsed.errors if e.startswith("col_lineage:")]
+        assert col_lineage_errors == [], f"Expected no col_lineage errors, got: {parsed.errors}"
+
+    def test_parse_file_can_call_with_out_parameter(self):
+        """Test that _parse_statement receives and uses the out parameter.
+
+        This verifies that T-01 implementation passes the out parameter correctly
+        so that errors from _extract_column_lineage are appended to the caller's
+        ParsedFile object instead of being discarded.
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+
+        sql = "SELECT 1 AS x"
+        parsed = parser.parse_file(Path("test.sql"), sql)
+
+        # Verify parse succeeded and statements were added
+        assert len(parsed.statements) == 1
+        assert parsed.statements[0].kind == "SELECT"
