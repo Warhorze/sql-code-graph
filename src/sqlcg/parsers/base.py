@@ -423,7 +423,7 @@ class SqlParser(ABC):
         stmt: Any,
         path: Path,
         out: ParsedFile,
-        schema: dict,
+        schema: dict | None,
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
     ) -> list[LineageEdge]:
