@@ -458,9 +458,14 @@ class SqlParser(ABC):
             if isinstance(stmt, exp.Select):
                 body = stmt
                 col_expressions = stmt.expressions
-            elif isinstance(stmt, exp.Create) and isinstance(stmt.expression, exp.Select):
+            elif isinstance(stmt, exp.Create) and isinstance(
+                stmt.expression, (exp.Select, exp.Subquery)
+            ):
                 # CREATE VIEW/TABLE AS SELECT — extract from the SELECT body
+                # Handle both bare SELECT and parenthesised (SELECT) forms
                 body = stmt.expression
+                if isinstance(body, exp.Subquery):
+                    body = body.this
                 col_expressions = body.expressions
             elif isinstance(stmt, exp.Insert) and isinstance(stmt.expression, exp.Select):
                 # INSERT INTO ... SELECT — extract from the SELECT body
@@ -471,10 +476,21 @@ class SqlParser(ABC):
 
             # Extract output columns
             for col_expr in col_expressions:
+                # Skip star projections — sg_lineage requires a concrete column name.
+                if isinstance(col_expr, exp.Star) or (
+                    isinstance(col_expr, exp.Column) and isinstance(col_expr.this, exp.Star)
+                ):
+                    qualifier = col_expr.table if isinstance(col_expr, exp.Column) else None
+                    out.errors.append(f"col_lineage_skip:star:{qualifier or '<unqualified>'}")
+                    continue
+
                 if col_expr.alias:
                     col_name = col_expr.alias
                 elif isinstance(col_expr, exp.Column):
                     col_name = col_expr.name
+                    if not col_name or col_name == "*":
+                        out.errors.append("col_lineage_skip:star:<empty_name>")
+                        continue
                 else:
                     # Expression with no resolvable name (e.g. ROUND(...), CAST(...))
                     # — sg_lineage requires a plain column name, skip these
