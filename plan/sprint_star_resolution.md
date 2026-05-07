@@ -1,5 +1,104 @@
 # Sprint Plan: Star Projection Resolution via Graph Backend
 
+## Reviewer Notes — 2026-05-07 (plan-reviewer)
+
+### BLOCKER — Schema version enforcement gap (T-02)
+
+`KuzuBackend.init_schema()` checks whether the `Repo` node table already exists.
+If it does, it returns immediately — no DDL is executed. This means an existing
+v1 database will pass the check, skip the `STAR_SOURCE` REL TABLE creation, and
+fail at runtime when T-04 tries to upsert the first `STAR_SOURCE` edge
+("Runtime exception: table STAR_SOURCE not found").
+
+**Fix applied in Risks table**: the mitigation entry for "Schema version bump"
+has been strengthened. Developer must also add a schema-version guard to the
+`index` command (not just `db info`). Specifically, after `backend.init_schema()`
+in `src/sqlcg/cli/commands/index.py` (line 63), add:
+
+```python
+stored = backend.get_schema_version()
+if stored != SCHEMA_VERSION:
+    raise typer.Exit(
+        console.print(
+            f"[red]Database schema is v{stored}; this build requires v{SCHEMA_VERSION}. "
+            "Run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-index.[/red]"
+        )
+    )
+```
+
+The same guard must be added in `src/sqlcg/cli/commands/watch.py` (line 30).
+The `db info` guard proposed in T-07 is still correct but is insufficient on
+its own — it only helps if the user explicitly runs `db info` before indexing.
+
+### WARN — `_extract_column_lineage` signature ambiguity (T-03)
+
+T-03 introduces `_resolve_star_source` which needs the statement's real source
+tables as `list[TableRef]`. The plan pseudocode shows:
+```python
+star_src_table = self._resolve_star_source(qualifier=qualifier or None, sources=query_sources)
+```
+But the existing `_extract_column_lineage` already has a `sources: dict[str, Any] | None`
+parameter (the `sources_map` for `sg_lineage` temp-table resolution). These are
+two different things.
+
+**Fix applied in T-03 below**: the new parameter is named `query_sources:
+list[TableRef]` and is added as a separate positional-or-keyword parameter AFTER
+the existing `sources` dict. The call site in `ansi_parser.py:182` must pass
+both: `sources=sources_map` (existing) and `query_sources=sources` (the list
+from line 178 of `_parse_statement`). The variable names are confusing because
+`sources` means different things at different call frames — the corrected T-03
+section makes this explicit.
+
+### WARN — Wiring checklist missing SnowflakeParser check (Wiring Checklist)
+
+T-03 lists `snowflake_parser.py` as an "affected file" (call-site change only).
+The wiring checklist only checks `ansi_parser.py` for `star_sources`. Added a
+row to confirm `snowflake_parser.py` was not broken by the return-type change.
+
+### WARN — E2E test corpus cannot produce STAR_EXPANSION edges from jaffle_shop
+
+The `tests/fixtures/jaffle_shop` corpus uses explicit column selects only — no
+`SELECT *`. The e2e test `test_dwh_corpus_emits_star_expanded_edges` will get
+zero `STAR_EXPANSION` edges if run against jaffle_shop. The Risks table already
+notes the synthesised fallback. The E2E test section has been updated to make
+the synthesised fixture a required deliverable, not an optional fallback.
+
+### OK — KuzuDB 0.11.3 compatibility verified
+
+All of the following were tested against KuzuDB 0.11.3 (verified with live runs):
+- `MERGE ... ON CREATE SET` — works.
+- MERGE with `RETURN count(r)` via `run_read` (conn.execute) — works and
+  auto-commits without an explicit transaction.
+- MERGE with `RETURN` inside `BEGIN TRANSACTION / COMMIT` — works.
+- `DETACH DELETE` on a query node cascades to attached `STAR_SOURCE` edges — confirmed.
+- `CALL show_tables() RETURN *` — works; result columns are `['id', 'name',
+  'type', 'database name', 'comment']`; filter on `name` field for STAR_SOURCE.
+- Edge property filter `[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]` in
+  MATCH clause — works.
+
+### OK — `QueryKind` string values
+
+`QueryKind.CREATE_TABLE = "CREATE_TABLE"` and `QueryKind.CREATE_VIEW =
+"CREATE_VIEW"` confirmed in `src/sqlcg/parsers/base.py` lines 20–21. The T-01
+pseudocode filter `s.kind in ("CREATE_TABLE", "CREATE_VIEW")` is correct.
+
+### OK — Caller count for `_extract_column_lineage`
+
+`_extract_column_lineage` has exactly one direct call site: `ansi_parser.py:182`.
+`SnowflakeParser._parse_scripting_file` calls `AnsiParser._parse_statement`, not
+`_extract_column_lineage` directly. The return-type change propagates through
+`_parse_statement` only, leaving `snowflake_parser.py` unaffected structurally.
+The plan's "single chokepoint" claim is correct.
+
+### OK — `test_data_models.py` and `test_db_info.py` exist
+
+Both files exist and can be extended. `tests/unit/test_data_models.py` currently
+tests `TableRef`, `ColumnRef`, `LineageEdge`. `tests/unit/test_db_info.py`
+currently tests health-check warnings. Both are appropriate extension points.
+
+
+---
+
 ## Summary
 
 After `sprint_column_lineage_fix` landed, the 1,457-file Snowflake DWH parse
@@ -378,8 +477,10 @@ and the sprint postmortem section.
   `dataclasses.FrozenInstanceError`).
 - Unit test `tests/unit/test_kuzu_backend.py::test_star_source_table_created`
   initialises a fresh `KuzuBackend(":memory:")`, calls `init_schema()`, and
-  asserts `db.run_read("CALL show_tables() RETURN *", {})` includes a row for
-  `STAR_SOURCE`. (KuzuDB exposes its catalog via `show_tables`.)
+  asserts `db.run_read("CALL show_tables() RETURN *", {})` includes a row where
+  the `name` column equals `STAR_SOURCE`. (Verified: KuzuDB 0.11.3 `show_tables()`
+  returns columns `['id', 'name', 'type', 'database name', 'comment']`;
+  filter on `row["name"] == "STAR_SOURCE"`.)
 - `grep -n "STAR_SOURCE" src/sqlcg/core/schema.py src/sqlcg/core/schema.cypher`
   returns three matches (enum, REL TABLE, comment).
 - `grep -n "SCHEMA_VERSION = " src/sqlcg/core/schema.py` returns `"2"`.
@@ -473,8 +574,23 @@ def _resolve_star_source(
     return sources[0]
 ```
 
-Pass `query_sources` from `_parse_statement` (it already has `sources` in
-scope at line 178).
+**REVIEWER NOTE — parameter naming**: `_extract_column_lineage` already has a
+`sources: dict[str, Any] | None` parameter (the `sources_map` dict for
+`sg_lineage` temp-table resolution). The new `query_sources: list[TableRef]`
+parameter for `_resolve_star_source` is a SEPARATE, ADDITIONAL parameter
+appended to the signature after `sources`. The call site in `ansi_parser.py:182`
+must pass BOTH:
+```python
+extraction = self._extract_column_lineage(
+    stmt, path, out, schema,
+    dst_table=target,
+    sources=sources_map,          # existing: dict for sg_lineage
+    query_sources=sources,         # new: list[TableRef] for _resolve_star_source
+                                   # 'sources' here is the list from line 178
+)
+```
+Do NOT rename the existing `sources` parameter — it is passed to `sg_lineage()`
+internally and must remain a dict.
 
 **Files affected**:
 - `src/sqlcg/parsers/base.py`
@@ -803,9 +919,18 @@ able to see how many star edges were expanded without writing Cypher by hand.
 - `test_reindex_re_expands` (T-06)
 
 ### E2E test (`tests/e2e/test_star_resolution_e2e.py` — new file)
-- `test_dwh_corpus_emits_star_expanded_edges`: run the existing
-  `tests/fixtures/jaffle_shop` corpus (or a redacted DWH slice if available;
-  see Risks) end-to-end via the CLI (`uv run sqlcg index ...`). Assert that
+
+**REVIEWER NOTE**: `tests/fixtures/jaffle_shop` uses only explicit column selects
+(no `SELECT *`) so it cannot produce any `STAR_EXPANSION` edges. The synthesised
+fixture is NOT optional — it is the only corpus that will make this test green.
+
+Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
+- `ddl_src.sql`: `CREATE TABLE star_corp.src_table (id INT, name STRING, amount DECIMAL);`
+- `ddl_tgt.sql`: `CREATE TABLE star_corp.tgt_table (id INT, name STRING, amount DECIMAL);`
+- `etl_star.sql`: `INSERT INTO star_corp.tgt_table SELECT * FROM star_corp.src_table;`
+
+- `test_dwh_corpus_emits_star_expanded_edges`: index `tests/fixtures/star_corpus/`
+  end-to-end via the CLI (`uv run sqlcg index ...`). Assert that
   `db info` reports a non-zero `STAR_EXPANSION lineage edges` count and that
   the `lineage_edges_created` summary key in the indexer return value is
   greater than the pre-T-05 baseline (record the baseline in the test file as
@@ -857,7 +982,7 @@ able to see how many star edges were expanded without writing Cypher by hand.
 | Schema staleness — DDL says column `foo` but ETL runtime has dropped it | Confidence `0.8` flags the edge as approximate; downstream consumers can filter on `confidence > 0.85` for strict mode. The architecture review already documents this acceptance (finding 6, lines 78–80). |
 | `test_dwh_corpus_emits_star_expanded_edges` relies on the real DWH | If the real DWH corpus is not in the repo, fall back to a synthesised DDL+ETL fixture under `tests/fixtures/star_corpus/` containing 3 DDL files and 5 ETL files. Test must be deterministic and green in CI. |
 | Wildcard `EXCLUDE` columns produce wrong expansions (`SELECT * EXCLUDE (col1)` expands `col1` anyway) | Out-of-scope per Non-Goals. Add a `# TODO` ONLY in a comment under `_resolve_star_source` documenting the limitation, NOT in the happy path of the expansion query. Regression test will catch it the day a future sprint addresses it. |
-| Schema version bump breaks existing user databases without warning | `KuzuBackend.get_schema_version()` already exists. Add a `db info` warning in T-07's CLI changes when `get_schema_version() != SCHEMA_VERSION` ("Database schema is outdated; re-index required"). |
+| Schema version bump breaks existing user databases without warning | `init_schema()` returns early for existing databases without checking the stored version — a v1 database will silently lack STAR_SOURCE REL TABLE and fail at T-04 upsert time. Developer MUST add a version guard in `index.py` (and `watch.py`) BEFORE the upsert loop: if `backend.get_schema_version() != SCHEMA_VERSION` raise a user-facing error instructing `db reset && db init && index`. The `db info` warning added in T-07 is necessary but insufficient — see Reviewer Notes BLOCKER at the top of this plan. |
 | `SELECT t1.*, t2.*` produces two `StarSource` markers — expansion may double-count if the target table only has one of them | Each `StarSource` produces an independent `COLUMN_LINEAGE` edge under MERGE; collisions on `(src.id, dst.id)` are absorbed. Add an explicit test in a follow-up sprint, not blocking. |
 | `target_table = ''` (bare `SELECT *` with no INSERT/CREATE) | Expansion query's `WHERE q.target_table <> ''` filter skips them. Documented in design. |
 
@@ -896,6 +1021,7 @@ able to see how many star edges were expanded without writing Cypher by hand.
 | `STAR_SOURCE` enum value | `grep -n "STAR_SOURCE = " src/sqlcg/core/schema.py` | exactly 1 match |
 | `_resolve_star_source` is called | `grep -n "_resolve_star_source" src/sqlcg/parsers/base.py` | at least 2 matches (def + call) |
 | `star_sources` is populated by parser | `grep -n "star_sources" src/sqlcg/parsers/` | matches in `base.py` and `ansi_parser.py` |
+| `snowflake_parser.py` not broken by return-type change | `grep -n "_extract_column_lineage" src/sqlcg/parsers/snowflake_parser.py` | zero matches (Snowflake only calls `_parse_statement`, not `_extract_column_lineage` directly) |
 | `_expand_star_sources` is called | `grep -n "_expand_star_sources" src/sqlcg/indexer/indexer.py` | exactly 3 matches (def + 2 calls) |
 | Expansion query exists | `grep -n "EXPAND_STAR_SOURCES_QUERY" src/sqlcg/` | matches in `core/queries.py` and `indexer/indexer.py` |
 | Star metrics in `db info` | `grep -n "STAR_EXPANSION" src/sqlcg/cli/commands/db.py` | at least 1 match |
