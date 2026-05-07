@@ -543,6 +543,7 @@ class SqlParser(ABC):
                         )
                         edges.extend(new_edges)
                         if not new_edges:
+                            out.errors.append(f"col_lineage_skip:dynamic_source:{col_name}")
                             self._log.debug(
                                 "sg_lineage returned root but no edges emitted: file=%s col=%s",
                                 path,

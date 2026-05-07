@@ -87,6 +87,22 @@ class TestExtractColumnLineageExceptions:
         )
 
 
+class TestE8DynamicSourceMarker:
+    """sg_lineage returns a root but no leaf sources — dynamic identifier pattern."""
+
+    def test_dynamic_identifier_emits_skip_marker(self):
+        # IDENTIFIER($var) is opaque to sqlglot; sg_lineage returns a root with no
+        # resolvable leaf — _lineage_node_to_edges emits nothing and we must see the marker.
+        parser = AnsiParser(SchemaResolver())
+        out = ParsedFile(path=Path("test.sql"), dialect=None)
+        # Use Anonymous function as a stand-in for identifier($var) — sqlglot can't resolve it
+        stmt = parse_one("INSERT INTO tgt SELECT IDENTIFIER('src_tbl') AS col1 FROM src")
+        parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
+        assert any(e.startswith("col_lineage_skip:dynamic_source:") for e in out.errors), (
+            f"Expected dynamic_source skip marker, got: {out.errors}"
+        )
+
+
 class TestT01ErrorPropagation:
     """T-01: Test error propagation from _parse_statement to ParsedFile."""
 
