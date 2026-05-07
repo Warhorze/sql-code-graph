@@ -1776,7 +1776,7 @@ stdout and the unhelpful lock error before shipping.
 
 ---
 
-### 11.5 [MEDIUM] `sqlcg uninstall` leaves DB at default path (v0.3.0 implementation gap)
+### 11.5 [RESOLVED] `sqlcg uninstall` leaves DB at default path
 
 **Observed behaviour**: `sqlcg uninstall` printed "Removed MCP registration" and "No
 database configured" but left `~/.sqlcg/graph.db` (50 MB) on disk.
@@ -1863,7 +1863,7 @@ Additions and escalations relative to section 10.4:
 | 4 | 11.3 — stale MCP entry not updated | `sqlcg install` should compare existing vs ideal entry and prompt to update | XS | HIGH |
 | 5 | 11.4 — no progress + lock error context | `rich.progress` in `index_repo`; lock-aware error message in `get_backend()` | S | HIGH |
 | 6 | 11.7 — dynamic identifiers yield no edges (E8) | Emit `col_lineage_skip:dynamic_source` marker; surface in MCP as `resolution=unresolvable` | XS | LOW |
-| 7 | 11.5 — uninstall ignores default DB path | Fall back to `KuzuConfig().db_path` in `uninstall.py` | XS | MEDIUM |
+| 7 | ~~11.5 — uninstall ignores default DB path~~ | ~~Fall back to `KuzuConfig().db_path` in `uninstall.py`~~ **DONE** | XS | ~~MEDIUM~~ CLOSED |
 
 
 
