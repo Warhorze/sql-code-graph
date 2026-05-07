@@ -1,5 +1,6 @@
 """Index command for scanning and indexing SQL files."""
 
+import os
 from pathlib import Path
 
 import typer
@@ -22,6 +23,12 @@ def index_cmd(  # noqa: B008
     timeout_per_file: int = typer.Option(  # noqa: B008
         30, "--timeout-per-file", help="Timeout per file in seconds"
     ),
+    buffer_pool_size: int = typer.Option(  # noqa: B008
+        0,
+        "--buffer-pool-size",
+        help="KuzuDB buffer pool size in MB (0 = default). "
+        "Set to 256-512 on memory-constrained machines.",
+    ),
     no_ddl: bool = typer.Option(  # noqa: B008
         False, "--no-ddl", help="Skip DDL statements (not yet fully implemented)"
     ),
@@ -40,6 +47,10 @@ def index_cmd(  # noqa: B008
     # TODO: wire no_ddl through to the indexer once it supports the parameter
     if no_ddl:
         console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
+
+    # Set buffer pool size via env var if specified
+    if buffer_pool_size > 0:
+        os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
 
     # Resolve dialect: 'auto' reads from .sqlcg.toml, otherwise use provided value
     if dialect == "auto":
@@ -66,7 +77,35 @@ def index_cmd(  # noqa: B008
 
         # Index the repository
         indexer = Indexer()
-        summary = indexer.index_repo(path, dialect, backend, dbt_manifest, timeout_per_file)
+
+        # Determine total files for progress callback
+        from sqlcg.utils.ignore import load_ignore_spec
+        from sqlcg.indexer.walker import walk_sql_files
+
+        spec = load_ignore_spec(path)
+        files = list(walk_sql_files(path, spec, use_git=True))
+        total_files = len(files)
+
+        # Define progress callback
+        def _make_progress_callback(total: int):
+            """Create a progress callback that prints progress every 100 files.
+
+            The callback is only invoked every 100 files, so with fewer than 100 files
+            in the repository, no progress line is printed.
+            """
+            def callback(n: int, total_n: int) -> None:
+                console.print(f"\r  Indexed {n}/{total_n} files...", end="", highlight=False)
+            return callback
+
+        summary = indexer.index_repo(
+            path,
+            dialect,
+            backend,
+            dbt_manifest,
+            timeout_per_file,
+            progress_callback=_make_progress_callback(total_files),
+        )
+        console.print()  # newline after carriage return progress line
 
         # Connect files to repo
         from sqlcg.core.schema import RelType

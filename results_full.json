@@ -1,0 +1,225 @@
+{
+  "run_date": "2026-05-06T21:32:57.525481",
+  "corpus_dir": "/home/ignwrad/Projects/dwh",
+  "dialect": "snowflake",
+  "total_files": 1457,
+  "total_statements": 8084,
+  "total_columns_processed": 697,
+  "runtime_seconds": 298.9,
+  "error_summary": {
+    "E1": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E2": {
+      "count": 443,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_DATUM.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_INKOOPPRIJS_HISTORIE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_INKOOP_ORDER.sql"
+      ],
+      "example_messages": [
+        "*",
+        "*",
+        "*",
+        "99999",
+        "CURRENT_TIMESTAMP()"
+      ]
+    },
+    "E3": {
+      "count": 2496,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_KLANT.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_FACTUUR.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_FACTUUR.sql",
+        "ddl/changelogs/BA-TABLES/WTFE_INKOOP_ONTVANGST.sql"
+      ],
+      "example_messages": [
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-small'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-small'' contains unsupported syntax. Falling back to parsing as a 'Command'.",
+        "'ALTER WAREHOUSE IDENTIFIER($WAREHOUSENAME) SET WAREHOUSE_SIZE ='X-large'' contains unsupported syntax. Falling back to parsing as a 'Command'."
+      ]
+    },
+    "E4": {
+      "count": 6,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDH_CONTRACT.sql",
+        "etl/pdi/template/htwfm_contract_us28254.sql",
+        "etl/pdi/template/htwfm_employee_us28254.sql",
+        "etl/pdi/template/us15770-check-controles-herstelactie.sql",
+        "etl/sql/int/test.sql",
+        "etl/sql/interface/outbound_ga4_artikelen.sql"
+      ],
+      "example_messages": [
+        "Expecting ). Line 7, Col: 37.\n  e tabel WTDH_WERKNEMER\n\nCREATE TABLE BA.WTDH_CONTRACT IF NOT EXISTS\n...",
+        "Required keyword: 'true' missing for <class 'sqlglot.expressions.functions.If'>. Line 5, Col: 5.\n  t...",
+        "Required keyword: 'true' missing for <class 'sqlglot.expressions.functions.If'>. Line 5, Col: 5.\n  t...",
+        "Invalid expression / Unexpected token. Line 114, Col: 7.\n           AND b.ea_actual_flag = 1)\n  -- B...",
+        "Expecting ). Line 329, Col: 32.\n  oud.\"Volgnummer\" = nieuw.\"Volgnummer\"\n)\nSELECT *\nFROM CHECK_TABLES..."
+      ]
+    },
+    "E5": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E6": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E7": {
+      "count": 0,
+      "example_files": [],
+      "example_messages": []
+    },
+    "E8": {
+      "count": 254,
+      "example_files": [
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDA_FORMULE.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+        "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+        "etl/pdi/template/Bijwerken_hthyb_ean_us29263.sql",
+        "etl/pdi/template/Bijwerken_hthyb_ean_us29263.sql"
+      ],
+      "example_messages": [
+        "col=dn_formule_code root has no leaf sources",
+        "col=da_formule_nummer root has no leaf sources",
+        "col=da_formule_naam root has no leaf sources",
+        "col=da_formule_land_code root has no leaf sources",
+        "col=da_formule_land_naam root has no leaf sources"
+      ]
+    }
+  },
+  "success_edges": 0,
+  "files_with_success": 0,
+  "files_ok": 1055,
+  "files_degraded": 396,
+  "files_failed": 6,
+  "slow_files": [
+    {
+      "file": "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL.sql",
+      "elapsed_seconds": 14.15,
+      "statement_count": 45
+    },
+    {
+      "file": "ddl/changelogs/BA-TABLES/WTDH_ARTIKEL_ETL.sql",
+      "elapsed_seconds": 14.83,
+      "statement_count": 41
+    },
+    {
+      "file": "ddl/changelogs/BA-VIEWS/WTDA_ARTIKEL.sql",
+      "elapsed_seconds": 4.37,
+      "statement_count": 3
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_DAG_BOUWMARKT.sql",
+      "elapsed_seconds": 3.85,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_WEEK_ARTIKELGROEP_BOUWMARKT.sql",
+      "elapsed_seconds": 2.02,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_WEEK_ARTIKEL_BOUWMARKT.sql",
+      "elapsed_seconds": 2.3,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_WEEK_ARTIKEL_FORMULE.sql",
+      "elapsed_seconds": 2.3,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_WEEK_BOUWMARKT.sql",
+      "elapsed_seconds": 15.31,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-DATAPRODUCTS/COMBI_WEEK_SEGMENT_FORMULE.sql",
+      "elapsed_seconds": 2.06,
+      "statement_count": 83
+    },
+    {
+      "file": "ddl/changelogs/IA-OUTBOUND/MSSPR_IA_OUTBOUND_DOORBELASTING.sql",
+      "elapsed_seconds": 3.53,
+      "statement_count": 7
+    },
+    {
+      "file": "ddl/changelogs/IA-SEMANTIC/ODS_WORKAROUND_ARTIKELDIMENSIE.sql",
+      "elapsed_seconds": 2.73,
+      "statement_count": 1
+    },
+    {
+      "file": "ddl/changelogs/IA-SEMANTIC/ODS_WORKAROUND_ARTIKELDIMENSIE_CONCEPT.sql",
+      "elapsed_seconds": 24.06,
+      "statement_count": 1
+    },
+    {
+      "file": "etl/sql/dim/wtda_artikel.sql",
+      "elapsed_seconds": 2.69,
+      "statement_count": 5
+    },
+    {
+      "file": "etl/sql/dim/wtdh_artikel.sql",
+      "elapsed_seconds": 21.89,
+      "statement_count": 126
+    },
+    {
+      "file": "etl/sql/dim/wtdh_bouwmarkt.sql",
+      "elapsed_seconds": 4.79,
+      "statement_count": 13
+    },
+    {
+      "file": "etl/sql/fact/wtfa_loonkosten_functie.sql",
+      "elapsed_seconds": 2.86,
+      "statement_count": 5
+    },
+    {
+      "file": "etl/sql/fact/wtfe_kpi_supply_chain_artikel_voorraadlocatie.sql",
+      "elapsed_seconds": 5.27,
+      "statement_count": 9
+    },
+    {
+      "file": "etl/sql/fact/wtfe_kpi_supply_chain_week_segment_voorraadlocatie.sql",
+      "elapsed_seconds": 2.33,
+      "statement_count": 9
+    },
+    {
+      "file": "etl/sql/fact/wtfe_kpi_week_bouwmarkt.sql",
+      "elapsed_seconds": 2.01,
+      "statement_count": 3
+    },
+    {
+      "file": "etl/sql/fact/wtfv_prijsvoorstel.sql",
+      "elapsed_seconds": 25.89,
+      "statement_count": 23
+    }
+  ],
+  "per_file_timing_p50_ms": 20.5,
+  "per_file_timing_p95_ms": 562.1,
+  "per_file_timing_p99_ms": 3101.0
+}

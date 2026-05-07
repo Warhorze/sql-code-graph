@@ -44,6 +44,51 @@ class TestMCPEntryRemoval:
         assert "sql-code-graph" not in result["mcpServers"]
 
 
+class TestGetDbPath:
+    """Test _get_db_path function deriving fallback from KuzuConfig."""
+
+    def test_scenario_graph_db_exists_when_no_env_var(self, tmp_path, monkeypatch):
+        """Guard: _get_db_path returns graph.db (not kuzu.db) when no env var is set."""
+        # Create ~/.sqlcg/graph.db directory structure
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        sqlcg_dir = fake_home / ".sqlcg"
+        sqlcg_dir.mkdir()
+        graph_db_dir = sqlcg_dir / "graph.db"
+        graph_db_dir.mkdir()
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        # Ensure SQLCG_DB_PATH is not set
+        monkeypatch.delenv("SQLCG_DB_PATH", raising=False)
+
+        result = uninstall._get_db_path()
+        assert result is not None, "Expected _get_db_path to find graph.db"
+        assert "graph.db" in result, f"Expected path to contain 'graph.db', got {result}"
+        assert result.endswith("graph.db"), f"Expected path to end with 'graph.db', got {result}"
+
+    def test_scenario_path_does_not_exist(self, tmp_path, monkeypatch):
+        """Guard: _get_db_path returns None when path doesn't exist."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        # Don't create .sqlcg directory
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.delenv("SQLCG_DB_PATH", raising=False)
+
+        result = uninstall._get_db_path()
+        assert result is None, f"Expected None when DB path does not exist, got {result}"
+
+    def test_scenario_sqlcg_db_path_env_var_set(self, tmp_path, monkeypatch):
+        """Guard: _get_db_path uses SQLCG_DB_PATH env var when set."""
+        db_dir = tmp_path / "custom_db"
+        db_dir.mkdir()
+
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_dir))
+
+        result = uninstall._get_db_path()
+        assert result == str(db_dir), f"Expected env var path {db_dir}, got {result}"
+
+
 class TestDatabaseDeletion:
     """Test database deletion logic."""
 

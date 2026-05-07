@@ -105,11 +105,16 @@ class Indexer:
             "failed": 0,
         }
         for parsed in pass2_results:
-            counts = self._upsert_parsed_file(parsed, db)
-            tables_found += counts["tables"]
-            lineage_edges += counts["edges"]
-            quality_key = parsed.parse_quality.value.lower()
-            quality_counts[quality_key] += 1
+            try:
+                with db.transaction():
+                    counts = self._upsert_parsed_file(parsed, db)
+                tables_found += counts["tables"]
+                lineage_edges += counts["edges"]
+                quality_key = parsed.parse_quality.value.lower()
+                quality_counts[quality_key] += 1
+            except Exception as exc:
+                logger.warning("Failed to upsert %s: %s — skipping", parsed.path, exc)
+                quality_counts["failed"] += 1
 
         return {
             "files_parsed": len(pass2_results),

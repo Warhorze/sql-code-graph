@@ -52,15 +52,35 @@ Reviewer agent: architect-reviewer
    `pyproject.toml`; CI matrix: 3.12 and 3.13 (verify KùzuDB 0.11.3 on 3.13 before
    enabling). Drop any `sys.version_info` guards for 3.10/3.11 syntax.
 
-6. **DDL requirement / `add_information_schema`** — **Resolved: DDL is not required
-   for the primary use case; defer `add_information_schema` to v2.**
-   For table-level lineage (the core use case), sqlglot resolves table references from
-   DML alone — DDL is not needed. Column-level lineage degrades gracefully when schema
-   is absent: `SELECT *` expands to `*` with `confidence=0.3` and `schema_required=true`
-   surfaced in the MCP response, which gives Claude enough signal to ask the user for
-   DDL if needed. `add_information_schema()` should raise `NotImplementedError` in v1
-   (finding 3.8); the `--schema-from-info-schema` CLI flag should error immediately.
-   Remove `add_information_schema` from the v1 deliverable list in the blueprint.
+6. **DDL requirement / `add_information_schema`** — **Re-opened (2026-05-07): un-deferred
+   to next sprint after column lineage fix.**
+   Original resolution was to defer to v2 because table-level lineage works without schema.
+   Re-opened because the v0.3.1 postmortem experiment (653 ETL files, Snowflake) confirmed
+   that `SELECT *` and `SELECT base.*` are the dominant projection pattern in this corpus —
+   T-02 now skips them cleanly but emits no edges. `sqlglot.optimizer.qualify.qualify(stmt,
+   schema=schema)` can expand star projections into explicit column names when schema is
+   available, unlocking column lineage for the majority of ETL files.
+
+   Required work:
+   1. **Two-pass index**: parse DDL corpus first (`ddl/` dir) → populate `SchemaResolver`;
+      then parse ETL corpus using the populated schema. CLI needs `--schema-from-ddl <dir>`
+      or automatic DDL-first ordering within `index_repo`.
+   2. **`add_information_schema` implementation**: feed `CREATE TABLE` column definitions
+      into `SchemaResolver.add_information_schema()` during the DDL pass. This was stubbed
+      as `NotImplementedError` — it needs to be real.
+   3. **Call `qualify` before `sg_lineage`**: in `_extract_column_lineage`, when schema is
+      non-empty, call `qualify(stmt, schema=schema, dialect=self.DIALECT)` to expand stars
+      before extracting `col_expressions`. Fall back gracefully when `qualify` raises.
+   4. **Confidence model**: edges derived from a schema-expanded star carry `confidence=0.8`
+      (not 1.0 — schema may be stale); edges from a named column with schema confirmation
+      stay at 1.0.
+
+   Risk: schema staleness. If DDL and ETL are out of sync, `qualify` may expand `SELECT *`
+   to the wrong column list. Mitigate by surfacing `schema_source_file` on each edge so
+   consumers can judge freshness.
+
+   **Previous resolution** (kept for reference): "DDL is not required for the primary use
+   case. Column-level lineage degrades gracefully when schema is absent."
 
 ---
 
@@ -1836,8 +1856,135 @@ Additions and escalations relative to section 10.4:
 
 | Rank | Finding | Action | Effort | Priority |
 |------|---------|--------|--------|----------|
-| 0 | 11.2 — 0 column edges in v0.3.0 | Diagnose `_extract_column_lineage` exception swallowing; fix finding 3.4 | XS–S | **CRITICAL** |
-| 1 | 11.1 — OOM during edge building | Add `--buffer-pool-size` flag; implement per-file commit pattern in `index_repo`; unify with watchdog pipeline | M | HIGH |
-| 2 | 11.3 — stale MCP entry not updated | `sqlcg install` should compare existing vs ideal entry and prompt to update | XS | HIGH |
-| 3 | 11.4 — no progress + lock error context | `rich.progress` in `index_repo`; lock-aware error message in `get_backend()` | S | HIGH |
-| 4 | 11.5 — uninstall ignores default DB path | Fall back to `KuzuConfig().db_path` in `uninstall.py` | XS | MEDIUM |
+| 0 | 11.2 — 0 column edges in v0.3.0 | ~~Diagnose `_extract_column_lineage` exception swallowing; fix finding 3.4~~ **DONE — sprint_column_lineage_fix** | XS–S | ~~CRITICAL~~ CLOSED |
+| 1 | 6 — star projections yield no edges | Two-pass DDL index → `add_information_schema` → `qualify` before `sg_lineage` | L | **HIGH** |
+| 2 | 11.6 — indexer too slow | `ProcessPoolExecutor` for parsing; bulk commits (N=50); `--workers` / `--batch-size` flags | L | **HIGH** |
+| 3 | 11.1 — OOM during edge building | Add `--buffer-pool-size` flag; implement per-file commit pattern in `index_repo`; unify with watchdog pipeline | M | HIGH |
+| 4 | 11.3 — stale MCP entry not updated | `sqlcg install` should compare existing vs ideal entry and prompt to update | XS | HIGH |
+| 5 | 11.4 — no progress + lock error context | `rich.progress` in `index_repo`; lock-aware error message in `get_backend()` | S | HIGH |
+| 6 | 11.7 — dynamic identifiers yield no edges (E8) | Emit `col_lineage_skip:dynamic_source` marker; surface in MCP as `resolution=unresolvable` | XS | LOW |
+| 7 | 11.5 — uninstall ignores default DB path | Fall back to `KuzuConfig().db_path` in `uninstall.py` | XS | MEDIUM |
+
+
+
+add version flag to cli   ╭─ Error ──────────────────────────────────────────────────────────────────────╮
+│ No such option: --version                                                    │
+╰────────────────────────────────────
+--reset is ambiguous, we should give use something like `--drop` some that explains the user how serious there action is 
+
+this command should default to writing to a log file to much output is generated
+
+sqlcg index /home/ignwrad/Projects/dwh --dialect ansi --buffer-pool-size 256 2>&1
+
+---
+
+### 11.7 [LOW] Dynamic source identifiers produce E8 — `sg_lineage` root has no leaf sources
+
+**Observed behaviour** (2026-05-07 experiment, 100 ETL files): 39 columns across at least
+4 files reach `sg_lineage`, get a root node back, but the tree walker finds no leaf table
+sources — recorded as E8 (`no_edges_from_root`). The dominant example is
+`rtga4_analytics_events.sql` (10 of the 39). No exception is raised; the column simply
+produces zero edges and the failure is silent.
+
+**Root cause**: the source table is a Snowflake dynamic identifier:
+
+```sql
+INSERT INTO DA_TMP.RTGA4_ANALYTICS_EVENTS
+SELECT value:origin_dataset::varchar AS ORIGIN_DATASET, ...
+FROM identifier($full_tablename) A   -- ← runtime variable
+```
+
+`sqlglot` parses `identifier($full_tablename)` as an opaque `exp.Anonymous` node. When
+`sg_lineage` walks the lineage tree to find leaf sources it hits this node, cannot resolve
+it to a real table, and returns a root whose `source` subtree is empty. The tree walker in
+`_lineage_node_to_edges` reaches a leaf with no `TableRef` and emits nothing.
+
+**This is a hard static-analysis ceiling** — the actual table name is a runtime value
+(`SET full_tablename = (SELECT 'DL_' || SPLIT_PART(CURRENT_DATABASE(),'_',2) || '.GA4.ANALYTICS_EVENTS')`).
+No amount of parser improvement will resolve it without executing the `SET` statement against
+a live database. It is fundamentally different from the star projection gap (finding 6), where
+schema injection unlocks the edges, and from T-03's temp-table gap, where `sources_map`
+provides the missing context.
+
+**Distinction from fixed issues**:
+
+| Issue | Cause | Fixed? |
+|-------|-------|--------|
+| E5 — `col_lineage:` errors swallowed | `out_temp` throwaway (T-01) | Yes — sprint_column_lineage_fix |
+| E2 — star crash | `sg_lineage('')` raises (T-02) | Yes — sprint_column_lineage_fix |
+| Star projections — no edges | Schema absent; `qualify` can't expand `*` | Next sprint (finding 6) |
+| E8 — dynamic identifiers | Runtime `identifier($var)` unresolvable | No — structural limit |
+
+**Recommended action** (low effort, low reward): detect the E8 case in `_lineage_node_to_edges`
+and emit a `col_lineage_skip:dynamic_source:<col_name>` marker to `out.errors`, matching the
+convention established by T-02's `col_lineage_skip:star:` markers. This makes the failure
+visible and distinguishable from the star-projection gap without claiming to fix it. The MCP
+tool can surface `resolution=unresolvable` on these columns so consumers know not to wait for
+lineage that will never arrive.
+
+No further investment is recommended unless the corpus gains a pattern where the variable is
+resolvable from context (e.g., `SET var = 'literal_table'`) — that would be a separate,
+targeted ticket.
+
+---
+
+### 11.6 [HIGH] Indexer is too slow for real corpora — needs parallel parsing and bulk DB commits
+
+**Observed behaviour** (2026-05-07): indexing 653 ETL files takes wall-clock minutes. The
+v0.3.1 postmortem experiment run (`collect_parse_errors.py`, 200 DDL files) took **43 s**
+with a single-threaded parser and per-file `backend.commit()`. Full re-index of the DWH
+repo (1,457 files) will likely exceed 10 minutes on current hardware. This is too slow to
+be interactive and makes the dev loop painful.
+
+**Root causes**:
+
+1. **Single-threaded parsing** — `index_repo` iterates files serially. `sqlglot.parse` and
+   `sg_lineage` are CPU-bound and hold the GIL; they do not benefit from `asyncio`. Each
+   file is independent, so parsing is embarrassingly parallel.
+
+2. **Per-file commit to KuzuDB** — every file flushes a commit to disk. For 1,457 files
+   this is 1,457 fsync-equivalent round-trips. KuzuDB's write path is not optimised for
+   high-frequency small commits; batching amortises the cost.
+
+**Design**:
+
+1. **`ProcessPoolExecutor` for parsing** — spawn a pool of worker processes (default:
+   `min(cpu_count, 8)`). Each worker receives a `(path, sql, dialect)` tuple and returns a
+   `ParsedFile`. No shared state; `SchemaResolver` is read-only after the DDL pass and can
+   be passed by value (pickle-safe). Pool size should be configurable via
+   `--workers N` / `SQLCG_WORKERS` env var. Use `chunksize` tuning to reduce IPC overhead
+   on large corpora.
+
+   Note: `threading.Thread` / `ThreadPoolExecutor` will **not** help here because `sqlglot`
+   parsing and `sg_lineage` are CPU-bound and hold the GIL. Use processes, not threads.
+   The existing `threading.Lock` on `SchemaResolver` (finding 3.3) is only needed in the
+   `sqlcg watch` path where the resolver is mutated — the bulk index path uses a frozen
+   resolver and needs no lock.
+
+2. **Bulk DB writes** — collect `ParsedFile` results from the worker pool in batches of N
+   (default: 50) and write the batch inside a single KuzuDB transaction. This replaces the
+   current per-file commit with at most `ceil(total_files / 50)` commits. Batch size should
+   be tunable via `--batch-size N`.
+
+   Interaction with finding 11.1 (OOM): per-file commits were introduced to cap memory
+   usage. Bulk commits re-introduce the risk if N is large. The safe default is N=50 and
+   the `--buffer-pool-size` flag (finding 11.1) should be set explicitly. Document this
+   tradeoff in the CLI help text.
+
+3. **Progress reporting** — the existing `progress_callback` hook in `indexer.py` (lines
+   33, 79–80) is already wired; the CLI just needs to pass a `rich.progress` callback
+   (finding 11.4). With a worker pool, update progress on each `Future` completion via
+   `as_completed()`.
+
+**Expected gain**: on an 8-core machine, parsing throughput should scale ~6–7× (leaving
+headroom for IPC). The 43 s DDL run should drop to ~7 s; a full 1,457-file re-index should
+complete in under 2 minutes.
+
+**Ordering**: implement after the schema/DDL pass sprint (finding 6) because the DDL pass
+introduces a `SchemaResolver` that must be serialisable for pickling into worker processes.
+If done before, the resolver will need to be refactored twice.
+
+**Files affected**:
+- `src/sqlcg/indexer/index_repo.py` — main loop, commit boundaries, pool wiring
+- `src/sqlcg/cli/commands/index.py` — `--workers`, `--batch-size` flags
+- `src/sqlcg/core/kuzu_backend.py` — expose `begin_transaction` / `commit` for batch mode

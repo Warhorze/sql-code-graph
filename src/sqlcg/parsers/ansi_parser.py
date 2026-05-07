@@ -59,14 +59,42 @@ class AnsiParser(SqlParser):
                 out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
                 break
 
+        # Build scope for all statements at once to avoid O(N) traversals
+        from sqlglot.optimizer.scope import build_scope
+
+        file_scopes: list[Any] = []
+        for stmt in statements:
+            try:
+                file_scopes.append(build_scope(stmt) if stmt is not None else None)
+            except Exception:
+                file_scopes.append(None)
+
+        # Initialize sources_map to accumulate temp table definitions
+        sources_map: dict[str, Any] = {}
+
         # Process each statement
         for stmt_index, stmt in enumerate(statements):
             if stmt is None:
                 continue
 
             try:
-                query_node = self._parse_statement(stmt, path, stmt_index)
+                scope = file_scopes[stmt_index] if stmt_index < len(file_scopes) else None
+                query_node = self._parse_statement(
+                    stmt, path, stmt_index, out, sources_map, scope=scope
+                )
                 out.statements.append(query_node)
+
+                # Register CTAS bodies in sources_map for downstream temp table references
+                if isinstance(stmt, exp.Create):
+                    # Unwrap Subquery wrapper: CREATE TABLE t AS (SELECT ...) has
+                    # stmt.expression = exp.Subquery, not exp.Select directly
+                    _expr = stmt.expression
+                    if isinstance(_expr, exp.Subquery):
+                        _expr = _expr.this
+                    if isinstance(_expr, exp.Select) and query_node.target:
+                        target_name = (query_node.target.name or "").lower()
+                        if target_name:
+                            sources_map[target_name] = _expr
 
                 # Track defined and referenced tables
                 if query_node.kind in ("CREATE_TABLE", "CREATE_VIEW"):
@@ -85,13 +113,24 @@ class AnsiParser(SqlParser):
 
         return out
 
-    def _parse_statement(self, stmt: Any, path: Path, stmt_index: int) -> QueryNode:
+    def _parse_statement(
+        self,
+        stmt: Any,
+        path: Path,
+        stmt_index: int,
+        out: ParsedFile,
+        sources_map: dict[str, Any] | None = None,
+        scope: Any = None,
+    ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
         Args:
             stmt: sqlglot AST node
             path: Path to the source file
             stmt_index: Statement index in the file
+            out: ParsedFile object to append errors to
+            sources_map: Map of temp table names to SELECT bodies for resolution
+            scope: Pre-built sqlglot Scope for the statement (optional optimization)
 
         Returns:
             QueryNode with extracted metadata
@@ -114,9 +153,13 @@ class AnsiParser(SqlParser):
 
         # Try to extract table references using scope analysis
         try:
-            from sqlglot.optimizer.scope import build_scope
+            # Use pre-built scope if provided, otherwise build it here (fallback)
+            root_scope = scope
+            if root_scope is None:
+                from sqlglot.optimizer.scope import build_scope
 
-            root_scope = build_scope(stmt)
+                root_scope = build_scope(stmt)
+
             if root_scope:
                 sources = self._real_tables(root_scope)
             else:
@@ -132,12 +175,13 @@ class AnsiParser(SqlParser):
 
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
         if target:
-            sources = [
-                src for src in sources if src.full_id != target.full_id
-            ]
+            sources = [src for src in sources if src.full_id != target.full_id]
 
-        # Extract column lineage (currently minimal implementation)
-        column_lineage = []
+        # Extract column lineage
+        schema = self._schema.as_dict() if self._schema else {}
+        column_lineage = self._extract_column_lineage(
+            stmt, path, out, schema, dst_table=target, sources=sources_map
+        )
 
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)
