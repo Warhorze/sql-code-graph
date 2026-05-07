@@ -397,6 +397,31 @@ for table in parsed.defined_tables:
     qnode = defined_by_query.get(table.full_id)
     if not qnode:
         continue
+
+    # Guard: detect duplicate DDL for the same table across files.
+    # Read the existing defined_in_file BEFORE writing columns so we can warn
+    # when two separate SQL files both declare CREATE TABLE <same_id>.
+    # The HAS_COLUMN union will still be written (confidence 0.8 already signals
+    # approximation); the warning makes the conflict observable without a schema
+    # change.
+    existing = db.run_read(
+        f"MATCH (t:SqlTable {{qualified: $qid}}) RETURN t.defined_in_file AS f",
+        {"qid": table.full_id},
+    )
+    if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
+        logger.warning(
+            "Table %s already defined in %s — %s will add columns to the union; "
+            "star expansion may include columns from the earlier DDL file",
+            table.full_id,
+            existing[0]["f"],
+            parsed.path_str,
+        )
+        out_errors = getattr(parsed, "errors", None)
+        if out_errors is not None:
+            out_errors.append(
+                f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
+            )
+
     for col_name in qnode.defined_columns:
         col_id = f"{table.full_id}.{col_name}"
         db.upsert_node(
@@ -437,6 +462,11 @@ for table in parsed.defined_tables:
   one match (proves it is wired into the upsert path).
 - `grep -rn "defined_columns" src/sqlcg/` returns matches in `base.py`,
   `ansi_parser.py`, and `indexer.py` (proves it is read, not just defined).
+- Integration test `tests/integration/test_star_resolution.py::test_duplicate_ddl_warns`:
+  index a two-file repo where both files contain `CREATE TABLE BA.src (col1 INT)`.
+  Assert `logger.warning` is called with a message containing both file paths and
+  `"will overwrite"`. Assert the graph ends up with exactly one `SqlTable` node
+  for `BA.src` and exactly one `HAS_COLUMN` edge for `col1` (no duplicate edges).
 
 ---
 
@@ -984,6 +1014,7 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 | Wildcard `EXCLUDE` columns produce wrong expansions (`SELECT * EXCLUDE (col1)` expands `col1` anyway) | Out-of-scope per Non-Goals. Add a `# TODO` ONLY in a comment under `_resolve_star_source` documenting the limitation, NOT in the happy path of the expansion query. Regression test will catch it the day a future sprint addresses it. |
 | Schema version bump breaks existing user databases without warning | `init_schema()` returns early for existing databases without checking the stored version — a v1 database will silently lack STAR_SOURCE REL TABLE and fail at T-04 upsert time. Developer MUST add a version guard in `index.py` (and `watch.py`) BEFORE the upsert loop: if `backend.get_schema_version() != SCHEMA_VERSION` raise a user-facing error instructing `db reset && db init && index`. The `db info` warning added in T-07 is necessary but insufficient — see Reviewer Notes BLOCKER at the top of this plan. |
 | `SELECT t1.*, t2.*` produces two `StarSource` markers — expansion may double-count if the target table only has one of them | Each `StarSource` produces an independent `COLUMN_LINEAGE` edge under MERGE; collisions on `(src.id, dst.id)` are absorbed. Add an explicit test in a follow-up sprint, not blocking. |
+| Multiple DDL files define the same table (`BA.src` appears in two `.sql` files) | **Addressed in T-01.** Before writing `HAS_COLUMN` edges for a DDL table, the indexer reads the existing `defined_in_file` value from the graph. If it is non-empty and belongs to a different file, a structured `logger.warning` is emitted AND a `duplicate_ddl:<table>:already_in:<prior_file>` entry is appended to `parsed.errors` (visible in `db info` parse quality). The `HAS_COLUMN` union is still written — preventing it would require storing file-provenance per column (a schema change out of scope here). Confidence `0.8` already signals approximation to consumers. Integration test `test_duplicate_ddl_warns` (T-01 acceptance) covers this path. |
 | `target_table = ''` (bare `SELECT *` with no INSERT/CREATE) | Expansion query's `WHERE q.target_table <> ''` filter skips them. Documented in design. |
 
 ---
@@ -1016,6 +1047,7 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 | Item | Grep command | Expected result |
 |---|---|---|
 | `defined_columns` is read by indexer | `grep -n "defined_columns" src/sqlcg/indexer/` | at least 1 match in `indexer.py` |
+| duplicate DDL guard logs and records error | `grep -n "duplicate_ddl" src/sqlcg/indexer/indexer.py` | at least 1 match (the warning + error append path in `_upsert_parsed_file`) |
 | `HAS_COLUMN` is written by indexer | `grep -n "RelType.HAS_COLUMN" src/sqlcg/indexer/` | at least 1 match |
 | `STAR_SOURCE` REL TABLE in schema.cypher | `grep -n "STAR_SOURCE" src/sqlcg/core/schema.cypher` | exactly 1 match |
 | `STAR_SOURCE` enum value | `grep -n "STAR_SOURCE = " src/sqlcg/core/schema.py` | exactly 1 match |

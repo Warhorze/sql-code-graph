@@ -403,3 +403,95 @@ def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
     assert "star_edges_expanded" in result, (
         f"index_repo summary must have 'star_edges_expanded'. Got keys: {list(result.keys())}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T-01 — Duplicate DDL detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
+def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
+    """Two files both defining CREATE TABLE BA.src must trigger a structured warning."""
+    import logging
+
+    (tmp_path / "ddl_v1.sql").write_text(
+        "CREATE TABLE BA.src (col1 INT);\n"
+    )
+    (tmp_path / "ddl_v2.sql").write_text(
+        "CREATE TABLE BA.src (col1 INT, col2 STRING);\n"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sqlcg.indexer.indexer"):
+        Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
+
+    # A WARNING containing both file references must have been emitted
+    dup_warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "BA.src" in r.message
+    ]
+    assert len(dup_warnings) >= 1, (
+        "Expected a logger.warning about duplicate DDL for BA.src. "
+        "Add the duplicate-DDL guard to _upsert_parsed_file as described in T-01."
+    )
+    # The warning must mention both files so the user can locate the conflict
+    warn_text = " ".join(dup_warnings)
+    assert "ddl_v1.sql" in warn_text or "ddl_v2.sql" in warn_text, (
+        "Warning must reference at least one of the conflicting file paths"
+    )
+
+
+@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
+def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
+    """duplicate_ddl:<table> must appear in the indexer's error channel after duplicate DDL."""
+    # We need to reach into parsed.errors; easiest is to patch the indexer
+    # and capture what _upsert_parsed_file receives.
+    from unittest.mock import patch
+
+    captured_errors: list[list[str]] = []
+    original_upsert = Indexer._upsert_parsed_file
+
+    def recording_upsert(self, parsed, db):
+        result = original_upsert(self, parsed, db)
+        captured_errors.append(list(parsed.errors))
+        return result
+
+    (tmp_path / "a.sql").write_text("CREATE TABLE BA.t (x INT);\n")
+    (tmp_path / "b.sql").write_text("CREATE TABLE BA.t (x INT, y INT);\n")
+
+    with patch.object(Indexer, "_upsert_parsed_file", recording_upsert):
+        Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
+
+    all_errors = [e for errors in captured_errors for e in errors]
+    dup_errors = [e for e in all_errors if e.startswith("duplicate_ddl:")]
+    assert len(dup_errors) >= 1, (
+        f"Expected at least one duplicate_ddl: error entry. All errors: {all_errors}"
+    )
+    assert "BA.t" in dup_errors[0], (
+        f"duplicate_ddl error must name the conflicting table. Got: {dup_errors[0]}"
+    )
+
+
+@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
+def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
+    """Despite the warning, both DDL files' columns must reach the graph (union semantics)."""
+    (tmp_path / "a.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
+    (tmp_path / "b.sql").write_text("CREATE TABLE BA.src (col2 STRING);\n")
+
+    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
+
+    # Exactly one SqlTable node for BA.src
+    tables = temp_db.run_read(
+        "MATCH (t:SqlTable {qualified: 'BA.src'}) RETURN count(t) AS n", {}
+    )
+    assert tables[0]["n"] == 1, "Duplicate DDL must not create duplicate SqlTable nodes"
+
+    # Both columns must be present (union of both DDL files)
+    cols = temp_db.run_read(
+        "MATCH (:SqlTable {qualified: 'BA.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
+        "RETURN c.col_name AS n ORDER BY n",
+        {},
+    )
+    col_names = [r["n"] for r in cols]
+    assert "col1" in col_names, "col1 from first DDL file must be in the graph"
+    assert "col2" in col_names, "col2 from second DDL file must be in the graph"
