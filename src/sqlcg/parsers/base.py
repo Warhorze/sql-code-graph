@@ -323,8 +323,109 @@ class SqlParser(ABC):
                     return TableRef(name=name)
                 return None
 
+    def _lineage_node_to_edges(
+        self,
+        root: Any,
+        dst_col_name: str,
+        dst_table: "TableRef | None",
+        path: Path,
+        out: ParsedFile,
+    ) -> list[LineageEdge]:
+        """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
+
+        sqlglot.lineage.Node has attributes:
+        - name: column name at this node
+        - source: upstream source expression (usually a Table node)
+        - downstream: list of child Node objects (columns this node feeds)
+
+        Each leaf in the tree represents a source column. The walk stops at
+        nodes whose source is a Table (a real table reference, not a CTE alias).
+
+        Args:
+            root: The LineageNode returned by sg_lineage()
+            dst_col_name: The output column name (destination)
+            path: Source file path (for error recording)
+            out: ParsedFile for error recording
+
+        Returns:
+            List of LineageEdge objects (may be empty if tree is malformed)
+        """
+
+        edges: list[LineageEdge] = []
+        visited: set[int] = set()  # guard against cycles
+
+        def _walk(node: Any) -> None:
+            if id(node) in visited:
+                return
+            visited.add(id(node))
+
+            # If this node has downstream nodes, recurse
+            if hasattr(node, "downstream") and node.downstream:
+                for child in node.downstream:
+                    _walk(child)
+            else:
+                # Leaf node — extract the source table and column
+                try:
+                    src_table_ref = self._lineage_node_to_table_ref(node)
+                    if src_table_ref is None:
+                        return
+                    src_col_name = (
+                        node.name.split(".")[-1]
+                        if hasattr(node, "name") and node.name
+                        else dst_col_name
+                    )
+                    dst_tbl = dst_table if dst_table else TableRef(name="<output>")
+                    edges.append(
+                        LineageEdge(
+                            src=ColumnRef(src_table_ref, src_col_name),
+                            dst=ColumnRef(dst_tbl, dst_col_name),
+                            transform="SELECT",
+                            confidence=0.9,
+                        )
+                    )
+                except Exception as exc:
+                    out.errors.append(f"col_lineage:tree_walk:{dst_col_name}:{exc}")
+                    self._log.warning(
+                        "LineageNode walk failed: file=%s col=%s error=%s",
+                        path,
+                        dst_col_name,
+                        exc,
+                    )
+
+        _walk(root)
+        return edges
+
+    def _lineage_node_to_table_ref(self, node: Any) -> "TableRef | None":
+        """Extract a TableRef from a sqlglot LineageNode's source attribute.
+
+        Args:
+            node: sqlglot.lineage.Node instance
+
+        Returns:
+            TableRef if source is a real Table, None for subqueries or CTEs
+        """
+        import sqlglot.expressions as exp
+
+        source = getattr(node, "source", None)
+        if source is None:
+            return None
+        if isinstance(source, exp.Table):
+            return TableRef(
+                catalog=source.catalog if hasattr(source, "catalog") else None,
+                db=source.db if hasattr(source, "db") else None,
+                name=source.name if hasattr(source, "name") else str(source),
+            )
+        # Subquery or CTE — return None (cannot resolve to a concrete table)
+        return None
+
     def _extract_column_lineage(
-        self, stmt: Any, path: Path, out: ParsedFile, schema: dict
+        self,
+        stmt: Any,
+        path: Path,
+        out: ParsedFile,
+        schema: dict | None,
+        dst_table: "TableRef | None" = None,
+        sources: dict[str, Any] | None = None,
     ) -> list[LineageEdge]:
         """Extract column-level lineage with structured error recording.
 
@@ -339,6 +440,8 @@ class SqlParser(ABC):
             path: Path to the source file
             out: ParsedFile object to append errors to
             schema: Schema dict from _schema.as_dict()
+            dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
+            sources: Map of table names to SELECT bodies for temp table resolution
 
         Returns:
             List of LineageEdge objects
@@ -357,67 +460,112 @@ class SqlParser(ABC):
             # Get the body of the query for lineage extraction
             if isinstance(stmt, exp.Select):
                 body = stmt
-                # Extract output columns
-                for col_expr in stmt.expressions:
-                    col_name = col_expr.alias if col_expr.alias else str(col_expr)
-                    # Schema validation: if schema is loaded and column isn't in it,
-                    # emit a reduced-confidence edge rather than a full-confidence one.
-                    if schema:
-                        table_cols: list[str] | None = None
-                        for _scope_name, cols in schema.items():
-                            if isinstance(cols, list):
-                                table_cols = cols
-                                break
-                            elif isinstance(cols, dict):
-                                for _db, tables in cols.items():
-                                    if isinstance(tables, dict):
-                                        for _tbl, tcols in tables.items():
-                                            if col_name in tcols:
-                                                table_cols = tcols
-                                                break
-                        if table_cols is not None and col_name not in table_cols:
-                            self._log.warning(
-                                "column %s not found in schema, emitting low-confidence edge",
-                                col_name,
-                            )
-                            edges.append(
-                                LineageEdge(
-                                    src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                    dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                    transform="UNKNOWN",
-                                    confidence=0.5,
-                                )
-                            )
-                            continue
+                col_expressions = stmt.expressions
+            elif isinstance(stmt, exp.Create) and isinstance(
+                stmt.expression, (exp.Select, exp.Subquery)
+            ):
+                # CREATE VIEW/TABLE AS SELECT — extract from the SELECT body
+                # Handle both bare SELECT and parenthesised (SELECT) forms
+                body = stmt.expression
+                if isinstance(body, exp.Subquery):
+                    body = body.this
+                col_expressions = body.expressions
+            elif isinstance(stmt, exp.Insert) and isinstance(stmt.expression, exp.Select):
+                # INSERT INTO ... SELECT — extract from the SELECT body
+                body = stmt.expression
+                col_expressions = body.expressions
+            else:
+                return edges
 
-                    try:
-                        root = sg_lineage(col_name, body, schema=schema, dialect=self.DIALECT)
-                        if root:
-                            # Successfully extracted lineage
-                            # TODO: convert root to LineageEdge(s)
-                            self._log.debug(
-                                "sg_lineage root obtained but conversion not yet "
-                                "implemented: file=%s col=%s",
-                                path,
-                                col_name,
-                            )
-                    except Exception as exc:
+            # Extract output columns
+            for col_expr in col_expressions:
+                # Skip star projections — sg_lineage requires a concrete column name.
+                if isinstance(col_expr, exp.Star) or (
+                    isinstance(col_expr, exp.Column) and isinstance(col_expr.this, exp.Star)
+                ):
+                    qualifier = col_expr.table if isinstance(col_expr, exp.Column) else None
+                    out.errors.append(f"col_lineage_skip:star:{qualifier or '<unqualified>'}")
+                    continue
+
+                if col_expr.alias:
+                    col_name = col_expr.alias
+                elif isinstance(col_expr, exp.Column):
+                    col_name = col_expr.name
+                    if not col_name or col_name == "*":
+                        out.errors.append("col_lineage_skip:star:<empty_name>")
+                        continue
+                else:
+                    # Expression with no resolvable name (e.g. ROUND(...), CAST(...))
+                    # — sg_lineage requires a plain column name, skip these
+                    continue
+                # Schema validation: if schema is loaded and column isn't in it,
+                # emit a reduced-confidence edge rather than a full-confidence one.
+                if schema:
+                    table_cols: list[str] | None = None
+                    for _scope_name, cols in schema.items():
+                        if isinstance(cols, list):
+                            table_cols = cols
+                            break
+                        elif isinstance(cols, dict):
+                            for _db, tables in cols.items():
+                                if isinstance(tables, dict):
+                                    for _tbl, tcols in tables.items():
+                                        if col_name in tcols:
+                                            table_cols = tcols
+                                            break
+                    if table_cols is not None and col_name not in table_cols:
                         self._log.warning(
-                            "column lineage extraction failed: file=%s col=%s error=%s",
-                            path,
+                            "column %s not found in schema, emitting low-confidence edge",
                             col_name,
-                            exc,
                         )
-                        out.errors.append(f"col_lineage:{col_name}:{exc}")
-                        # Emit a zero-confidence placeholder edge
                         edges.append(
                             LineageEdge(
                                 src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
                                 dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
                                 transform="UNKNOWN",
-                                confidence=0.0,
+                                confidence=0.5,
                             )
                         )
+                        continue
+
+                try:
+                    root = sg_lineage(
+                        col_name, body, schema=schema, sources=sources or {}, dialect=self.DIALECT
+                    )
+                    if root:
+                        # Successfully extracted lineage — walk tree and emit edges
+                        new_edges = self._lineage_node_to_edges(
+                            root,
+                            dst_col_name=col_name,
+                            dst_table=dst_table,
+                            path=path,
+                            out=out,
+                        )
+                        edges.extend(new_edges)
+                        if not new_edges:
+                            out.errors.append(f"col_lineage_skip:dynamic_source:{col_name}")
+                            self._log.debug(
+                                "sg_lineage returned root but no edges emitted: file=%s col=%s",
+                                path,
+                                col_name,
+                            )
+                except Exception as exc:
+                    self._log.warning(
+                        "column lineage extraction failed: file=%s col=%s error=%s",
+                        path,
+                        col_name,
+                        exc,
+                    )
+                    out.errors.append(f"col_lineage:{col_name}:{exc}")
+                    # Emit a zero-confidence placeholder edge
+                    edges.append(
+                        LineageEdge(
+                            src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                            dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                            transform="UNKNOWN",
+                            confidence=0.0,
+                        )
+                    )
 
         except Exception as exc:
             self._log.warning(

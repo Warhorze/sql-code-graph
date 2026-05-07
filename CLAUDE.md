@@ -45,6 +45,19 @@ tests/
 plan/               # Sprint plans, WORKFLOW.md, progress.txt
 ```
 
+## Commands
+
+This project uses `uv`. Never activate a virtualenv manually, never use `pip`, never use bare `python` or `pytest`.
+
+| Task | Command |
+|------|---------|
+| Run tests | `uv run pytest` |
+| Run a single test | `uv run pytest tests/unit/test_foo.py::TestClass::test_name -x` |
+| Run the CLI | `uv run sqlcg` |
+| Type check | `uv run pyright` |
+| Lint | `uv run ruff check src tests` |
+| Format | `uv run ruff format src tests` |
+
 ## Non-negotiable rules
 
 - No backward compatibility. Re-index is the migration path.

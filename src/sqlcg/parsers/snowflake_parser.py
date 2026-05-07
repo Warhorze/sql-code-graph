@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import sqlglot
+import sqlglot.expressions as exp
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
@@ -98,6 +99,9 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
+        # Initialize sources_map for temp table resolution
+        sources_map: dict[str, Any] = {}
+
         # Extract DML statements using regex
         dml_matches = _EMBEDDED_DML.finditer(sql)
         stmt_index = 0
@@ -117,13 +121,24 @@ class SnowflakeParser(AnsiParser):
                     try:
                         # Call parent's _parse_statement method
                         query_node: Any = AnsiParser._parse_statement(  # type: ignore
-                            self, stmt, path, stmt_index
+                            self, stmt, path, stmt_index, out, sources_map
                         )
                         # Mark as parse_failed since we're in scripting mode
                         query_node.parse_failed = True
                         query_node.confidence = 0.3
                         query_node.parsing_mode = "scripting"
                         out.statements.append(query_node)
+
+                        # Register CTAS bodies in sources_map for downstream temp table refs
+                        if isinstance(stmt, exp.Create):
+                            _expr = stmt.expression
+                            if isinstance(_expr, exp.Subquery):
+                                _expr = _expr.this
+                            if isinstance(_expr, exp.Select) and query_node.target:
+                                target_name = (query_node.target.name or "").lower()
+                                if target_name:
+                                    sources_map[target_name] = _expr
+
                         stmt_index += 1
 
                         # Track table references
