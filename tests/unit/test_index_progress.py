@@ -1,5 +1,6 @@
 """Unit tests for progress callback wiring in sqlcg index."""
 
+import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -92,8 +93,20 @@ class TestProgressCallbackCLIWiring:
             sql_file = tmp_path / f"file_{i:03d}.sql"
             sql_file.write_text("SELECT 1;")
 
-        # Run the index command
-        result = runner.invoke(app, ["index", str(tmp_path)])
+        # Use a fresh database for this test
+        test_db_path = tmp_path / ".sqlcg" / "graph.db"
+        test_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Run the index command with a fresh database
+        old_db_path = os.environ.get("SQLCG_DB_PATH")
+        try:
+            os.environ["SQLCG_DB_PATH"] = str(test_db_path)
+            result = runner.invoke(app, ["index", str(tmp_path)])
+        finally:
+            if old_db_path is not None:
+                os.environ["SQLCG_DB_PATH"] = old_db_path
+            else:
+                os.environ.pop("SQLCG_DB_PATH", None)
 
         # Verify exit code is success
         assert result.exit_code == 0, f"Command failed: {result.output}"

@@ -16,7 +16,6 @@ from sqlcg.core.kuzu_backend import KuzuBackend
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="RelType.STAR_SOURCE not yet added — T-02", strict=True)
 def test_rel_type_star_source_enum_value():
     """RelType must expose STAR_SOURCE = 'STAR_SOURCE' after T-02."""
     from sqlcg.core.schema import RelType
@@ -25,7 +24,6 @@ def test_rel_type_star_source_enum_value():
     assert RelType.STAR_SOURCE == "STAR_SOURCE"
 
 
-@pytest.mark.xfail(reason="SCHEMA_VERSION not yet bumped — T-02", strict=True)
 def test_schema_version_is_two():
     """SCHEMA_VERSION must be '2' after T-02."""
     from sqlcg.core.schema import SCHEMA_VERSION
@@ -36,7 +34,6 @@ def test_schema_version_is_two():
     )
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet in schema.cypher — T-02", strict=True)
 def test_star_source_rel_table_in_schema_cypher():
     """schema.cypher must contain the STAR_SOURCE REL TABLE definition."""
     from sqlcg.core.schema import SCHEMA_DDL
@@ -51,7 +48,6 @@ def test_star_source_rel_table_in_schema_cypher():
     assert "confidence" in SCHEMA_DDL
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet created by init_schema — T-02", strict=True)
 def test_star_source_table_created_in_fresh_db():
     """init_schema() on a fresh in-memory DB must create the STAR_SOURCE REL TABLE."""
     db = KuzuBackend(":memory:")
@@ -66,7 +62,6 @@ def test_star_source_table_created_in_fresh_db():
         db.close()
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet created by init_schema — T-02", strict=True)
 def test_star_source_rel_has_correct_properties():
     """The STAR_SOURCE REL TABLE must accept qualifier, target_table, confidence writes."""
     db = KuzuBackend(":memory:")

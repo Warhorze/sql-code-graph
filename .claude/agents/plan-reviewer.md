@@ -88,12 +88,45 @@ Before starting work, call `list_graph_stats_tool` once.
 9. **Commit** the corrected plan (fix pre-commit issues if they fail).
 10. Add handoff entry to `.claude/progress.txt` (READY or BLOCKED status).
 
+## Failing Acceptance Tests
+
+After correcting the plan, write one or more failing tests per ticket that directly
+exercise its acceptance criteria. These tests **must fail** before the developer
+starts — they are the definition of done, not after-the-fact verification.
+
+### Rules
+
+- Place tests in the appropriate existing layer (`tests/unit/`, `tests/integration/`,
+  `tests/e2e/`) based on what the ticket delivers.
+- Name test functions after the ticket: `test_T01_ddl_columns_persisted`,
+  `test_T03_star_source_emitted`, etc. This makes `pytest -k T-03` work.
+- Each test must assert **observable output** (non-empty list, specific field value,
+  edge count > 0). A test that only checks "no exception raised" is not acceptable.
+- Tests must import only what already exists today. If the ticket introduces a new
+  symbol (class, function, constant), mark the import with `# introduced by T-XX`
+  and use `pytest.importorskip` or a `try/except ImportError` + `pytest.skip` so
+  the suite doesn't error before the developer lands the code:
+  ```python
+  try:
+      from sqlcg.core.schema import RelType
+      _ = RelType.STAR_SOURCE          # introduced by T-02
+  except (ImportError, AttributeError):
+      pytest.skip("T-02 not yet implemented")
+  ```
+- Do **not** skip via `@pytest.mark.skip` — the test must actively fail (or skip due
+  to missing symbol) so CI shows red until the feature lands.
+- Run `uv run pytest <new test file> --no-header -q` to confirm the tests fail (or
+  skip) before committing. A test that accidentally passes is not a failing test.
+- Commit tests in a single commit separate from the plan corrections:
+  `test(T-01,T-02): add failing acceptance tests for star-resolution tickets`
+
 ## MUST NOT
 
 - Rewrite plans substantially (correct, don't redesign)
 - Add new features or scope to the plan
 - Change design decisions (escalate to architect-planner)
-- Start implementation or modify code files
+- Modify production source files (`src/`)
+- Write tests that pass before the developer implements the feature
 - Approve plans with unresolved blocking questions
 
 ## Stop Conditions
@@ -128,4 +161,5 @@ Mark plan as "NOT READY FOR IMPLEMENTATION" until resolved.
 - Reviewed and corrected `plan/<plan>.md`
 - Issues found and how they were resolved
 - Blocking questions section (if any blockers found)
-- A commit capturing the plan corrections
+- Failing acceptance tests committed separately from plan corrections
+- A confirmed-red (or skip) test run logged before handoff
