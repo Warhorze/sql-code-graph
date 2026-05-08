@@ -71,13 +71,11 @@ class TestSchemaResolver:
         assert len(results) == 1
         assert isinstance(results[0], dict)
 
-    def test_add_information_schema_raises_not_implemented(self):
-        """Test that add_information_schema raises NotImplementedError."""
+    def test_add_information_schema_raises_file_not_found(self, tmp_path):
+        """Test that add_information_schema raises FileNotFoundError when file missing."""
         resolver = SchemaResolver()
-        with pytest.raises(
-            NotImplementedError, match="--schema-from-info-schema is not yet implemented"
-        ):
-            resolver.add_information_schema("dummy.csv")
+        with pytest.raises(FileNotFoundError):
+            resolver.add_information_schema(tmp_path / "nonexistent.csv")
 
     def test_as_dict_returns_nested_structure(self):
         """Test as_dict returns properly nested structure."""

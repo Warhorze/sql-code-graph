@@ -11,6 +11,7 @@ from sqlcg.cli.commands import (
     git,
     index,
     install,
+    load_schema,
     mcp,
     report,
     uninstall,
@@ -39,6 +40,7 @@ app.add_typer(git.app, name="git")
 # Register single commands
 app.command("index")(index.index_cmd)
 app.command("watch")(watch.watch_cmd)
+app.command("load-schema")(load_schema.load_schema_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)
 app.command("install")(install.install_cmd)

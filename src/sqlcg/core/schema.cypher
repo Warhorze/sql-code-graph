@@ -62,7 +62,8 @@ CREATE REL TABLE QUERY_DEFINED_IN (
 
 -- Table -> Column: table has this column
 CREATE REL TABLE HAS_COLUMN (
-    FROM SqlTable TO SqlColumn
+    FROM SqlTable TO SqlColumn,
+    source STRING
 );
 
 -- Query -> Table: query selects from table
