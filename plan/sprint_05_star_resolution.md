@@ -972,13 +972,71 @@ export from the production environment is the authoritative source of truth.
 When loaded, it takes precedence over DDL columns — the star expansion Cypher
 then uses production-verified column sets, eliminating phantom columns.
 
+**Recommended UX (primary path)**:
+
+Point `index` at the ETL folder only — no DDL folder needed when the CSV is
+present. Fewer files to scan, faster indexing, full star resolution:
+
+```bash
+# One-time: drop the CSV into the repo
+cp ~/Downloads/columns.csv <repo>/.sqlcg/schema.csv
+
+# From then on — just this
+sqlcg index etl/
+```
+
+`index` auto-discovers `.sqlcg/schema.csv` in the repo root and loads it
+before the upsert loop (same as running `load-schema` manually first).
+Use `--schema <path>` to point at a different file; use `load-schema` for
+ad-hoc or CI-driven refreshes.
+
 **Phase ordering**:
 
 ```
+# Convention path (schema.csv in .sqlcg/):
+sqlcg index etl/                     # auto-loads .sqlcg/schema.csv → Phase 2+3+4
+
+# Explicit path:
 sqlcg load-schema columns.csv        # Phase 2 — writes gold HAS_COLUMN to graph
-sqlcg index <path>                   # Phase 3 — DDL HAS_COLUMN skipped for gold tables
+sqlcg index etl/                     # Phase 3 — DDL HAS_COLUMN skipped for gold tables
                                      # Phase 4 — star expansion uses gold columns
 ```
+
+**Generating the CSV from Snowflake**:
+
+Run in a Snowflake worksheet and export as CSV (File → Download):
+
+```sql
+SELECT
+    TABLE_CATALOG,
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    COLUMN_NAME,
+    ORDINAL_POSITION,
+    DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+```
+
+Place the file at `<repo>/.sqlcg/schema.csv`. `DATA_TYPE` is exported for
+forward-compatibility but not read by the current implementation.
+
+**Convention-based auto-discovery**:
+
+`src/sqlcg/core/config.py` (`KuzuConfig`) gains a `schema_csv` property:
+
+```python
+@property
+def schema_csv(self) -> Path | None:
+    candidate = self.repo_root / ".sqlcg" / "schema.csv"
+    return candidate if candidate.exists() else None
+```
+
+`src/sqlcg/cli/commands/index.py` — before the upsert loop, if
+`config.schema_csv` is not None (and `--schema` was not passed), call the
+same CSV-loading logic as `load_schema_cmd`. `--schema <path>` takes
+precedence over the convention path.
 
 **Schema change (coordinate with T-02)**:
 
@@ -1228,6 +1286,14 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
   1 match (T-01's DDL HAS_COLUMN write passes the source tag).
 - `grep -n "source STRING" src/sqlcg/core/schema.cypher` returns exactly 1 match
   (in HAS_COLUMN block).
+- Integration test `tests/integration/test_star_resolution.py::test_index_autodiscovers_schema_csv`:
+  write a `schema.csv` to `tmp_path / ".sqlcg" / "schema.csv"`, call
+  `index_repo(tmp_path / "etl", ...)` (ETL folder only, no DDL). Assert
+  `HAS_COLUMN` edges are present with `source='information_schema'` and that
+  star expansion runs correctly — proving the ETL-folder-only path works end-to-end.
+- E2E: `sqlcg index etl/` with `.sqlcg/schema.csv` present prints no
+  "schema.csv not found" warning and `db info` reports non-zero
+  `STAR_EXPANSION lineage edges`.
 
 ---
 
@@ -1376,6 +1442,8 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 | `gold_tables` skip-guard wired | `grep -n "gold_tables" src/sqlcg/indexer/indexer.py` | at least 2 matches (load + pass-through) |
 | DDL HAS_COLUMN writes pass source tag | `grep -n '"source": "ddl"' src/sqlcg/indexer/indexer.py` | at least 1 match |
 | information_schema source tag in load_schema | `grep -n "information_schema" src/sqlcg/cli/commands/load_schema.py` | at least 1 match |
+| `.sqlcg/schema.csv` auto-discovery wired | `grep -n "schema_csv" src/sqlcg/core/config.py src/sqlcg/cli/commands/index.py` | at least 1 match in each file |
+| Snowflake SQL in CLI help or docstring | `grep -n "INFORMATION_SCHEMA.COLUMNS" src/sqlcg/cli/commands/load_schema.py` | at least 1 match |
 
 ---
 
