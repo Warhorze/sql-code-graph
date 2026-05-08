@@ -95,6 +95,15 @@ class Indexer:
                 logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
                 pass2_results.append(parsed)
 
+        # Load gold tables (information_schema-backed tables) before upserting
+        # to suppress DDL columns for tables with production-verified schemas
+        gold_rows = db.run_read(
+            "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
+            "RETURN DISTINCT t.qualified AS q",
+            {},
+        )
+        gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
+
         # Upsert all results and count quality distribution
         tables_found = 0
         lineage_edges = 0
@@ -107,7 +116,7 @@ class Indexer:
         for parsed in pass2_results:
             try:
                 with db.transaction():
-                    counts = self._upsert_parsed_file(parsed, db)
+                    counts = self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
                 tables_found += counts["tables"]
                 lineage_edges += counts["edges"]
                 quality_key = parsed.parse_quality.value.lower()
@@ -140,7 +149,16 @@ class Indexer:
             parser = get_parser(dialect, schema_resolver)
             sql = Path(file_path).read_text(encoding="utf-8")
             parsed = parser.parse_file(Path(file_path), sql)
-            self._upsert_parsed_file(parsed, db)
+
+            # Load gold tables for this re-index call
+            gold_rows = db.run_read(
+                "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
+                "RETURN DISTINCT t.qualified AS q",
+                {},
+            )
+            gold_tables = frozenset(row["q"] for row in gold_rows)
+
+            self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
@@ -170,17 +188,24 @@ class Indexer:
                 out.errors.append(f"timeout:{timeout}s")
                 return out
 
-    def _upsert_parsed_file(self, parsed: ParsedFile, db: GraphBackend) -> dict:
+    def _upsert_parsed_file(
+        self,
+        parsed: ParsedFile,
+        db: GraphBackend,
+        gold_tables: frozenset[str] = frozenset(),
+    ) -> dict:
         """Map ParsedFile → graph nodes/edges.
 
         Args:
             parsed: ParsedFile to upsert
             db: GraphBackend instance
+            gold_tables: Set of table full_ids with information_schema-backed columns
+                        (skip DDL column writes for these tables)
 
         Returns:
-            Dict with keys: tables, edges
+            Dict with keys: tables, edges, columns_defined
         """
-        counts = {"tables": 0, "edges": 0}
+        counts = {"tables": 0, "edges": 0, "columns_defined": 0}
 
         # Upsert File node
         db.upsert_node(
@@ -215,6 +240,71 @@ class Indexer:
                 {},
             )
             counts["tables"] += 1
+
+        # Build a map of target.full_id -> QueryNode for column lookup
+        defined_by_query = {
+            s.target.full_id: s
+            for s in parsed.statements
+            if s.target
+            and s.kind in ("CREATE_TABLE", "CREATE_VIEW")
+            and s.defined_columns
+        }
+
+        # Upsert DDL columns and HAS_COLUMN edges
+        for table in parsed.defined_tables:
+            # Check if this table is covered by information_schema (gold table)
+            if table.full_id in gold_tables:
+                logger.debug(
+                    "Skipping DDL columns for %s — information_schema takes precedence",
+                    table.full_id,
+                )
+                continue
+
+            qnode = defined_by_query.get(table.full_id)
+            if not qnode:
+                continue
+
+            # Guard: detect duplicate DDL for the same table across files
+            existing = db.run_read(
+                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
+                {"qid": table.full_id},
+            )
+            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
+                logger.warning(
+                    "Table %s already defined in %s — %s will add columns to the union; "
+                    "star expansion may include columns from the earlier DDL file",
+                    table.full_id,
+                    existing[0]["f"],
+                    parsed.path_str,
+                )
+                if hasattr(parsed, "errors"):
+                    parsed.errors.append(
+                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
+                    )
+
+            for col_name in qnode.defined_columns:
+                col_id = f"{table.full_id}.{col_name}"
+                db.upsert_node(
+                    NodeLabel.COLUMN,
+                    col_id,
+                    {
+                        "id": col_id,
+                        "col_name": col_name,
+                        "table_qualified": table.full_id,
+                        "catalog": table.catalog or "",
+                        "db": table.db or "",
+                        "table_name": table.name,
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.TABLE,
+                    table.full_id,
+                    NodeLabel.COLUMN,
+                    col_id,
+                    RelType.HAS_COLUMN,
+                    {"source": "ddl"},
+                )
+                counts["columns_defined"] += 1
 
         # Upsert query nodes
         for i, stmt in enumerate(parsed.statements):
