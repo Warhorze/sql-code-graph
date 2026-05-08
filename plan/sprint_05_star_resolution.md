@@ -133,8 +133,10 @@ across files.
 - `src/sqlcg/core/schema.py` — add `RelType.STAR_SOURCE`, `RelType.HAS_COLUMN`
   is already present
 - `src/sqlcg/core/schema.cypher` — add `STAR_SOURCE` REL TABLE; SqlColumn already exists
-- `src/sqlcg/core/queries.py` — add the post-ingestion Cypher expansion query
-  and the `DELETE_STAR_SOURCE_FOR_FILE` cleanup query
+- `src/sqlcg/core/queries.cypher` — **new file**: all operational Cypher queries
+  (migrate existing 9 from `queries.py` + new sprint-05 queries)
+- `src/sqlcg/core/queries.py` — converted to a thin loader that reads and parses
+  `queries.cypher`; no Cypher strings remain in Python
 - `src/sqlcg/core/kuzu_backend.py` — extend `delete_nodes_for_file` to also
   drop `STAR_SOURCE` edges anchored to the file's queries
 - `src/sqlcg/parsers/base.py` — replace the "append `col_lineage_skip:star:*` to
@@ -785,8 +787,11 @@ internally and must remain a dict.
 **Depends on**: T-01 (DDL columns in graph), T-04 (`STAR_SOURCE` edges in graph)
 
 **Files**:
-- `src/sqlcg/core/queries.py` — append `EXPAND_STAR_SOURCES_QUERY` (full text
-  given in the Design section above).
+- `src/sqlcg/core/queries.cypher` — append `EXPAND_STAR_SOURCES` block (full
+  Cypher given in the Design section above). The named block header is
+  `-- EXPAND_STAR_SOURCES` (no `_QUERY` suffix — the loader adds that in Python).
+- `src/sqlcg/core/queries.py` — add `EXPAND_STAR_SOURCES_QUERY = _Q["EXPAND_STAR_SOURCES"]`
+  after the loader block (T-09 creates the loader; T-05 just adds this line).
 - `src/sqlcg/indexer/indexer.py` — add a new private method
   `_expand_star_sources(db: GraphBackend) -> int` that runs the query inside a
   transaction and returns the row count from the `RETURN count(r)` clause.
@@ -935,16 +940,20 @@ able to see how many star edges were expanded without writing Cypher by hand.
   rows: `STAR_SOURCE edges` and `STAR_EXPANSION lineage edges`. Use the
   existing rich/text rendering pattern in that file (read it first, reuse the
   same table style; do not introduce new rendering logic).
-- `src/sqlcg/core/queries.py` — add two count queries:
+- `src/sqlcg/core/queries.cypher` — append two named blocks:
 
+  ```cypher
+  -- COUNT_STAR_SOURCES
+  MATCH ()-[r:STAR_SOURCE]->() RETURN count(r) AS n
+
+  -- COUNT_STAR_EXPANSIONS
+  MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n
+  ```
+
+- `src/sqlcg/core/queries.py` — add the two loader lines:
   ```python
-  COUNT_STAR_SOURCES_QUERY = (
-      f"MATCH ()-[r:{RelType.STAR_SOURCE}]->() RETURN count(r) AS n"
-  )
-  COUNT_STAR_EXPANSIONS_QUERY = (
-      f"MATCH ()-[r:{RelType.COLUMN_LINEAGE} "
-      f"{{transform: 'STAR_EXPANSION'}}]->() RETURN count(r) AS n"
-  )
+  COUNT_STAR_SOURCES_QUERY = _Q["COUNT_STAR_SOURCES"]
+  COUNT_STAR_EXPANSIONS_QUERY = _Q["COUNT_STAR_EXPANSIONS"]
   ```
 
 **Acceptance**:
@@ -1310,9 +1319,130 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
 
 ---
 
+### T-09 — Migrate all Cypher out of `queries.py` into `queries.cypher`
+
+**Depends on**: nothing (pure refactor, no behaviour change)
+
+**Why**: Cypher is a query language and belongs in `.cypher` files where it gets
+syntax highlighting, can be tested directly against KuzuDB, and is not tangled
+with Python f-string escaping. `queries.py` currently embeds all operational
+Cypher as Python string constants (some using f-strings for `NodeLabel`/`RelType`
+interpolation). This ticket moves all Cypher to `src/sqlcg/core/queries.cypher`
+and converts `queries.py` to a thin named-block loader. Must land before T-05
+and T-07 so new queries go directly into the `.cypher` file.
+
+**File format** (`src/sqlcg/core/queries.cypher`):
+
+```cypher
+-- DELETE_COLUMNS_FOR_FILE
+MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn)
+DETACH DELETE c
+
+-- DELETE_QUERIES_FOR_FILE
+MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery)
+DETACH DELETE q
+
+-- DELETE_TABLES_FOR_FILE
+MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
+DETACH DELETE t
+
+-- DELETE_FILE
+MATCH (f:File {path: $path}) DETACH DELETE f
+
+-- STALE_VIEWS
+MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
+<-[:SELECTS_FROM]-(q:SqlQuery)-[:DECLARES]->(v:SqlTable {kind: 'VIEW'})
+RETURN DISTINCT v.qualified AS view_name
+
+-- INDEX_REPO_FILES
+MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path
+
+-- TRACE_COLUMN_LINEAGE
+MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+RETURN src.id AS id, src.col_name AS col_name
+
+-- FIND_TABLE_USAGES
+MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)
+-[:QUERY_DEFINED_IN]->(f:File)
+RETURN f.path AS file, q.sql AS sql, q.kind AS kind
+
+-- GET_DOWNSTREAM_DEPENDENCIES
+MATCH (src:SqlColumn {id: $id})-[:COLUMN_LINEAGE]->(dst:SqlColumn)
+RETURN dst.id AS id, dst.col_name AS col_name
+
+-- GET_UPSTREAM_DEPENDENCIES
+MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+RETURN src.id AS id, src.col_name AS col_name
+
+-- SEARCH_SQL_PATTERN
+MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
+WHERE contains(q.sql, $query)
+RETURN f.path AS file, q.sql AS sql, q.kind AS kind
+LIMIT $limit
+
+-- LIST_DIALECTS_AND_REPOS
+MATCH (r:Repo)<-[:BELONGS_TO]-(f:File)
+RETURN r.path AS path, r.name AS name, collect(DISTINCT f.dialect) AS dialects
+```
+
+**Loader** (`src/sqlcg/core/queries.py` — replaces current content):
+
+```python
+"""Cypher query loader. All query strings live in queries.cypher."""
+import re
+from pathlib import Path
+
+_CYPHER_FILE = Path(__file__).parent / "queries.cypher"
+
+def _load() -> dict[str, str]:
+    text = _CYPHER_FILE.read_text(encoding="utf-8")
+    blocks = re.split(r"^--\s+(\w+)\s*$", text, flags=re.MULTILINE)
+    return {blocks[i]: blocks[i + 1].strip() for i in range(1, len(blocks), 2)}
+
+_Q = _load()
+
+DELETE_COLUMNS_FOR_FILE = _Q["DELETE_COLUMNS_FOR_FILE"]
+DELETE_QUERIES_FOR_FILE = _Q["DELETE_QUERIES_FOR_FILE"]
+DELETE_TABLES_FOR_FILE = _Q["DELETE_TABLES_FOR_FILE"]
+DELETE_FILE = _Q["DELETE_FILE"]
+STALE_VIEWS_QUERY = _Q["STALE_VIEWS"]
+INDEX_REPO_FILES_QUERY = _Q["INDEX_REPO_FILES"]
+TRACE_COLUMN_LINEAGE_QUERY = _Q["TRACE_COLUMN_LINEAGE"]
+FIND_TABLE_USAGES_QUERY = _Q["FIND_TABLE_USAGES"]
+GET_DOWNSTREAM_DEPENDENCIES_QUERY = _Q["GET_DOWNSTREAM_DEPENDENCIES"]
+GET_UPSTREAM_DEPENDENCIES_QUERY = _Q["GET_UPSTREAM_DEPENDENCIES"]
+SEARCH_SQL_PATTERN_QUERY = _Q["SEARCH_SQL_PATTERN"]
+LIST_DIALECTS_AND_REPOS_QUERY = _Q["LIST_DIALECTS_AND_REPOS"]
+```
+
+Note: f-string interpolation of `NodeLabel`/`RelType` enum values is removed —
+the `.cypher` file uses the literal table/rel names (`File`, `DEFINED_IN`, etc.)
+which are stable and already match `schema.cypher`.
+
+**Files**:
+- `src/sqlcg/core/queries.cypher` — new file, all 12 existing queries
+- `src/sqlcg/core/queries.py` — replaced with loader (no Cypher strings remain)
+
+**Acceptance**:
+- `grep -rn "MATCH\|MERGE\|RETURN\|DELETE" src/sqlcg/core/queries.py` returns
+  0 matches (no Cypher in Python).
+- `grep -c "^--" src/sqlcg/core/queries.cypher` returns `12` (12 named blocks).
+- Unit test `tests/unit/test_queries_loader.py::test_all_constants_load`:
+  import every constant from `queries.py` and assert each is a non-empty string
+  containing at least one of `MATCH`, `MERGE`, or `RETURN`.
+- Unit test `tests/unit/test_queries_loader.py::test_missing_block_raises`:
+  call `_Q["NONEXISTENT"]` and assert `KeyError` is raised (proves the loader
+  does not silently return `None`).
+- `uv run pytest` green — no existing tests broken by the rename (all callers
+  import the same constant names from `queries.py`; only the implementation
+  changes).
+
+---
+
 ## Test Strategy
 
 ### Unit tests (no graph backend)
+- `tests/unit/test_queries_loader.py` — loader correctness (T-09).
 - `tests/unit/test_data_models.py` — `StarSource` frozen dataclass invariants (T-02).
 - `tests/unit/test_base_parser.py`:
   - `test_create_table_extracts_column_names` (T-01)
@@ -1388,6 +1518,8 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
       `DETACH DELETE`) and re-runs expansion. Tests confirm cleanup.
 - [ ] T-07: `db info` surfaces both `STAR_SOURCE edges` and
       `STAR_EXPANSION lineage edges` counts.
+- [ ] T-09: All Cypher moved to `queries.cypher`; `queries.py` is a pure loader;
+      `grep -rn "MATCH\|MERGE" src/sqlcg/core/queries.py` returns 0 matches.
 - [ ] T-08: `sqlcg load-schema <csv>` writes `HAS_COLUMN` edges tagged
       `source='information_schema'`. DDL-inferred columns are suppressed for
       tables covered by the CSV. `SchemaResolver.add_information_schema()` stub
@@ -1450,6 +1582,8 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 | No TODO in expansion path | `grep -n "TODO" src/sqlcg/indexer/indexer.py src/sqlcg/core/queries.py` | no new TODOs introduced by this sprint |
 | `SCHEMA_VERSION` bumped | `grep -n 'SCHEMA_VERSION = ' src/sqlcg/core/schema.py` | result is `"2"` |
 | `source STRING` in HAS_COLUMN schema | `grep -n "source STRING" src/sqlcg/core/schema.cypher` | exactly 1 match (in HAS_COLUMN block) |
+| No Cypher strings in queries.py | `grep -rn "MATCH\|MERGE\|RETURN\|DELETE" src/sqlcg/core/queries.py` | 0 matches |
+| queries.cypher has 12 existing + new blocks | `grep -c "^--" src/sqlcg/core/queries.cypher` | at least 15 (12 existing + EXPAND_STAR_SOURCES + COUNT_STAR_SOURCES + COUNT_STAR_EXPANSIONS) |
 | `add_information_schema` stub removed | `grep -n "NotImplementedError" src/sqlcg/lineage/schema_resolver.py` | 0 matches |
 | `load-schema` command registered | `grep -n "load.schema\|load_schema" src/sqlcg/cli/main.py` | at least 1 match |
 | `gold_tables` skip-guard wired | `grep -n "gold_tables" src/sqlcg/indexer/indexer.py` | at least 2 matches (load + pass-through) |
@@ -1462,10 +1596,13 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 
 ## Ticket Order Summary
 
-1. **T-08** — Load information schema CSV (`load-schema` command + `SchemaResolver` stub) — run
-   first so `gold_tables` is populated before DDL HAS_COLUMN writes in T-01. Can be
-   implemented in parallel with T-02/T-03 since it is purely additive.
-2. **T-01** — Persist DDL columns (`HAS_COLUMN` writes, suppressed for gold tables) — unblocks expansion target side.
+1. **T-09** — Migrate all Cypher to `queries.cypher`; `queries.py` becomes a loader — pure
+   refactor, no behaviour change. Must land first so T-05 and T-07 write directly to the
+   `.cypher` file.
+2. **T-08** — Load information schema CSV (`load-schema` command + `SchemaResolver` stub) — run
+   before T-01 so `gold_tables` is populated before DDL HAS_COLUMN writes. Can be
+   implemented in parallel with T-09 since both are additive.
+3. **T-01** — Persist DDL columns (`HAS_COLUMN` writes, suppressed for gold tables) — unblocks expansion target side.
 3. **T-02** — Add `STAR_SOURCE` schema + `StarSource` dataclass + `source STRING` on HAS_COLUMN — one schema v2 bump.
 4. **T-03** — Parser emits `StarSource` markers — feeds the indexer.
 5. **T-04** — Indexer upserts `STAR_SOURCE` edges — graph now has all inputs.
@@ -1474,7 +1611,7 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 8. **T-07** — `db info` surfaces star metrics — closes the silent-failure loop.
 
 **PR grouping** (revised for T-08):
-- **PR 1**: T-08 (load-schema command + SchemaResolver stub) — independent, ships first.
+- **PR 1**: T-09 + T-08 (Cypher migration + load-schema command) — both independent, no graph schema change.
 - **PR 2**: T-01 + T-02 (DDL columns with gold-table skip + schema v2 bump with source STRING) — schema change forces re-index once.
 - **PR 3**: T-03 + T-04 + T-05 + T-06 (parser markers + indexer wiring + expansion + reindex) — headline functionality lands together.
 - **PR 4**: T-07 (CLI surfacing) — small polish, ships last.
