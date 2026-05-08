@@ -3,7 +3,7 @@
 from enum import StrEnum
 from importlib.resources import files
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 
 class NodeLabel(StrEnum):
@@ -26,6 +26,7 @@ class RelType(StrEnum):
     UPDATES = "UPDATES"
     COLUMN_LINEAGE = "COLUMN_LINEAGE"
     DECLARES = "DECLARES"
+    STAR_SOURCE = "STAR_SOURCE"
 
 
 # Backward-compatible aliases

@@ -10,8 +10,8 @@ they are executed.
 
 ## Scope
 
-- **IN SCOPE**: Plan correctness, completeness, ordering, risk assessment
-- **OUT OF SCOPE**: Implementation, code changes, creating new plans
+- **IN SCOPE**: Plan correctness, completeness, ordering, risk assessment, writing failing acceptance tests
+- **OUT OF SCOPE**: Feature implementation, production code changes, creating new plans
 
 ## When Invoked
 
@@ -24,7 +24,8 @@ implementation. The user specifies which plan to review.
 |----------|------------|-------|
 | `plan/<plan>.md` | Read + Write | Correct issues, add clarifications |
 | `ARCHITECTURE_REVIEW.md` | Read only | Constraints, priorities, decisions |
-| `app/**/*.py` | Read only | Verify plan assumptions match code |
+| `src/**/*.py` | Read only | Verify plan assumptions match code |
+| `tests/**/*.py` | Read + Write | Write failing acceptance tests (see below) |
 | Git history | Read only | Recent plan changes via `git diff` |
 
 ## Inputs
@@ -84,8 +85,9 @@ Before starting work, call `list_graph_stats_tool` once.
    - **Notes**: Optional improvements
 7. **For blockers and warnings**: Update the plan with fixes and clarifications.
 8. **For fundamental issues**: Add to `### Blocking Questions` section.
-9. **Commit** the corrected plan (fix pre-commit issues if they fail).
-10. Add handoff entry to `plan/progress.txt` (READY or BLOCKED status).
+9. **Write failing acceptance tests** for each ticket's acceptance criteria (see below).
+10. **Commit** the corrected plan and failing tests together (fix pre-commit issues if they fail).
+11. Add handoff entry to `plan/progress.txt` (READY or BLOCKED status).
 
 ## MUST NOT
 
