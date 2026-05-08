@@ -1082,12 +1082,14 @@ All existing `upsert_edge(..., RelType.HAS_COLUMN, {})` calls in T-01 must pass
 ```python
 def _make_qualified(catalog: str, schema: str, table: str, include_catalog: bool) -> str:
     parts = [p for p in ([catalog] if include_catalog else []) + [schema, table] if p]
-    return ".".join(parts)
+    return ".".join(p.lower() for p in parts)
 ```
 
-Default (`--include-catalog` absent): `{TABLE_SCHEMA}.{TABLE_NAME}` — matches
-the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
-`--include-catalog` when the repo uses 3-part references (`MYDB.BA.src`).
+All parts are lowercased before joining. This matches the graph's convention
+(`BA.src`, not `BA.SRC`) and ensures the `gold_tables` frozenset lookup is
+case-insensitive. Default (`--include-catalog` absent): `{schema}.{table}` —
+matches the 2-part `BA.src` pattern. Pass `--include-catalog` when the repo
+uses 3-part references (`mydb.ba.src`).
 
 **Files**:
 
@@ -1182,10 +1184,10 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
               console.print(f"[red]CSV missing columns: {missing}[/red]")
               raise typer.Exit(1)
           for row in reader:
-              parts = (
-                  [row["TABLE_CATALOG"]] if include_catalog and row["TABLE_CATALOG"] else []
-              ) + [row["TABLE_SCHEMA"], row["TABLE_NAME"]]
-              qualified = ".".join(p for p in parts if p)
+              qualified = _make_qualified(
+                  row["TABLE_CATALOG"], row["TABLE_SCHEMA"], row["TABLE_NAME"],
+                  include_catalog=include_catalog,
+              )
               tables.setdefault(qualified, []).append(
                   (int(row["ORDINAL_POSITION"]), row["COLUMN_NAME"])
               )
