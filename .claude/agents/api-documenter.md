@@ -47,7 +47,7 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: api-documenter).
+2. Update `.claude/progress.txt` Current State (agent: api-documenter).
 3. Identify routes that need documentation improvements.
 4. For each route, verify:
    - `summary` and `description` are present and accurate
@@ -57,7 +57,7 @@ Before starting work, call `list_graph_stats_tool` once.
 5. Update route decorators and Pydantic models.
 6. Validate OpenAPI output matches runtime behavior.
 7. Commit changes with clear message.
-8. Add handoff entry to `plan/progress.txt` with summary of changes.
+8. Add handoff entry to `.claude/progress.txt` with summary of changes.
 
 ## Documentation Standards
 

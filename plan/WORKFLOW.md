@@ -113,7 +113,7 @@ sprint-planner     owns compliance for  plan/sprint_*.md
 
 PROGRESS TRACKING:
 ──────────────────
-All agents update plan/progress.txt when starting or completing work.
+All agents update .claude/progress.txt when starting or completing work.
 This file tracks handoffs between phases and records blocking questions.
 ```
 
@@ -121,7 +121,7 @@ This file tracks handoffs between phases and records blocking questions.
 
 ## Progress Tracking
 
-The file `plan/progress.txt` tracks workflow state and handoffs between agents:
+The file `.claude/progress.txt` tracks workflow state and handoffs between agents:
 
 - **Current State**: Which agent is active and on what feature
 - **Handoff Log**: Chronological record of agent completions and blockers
@@ -279,7 +279,7 @@ When escalating:
 
 1. Stop without committing broken or half-finished code
 2. Add `## Escalation — <reason>` to the plan file
-3. Update `plan/progress.txt` with `status: escalated-to-planner`
+3. Update `.claude/progress.txt` with `status: escalated-to-planner`
 4. Hand off to the planner to revise before resuming
 
 **Rule**: escalate early. Do not work around a broken plan.

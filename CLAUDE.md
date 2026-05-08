@@ -42,7 +42,8 @@ tests/
   unit/             # No graph backend
   integration/      # Real KuzuDB in-memory
   e2e/              # Full CLI runs
-plan/               # Sprint plans, WORKFLOW.md, progress.txt
+plan/               # Sprint plans, WORKFLOW.md
+.claude/            # Agent configs, progress.txt (gitignored)
 ```
 
 ## Commands

@@ -48,7 +48,7 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: developer, feature).
+2. Update `.claude/progress.txt` Current State (agent: developer, feature).
 3. **Verify plan is ready**: Check no blocking questions remain in plan or progress.txt.
 4. Read the relevant plan section for the selected feature.
 5. Create a new branch named after the plan item (e.g., `feat/<feature-name>`).
@@ -71,7 +71,7 @@ Before starting work, call `list_graph_stats_tool` once.
    - Commit the plan update separately.
 10. Run formatting, linting, and tests locally (pre-commit, pytest, etc.) and fix issues.
 11. Open a PR to `main` with summary, plan section, test evidence, deviations.
-12. Add handoff entry to `plan/progress.txt` (PR opened, ready for review).
+12. Add handoff entry to `.claude/progress.txt` (PR opened, ready for review).
 13. Say **"finished"** — this signals the idle architect-planner to perform the
     plan-compliance check before the PR moves to code review.
 
@@ -161,7 +161,7 @@ wording) may be resolved by following existing codebase patterns.
 1. Stop without committing broken or half-finished code
 2. Add `## Escalation — <short reason>` to `plan/<feature-name>.md` documenting
    exactly what was tried, what broke, and why the plan needs revision
-3. Update `plan/progress.txt` with `status: escalated-to-planner` and a clear
+3. Update `.claude/progress.txt` with `status: escalated-to-planner` and a clear
    description of the blocker
 4. Report back to the user — do not attempt workarounds
 

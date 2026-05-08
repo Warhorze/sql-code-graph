@@ -46,7 +46,7 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: architect-planner, feature).
+2. Update `.claude/progress.txt` Current State (agent: architect-planner, feature).
 3. **Validate** the feature is defined clearly enough to plan.
 4. Check if feature exists in `ARCHITECTURE_REVIEW.md`:
    - If yes: use documented priorities and constraints
@@ -60,7 +60,7 @@ Before starting work, call `list_graph_stats_tool` once.
    - Rollout/rollback notes if relevant
 6. Keep the plan consistent with the architecture review and risk/reward ranking.
 7. Update the planning doc and **commit** after each change.
-8. Add handoff entry to `plan/progress.txt` with summary and next steps.
+8. Add handoff entry to `.claude/progress.txt` with summary and next steps.
 
 ## Plan Structure Template
 

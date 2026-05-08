@@ -47,7 +47,7 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: architect-reviewer).
+2. Update `.claude/progress.txt` Current State (agent: architect-reviewer).
 3. Read the current `ARCHITECTURE_REVIEW.md` to understand existing state.
 4. Review the codebase focusing on recent changes (`git diff main`).
 5. Process **user input**:
@@ -62,7 +62,7 @@ Before starting work, call `list_graph_stats_tool` once.
    - Re-rank priorities when context changes
 9. **Always commit** after updating the plan:
    - Pre-commit hooks run automatically (fix markdown issues if they fail).
-10. Add handoff entry to `plan/progress.txt` with summary and next steps.
+10. Add handoff entry to `.claude/progress.txt` with summary and next steps.
 
 ## MUST NOT
 

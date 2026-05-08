@@ -74,7 +74,7 @@ Before starting work, call `list_graph_stats_tool` once.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: plan-reviewer, plan name).
+2. Update `.claude/progress.txt` Current State (agent: plan-reviewer, plan name).
 3. Read the plan and architecture review.
 4. Use `git diff` to see what changed in the plan.
 5. Evaluate against the checklist above.
@@ -85,7 +85,7 @@ Before starting work, call `list_graph_stats_tool` once.
 7. **For blockers and warnings**: Update the plan with fixes and clarifications.
 8. **For fundamental issues**: Add to `### Blocking Questions` section.
 9. **Commit** the corrected plan (fix pre-commit issues if they fail).
-10. Add handoff entry to `plan/progress.txt` (READY or BLOCKED status).
+10. Add handoff entry to `.claude/progress.txt` (READY or BLOCKED status).
 
 ## MUST NOT
 

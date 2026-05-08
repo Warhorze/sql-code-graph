@@ -48,14 +48,14 @@ and tell the user to run the planner compliance check first.
 ## Flow
 
 1. Run the code graph health check (see above).
-2. Update `plan/progress.txt` Current State (agent: code-reviewer, PR #).
+2. Update `.claude/progress.txt` Current State (agent: code-reviewer, PR #).
 3. Check for open PRs and select the PR under review (prefer newest, unless specified).
 4. Fetch the PR branch locally and compare against `main`.
 5. Use `git diff main...HEAD` (and commit history) to understand the change set.
 6. Evaluate against the review checklist.
 7. Provide structured feedback (see Feedback Format).
 8. Make approval decision (see Approval Decision).
-9. Add handoff entry to `plan/progress.txt` (APPROVED, REQUEST CHANGES, or REJECTED).
+9. Add handoff entry to `.claude/progress.txt` (APPROVED, REQUEST CHANGES, or REJECTED).
 
 ## Review Checklist
 
