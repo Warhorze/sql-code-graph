@@ -302,7 +302,6 @@ def test_reindex_re_expands_star_sources(temp_db, tmp_path):
     assert rows[0]["n"] == 2, "After reindex, star expansion edges must be re-created (not lost)"
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
     """reindex_file must not duplicate STAR_SOURCE edges (MERGE idempotency via DETACH DELETE)."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
