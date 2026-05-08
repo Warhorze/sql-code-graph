@@ -1558,7 +1558,7 @@ is now a mandatory deliverable for the developer.
 
 ### 10.7 Policy Note — No Backward Compatibility Constraint
 
-The user confirmed: "WE DON'T NEED TO KEEP A VERSION, WE WILL BREAK THINGS CAUSE
+"WE DON'T NEED TO KEEP A VERSION, WE WILL BREAK THINGS CAUSE
 THE PACKAGE IS LIVE."
 
 This policy applies to: MetricsStore SQLite schema, KùzuDB graph schema, MCP tool
@@ -1865,17 +1865,15 @@ Additions and escalations relative to section 10.4:
 | 6 | 11.7 — dynamic identifiers yield no edges (E8) | Emit `col_lineage_skip:dynamic_source` marker; surface in MCP as `resolution=unresolvable` | XS | LOW |
 | 7 | ~~11.5 — uninstall ignores default DB path~~ | ~~Fall back to `KuzuConfig().db_path` in `uninstall.py`~~ **DONE** | XS | ~~MEDIUM~~ CLOSED |
 
+### minor ui changes
+add version flag to cli `--version` 
 
-
-add version flag to cli   ╭─ Error ──────────────────────────────────────────────────────────────────────╮
-│ No such option: --version                                                    │
-╰────────────────────────────────────
---reset is ambiguous, we should give use something like `--drop` some that explains the user how serious there action is 
+the database command `--reset` is ambiguous, we should give use something like `--drop` some that explains the user how serious there action is 
 
 this command should default to writing to a log file to much output is generated
-
-sqlcg index /home/ignwrad/Projects/dwh --dialect ansi --buffer-pool-size 256 2>&1
-
+```bash
+sqlcg index /home/ignwrad/Projects/dwh --dialect <dialect> --buffer-pool-size 256 2>&1
+```
 ---
 
 ### 11.7 [LOW] Dynamic source identifiers produce E8 — `sg_lineage` root has no leaf sources
