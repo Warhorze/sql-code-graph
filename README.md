@@ -159,6 +159,9 @@ it before indexing — no separate command needed. Point it at your ETL folder r
 than the full repo: fewer files to scan, faster indexing, and the schema CSV covers
 what DDL parsing was doing anyway.
 
+<!-- TODO: add benchmark numbers after testing — expected savings from ETL-folder-only
+     indexing vs full-repo scan (file count ratio, wall-clock time, star edges resolved) -->
+
 After indexing, `sqlcg db info` will show non-zero `STAR_EXPANSION lineage edges`,
 and `trace_column_lineage` will return results for queries that previously returned
 empty.
