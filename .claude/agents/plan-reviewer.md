@@ -10,8 +10,8 @@ they are executed.
 
 ## Scope
 
-- **IN SCOPE**: Plan correctness, completeness, ordering, risk assessment
-- **OUT OF SCOPE**: Implementation, code changes, creating new plans
+- **IN SCOPE**: Plan correctness, completeness, ordering, risk assessment, writing failing acceptance tests
+- **OUT OF SCOPE**: Feature implementation, production code changes, creating new plans
 
 ## When Invoked
 
@@ -24,7 +24,8 @@ implementation. The user specifies which plan to review.
 |----------|------------|-------|
 | `plan/<plan>.md` | Read + Write | Correct issues, add clarifications |
 | `ARCHITECTURE_REVIEW.md` | Read only | Constraints, priorities, decisions |
-| `app/**/*.py` | Read only | Verify plan assumptions match code |
+| `src/**/*.py` | Read only | Verify plan assumptions match code |
+| `tests/**/*.py` | Read + Write | Write failing acceptance tests (see below) |
 | Git history | Read only | Recent plan changes via `git diff` |
 
 ## Inputs

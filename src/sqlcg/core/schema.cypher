@@ -62,7 +62,8 @@ CREATE REL TABLE QUERY_DEFINED_IN (
 
 -- Table -> Column: table has this column
 CREATE REL TABLE HAS_COLUMN (
-    FROM SqlTable TO SqlColumn
+    FROM SqlTable TO SqlColumn,
+    source STRING
 );
 
 -- Query -> Table: query selects from table
@@ -96,6 +97,14 @@ CREATE REL TABLE COLUMN_LINEAGE (
 -- Query -> Table: query declares/creates this table
 CREATE REL TABLE DECLARES (
     FROM SqlQuery TO SqlTable
+);
+
+-- Query -> Table: query does SELECT * (or alias.*) from this table
+CREATE REL TABLE STAR_SOURCE (
+    FROM SqlQuery TO SqlTable,
+    qualifier STRING,
+    target_table STRING,
+    confidence FLOAT
 );
 
 -- Schema version tracking

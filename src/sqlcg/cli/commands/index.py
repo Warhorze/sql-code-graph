@@ -62,8 +62,16 @@ def index_cmd(  # noqa: B008
     with get_backend() as backend:
         backend.init_schema()
 
-        # Create Repo node for this repository
-        from sqlcg.core.schema import NodeLabel
+        # Check schema version — must match current build
+        from sqlcg.core.schema import SCHEMA_VERSION, NodeLabel
+
+        stored = backend.get_schema_version()
+        if stored != SCHEMA_VERSION:
+            console.print(
+                f"[red]Database schema is v{stored}; this build requires v{SCHEMA_VERSION}. "
+                "Run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-index.[/red]"
+            )
+            raise typer.Exit(1)
 
         abs_path = str(path.resolve())
         backend.upsert_node(
@@ -79,8 +87,8 @@ def index_cmd(  # noqa: B008
         indexer = Indexer()
 
         # Determine total files for progress callback
-        from sqlcg.utils.ignore import load_ignore_spec
         from sqlcg.indexer.walker import walk_sql_files
+        from sqlcg.utils.ignore import load_ignore_spec
 
         spec = load_ignore_spec(path)
         files = list(walk_sql_files(path, spec, use_git=True))
@@ -93,8 +101,10 @@ def index_cmd(  # noqa: B008
             The callback is only invoked every 100 files, so with fewer than 100 files
             in the repository, no progress line is printed.
             """
+
             def callback(n: int, total_n: int) -> None:
                 console.print(f"\r  Indexed {n}/{total_n} files...", end="", highlight=False)
+
             return callback
 
         summary = indexer.index_repo(

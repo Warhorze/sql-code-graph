@@ -122,6 +122,19 @@ class LineageEdge:
         )
 
 
+@dataclass(frozen=True)
+class StarSource:
+    """A SELECT * marker for graph-backend resolution.
+
+    Attributes:
+        source: The TableRef the star projects (e.g. 'BA.source_table' or alias)
+        qualifier: The alias used in the SQL (None for bare 'SELECT *')
+    """
+
+    source: TableRef
+    qualifier: str | None = None
+
+
 @dataclass
 class QueryNode:
     """A parsed SQL query node (mutable by design for pass-2 patching).
@@ -158,6 +171,8 @@ class QueryNode:
     parse_failed: bool = False
     confidence: float = 1.0
     parsing_mode: str = "sqlglot"
+    star_sources: list[StarSource] = field(default_factory=list)
+    defined_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
