@@ -58,7 +58,32 @@ This project uses `uv`. Never activate a virtualenv manually, never use `pip`, n
 | Lint | `uv run ruff check src tests` |
 | Format | `uv run ruff format src tests` |
 
-## Non-negotiable rules
+## Target scale — serve both ends of the spectrum
+
+This project must work correctly and comfortably at two very different scales:
+
+| | Small repo | Large repo |
+|---|---|---|
+| **Size** | ~20 ETL files | 1,000–1,600 SQL files |
+| **Schema source** | DDL files are enough | Production information schema CSV required |
+| **Indexing time** | Seconds — slow parsing is invisible | Must be fast; file-at-a-time is too slow |
+| **Memory** | No OOM concern | Must not OOM; batch writes are necessary |
+| **Setup friction** | Zero — `sqlcg index ./sql` just works | Acceptable to require `.sqlcg/schema.csv` |
+
+**Design rule**: never solve a large-repo problem in a way that degrades the small-repo
+experience. A user with 20 ETLs should not need to export an information schema CSV,
+configure batching, or understand graph internals to get useful lineage.
+
+**OOM history**: a prior approach loaded all parsed files into memory before writing to
+KuzuDB, causing OOM on large repos. The fix (write one file at a time + commit) is
+correct for correctness but unacceptably slow at scale. Any future memory solution
+must preserve throughput — batched writes (e.g. N files per transaction) are preferred
+over single-file commits. Document the chosen batch size and its memory/speed rationale
+in the relevant sprint plan.
+
+**Perf budget**: indexing 1,600 files with schema CSV provided should complete in
+under 5 minutes on a laptop. Measure and record actual timings in sprint postmortems.
+<!-- TODO: replace with real benchmark numbers after large-repo testing -->
 
 - No backward compatibility. Re-index is the migration path.
 - No TODO in the happy path of any feature.
