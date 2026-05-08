@@ -22,7 +22,6 @@ from sqlcg.parsers.base import TableRef
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="StarSource not yet implemented — T-02", strict=True)
 def test_star_source_dataclass_fields():
     """StarSource must expose .source (TableRef) and .qualifier (str | None)."""
     from sqlcg.parsers.base import StarSource
@@ -32,7 +31,6 @@ def test_star_source_dataclass_fields():
     assert ss.qualifier == "base"
 
 
-@pytest.mark.xfail(reason="StarSource not yet implemented — T-02", strict=True)
 def test_star_source_is_frozen():
     """StarSource must be a frozen dataclass (mutation raises FrozenInstanceError)."""
     from sqlcg.parsers.base import StarSource
@@ -42,7 +40,6 @@ def test_star_source_is_frozen():
         ss.qualifier = "oops"  # type: ignore[misc]
 
 
-@pytest.mark.xfail(reason="StarSource not yet implemented — T-02", strict=True)
 def test_star_source_default_qualifier_is_none():
     """StarSource qualifier defaults to None."""
     from sqlcg.parsers.base import StarSource
@@ -56,7 +53,6 @@ def test_star_source_default_qualifier_is_none():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="defined_columns field not yet added to QueryNode — T-01", strict=True)
 def test_query_node_has_defined_columns_field():
     """QueryNode must have a defined_columns list field defaulting to []."""
     from sqlcg.parsers.base import QueryNode
@@ -66,7 +62,6 @@ def test_query_node_has_defined_columns_field():
     assert node.defined_columns == []
 
 
-@pytest.mark.xfail(reason="defined_columns extraction not yet implemented — T-01", strict=True)
 def test_create_table_extracts_column_names():
     """CREATE TABLE parses column names into QueryNode.defined_columns in source order."""
     parser = AnsiParser(SchemaResolver())
@@ -79,7 +74,6 @@ def test_create_table_extracts_column_names():
     assert stmt.defined_columns == ["a", "b", "c"]
 
 
-@pytest.mark.xfail(reason="defined_columns extraction not yet implemented — T-01", strict=True)
 def test_non_create_table_has_empty_defined_columns():
     """INSERT INTO ... SELECT must not populate defined_columns."""
     parser = AnsiParser(SchemaResolver())
@@ -95,7 +89,6 @@ def test_non_create_table_has_empty_defined_columns():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="star_sources field not yet added to QueryNode — T-02", strict=True)
 def test_query_node_has_star_sources_field():
     """QueryNode must have a star_sources list field defaulting to []."""
     from sqlcg.parsers.base import QueryNode
