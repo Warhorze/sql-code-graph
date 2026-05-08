@@ -42,7 +42,6 @@ def star_repo(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_columns_persisted(temp_db, tmp_path):
     """Indexing CREATE TABLE must upsert SqlColumn nodes via HAS_COLUMN edges."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (col1 INT, col2 STRING);\n")
@@ -58,7 +57,6 @@ def test_ddl_columns_persisted(temp_db, tmp_path):
     )
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_column_node_properties(temp_db, tmp_path):
     """Each SqlColumn node must have id, col_name, table_qualified set correctly."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (amount DECIMAL);\n")
@@ -417,7 +415,6 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     )
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
     """Despite the warning, both DDL files' columns must reach the graph (union semantics)."""
     (tmp_path / "a.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
