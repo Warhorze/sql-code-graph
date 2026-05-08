@@ -55,6 +55,9 @@ Before starting work, call `list_graph_stats_tool` once.
 6. Implement the work in small, reviewable steps with **intermediate commits**:
    - Each commit represents a logical milestone (scaffold, core logic, wiring, tests, docs).
    - Keep diffs focused and reversible.
+   - **Every commit message must include the ticket ID** as a parenthetical in the scope:
+     `feat(T-01): short description` or `fix(T-03): short description`.
+     This makes per-ticket review and bisect trivial.
 7. **Minimize diffs**:
    - Prefer aligning with existing code patterns over refactoring adjacent code
    - Avoid unrelated formatting, renaming, or restructuring
