@@ -131,7 +131,6 @@ def test_select_alias_star_records_qualifier():
     assert insert.star_sources[0].qualifier == "base"
 
 
-@pytest.mark.xfail(reason="_extract_column_lineage StarSource emission not implemented — T-03", strict=True)
 def test_no_sources_skips_star_source():
     """Bare SELECT * with no resolvable source tables emits no StarSource but keeps error marker."""
     parser = AnsiParser(SchemaResolver())
