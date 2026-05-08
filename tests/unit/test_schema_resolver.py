@@ -156,7 +156,7 @@ class TestSchemaResolver:
 
     @pytest.mark.xfail(reason="add_information_schema not yet implemented — T-08", strict=True)
     def test_add_information_schema_populates_tables(self, tmp_path):
-        """CSV with 2 tables must populate resolver in ORDINAL_POSITION order."""
+        """CSV with 2 tables / 3 columns each must populate resolver in ORDINAL_POSITION order."""
         csv_file = tmp_path / "cols.csv"
         csv_file.write_text(
             "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,DATA_TYPE\n"
@@ -172,7 +172,12 @@ class TestSchemaResolver:
         result = resolver.add_information_schema(csv_file)
 
         assert result == 2, f"Expected 2 tables loaded, got {result}"
+
         schema = resolver.as_dict()
+        assert "BA" in schema
+        assert "orders" in schema["BA"]
+        assert "customers" in schema["BA"]
+        # Columns must be sorted by ORDINAL_POSITION, not CSV row order
         assert schema["BA"]["orders"] == ["id", "total", "status"]
         assert schema["BA"]["customers"] == ["id", "name", "email"]
 
@@ -181,7 +186,8 @@ class TestSchemaResolver:
         """CSV missing ORDINAL_POSITION must raise ValueError naming the missing column."""
         csv_file = tmp_path / "bad.csv"
         csv_file.write_text(
-            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME\nmydb,BA,orders,id\n",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME\n"
+            "mydb,BA,orders,id\n",
             encoding="utf-8",
         )
         resolver = SchemaResolver()
@@ -214,4 +220,8 @@ class TestSchemaResolver:
         resolver = SchemaResolver()
         resolver.add_information_schema(csv_file)
         resolver.add_information_schema(csv_file)
-        assert resolver.as_dict()["BA"]["src"] == ["a"]
+
+        schema = resolver.as_dict()
+        assert schema["BA"]["src"] == ["a"], (
+            "Second add_information_schema call must not duplicate columns"
+        )
