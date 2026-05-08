@@ -1139,6 +1139,19 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
       Writes HAS_COLUMN edges tagged source='information_schema'. Run this before
       'sqlcg index' so DDL-inferred columns are suppressed for covered tables.
       Idempotent: safe to run multiple times.
+
+      For automatic pickup, place the CSV at <repo>/.sqlcg/schema.csv — 'sqlcg index'
+      will load it without needing this command explicitly.
+
+      Generate the CSV from Snowflake:
+
+          SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME,
+                 COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+          ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+
+      Export as CSV and drop at .sqlcg/schema.csv in your SQL repo root.
       """
       required = {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME",
                   "COLUMN_NAME", "ORDINAL_POSITION"}

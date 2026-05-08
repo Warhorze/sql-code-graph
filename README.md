@@ -111,13 +111,69 @@ Quality is shown per-file after `sqlcg index` and in `sqlcg gain` Section F.
 `list_dialects_and_repos()` warns when scripting fallback exceeds 20% of queries.
 
 **What causes TABLE_ONLY?** Mostly `SELECT *` — sqlglot can't trace column names through
-a wildcard. Alias those selects to get FULL coverage.
+a wildcard without knowing the source table's columns. See [Resolving SELECT *](#resolving-select-)
+below to fix this without rewriting your ETLs.
 
 **What causes SCRIPTING_FALLBACK?** Snowflake `$$` procedure bodies or `BEGIN…END` scripting
 blocks. sqlglot parses the block as a raw `Command` node and extracts DML via tokenizer
 fallback. Table edges are usually correct; column edges are not.
 
 Check `sqlcg db info` for the parsing mode distribution across all indexed queries.
+
+## Resolving SELECT *
+
+By default, `SELECT *` ETLs produce `TABLE_ONLY` parse quality because sqlglot needs
+to know the source table's column list to expand the wildcard. The fastest fix is to
+provide your production information schema as a CSV — sqlcg uses it as the authoritative
+column source, replacing any DDL-inferred columns.
+
+**Step 1 — Export from Snowflake** (run in a worksheet, export as CSV):
+
+```sql
+SELECT
+    TABLE_CATALOG,
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    COLUMN_NAME,
+    ORDINAL_POSITION,
+    DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+```
+
+**Step 2 — Drop it in your repo**:
+
+```bash
+cp ~/Downloads/columns.csv <your-sql-repo>/.sqlcg/schema.csv
+```
+
+**Step 3 — Index your ETL folder only**:
+
+```bash
+sqlcg index etl/
+```
+
+That's the entire workflow. `sqlcg index` auto-discovers `.sqlcg/schema.csv` and loads
+it before indexing — no separate command needed. Point it at your ETL folder rather
+than the full repo: fewer files to scan, faster indexing, and the schema CSV covers
+what DDL parsing was doing anyway.
+
+After indexing, `sqlcg db info` will show non-zero `STAR_EXPANSION lineage edges`,
+and `trace_column_lineage` will return results for queries that previously returned
+empty.
+
+**Alternative: explicit load**
+
+If your schema CSV lives elsewhere or you want to refresh it without re-indexing:
+
+```bash
+sqlcg load-schema /path/to/columns.csv   # load or refresh schema
+sqlcg index etl/                         # re-index using updated schema
+```
+
+**Precedence**: production CSV > DDL files > nothing. Partial CSVs are fine — tables
+not covered fall back to DDL-inferred columns automatically.
 
 ## MCP tools reference
 
@@ -147,6 +203,8 @@ sqlcg install                          # register MCP server in Claude Code
 sqlcg db init                          # initialise graph database
 sqlcg index <path> --dialect <d>       # index SQL files
 sqlcg index <path> --dialect auto      # read dialect from .sqlcg.toml
+sqlcg load-schema <csv>                # load production schema (auto-discovered from .sqlcg/schema.csv)
+sqlcg load-schema <csv> --include-catalog  # use 3-part names (CATALOG.SCHEMA.TABLE)
 sqlcg watch <path>                     # watch for file changes
 sqlcg git install-hooks                # install post-checkout hook
 sqlcg gain                             # show usage metrics
