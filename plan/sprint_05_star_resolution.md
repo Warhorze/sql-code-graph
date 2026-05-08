@@ -502,8 +502,9 @@ for table in parsed.defined_tables:
 - Integration test `tests/integration/test_star_resolution.py::test_duplicate_ddl_warns`:
   index a two-file repo where both files contain `CREATE TABLE BA.src (col1 INT)`.
   Assert `logger.warning` is called with a message containing both file paths and
-  `"will overwrite"`. Assert the graph ends up with exactly one `SqlTable` node
-  for `BA.src` and exactly one `HAS_COLUMN` edge for `col1` (no duplicate edges).
+  `"will add columns to the union"`. Assert the graph ends up with exactly one
+  `SqlTable` node for `BA.src` and exactly one `HAS_COLUMN` edge for `col1`
+  (no duplicate edges).
 
 ---
 
@@ -917,6 +918,13 @@ the existing query catches them.
   `self._expand_star_sources(db)` after the existing dependent-view loop
   (after line 146). No new constants required.
 
+  **Note**: `_expand_star_sources` is intentionally placed AFTER the
+  `_reindex_view_definition` loop. Each recursive `reindex_file` call for a
+  stale view will call `_expand_star_sources` again — this is correct and
+  idempotent via MERGE. Do NOT move `_expand_star_sources` before the
+  stale-view loop to reduce call count: stale views contribute new `STAR_SOURCE`
+  edges that must be captured in their own expansion pass.
+
 **Acceptance**:
 - The two integration tests above pass.
 - `grep -n "_expand_star_sources" src/sqlcg/indexer/indexer.py` returns 3
@@ -1033,19 +1041,20 @@ forward-compatibility but not read by the current implementation.
 
 **Convention-based auto-discovery**:
 
-`src/sqlcg/core/config.py` (`KuzuConfig`) gains a `schema_csv` property:
+Auto-discovery lives in `src/sqlcg/cli/commands/index.py`, not in `KuzuConfig`
+(`KuzuConfig` has no `repo_root` field and adding one is out of scope):
 
 ```python
-@property
-def schema_csv(self) -> Path | None:
-    candidate = self.repo_root / ".sqlcg" / "schema.csv"
-    return candidate if candidate.exists() else None
+# In index.py, after resolving the index path argument:
+_convention = path / ".sqlcg" / "schema.csv"
+schema_csv: Path | None = schema_arg or (_convention if _convention.exists() else None)
+if schema_csv:
+    _load_schema_into_graph(schema_csv, include_catalog=include_catalog, db=db)
 ```
 
-`src/sqlcg/cli/commands/index.py` — before the upsert loop, if
-`config.schema_csv` is not None (and `--schema` was not passed), call the
-same CSV-loading logic as `load_schema_cmd`. `--schema <path>` takes
-precedence over the convention path.
+`--schema <path>` (the explicit flag) takes precedence over the convention
+path. `_load_schema_into_graph` is the shared helper extracted from
+`load_schema_cmd` so both paths reuse the same logic.
 
 **Schema change (coordinate with T-02)**:
 
@@ -1246,12 +1255,25 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
 - `src/sqlcg/indexer/indexer.py` — `index_repo` loads `gold_tables` before the file
   loop (see T-01 amendment above). `_upsert_parsed_file` gains
   `gold_tables: frozenset[str] = frozenset()` keyword parameter.
+  `reindex_file` must ALSO load `gold_tables` before calling `_upsert_parsed_file`
+  — it cannot rely on `index_repo`'s load since it is called independently:
+
+  ```python
+  # In reindex_file, immediately before _upsert_parsed_file:
+  gold_rows = db.run_read(
+      "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
+      "RETURN DISTINCT t.qualified AS q",
+      {},
+  )
+  gold_tables = frozenset(row["q"] for row in gold_rows)
+  self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
+  ```
 
 **Risks addressed**:
 
 | Risk | Mitigation |
 |---|---|
-| CSV TABLE_SCHEMA case differs from graph `qualified` | Normalize both sides to lower-case in `_make_qualified` and in the skip-check lookup. Document in command help. |
+| CSV TABLE_SCHEMA case differs from graph `qualified` | Normalize both sides to lower-case in `_make_qualified` and in the skip-check lookup. Document in command help. Covered by `test_qualified_name_lowercased` and `test_case_insensitive_gold_guard` in acceptance below. |
 | CSV covers table but graph has no matching node yet | `load-schema` upserts the SqlTable node with `defined_in_file=''`. When `index` runs later, the node already exists; the DDL upsert is a MERGE (no duplicate). |
 | CSV does not cover a table (partial CSV) | `gold_tables` frozenset is empty for that table; DDL columns proceed normally. |
 | Re-running `load-schema` with updated CSV | MERGE on column node (keyed on `col_id`) is idempotent. New columns are added; removed columns are NOT deleted (deletion is out of scope — re-index or `db reset` is the migration path per CLAUDE.md). |
@@ -1303,11 +1325,29 @@ the 2-part `BA.src` pattern used by ETLs that omit the catalog. Pass
 - `grep -n "source.*information_schema\|information_schema.*source"
   src/sqlcg/cli/commands/load_schema.py` returns at least 1 match.
 - `grep -n "gold_tables" src/sqlcg/indexer/indexer.py` returns at least
-  2 matches (load site + pass-through to `_upsert_parsed_file`).
+  3 matches (load in `index_repo` + load in `reindex_file` + pass-through to
+  `_upsert_parsed_file`).
+- Integration test `tests/integration/test_star_resolution.py::test_reindex_respects_gold_tables`:
+  call `load_schema_cmd` to load CSV covering `BA.src (col1, col2)`, then call
+  `reindex_file` on a DDL file containing `CREATE TABLE BA.src (col1, col2, col3)`.
+  Assert `BA.src` still has exactly 2 `HAS_COLUMN` edges with
+  `source='information_schema'` (not 3) — proves `reindex_file` loads
+  `gold_tables` independently.
 - `grep -n '"source": "ddl"' src/sqlcg/indexer/indexer.py` returns at least
   1 match (T-01's DDL HAS_COLUMN write passes the source tag).
 - `grep -n "source STRING" src/sqlcg/core/schema.cypher` returns exactly 1 match
   (in HAS_COLUMN block).
+- Unit test `tests/unit/test_load_schema.py::test_qualified_name_lowercased`:
+  call `_make_qualified("MYDB", "BA", "SRC_TABLE", include_catalog=False)` and
+  assert the result equals `"ba.src_table"`. Also assert
+  `_make_qualified("MYDB", "BA", "SRC_TABLE", include_catalog=True)` equals
+  `"mydb.ba.src_table"`. Proves normalisation is applied before graph writes.
+- Integration test `tests/integration/test_star_resolution.py::test_case_insensitive_gold_guard`:
+  write a CSV with `TABLE_SCHEMA=BA,TABLE_NAME=SRC` (upper-case). After
+  `load_schema_cmd`, index a DDL file with `CREATE TABLE ba.src (col1, col2, col3)`
+  (lower-case). Assert `ba.src` has exactly 2 `HAS_COLUMN` edges (`col1`, `col2`
+  from CSV), not 3 — proves case normalisation prevents the DDL write from bypassing
+  the gold guard.
 - Integration test `tests/integration/test_star_resolution.py::test_index_autodiscovers_schema_csv`:
   write a `schema.csv` to `tmp_path / ".sqlcg" / "schema.csv"`, call
   `index_repo(tmp_path / "etl", ...)` (ETL folder only, no DDL). Assert
@@ -1433,6 +1473,18 @@ which are stable and already match `schema.cypher`.
 - Unit test `tests/unit/test_queries_loader.py::test_missing_block_raises`:
   call `_Q["NONEXISTENT"]` and assert `KeyError` is raised (proves the loader
   does not silently return `None`).
+- **Format contract** (add as a comment block at the top of `queries.cypher`):
+  Named-block headers use the format `-- BLOCK_NAME` on a line by itself, with
+  the name matching `[A-Z][A-Z0-9_]*`. Inline `--` comments inside a query body
+  MUST appear on the same line as Cypher text (e.g. `MATCH (n) -- inline comment`)
+  or be avoided entirely. A standalone `-- WORD` line inside a query body will
+  silently split that block — the loader provides no error for this case.
+- **Pre-merge audit**: run
+  `grep -rn "DELETE_COLUMNS_FOR_FILE\|DELETE_QUERIES_FOR_FILE\|STALE_VIEWS_QUERY\|TRACE_COLUMN_LINEAGE_QUERY" tests/`
+  and verify no test uses `==` to compare the constant's string value directly.
+  Substring (`in`) and functional assertions are safe; exact string equality
+  will break if whitespace differs between the old f-string and the `.cypher`
+  file. Rewrite any such test to use a functional assertion before merging.
 - `uv run pytest` green — no existing tests broken by the rename (all callers
   import the same constant names from `queries.py`; only the implementation
   changes).
@@ -1589,7 +1641,7 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 | `gold_tables` skip-guard wired | `grep -n "gold_tables" src/sqlcg/indexer/indexer.py` | at least 2 matches (load + pass-through) |
 | DDL HAS_COLUMN writes pass source tag | `grep -n '"source": "ddl"' src/sqlcg/indexer/indexer.py` | at least 1 match |
 | information_schema source tag in load_schema | `grep -n "information_schema" src/sqlcg/cli/commands/load_schema.py` | at least 1 match |
-| `.sqlcg/schema.csv` auto-discovery wired | `grep -n "schema_csv" src/sqlcg/core/config.py src/sqlcg/cli/commands/index.py` | at least 1 match in each file |
+| `.sqlcg/schema.csv` auto-discovery wired | `grep -n "schema.csv\|schema_csv" src/sqlcg/cli/commands/index.py` | at least 1 match |
 | Snowflake SQL in CLI help or docstring | `grep -n "INFORMATION_SCHEMA.COLUMNS" src/sqlcg/cli/commands/load_schema.py` | at least 1 match |
 
 ---
@@ -1612,6 +1664,11 @@ Required deliverable: create `tests/fixtures/star_corpus/` with at minimum:
 
 **PR grouping** (revised for T-08):
 - **PR 1**: T-09 + T-08 (Cypher migration + load-schema command) — both independent, no graph schema change.
+  **PR 1 caveat**: `load-schema` ships in PR 1 but requires schema v2 (`source STRING` on `HAS_COLUMN`)
+  which lands in PR 2. Add a runtime guard in `load_schema_cmd`: if
+  `db.get_schema_version() != SCHEMA_VERSION`, print
+  `[yellow]load-schema requires schema v2 — run 'sqlcg db reset && sqlcg db init' first[/yellow]`
+  and `raise typer.Exit(1)`. This prevents silent `upsert_edge` failures between PR 1 and PR 2.
 - **PR 2**: T-01 + T-02 (DDL columns with gold-table skip + schema v2 bump with source STRING) — schema change forces re-index once.
 - **PR 3**: T-03 + T-04 + T-05 + T-06 (parser markers + indexer wiring + expansion + reindex) — headline functionality lands together.
 - **PR 4**: T-07 (CLI surfacing) — small polish, ships last.
