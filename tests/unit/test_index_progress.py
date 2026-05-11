@@ -2,9 +2,7 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
-import pytest
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
@@ -36,7 +34,7 @@ class TestProgressCallbackUnit:
         backend = KuzuBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
-        summary = indexer.index_repo(
+        indexer.index_repo(
             tmp_path,
             dialect=None,
             db=backend,
@@ -45,8 +43,7 @@ class TestProgressCallbackUnit:
 
         # Verify callback was called at 100-file boundary
         assert any(n == 100 for n, t in calls), (
-            f"Progress callback must be invoked at 100-file boundary. "
-            f"Calls: {calls}"
+            f"Progress callback must be invoked at 100-file boundary. Calls: {calls}"
         )
         assert all(t == 105 for n, t in calls), (
             f"Total argument must be 105 in all calls. Calls: {calls}"
@@ -78,8 +75,7 @@ class TestProgressCallbackUnit:
 
         # Verify callback was never called (below 100 files)
         assert len(calls) == 0, (
-            f"Progress callback must not be invoked for < 100 files. "
-            f"Got {len(calls)} calls."
+            f"Progress callback must not be invoked for < 100 files. Got {len(calls)} calls."
         )
 
 

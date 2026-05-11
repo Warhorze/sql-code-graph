@@ -1,9 +1,7 @@
 """Integration tests for per-file commit boundary in indexer."""
 
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import patch
 
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.indexer.indexer import Indexer
@@ -33,7 +31,7 @@ class TestPerFileCommitBoundary:
 
         with patch.object(backend, "transaction", side_effect=counting_transaction):
             indexer = Indexer()
-            summary = indexer.index_repo(tmp_path, dialect=None, db=backend)
+            indexer.index_repo(tmp_path, dialect=None, db=backend)
 
         # Verify one transaction per file (200 files = 200 transactions)
         assert transaction_count == 200, (
@@ -68,8 +66,7 @@ class TestPerFileCommitBoundary:
 
         # Verify failed file is counted in quality, not silent loss
         assert summary["quality"]["failed"] >= 1, (
-            f"Failed file must be counted in quality metrics. "
-            f"Quality counts: {summary['quality']}"
+            f"Failed file must be counted in quality metrics. Quality counts: {summary['quality']}"
         )
         assert summary["files_parsed"] >= 4, (
             f"At least 4 files should parse successfully (5 total - 1 failure). "
