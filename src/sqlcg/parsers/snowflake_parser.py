@@ -59,6 +59,9 @@ class SnowflakeParser(AnsiParser):
         Returns:
             ParsedFile with parsed statements and metadata
         """
+        # Apply Snowflake-specific preprocessing (Gap 1 + Gap 3 fixes)
+        sql = self._preprocess_snowflake_sql(sql)
+
         # Check for scripting blocks
         if self._has_scripting_block(sql):
             logger.info("Snowflake scripting block detected in %s, using DML extraction", path)
@@ -66,6 +69,92 @@ class SnowflakeParser(AnsiParser):
 
         # Otherwise use standard ANSI parsing with Snowflake dialect
         return AnsiParser.parse_file(self, path, sql)  # type: ignore
+
+    @staticmethod
+    def _preprocess_snowflake_sql(sql: str) -> str:
+        """Apply Snowflake-specific pre-processing workarounds for sqlglot dialect gaps.
+
+        Handles:
+        1. Gap 1: Normalise CREATE TEMP TABLE t IF NOT EXISTS to CREATE TEMPORARY TABLE t
+        2. Gap 3: Strip UNPIVOT clauses (destructive but acceptable for partial lineage extraction)
+
+        Args:
+            sql: Raw Snowflake SQL text
+
+        Returns:
+            Pre-processed SQL text
+        """
+        # Gap 1: CREATE TEMP/TEMPORARY TABLE name IF NOT EXISTS -> CREATE TEMPORARY TABLE name
+        # This regex matches CREATE TEMP[ORARY] TABLE name IF NOT EXISTS and drops the IF NOT EXISTS
+        sql = re.sub(
+            r"CREATE\s+(TEMP(?:ORARY)?)\s+TABLE\s+(\w+)\s+IF\s+NOT\s+EXISTS",
+            r"CREATE TEMPORARY TABLE \2",
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+        # Gap 3: Strip UNPIVOT clauses if present
+        # UNPIVOT (...) [AS alias] — strip the entire clause
+        # Handle nested parentheses by counting parens
+        if "UNPIVOT" in sql.upper():
+            # Strategy: find UNPIVOT, then match everything until we close all parens
+            # Use a more permissive pattern: UNPIVOT\s*\([^)]+\([^)]*\)[^)]*\)
+            # This matches UNPIVOT (val FOR col IN (...)) AS alias
+            sql = re.sub(
+                r"\s+UNPIVOT\s*\([^)]*\([^)]*\)[^)]*\)\s*(?:AS\s+\w+)?",
+                "",
+                sql,
+                flags=re.IGNORECASE,
+            )
+
+        return sql
+
+    @staticmethod
+    def _parse_with_recovery(sql: str, dialect: str | None) -> tuple[list[Any], list[str]]:
+        """Parse SQL, falling back to per-chunk recovery on tokenisation failure (Gap 2).
+
+        When the primary parse fails, splits on `;` and re-parses each chunk
+        independently, collecting successful statements and recording errors
+        for failed chunks.
+
+        Args:
+            sql: SQL text to parse
+            dialect: Dialect string for sqlglot.parse
+
+        Returns:
+            Tuple of (statements list, recovery errors list). recovery_errors is non-empty
+            when at least one chunk failed to parse.
+        """
+        try:
+            return sqlglot.parse(sql, dialect=dialect), []
+        except Exception as primary_exc:
+            # Recovery: split on semicolons and parse each chunk independently
+            errors = [f"parse_recovery:primary:{primary_exc}"]
+            stmts: list[Any] = []
+            for chunk in sql.split(";"):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                try:
+                    parsed = sqlglot.parse(chunk, dialect=dialect)
+                    stmts.extend(s for s in parsed if s is not None)
+                except Exception as chunk_exc:
+                    errors.append(f"parse_recovery:chunk:{chunk_exc}")
+            return stmts, errors
+
+    def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:
+        """Override _do_parse to apply Snowflake-specific recovery (Gap 2).
+
+        For Snowflake dialect, uses per-chunk recovery on parse failure.
+        All other dialects use the standard AnsiParser._do_parse.
+
+        Args:
+            sql: SQL text to parse
+
+        Returns:
+            Tuple of (statements list, error strings list)
+        """
+        return self._parse_with_recovery(sql, self.DIALECT)
 
     def _has_scripting_block(self, sql: str) -> bool:
         """Token-aware BEGIN detection — avoids false-positives on string literals and comments.

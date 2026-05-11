@@ -490,6 +490,7 @@ class SqlParser(ABC):
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
         schema_sources: dict[str, str] | None = None,
+        scope: Any | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
 
@@ -508,6 +509,10 @@ class SqlParser(ABC):
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
             schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
+            scope: Pre-built sqlglot Scope for this statement (optional optimization).
+                When provided, sg_lineage() will reuse this scope instead of re-qualifying.
+                The scope must be built from the same body as passed to sg_lineage().
+                Passing an incorrect scope will produce wrong lineage silently.
 
         Returns:
             LineageExtraction with edges and star_sources
@@ -618,13 +623,15 @@ class SqlParser(ABC):
 
                 try:
                     combined_sources = {**(sources or {}), **(schema_sources or {})}
-                    root = sg_lineage(
-                        col_name,
-                        body,
-                        schema=schema,
-                        sources=combined_sources,
-                        dialect=self.DIALECT,
-                    )
+                    # Only pass scope if it's non-None (optimization for reuse)
+                    sg_kwargs = {
+                        "schema": schema,
+                        "sources": combined_sources,
+                        "dialect": self.DIALECT,
+                    }
+                    if scope is not None:
+                        sg_kwargs["scope"] = scope
+                    root = sg_lineage(col_name, body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
                         new_edges = self._lineage_node_to_edges(

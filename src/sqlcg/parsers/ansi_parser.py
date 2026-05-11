@@ -128,6 +128,24 @@ class AnsiParser(SqlParser):
 
         return out
 
+    def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:
+        """Parse SQL text into statements, returning both statements and any parse errors.
+
+        This method is a hook that can be overridden by subclasses (e.g., SnowflakeParser)
+        to implement dialect-specific recovery or pre-processing logic.
+
+        Args:
+            sql: SQL text to parse
+
+        Returns:
+            Tuple of (statements list, error strings list). Errors are non-fatal;
+            recovery may have collected partial statements even on parse failure.
+        """
+        try:
+            return sqlglot.parse(sql, dialect=self.DIALECT), []
+        except Exception as exc:
+            return [], [f"parse_error:{exc}"]
+
     def _parse_statement(
         self,
         stmt: Any,
@@ -212,6 +230,7 @@ class AnsiParser(SqlParser):
                 sources=sources_map,
                 query_sources=sources,
                 schema_sources=schema_sources,
+                # scope=root_scope,  # TODO: T-05 scope optimization
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
