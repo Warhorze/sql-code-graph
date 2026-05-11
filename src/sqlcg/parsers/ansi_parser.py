@@ -153,7 +153,7 @@ class AnsiParser(SqlParser):
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
-        schema_sources: dict[str, str] | None = None,
+        schema_sources: dict[str, Any] | None = None,
         skip_column_lineage: bool = False,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
@@ -165,7 +165,7 @@ class AnsiParser(SqlParser):
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
-            schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
+            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
 
         Returns:

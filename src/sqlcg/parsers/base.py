@@ -489,7 +489,7 @@ class SqlParser(ABC):
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
-        schema_sources: dict[str, str] | None = None,
+        schema_sources: dict[str, Any] | None = None,
         scope: Any | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
@@ -508,7 +508,7 @@ class SqlParser(ABC):
             dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
-            schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
+            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             scope: Pre-built sqlglot Scope for the query body (optional optimization).
                 When provided, sg_lineage() will reuse this scope instead of re-qualifying.
                 If not provided, a scope will be built from the extracted body before each

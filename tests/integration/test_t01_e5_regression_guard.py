@@ -99,7 +99,9 @@ class TestE5RegressionGuard:
         )
 
     def test_schema_sources_passed_to_sg_lineage(self, tmp_path):
-        """schema_sources dict is generated and made available to sg_lineage."""
+        """schema_sources dict is generated with parsed SELECT nodes for sg_lineage."""
+        import sqlglot.expressions as exp
+
         schema_csv = _write_schema_csv(
             tmp_path,
             [
@@ -123,13 +125,16 @@ class TestE5RegressionGuard:
         resolver = SchemaResolver("snowflake")
         resolver.add_information_schema(schema_csv)
 
-        # Test that as_sources_dict is called and returns the expected structure
+        # Test that as_sources_dict is called and returns parsed exp.Select nodes
         schema_sources = resolver.as_sources_dict()
 
         assert "orders" in schema_sources
         assert "ba.orders" in schema_sources
-        assert schema_sources["orders"] == "SELECT id, amount FROM BA.orders"
-        assert schema_sources["ba.orders"] == "SELECT id, amount FROM BA.orders"
+        # Values should be parsed exp.Select nodes, not strings
+        assert isinstance(schema_sources["orders"], exp.Select)
+        assert isinstance(schema_sources["ba.orders"], exp.Select)
+        # Verify the SELECT nodes have the correct structure
+        assert str(schema_sources["orders"]).upper() == "SELECT id, amount FROM BA.orders".upper()
 
     def test_schema_sources_computation_once_per_file(self):
         """schema_sources must be computed once per file, not once per statement.

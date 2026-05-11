@@ -243,13 +243,17 @@ class TestSchemaResolver:
 
         result = resolver.as_sources_dict()
 
+        import sqlglot.expressions as exp
+
         # Expect both bare name and schema.name keys (lowercased)
         assert "orders" in result
         assert "ba.orders" in result
 
-        # SELECT statement must contain both columns
-        assert result["orders"] == "SELECT id, amount FROM BA.orders"
-        assert result["ba.orders"] == "SELECT id, amount FROM BA.orders"
+        # Values should be parsed exp.Select nodes, not strings
+        assert isinstance(result["orders"], exp.Select)
+        assert isinstance(result["ba.orders"], exp.Select)
+        # Verify the SELECT nodes have the correct structure
+        assert str(result["orders"]).upper() == "SELECT id, amount FROM BA.orders".upper()
 
     def test_as_sources_dict_excludes_tables_with_no_columns(self):
         """Tables with empty column lists are excluded."""
@@ -281,11 +285,19 @@ class TestSchemaResolver:
 
         result = resolver.as_sources_dict()
 
+        import sqlglot.expressions as exp
+
         # Both tables present with schema-qualified keys
         assert "ia_semantic.view1" in result
         assert "ba.table1" in result
-        assert result["ia_semantic.view1"] == "SELECT col1 FROM IA_SEMANTIC.view1"
-        assert result["ba.table1"] == "SELECT col2 FROM BA.table1"
+        # Values should be parsed exp.Select nodes, not strings
+        assert isinstance(result["ia_semantic.view1"], exp.Select)
+        assert isinstance(result["ba.table1"], exp.Select)
+        # Verify the SELECT nodes have the correct structure
+        assert (
+            str(result["ia_semantic.view1"]).upper() == "SELECT col1 FROM IA_SEMANTIC.view1".upper()
+        )
+        assert str(result["ba.table1"]).upper() == "SELECT col2 FROM BA.table1".upper()
 
     def test_as_sources_dict_thread_safe(self):
         """as_sources_dict() is thread-safe."""
