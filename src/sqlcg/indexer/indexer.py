@@ -32,6 +32,7 @@ class Indexer:
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
         schema_csv: Path | None = None,
+        no_ddl: bool = False,
     ) -> dict:
         """Full two-pass index. Returns summary dict.
 
@@ -47,6 +48,7 @@ class Indexer:
             progress_callback: Optional callback(n, total) invoked every 100 files
             schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
                 auto-discovers <path>/.sqlcg/schema.csv if present.
+            no_ddl: When True, skip DDL-only files from upsert into the graph
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
@@ -114,6 +116,7 @@ class Indexer:
         gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
 
         # Upsert all results and count quality distribution
+
         tables_found = 0
         lineage_edges = 0
         star_sources_found = 0
@@ -125,6 +128,13 @@ class Indexer:
             "failed": 0,
         }
         for parsed in pass2_results:
+            # When no_ddl=True, skip table-node upserts for files that are pure-DDL
+            # (marked with parse_mode:pure_ddl_skip error marker)
+            skip_upsert = no_ddl and any("pure_ddl_skip" in e for e in parsed.errors)
+            if skip_upsert:
+                quality_counts["scripting_fallback"] += 1
+                continue
+
             try:
                 with db.transaction():
                     counts = self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)

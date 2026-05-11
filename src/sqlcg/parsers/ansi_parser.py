@@ -53,6 +53,11 @@ class AnsiParser(SqlParser):
             out.parse_quality = ParseQuality.FAILED
             return out
 
+        # Check for pure-DDL files (still parse table definitions but skip lineage)
+        is_pure_ddl = self._is_pure_ddl_file(statements)
+        if is_pure_ddl:
+            out.errors.append("parse_mode:pure_ddl_skip")
+
         # Check for scripting fallback
         for stmt in statements:
             if stmt is not None and isinstance(stmt, exp.Command):
@@ -90,6 +95,7 @@ class AnsiParser(SqlParser):
                     sources_map,
                     scope=scope,
                     schema_sources=schema_sources,
+                    skip_column_lineage=is_pure_ddl,
                 )
                 out.statements.append(query_node)
 
@@ -131,6 +137,7 @@ class AnsiParser(SqlParser):
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
         schema_sources: dict[str, str] | None = None,
+        skip_column_lineage: bool = False,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -142,6 +149,7 @@ class AnsiParser(SqlParser):
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
             schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
+            skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
 
         Returns:
             QueryNode with extracted metadata
@@ -188,18 +196,23 @@ class AnsiParser(SqlParser):
         if target:
             sources = [src for src in sources if src.full_id != target.full_id]
 
-        # Extract column lineage
-        schema = self._schema.as_dict() if self._schema else {}
-        extraction = self._extract_column_lineage(
-            stmt,
-            path,
-            out,
-            schema,
-            dst_table=target,
-            sources=sources_map,
-            query_sources=sources,
-            schema_sources=schema_sources,
-        )
+        # Extract column lineage (skip for pure-DDL files)
+        if skip_column_lineage:
+            from sqlcg.parsers.base import LineageExtraction
+
+            extraction = LineageExtraction(edges=[], star_sources=[])
+        else:
+            schema = self._schema.as_dict() if self._schema else {}
+            extraction = self._extract_column_lineage(
+                stmt,
+                path,
+                out,
+                schema,
+                dst_table=target,
+                sources=sources_map,
+                query_sources=sources,
+                schema_sources=schema_sources,
+            )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
 

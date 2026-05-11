@@ -287,6 +287,40 @@ class SqlParser(ABC):
             case _:
                 return QueryKind.OTHER
 
+    @staticmethod
+    def _is_pure_ddl_file(statements: list[Any]) -> bool:
+        """Return True if every non-None statement is a DDL Command or pure DDL node
+        with no embedded SELECT/INSERT/MERGE/CTAS body.
+
+        A file is pure-DDL when it will never produce column lineage regardless of
+        how many times sg_lineage() is called on it. Such files should be skipped
+        early to avoid O(N_statements) scope-build and lineage calls.
+
+        Files that mix DDL and DML (e.g., a changelog with CREATE TABLE followed by
+        INSERT) are NOT pure-DDL and must not be skipped.
+        """
+        import sqlglot.expressions as exp
+
+        has_any_stmt = False
+        for stmt in statements:
+            if stmt is None:
+                continue
+            has_any_stmt = True
+            # Command = sqlglot fallback for unsupported DDL
+            if isinstance(stmt, exp.Command):
+                continue
+            # ALTER, DROP, and other DDL-only statements
+            if isinstance(stmt, (exp.Alter, exp.Drop)):
+                continue
+            # Pure DDL creates (no CTAS body)
+            if isinstance(stmt, exp.Create) and not isinstance(
+                stmt.expression, (exp.Select, exp.Subquery)
+            ):
+                continue
+            # Anything else (SELECT, INSERT, MERGE, CTAS) — file is NOT pure-DDL
+            return False
+        return has_any_stmt  # must have at least one statement
+
     def _real_tables(self, scope: Any) -> list[TableRef]:
         """Return real (non-CTE) tables referenced in a scope.
 
