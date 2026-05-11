@@ -2106,18 +2106,19 @@ The correct fix for p99 is early DDL-file detection and skip.
 
 ### 12.4 Priority Ranking for Follow-On Sprint
 
-Ranked by impact × effort (high impact, low effort first):
+Ranked by impact × effort (high impact, low effort first). Updated after E4/E5
+investigation (Q-12-1 and Q-12-2 resolved — see section 12.6):
 
 | Rank | Code | Title | Rationale | Effort |
 |------|------|-------|-----------|--------|
-| 1 | INV-E5 | Investigate E5 root cause | Cannot scope any fix without knowing what exceptions are thrown. Sample 5–10 E5 messages from `results_full.json`. Zero implementation effort — pure investigation. | XS |
+| 1 | FIX-E5 | `sources=` schema expansion in `sg_lineage()` | Root cause confirmed: `qualify()` cannot expand cross-file CTE sources when the schema is absent. Fix: pass the loaded information schema (`columns.csv`) as `sources=` to `sg_lineage()`. Affects 1,280 errors, all IA-DATAPRODUCTS DML aggregates. High impact, well-scoped. | M |
 | 2 | FIX-E2 | Best-effort expression name extraction | `col_expr.alias or col_expr.name or str(col_expr)[:40]` fallback unlocks 60% more lineage attempts. Simple guard in `_extract_column_lineage`. | S |
 | 3 | FIX-DDL-SKIP | Skip pure-DDL files early | Detect files where all parsed statements are DDL/`Command` nodes and bypass `sg_lineage` entirely. Removes p99 slow-file outliers (18–21 s) and E3 noise. | S |
-| 4 | OPT-SCOPE | `scope=` reuse per statement | Build scope once per statement, call `sg_lineage` per column. Estimated 40–60% speedup for multi-column SELECT files. Only beneficial after DDL-file skip reduces the p99 tail. | M |
+| 4 | FIX-E4 | Separate ticket: sqlglot Snowflake dialect gaps | 6 DML files fail at parse time due to three distinct sqlglot gaps: (1) `IF NOT EXISTS` misread as `If()` function call (2 files), (2) complex DML/duplicate blocks cause unexpected-token errors (2 files), (3) UNPIVOT clause not fully supported (1 file), (4) one file has no captured message. Medium priority — lineage is lost for all 6, but these are real upstream sqlglot bugs, not local fixes. | M |
+| 5 | OPT-SCOPE | `scope=` reuse per statement | Build scope once per statement, call `sg_lineage` per column. Estimated 40–60% speedup for multi-column SELECT files. Only beneficial after DDL-file skip reduces the p99 tail. | M |
 
-INV-E5 is a hard prerequisite for FIX-E5 (not listed above — E5 fix cannot be scoped until
-the exception types are known). Items 2–4 are independent of INV-E5 and can proceed in
-parallel.
+FIX-E5 is now unblocked (INV-E5 investigation completed). FIX-E2, FIX-DDL-SKIP, and
+FIX-E4 are independent of each other and can proceed in parallel with FIX-E5.
 
 ---
 
@@ -2143,20 +2144,79 @@ E6 = 0 in both runs — schema format is not causing mismatches. The nested form
 is needed. The schema path is simply not reached because E5 blocks earlier.
 
 **Q: Is E4 (parse failure) concentrated in DDL or DML files?**
-6 files failed with full parse failure. Nature (DML vs DDL) not yet confirmed from
-`results_full.json` — see open question Q-12-1.
+Confirmed DML — all 6 E4 files are hybrid DDL+DML or pure DML (CREATE TEMP TABLE +
+INSERT, SELECT with CTEs, UNPIVOT). Lineage impact is HIGH for all 6. Three distinct
+sqlglot dialect gaps identified (IF NOT EXISTS, unexpected token, UNPIVOT). A separate
+medium-priority ticket (FIX-E4) has been raised. See Q-12-1 in section 12.6 for the
+full breakdown.
 
 ---
 
 ### 12.6 Open Questions
 
-**Q-12-1**: What are the 6 E4 (full parse failure) files, and are they DML or DDL?
-If any are DML ETL files, this is a high-priority parser gap. If all are DDL, impact
-is limited and DDL-file skip (FIX-DDL-SKIP) will eliminate them anyway.
-Action: sample `error_summary.E4.example_files` from `results_full.json`.
+Both questions resolved after E4/E5 investigation (2026-05-11).
 
-**Q-12-2**: What exception types appear in E5?
-1,280 E5 errors with unknown root cause. Must sample `error_summary.E5.example_messages`
-from `results_full.json` to determine whether E5 is one exception type or many.
-Action: INV-E5 (rank 1 in section 12.4).
+---
+
+**Q-12-1** (E4) — RESOLVED
+
+All 6 E4 parse-failure files contain DML. Lineage impact is HIGH for all.
+
+| File | Path | DML? | Parse Error | Lineage Impact |
+|------|------|------|-------------|----------------|
+| WTDH_CONTRACT.sql | ddl/changelogs/BA-TABLES/ | YES (hybrid DDL+DML, has INSERT/MERGE/WITH-CTE) | `Expecting ).` at line 7 in `CREATE TABLE ... IF NOT EXISTS` | HIGH |
+| htwfm_contract_us28254.sql | etl/pdi/template/ | YES (CREATE TEMP TABLE + INSERT + SELECT) | `Required keyword: 'true' missing for If()` — sqlglot misparses Snowflake `IF NOT EXISTS` as function call | HIGH |
+| htwfm_employee_us28254.sql | etl/pdi/template/ | YES (CREATE TEMP TABLE + INSERT + SELECT) | Same IF() error | HIGH |
+| us15770-check-controles-herstelactie.sql | etl/pdi/template/ | YES (CREATE TEMP TABLE + INSERT + SELECT + UNIONs) | `Invalid expression / Unexpected token` at line 114 | HIGH |
+| test.sql | etl/sql/int/ | YES (large SELECT with CTE, FULL OUTER JOIN, UNPIVOT) | `Expecting ).` at line 329 — UNPIVOT clause not fully supported | HIGH (dev file, limited production impact) |
+| outbound_ga4_artikelen.sql | etl/sql/interface/ | YES (multiple INSERT + SELECT + JOINs) | No error message captured (only 5 of 6 stored by diagnostic script) | HIGH |
+
+**Error patterns identified:**
+
+1. IF() dialect gap (2 files): sqlglot misparses Snowflake `CREATE TABLE ... IF NOT EXISTS`
+   as an `If()` function call. Upstream sqlglot bug or dialect definition gap.
+2. Syntax / Unexpected token (2 files): complex DML or duplicate SQL blocks cause parser
+   failure at tokenisation time.
+3. UNPIVOT unsupported (1 file): sqlglot does not fully support Snowflake UNPIVOT in this
+   context.
+4. No message captured (1 file): only 5 examples stored by the diagnostic script.
+
+**Action taken**: Separate fix ticket FIX-E4 raised (rank 4 in section 12.4, medium
+priority). These are real sqlglot Snowflake dialect gaps; not local code issues.
+
+---
+
+**Q-12-2** (E5) — RESOLVED
+
+- Distinct exception types across 50 sampled messages: 1 (homogeneous).
+- Dominant message: `Cannot find column '<COLUMN>' in query.` — 100% of samples.
+- E1/E5 boundary check: zero of 50 sampled messages contained a `.` in the column name;
+  no E1-pattern contamination confirmed.
+
+**SQL pattern**: All E5-affected files are `CREATE OR REPLACE DYNAMIC TABLE` statements
+with multi-level CTEs whose source tables are cross-file semantic views (e.g.,
+`IA_SEMANTIC."Schapbeschikbaarheid"`, `IA_SEMANTIC."Transactie"`). The failing column is
+defined inside a CTE via a CASE expression, then referenced via CTE alias in the outer
+SELECT. Because `sg_lineage()` is called without `schema=` or `sources=`, `qualify()`
+cannot expand the CTE to resolve the column to a leaf table.
+
+Concrete example (`AGG_BESTELADVIEZEN_WEEK_SEGMENT_FORMULE_VOORRAADLOCATIE.sql`):
+
+```sql
+WITH MOVERTYPE_PER_DAG_BOUWMARKT_ARTIKEL AS (
+    SELECT CASE WHEN AVG("Rotatie") >= 0.5 THEN 'Fast-mover' ... END AS "Movertype"
+    FROM IA_SEMANTIC."Schapbeschikbaarheid"   -- cross-file source, absent from schema={}
+    ...
+)
+SELECT mvt."Movertype"   -- Cannot find column 'MOVERTYPE' — CTE not expandable
+FROM ... LEFT JOIN MOVERTYPE_PER_DAG_BOUWMARKT_ARTIKEL mvt ON ...
+```
+
+**Hypothesis confirmed**: `qualify()` inside `sg_lineage()` cannot expand CTE references
+when the CTE's source tables are absent from the `schema=` parameter.
+
+**Fix direction confirmed**: Pass the information schema already loaded via `columns.csv`
+as `sources=` to `sg_lineage()`, enabling `qualify()` to resolve cross-file CTE sources.
+This is Architecture Finding R-02 applied. Tracked as FIX-E5 (rank 1 in section 12.4,
+high priority — 1,280 errors, all DML aggregates in IA-DATAPRODUCTS).
 - `src/sqlcg/core/kuzu_backend.py` — expose `begin_transaction` / `commit` for batch mode

@@ -1,8 +1,8 @@
 ## Current State
 
-agent: architect-planner (E4/E5 investigation plan written)
-plan: plan/investigation_e5_e4.md
-status: Investigation plan written; awaiting developer to answer Q-12-1 and Q-12-2
+agent: architect-reviewer (E4/E5 open questions resolved, ARCHITECTURE_REVIEW.md updated)
+plan: plan/investigation_e5_e4.md (investigation complete)
+status: Q-12-1 and Q-12-2 closed; § 12.4 re-ranked; § 12.6 replaced with findings; ready for sprint-planner
 branch: feat/sprint-05-t03-t07
 date: 2026-05-11
 
@@ -55,3 +55,16 @@ Handoff — architect-planner (2026-05-11):
   - Plan provides step-by-step instructions, exact fields to record, and success criteria
   - Next: developer inspects the 6 E4 files and widens E5 sample; architect-reviewer closes § 12.6;
     sprint-planner writes fix tickets
+
+Handoff — architect-reviewer (2026-05-11):
+  - Closed Q-12-1 (E4): all 6 files are DML; three sqlglot dialect gaps confirmed
+    (IF NOT EXISTS as If(), unexpected token, UNPIVOT unsupported). FIX-E4 raised
+    as separate medium-priority ticket.
+  - Closed Q-12-2 (E5): single homogeneous exception type confirmed across 50 samples
+    ("Cannot find column '<COLUMN>' in query."); root cause is qualify() failing to
+    expand cross-file CTEs when source tables absent from schema=. Fix direction: pass
+    information-schema as sources= to sg_lineage(). FIX-E5 moved to rank 1 (high priority).
+  - Updated ARCHITECTURE_REVIEW.md § 12.4 (priority table re-ranked, FIX-E5 now rank 1,
+    FIX-E4 added at rank 4), § 12.5 (E4 deferred question answered), § 12.6 (open
+    questions replaced with full documented findings).
+  - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint.
