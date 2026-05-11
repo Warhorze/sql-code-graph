@@ -16,7 +16,6 @@ from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
 from sqlcg.parsers.base import TableRef
 
-
 # ---------------------------------------------------------------------------
 # T-02 — StarSource dataclass
 # ---------------------------------------------------------------------------
@@ -103,7 +102,6 @@ def test_query_node_has_star_sources_field():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="_extract_column_lineage StarSource emission not implemented — T-03", strict=True)
 def test_select_star_records_star_source():
     """INSERT INTO ... SELECT * FROM src must populate star_sources on the QueryNode."""
     parser = AnsiParser(SchemaResolver())
@@ -118,7 +116,6 @@ def test_select_star_records_star_source():
     assert insert.column_lineage == []
 
 
-@pytest.mark.xfail(reason="_extract_column_lineage StarSource emission not implemented — T-03", strict=True)
 def test_select_alias_star_records_qualifier():
     """SELECT base.* FROM src AS base must set qualifier='base' and resolve source."""
     parser = AnsiParser(SchemaResolver())
@@ -144,7 +141,6 @@ def test_no_sources_skips_star_source():
     assert any("col_lineage_skip:star:" in e for e in parsed.errors)
 
 
-@pytest.mark.xfail(reason="_extract_column_lineage StarSource emission not implemented — T-03", strict=True)
 def test_existing_star_error_marker_retained_alongside_star_source():
     """After T-03, BOTH the error marker AND a StarSource must be present simultaneously.
 
@@ -167,7 +163,6 @@ def test_existing_star_error_marker_retained_alongside_star_source():
     )
 
 
-@pytest.mark.xfail(reason="_extract_column_lineage StarSource emission not implemented — T-03", strict=True)
 def test_multi_source_star_uses_first_source_as_fallback():
     """SELECT * FROM a JOIN b — with no qualifier, first source is the fallback."""
     parser = AnsiParser(SchemaResolver())
@@ -182,7 +177,6 @@ def test_multi_source_star_uses_first_source_as_fallback():
     assert stmt.star_sources[0].qualifier is None
 
 
-@pytest.mark.xfail(reason="_resolve_star_source not yet implemented — T-03", strict=True)
 def test_resolve_star_source_method_exists_on_parser():
     """SqlParser must have a _resolve_star_source instance method after T-03."""
     parser = AnsiParser(SchemaResolver())
@@ -198,7 +192,6 @@ def test_resolve_star_source_method_exists_on_parser():
     assert result.full_id == "BA.src"
 
 
-@pytest.mark.xfail(reason="_resolve_star_source not yet implemented — T-03", strict=True)
 def test_resolve_star_source_alias_match():
     """_resolve_star_source must resolve alias 'b' to the matching TableRef."""
     parser = AnsiParser(SchemaResolver())
@@ -211,7 +204,6 @@ def test_resolve_star_source_alias_match():
     assert result.name == "src_b"
 
 
-@pytest.mark.xfail(reason="_resolve_star_source not yet implemented — T-03", strict=True)
 def test_resolve_star_source_empty_sources_returns_none():
     """_resolve_star_source must return None when sources list is empty."""
     parser = AnsiParser(SchemaResolver())

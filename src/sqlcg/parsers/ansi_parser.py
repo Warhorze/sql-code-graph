@@ -179,9 +179,11 @@ class AnsiParser(SqlParser):
 
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
-        column_lineage = self._extract_column_lineage(
-            stmt, path, out, schema, dst_table=target, sources=sources_map
+        extraction = self._extract_column_lineage(
+            stmt, path, out, schema, dst_table=target, sources=sources_map, query_sources=sources
         )
+        column_lineage = extraction.edges
+        star_sources = extraction.star_sources
 
         # Extract defined columns for CREATE TABLE statements
         defined_columns: list[str] = []
@@ -204,6 +206,7 @@ class AnsiParser(SqlParser):
             confidence=confidence,
             parsing_mode="sqlglot",
             defined_columns=defined_columns,
+            star_sources=star_sources,
         )
 
     @staticmethod

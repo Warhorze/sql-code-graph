@@ -1,0 +1,20 @@
+## Current State
+
+agent: developer (T-03–T-07 implementation starting)
+plan: plan/sprint_05_star_resolution.md
+status: T-01, T-02, T-09 complete (PR #16) | T-08 complete (PR #17) | T-03–T-07 starting now
+branch: feat/sprint-05-t03-t07 (based on feat/sprint-05-star-resolution)
+date: 2026-05-11
+
+Session start:
+  - Checked out feat/sprint-05-star-resolution (has T-01, T-02, T-09)
+  - Created new branch feat/sprint-05-t03-t07
+  - Ready to implement T-03 (parser emits StarSource)
+
+Next steps:
+  - T-03: Parser emits StarSource markers on QueryNode
+  - T-04: Indexer upserts STAR_SOURCE edges
+  - T-05: Post-ingestion expansion query and indexer step
+  - T-06: delete_nodes_for_file cleans up STAR_SOURCE edges; reindex_file re-runs expansion
+  - T-07: db info surfaces star-expansion metrics
+  - Create star_corpus fixtures

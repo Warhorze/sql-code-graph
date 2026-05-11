@@ -107,6 +107,7 @@ class Indexer:
         # Upsert all results and count quality distribution
         tables_found = 0
         lineage_edges = 0
+        star_sources_found = 0
         quality_counts = {
             "full": 0,
             "table_only": 0,
@@ -119,17 +120,23 @@ class Indexer:
                     counts = self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
                 tables_found += counts["tables"]
                 lineage_edges += counts["edges"]
+                star_sources_found += counts.get("star_sources", 0)
                 quality_key = parsed.parse_quality.value.lower()
                 quality_counts[quality_key] += 1
             except Exception as exc:
                 logger.warning("Failed to upsert %s: %s — skipping", parsed.path, exc)
                 quality_counts["failed"] += 1
 
+        # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
+        star_edges_expanded = self._expand_star_sources(db)
+
         return {
             "files_parsed": len(pass2_results),
             "parse_errors": parse_errors,
             "tables_found": tables_found,
             "lineage_edges_created": lineage_edges,
+            "star_sources": star_sources_found,
+            "star_edges_expanded": star_edges_expanded,
             "quality": quality_counts,
         }
 
@@ -159,6 +166,9 @@ class Indexer:
             gold_tables = frozenset(row["q"] for row in gold_rows)
 
             self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
+
+            # Re-run star expansion after re-indexing (idempotent via MERGE)
+            self._expand_star_sources(db)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
@@ -245,9 +255,7 @@ class Indexer:
         defined_by_query = {
             s.target.full_id: s
             for s in parsed.statements
-            if s.target
-            and s.kind in ("CREATE_TABLE", "CREATE_VIEW")
-            and s.defined_columns
+            if s.target and s.kind in ("CREATE_TABLE", "CREATE_VIEW") and s.defined_columns
         }
 
         # Upsert DDL columns and HAS_COLUMN edges
@@ -398,6 +406,34 @@ class Indexer:
                 )
                 counts["edges"] += 1
 
+            # STAR_SOURCE edges for graph-backend expansion
+            for star in stmt.star_sources:
+                db.upsert_node(
+                    NodeLabel.TABLE,
+                    star.source.full_id,
+                    {
+                        "qualified": star.source.full_id,
+                        "name": star.source.name,
+                        "catalog": star.source.catalog or "",
+                        "db": star.source.db or "",
+                        "kind": "TABLE",
+                        "defined_in_file": "",
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.QUERY,
+                    query_id,
+                    NodeLabel.TABLE,
+                    star.source.full_id,
+                    RelType.STAR_SOURCE,
+                    {
+                        "qualifier": star.qualifier or "<unqualified>",
+                        "target_table": stmt.target.full_id if stmt.target else "",
+                        "confidence": 0.8,
+                    },
+                )
+                counts["star_sources"] = counts.get("star_sources", 0) + 1
+
         return counts
 
     def _upsert_all(self, results: list[ParsedFile], db: GraphBackend) -> None:
@@ -409,6 +445,35 @@ class Indexer:
         """
         for parsed in results:
             self._upsert_parsed_file(parsed, db)
+
+    def _expand_star_sources(self, db: GraphBackend) -> int:
+        """Run the post-ingestion star expansion query.
+
+        Returns:
+            Number of COLUMN_LINEAGE edges created by the expansion
+        """
+        from sqlcg.core.queries import EXPAND_STAR_SOURCES_QUERY
+
+        # Count COLUMN_LINEAGE edges before expansion
+        before = db.run_read(
+            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+            {},
+        )
+        before_count = before[0]["n"] if before else 0
+
+        # Run the expansion query
+        with db.transaction():
+            db.run_read(EXPAND_STAR_SOURCES_QUERY, {})
+
+        # Count COLUMN_LINEAGE edges after expansion
+        after = db.run_read(
+            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+            {},
+        )
+        after_count = after[0]["n"] if after else 0
+
+        # Return the number of new edges created
+        return max(0, after_count - before_count)
 
     def _reindex_view_definition(
         self, view_name: str, db: GraphBackend, dialect: str | None

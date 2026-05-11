@@ -52,11 +52,11 @@ This project uses `uv`. Never activate a virtualenv manually, never use `pip`, n
 
 | Task | Command |
 |------|---------|
-| Run tests | `uv run pytest` |
-| Run a single test | `uv run pytest tests/unit/test_foo.py::TestClass::test_name -x` |
+| Run tests | `rtk uv run pytest` (fall back to `uv run pytest` if output lacks detail) |
+| Run a single test | `rtk uv run pytest tests/unit/test_foo.py::TestClass::test_name -x` |
 | Run the CLI | `uv run sqlcg` |
-| Type check | `uv run pyright` |
-| Lint | `uv run ruff check src tests` |
+| Type check | `rtk uv run pyright` |
+| Lint | `rtk uv run ruff check src tests` |
 | Format | `uv run ruff format src tests` |
 
 ## Target scale — serve both ends of the spectrum
@@ -86,6 +86,7 @@ in the relevant sprint plan.
 under 5 minutes on a laptop. Measure and record actual timings in sprint postmortems.
 <!-- TODO: replace with real benchmark numbers after large-repo testing -->
 
+- When referring to files in docs or plans, use markdown hyperlinks (e.g. [`schema.py`](src/sqlcg/core/schema.py)) so stale references are immediately visible when file names change.
 - No backward compatibility. Re-index is the migration path.
 - No TODO in the happy path of any feature.
 - Every new method must have a grep-confirmed call site before PR opens.

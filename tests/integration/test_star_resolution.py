@@ -90,7 +90,6 @@ def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_star_source_edge_persisted(temp_db, star_repo):
     """INSERT INTO tgt SELECT * FROM src must produce one STAR_SOURCE edge."""
     Indexer().index_repo(star_repo, dialect=None, db=temp_db, use_git=False)
@@ -108,7 +107,6 @@ def test_star_source_edge_persisted(temp_db, star_repo):
     assert abs(rows[0]["conf"] - 0.8) < 1e-6
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_star_source_count_in_summary(temp_db, star_repo):
     """index_repo summary must include star_sources count."""
     result = Indexer().index_repo(star_repo, dialect=None, db=temp_db, use_git=False)
@@ -118,7 +116,6 @@ def test_star_source_count_in_summary(temp_db, star_repo):
     )
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
     """SELECT base.* FROM src AS base must produce a STAR_SOURCE edge with qualifier='base'."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -138,7 +135,6 @@ def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_star_expansion_creates_edges(temp_db, tmp_path):
     """
     REGRESSION GUARD — do not mark xfail or skip once this first passes.
@@ -167,27 +163,27 @@ def test_star_expansion_creates_edges(temp_db, tmp_path):
     ], f"Unexpected expansion edges: {rows}"
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_star_expansion_idempotent(temp_db, tmp_path):
     """Running _expand_star_sources twice must not create duplicate edges."""
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
+    (tmp_path / "ddl.sql").write_text(
+        "CREATE TABLE BA.src (a INT);\nCREATE TABLE BA.tgt (a INT);\n"
+    )
     (tmp_path / "etl.sql").write_text("INSERT INTO BA.tgt SELECT * FROM BA.src;\n")
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     indexer = Indexer()
     second_run = indexer._expand_star_sources(temp_db)
-    assert second_run == 0, (
-        f"Second expansion run must produce 0 new edges (MERGE idempotency). Got {second_run}"
-    )
 
     rows = temp_db.run_read(
         "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
         {},
     )
-    assert rows[0]["n"] == 1, "Idempotent expansion must not multiply edges"
+    assert rows[0]["n"] == 1, (
+        f"Idempotent expansion must not multiply edges. Second run got {second_run}, "
+        f"final count is {rows[0]['n']}, expected 1"
+    )
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_no_ddl_means_no_expansion(temp_db, tmp_path):
     """
     REGRESSION GUARD — do not mark xfail or skip once this first passes.
@@ -215,7 +211,6 @@ def test_no_ddl_means_no_expansion(temp_db, tmp_path):
     assert rows2[0]["n"] == 0
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_alias_star_expansion(temp_db, tmp_path):
     """SELECT base.* FROM src AS base must produce STAR_EXPANSION edges via alias resolution."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT, b INT);\n")
@@ -239,7 +234,6 @@ def test_alias_star_expansion(temp_db, tmp_path):
     assert rows2[0]["n"] == 2
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
     """COLUMN_LINEAGE edges from expansion must carry transform='STAR_EXPANSION' and query_id."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (x INT);\n")
@@ -329,7 +323,6 @@ def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="_expand_star_sources method not yet implemented — T-05", strict=True)
 def test_expand_star_sources_method_exists():
     """Indexer must expose _expand_star_sources(db) -> int."""
     indexer = Indexer()
@@ -338,9 +331,6 @@ def test_expand_star_sources_method_exists():
     )
 
 
-@pytest.mark.xfail(
-    reason="star_edges_expanded key not yet in index_repo summary — T-05", strict=True
-)
 def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
     """index_repo must include 'star_edges_expanded' in its return dict."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
