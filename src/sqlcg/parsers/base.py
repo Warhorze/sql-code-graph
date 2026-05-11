@@ -630,8 +630,14 @@ class SqlParser(ABC):
                         continue
 
                 try:
-                    # Build scope on first column for reuse across all columns (T-05)
-                    # This skips redundant qualify() calls inside sg_lineage()
+                    # Build scope on first column for reuse across all columns (T-05 optimization).
+                    # NOTE: We build body_scope locally from the extracted body rather than
+                    # using a pre-built scope from the statement, because CREATE/INSERT statements
+                    # have their scope rooted at the outer statement, but the body passed here
+                    # is the inner SELECT. Reusing the outer scope would produce incorrect
+                    # qualification. The pre-built scope from parse_file would only be useful
+                    # if we had a mechanism to extract the matching inner scope, which is
+                    # complex and not yet implemented (see sprint_06 T-05 deviation for details).
                     if body_scope is None and scope is None:
                         try:
                             from sqlglot.optimizer.qualify import qualify
