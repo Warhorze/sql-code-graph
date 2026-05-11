@@ -5,7 +5,8 @@ This script does NOT write to KuzuDB. It runs pure parser analysis on a corpus
 directory and produces a JSON report of error frequencies and timing metrics.
 
 Usage:
-    uv run python scripts/collect_parse_errors.py <corpus_dir> --dialect snowflake [--output results.json] [--max-files N] [--slow-threshold 1.0]
+    uv run python scripts/collect_parse_errors.py <corpus_dir> --dialect snowflake
+        [--output results.json] [--max-files N] [--slow-threshold 1.0]
 """
 
 import argparse
@@ -23,8 +24,8 @@ import sqlglot.expressions as exp
 from sqlglot.lineage import lineage as sg_lineage
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
-from sqlcg.parsers.snowflake_parser import SnowflakeParser
 from sqlcg.parsers.ansi_parser import AnsiParser
+from sqlcg.parsers.snowflake_parser import SnowflakeParser
 
 
 class CommandFallbackCapture(logging.Handler):
@@ -238,13 +239,17 @@ def collect_parse_errors(
                     # Likely E1 but hard to disambiguate from error message alone
                     errors["E5"]["count"] += 1
                     if len(errors["E5"]["example_files"]) < 10:
-                        errors["E5"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                        errors["E5"]["example_files"].append(
+                            str(file_path.relative_to(corpus_path))
+                        )
                     if len(errors["E5"]["example_messages"]) < 5:
                         errors["E5"]["example_messages"].append(error_msg)
                 else:
                     errors["E5"]["count"] += 1
                     if len(errors["E5"]["example_files"]) < 10:
-                        errors["E5"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                        errors["E5"]["example_files"].append(
+                            str(file_path.relative_to(corpus_path))
+                        )
                     if len(errors["E5"]["example_messages"]) < 5:
                         errors["E5"]["example_messages"].append(error_msg)
 
@@ -438,11 +443,17 @@ def collect_parse_errors(
     total_col_exprs = total_cols_processed
     if total_col_exprs == 0:
         total_col_exprs = 1  # Avoid division by zero
-    print(f"E1  alias_col_ref      {errors['E1']['count']:6d} occurrences ({100*errors['E1']['count']/total_col_exprs:5.1f}% of col exprs)")
-    print(f"E2  expr_no_name       {errors['E2']['count']:6d} occurrences ({100*errors['E2']['count']/total_col_exprs:5.1f}% of col exprs)  ← skipped (expected)")
-    print(f"E3  command_fallback   {errors['E3']['count']:6d} occurrences (Command fallback in {len(set(errors['E3']['example_files'])):3d} files)")
-    print(f"E4  parse_failure      {errors['E4']['count']:6d} occurrences ({len(set(errors['E4']['example_files'])):3d} files, full skip)")
-    print(f"E5  lineage_other      {errors['E5']['count']:6d} occurrences ({100*errors['E5']['count']/total_col_exprs:5.1f}% of col exprs)")
+    n1, n2, n3, n4, n5 = (errors[k]["count"] for k in ("E1", "E2", "E3", "E4", "E5"))
+    e1_pct = 100 * n1 / total_col_exprs
+    e2_pct = 100 * n2 / total_col_exprs
+    e5_pct = 100 * n5 / total_col_exprs
+    e3_files = len(set(errors["E3"]["example_files"]))
+    e4_files = len(set(errors["E4"]["example_files"]))
+    print(f"E1  alias_col_ref      {n1:6d} occurrences ({e1_pct:5.1f}% of col exprs)")
+    print(f"E2  expr_no_name       {n2:6d} occurrences ({e2_pct:5.1f}% of col exprs)  <- skipped")
+    print(f"E3  command_fallback   {n3:6d} occurrences (Command fallback in {e3_files:3d} files)")
+    print(f"E4  parse_failure      {n4:6d} occurrences ({e4_files:3d} files, full skip)")
+    print(f"E5  lineage_other      {n5:6d} occurrences ({e5_pct:5.1f}% of col exprs)")
     e6_note = f"from {len(schema)} schemas" if schema else "schema was empty in this run"
     print(f"E6  schema_mismatch    {errors['E6']['count']:6d} occurrences ({e6_note})")
     print(f"E7  tree_walk_fail     {errors['E7']['count']:6d} occurrences")
@@ -451,7 +462,10 @@ def collect_parse_errors(
     print("\n=== Success ===")
     total_files = len(sql_files)
     pct_resolved = 100 * files_with_success / total_files if total_files else 0
-    print(f"sg_lineage edges emitted:  {success_edges:,} (from {files_with_success} of {total_files} files — {pct_resolved:.1f}% resolved)")
+    print(
+        f"sg_lineage edges emitted:  {success_edges:,} "
+        f"(from {files_with_success} of {total_files} files — {pct_resolved:.1f}% resolved)"
+    )
 
     print("\n=== File Quality ===")
     print(f"Files parsed OK (FULL):    {files_ok}")
@@ -461,9 +475,10 @@ def collect_parse_errors(
     if slow_files:
         print(f"\n=== Slow Files (> {slow_threshold}s) ===")
         for item in slow_files[:10]:
-            print(f"{item['elapsed_seconds']:5.1f}s  {item['file']:50s}  ({item['statement_count']} statements)")
+            stmts = item["statement_count"]
+            print(f"{item['elapsed_seconds']:5.1f}s  {item['file']:50s}  ({stmts} statements)")
 
-    print(f"\n=== Per-File Timing ===")
+    print("\n=== Per-File Timing ===")
     print(f"p50: {result['per_file_timing_p50_ms']:.1f} ms")
     print(f"p95: {result['per_file_timing_p95_ms']:.1f} ms")
     print(f"p99: {result['per_file_timing_p99_ms']:.1f} ms")
@@ -478,7 +493,8 @@ def main():
         epilog="""
 Examples:
   uv run python scripts/collect_parse_errors.py /home/ignwrad/Projects/dwh --dialect snowflake
-  uv run python scripts/collect_parse_errors.py /home/ignwrad/Projects/dwh --max-files 200 --output results_quick.json
+  uv run python scripts/collect_parse_errors.py /home/ignwrad/Projects/dwh \\
+      --max-files 200 --output results_quick.json
         """,
     )
 
