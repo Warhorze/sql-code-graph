@@ -116,23 +116,22 @@ The JSON stores only 5 example messages. To determine whether `Cannot find colum
 is the only E5 exception type, run a targeted query against the full JSON or
 re-run the diagnostic script with wider sampling.
 
-**Option A — re-run script with `--max-files` and increased example count**
+**Option A — edit the hardcoded cap and re-run on a subset**
 
-If the diagnostic script (`scripts/collect_parse_errors.py`) exposes a
-`--max-examples` argument (or can be trivially modified to store more), re-run
-with a higher cap:
+The script does not expose CLI flags for the example cap. The limits are
+hardcoded constants in `scripts/collect_parse_errors.py` (look for `< 5` for
+messages and `< 10` for files). Edit those constants directly in the script,
+then re-run on the `ddl/changelogs/IA-DATAPRODUCTS/` subdirectory only
+(all 10 E5 example files are there, so a full-corpus re-run is not needed):
 
 ```bash
-uv run python scripts/collect_parse_errors.py /home/ignwrad/Projects/dwh \
+uv run python scripts/collect_parse_errors.py \
+  /home/ignwrad/Projects/dwh/ddl/changelogs/IA-DATAPRODUCTS \
   --dialect snowflake \
-  --max-files 200 \
   --output results_e5_sample.json
 ```
 
 Then inspect `error_summary.E5.example_messages` in `results_e5_sample.json`.
-If the script does not support a higher cap, edit the constant that controls
-`example_messages` list length (look for `[:5]` or `[:10]` in the script) and
-re-run on a subset.
 
 **Option B — direct file inspection**
 
@@ -216,6 +215,11 @@ E5 findings:
 - SQL pattern: <CTE reference | cross-file view | subquery alias | other>
 - Hypothesis confirmed/refuted: <CTE cross-file | internal alias | other>
 - Fix direction: <sources= expansion | qualify() workaround | other>
+- E1/E5 boundary note: flag any messages where "Cannot find column" AND the
+  column name contains ".". The script increments E5 for BOTH branches of the
+  E1/E5 guard (lines ~237–249 of collect_parse_errors.py), so some counted E5s
+  may be E1-pattern errors (table-alias prefix). Record how many samples, if
+  any, fall into this category.
 ```
 
 ---

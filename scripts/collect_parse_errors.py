@@ -40,12 +40,31 @@ class CommandFallbackCapture(logging.Handler):
             self.warnings.append(msg)
 
 
+def _load_schema_dict(csv_path: Path) -> dict:
+    """Build a sqlglot-compatible schema dict from an INFORMATION_SCHEMA CSV.
+
+    Returns {table_schema: {table_name: [col_name, ...]}} keyed by lowercased parts.
+    """
+    import csv
+
+    schema: dict = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            db = row["TABLE_SCHEMA"].lower()
+            table = row["TABLE_NAME"].lower()
+            col = row["COLUMN_NAME"].lower()
+            schema.setdefault(db, {}).setdefault(table, []).append(col)
+    return schema
+
+
 def collect_parse_errors(
     corpus_dir: str,
     dialect: str = "snowflake",
     output: str = "parse_errors_results.json",
     max_files: int | None = None,
     slow_threshold: float = 1.0,
+    schema_csv: str | None = None,
 ) -> None:
     """Scan a SQL corpus and collect error statistics.
 
@@ -55,11 +74,23 @@ def collect_parse_errors(
         output: Path to write JSON results
         max_files: Max number of files to process (None = all)
         slow_threshold: Files taking longer than this many seconds are flagged
+        schema_csv: Optional path to INFORMATION_SCHEMA CSV; if provided, schema is
+            passed to sg_lineage() to improve column qualification
     """
     corpus_path = Path(corpus_dir)
     if not corpus_path.is_dir():
         print(f"Error: {corpus_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    schema: dict = {}
+    if schema_csv:
+        csv_path = Path(schema_csv)
+        if not csv_path.is_file():
+            print(f"Error: schema CSV not found: {schema_csv}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loading schema from {schema_csv}...")
+        schema = _load_schema_dict(csv_path)
+        print(f"  Loaded {sum(len(v) for v in schema.values())} tables from {len(schema)} schemas.")
 
     # Discover all .sql files
     print(f"Scanning {corpus_dir} for .sql files...")
@@ -285,7 +316,7 @@ def collect_parse_errors(
                                 else:
                                     continue
 
-                                root = sg_lineage(col_name, body, schema={}, dialect=dialect)
+                                root = sg_lineage(col_name, body, schema=schema, dialect=dialect)
 
                                 if root:
                                     # Check if edges were produced
@@ -412,12 +443,15 @@ def collect_parse_errors(
     print(f"E3  command_fallback   {errors['E3']['count']:6d} occurrences (Command fallback in {len(set(errors['E3']['example_files'])):3d} files)")
     print(f"E4  parse_failure      {errors['E4']['count']:6d} occurrences ({len(set(errors['E4']['example_files'])):3d} files, full skip)")
     print(f"E5  lineage_other      {errors['E5']['count']:6d} occurrences ({100*errors['E5']['count']/total_col_exprs:5.1f}% of col exprs)")
-    print(f"E6  schema_mismatch    {errors['E6']['count']:6d} occurrences (schema was empty in this run)")
+    e6_note = f"from {len(schema)} schemas" if schema else "schema was empty in this run"
+    print(f"E6  schema_mismatch    {errors['E6']['count']:6d} occurrences ({e6_note})")
     print(f"E7  tree_walk_fail     {errors['E7']['count']:6d} occurrences")
     print(f"E8  no_edges_from_root {errors['E8']['count']:6d} occurrences")
 
     print("\n=== Success ===")
-    print(f"sg_lineage edges emitted:  {success_edges:,} (from {files_with_success} of {len(sql_files)} files)")
+    total_files = len(sql_files)
+    pct_resolved = 100 * files_with_success / total_files if total_files else 0
+    print(f"sg_lineage edges emitted:  {success_edges:,} (from {files_with_success} of {total_files} files — {pct_resolved:.1f}% resolved)")
 
     print("\n=== File Quality ===")
     print(f"Files parsed OK (FULL):    {files_ok}")
@@ -433,6 +467,7 @@ def collect_parse_errors(
     print(f"p50: {result['per_file_timing_p50_ms']:.1f} ms")
     print(f"p95: {result['per_file_timing_p95_ms']:.1f} ms")
     print(f"p99: {result['per_file_timing_p99_ms']:.1f} ms")
+    print(f"\nTotal runtime: {total_time:.1f}s")
 
 
 def main():
@@ -470,6 +505,11 @@ Examples:
         default=1.0,
         help="Files taking longer than this many seconds are flagged (default: 1.0)",
     )
+    parser.add_argument(
+        "--schema-csv",
+        default=None,
+        help="Path to INFORMATION_SCHEMA.COLUMNS CSV to pass schema to sg_lineage()",
+    )
 
     args = parser.parse_args()
 
@@ -479,6 +519,7 @@ Examples:
         output=args.output,
         max_files=args.max_files,
         slow_threshold=args.slow_threshold,
+        schema_csv=args.schema_csv,
     )
 
 

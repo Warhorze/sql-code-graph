@@ -71,13 +71,11 @@ class TestSchemaResolver:
         assert len(results) == 1
         assert isinstance(results[0], dict)
 
-    def test_add_information_schema_raises_not_implemented(self):
-        """Test that add_information_schema raises NotImplementedError."""
+    def test_add_information_schema_raises_file_not_found(self, tmp_path):
+        """add_information_schema raises FileNotFoundError for nonexistent path."""
         resolver = SchemaResolver()
-        with pytest.raises(
-            NotImplementedError, match="--schema-from-info-schema is not yet implemented"
-        ):
-            resolver.add_information_schema("dummy.csv")
+        with pytest.raises(FileNotFoundError):
+            resolver.add_information_schema(tmp_path / "nonexistent.csv")
 
     def test_as_dict_returns_nested_structure(self):
         """Test as_dict returns properly nested structure."""
@@ -154,7 +152,6 @@ class TestSchemaResolver:
     # T-08 — add_information_schema
     # -----------------------------------------------------------------------
 
-    @pytest.mark.xfail(reason="add_information_schema not yet implemented — T-08", strict=True)
     def test_add_information_schema_populates_tables(self, tmp_path):
         """CSV with 2 tables / 3 columns each must populate resolver in ORDINAL_POSITION order."""
         csv_file = tmp_path / "cols.csv"
@@ -181,20 +178,17 @@ class TestSchemaResolver:
         assert schema["BA"]["orders"] == ["id", "total", "status"]
         assert schema["BA"]["customers"] == ["id", "name", "email"]
 
-    @pytest.mark.xfail(reason="add_information_schema not yet implemented — T-08", strict=True)
     def test_add_information_schema_missing_column_raises(self, tmp_path):
         """CSV missing ORDINAL_POSITION must raise ValueError naming the missing column."""
         csv_file = tmp_path / "bad.csv"
         csv_file.write_text(
-            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME\n"
-            "mydb,BA,orders,id\n",
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME\nmydb,BA,orders,id\n",
             encoding="utf-8",
         )
         resolver = SchemaResolver()
         with pytest.raises(ValueError, match="ORDINAL_POSITION"):
             resolver.add_information_schema(csv_file)
 
-    @pytest.mark.xfail(reason="add_information_schema not yet implemented — T-08", strict=True)
     def test_add_information_schema_returns_table_count(self, tmp_path):
         """Return value must be the number of distinct tables, not row count."""
         csv_file = tmp_path / "cols.csv"
@@ -208,7 +202,6 @@ class TestSchemaResolver:
         resolver = SchemaResolver()
         assert resolver.add_information_schema(csv_file) == 2
 
-    @pytest.mark.xfail(reason="add_information_schema not yet implemented — T-08", strict=True)
     def test_add_information_schema_idempotent(self, tmp_path):
         """Calling add_information_schema twice must not duplicate columns."""
         csv_file = tmp_path / "cols.csv"

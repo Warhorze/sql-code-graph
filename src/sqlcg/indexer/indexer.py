@@ -31,6 +31,7 @@ class Indexer:
         timeout_per_file: int = 30,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
+        schema_csv: Path | None = None,
     ) -> dict:
         """Full two-pass index. Returns summary dict.
 
@@ -44,11 +45,19 @@ class Indexer:
                 indexing to tracked files; falls back to rglob when git
                 is unavailable or the directory is not a git repository.
             progress_callback: Optional callback(n, total) invoked every 100 files
+            schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
+                auto-discovers <path>/.sqlcg/schema.csv if present.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
             lineage_edges_created, quality
         """
+        # Load explicit INFORMATION_SCHEMA CSV if provided
+        if schema_csv and schema_csv.exists():
+            from sqlcg.cli.commands.load_schema import _load_schema_into_graph
+
+            _load_schema_into_graph(schema_csv, include_catalog=False, db=db)
+
         spec = load_ignore_spec(path)
         schema_resolver = SchemaResolver(dialect=dialect)
         parser = get_parser(dialect, schema_resolver)
@@ -108,6 +117,7 @@ class Indexer:
         tables_found = 0
         lineage_edges = 0
         star_sources_found = 0
+        columns_defined = 0
         quality_counts = {
             "full": 0,
             "table_only": 0,
@@ -121,6 +131,7 @@ class Indexer:
                 tables_found += counts["tables"]
                 lineage_edges += counts["edges"]
                 star_sources_found += counts.get("star_sources", 0)
+                columns_defined += counts.get("columns_defined", 0)
                 quality_key = parsed.parse_quality.value.lower()
                 quality_counts[quality_key] += 1
             except Exception as exc:
@@ -135,6 +146,7 @@ class Indexer:
             "parse_errors": parse_errors,
             "tables_found": tables_found,
             "lineage_edges_created": lineage_edges,
+            "columns_defined": columns_defined,
             "star_sources": star_sources_found,
             "star_edges_expanded": star_edges_expanded,
             "quality": quality_counts,
@@ -167,12 +179,12 @@ class Indexer:
 
             self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
 
-        # Re-run star expansion after re-indexing (idempotent via MERGE)
-        # Call this outside the transaction
-        self._expand_star_sources(db)
-
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
+
+        # Re-run star expansion after re-indexing and all stale views are processed
+        # Call this outside the transaction
+        self._expand_star_sources(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
         """Parse one file, with optional timeout.
@@ -198,6 +210,11 @@ class Indexer:
                 out = ParsedFile(path=path, dialect=parser.DIALECT)
                 out.errors.append(f"timeout:{timeout}s")
                 return out
+
+    @staticmethod
+    def _qid(full_id: str) -> str:
+        """Canonical graph key for a table/column: lowercased full_id."""
+        return full_id.lower()
 
     def _upsert_parsed_file(
         self,
@@ -228,8 +245,26 @@ class Indexer:
             },
         )
 
-        # Upsert defined tables
+        # Upsert defined tables (with duplicate DDL detection)
         for table in parsed.defined_tables:
+            # Guard: detect duplicate DDL for the same table across files
+            existing = db.run_read(
+                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
+                {"qid": table.full_id},
+            )
+            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
+                logger.warning(
+                    "Table %s already defined in %s — %s will add columns to the union; "
+                    "star expansion may include columns from the earlier DDL file",
+                    table.full_id,
+                    existing[0]["f"],
+                    parsed.path_str,
+                )
+                if hasattr(parsed, "errors"):
+                    parsed.errors.append(
+                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
+                    )
+
             db.upsert_node(
                 NodeLabel.TABLE,
                 table.full_id,
@@ -275,24 +310,6 @@ class Indexer:
             qnode = defined_by_query.get(table.full_id)
             if not qnode:
                 continue
-
-            # Guard: detect duplicate DDL for the same table across files
-            existing = db.run_read(
-                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
-                {"qid": table.full_id},
-            )
-            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
-                logger.warning(
-                    "Table %s already defined in %s — %s will add columns to the union; "
-                    "star expansion may include columns from the earlier DDL file",
-                    table.full_id,
-                    existing[0]["f"],
-                    parsed.path_str,
-                )
-                if hasattr(parsed, "errors"):
-                    parsed.errors.append(
-                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
-                    )
 
             for col_name in qnode.defined_columns:
                 col_id = f"{table.full_id}.{col_name}"

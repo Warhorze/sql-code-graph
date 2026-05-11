@@ -33,17 +33,15 @@ def index_cmd(  # noqa: B008
         False, "--no-ddl", help="Skip DDL statements (not yet fully implemented)"
     ),
     schema_from_info_schema: str | None = typer.Option(  # noqa: B008
-        None, "--schema-from-info-schema", hidden=True, help="(Not yet implemented)"
+        None,
+        "--schema-from-info-schema",
+        help="Path to INFORMATION_SCHEMA.COLUMNS CSV (overrides .sqlcg/schema.csv convention).",
     ),
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary console output"
     ),
 ) -> None:
     """Index SQL files in a directory."""
-    if schema_from_info_schema:
-        console.print("[red]--schema-from-info-schema is not yet implemented (v2)[/red]")
-        raise typer.Exit(1)
-
     # TODO: wire no_ddl through to the indexer once it supports the parameter
     if no_ddl:
         console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
@@ -72,6 +70,29 @@ def index_cmd(  # noqa: B008
                 "Run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-index.[/red]"
             )
             raise typer.Exit(1)
+
+        # Auto-discover or explicitly load INFORMATION_SCHEMA CSV
+        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
+
+        _convention = path / ".sqlcg" / "schema.csv"
+        schema_csv: Path | None = (
+            Path(schema_from_info_schema)
+            if schema_from_info_schema
+            else (_convention if _convention.exists() else None)
+        )
+        if schema_csv:
+            try:
+                tables_loaded, cols_loaded = _load_schema_into_graph(
+                    schema_csv, include_catalog=False, db=backend
+                )
+                if not quiet:
+                    console.print(
+                        f"[blue]Schema[/blue] loaded {tables_loaded} tables, "
+                        f"{cols_loaded} columns from {schema_csv}"
+                    )
+            except ValueError as exc:
+                console.print(f"[red]Schema CSV error: {exc}[/red]")
+                raise typer.Exit(1) from exc
 
         abs_path = str(path.resolve())
         backend.upsert_node(
@@ -114,6 +135,7 @@ def index_cmd(  # noqa: B008
             dbt_manifest,
             timeout_per_file,
             progress_callback=_make_progress_callback(total_files),
+            schema_csv=None,
         )
         console.print()  # newline after carriage return progress line
 

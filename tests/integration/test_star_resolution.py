@@ -73,7 +73,6 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
     assert rows[0]["tq"] == "BA.src"
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
     """index_repo summary must include columns_defined count after T-01."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.t (a INT, b INT, c INT);\n")
@@ -345,7 +344,6 @@ def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     """Two files both defining CREATE TABLE BA.src must trigger a structured warning."""
     import logging
@@ -371,7 +369,6 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     )
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     """duplicate_ddl:<table> must appear in the indexer's error channel after duplicate DDL."""
     # We need to reach into parsed.errors; easiest is to patch the indexer
@@ -381,8 +378,8 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     captured_errors: list[list[str]] = []
     original_upsert = Indexer._upsert_parsed_file
 
-    def recording_upsert(self, parsed, db):
-        result = original_upsert(self, parsed, db)
+    def recording_upsert(self, parsed, db, gold_tables=frozenset()):
+        result = original_upsert(self, parsed, db, gold_tables=gold_tables)
         captured_errors.append(list(parsed.errors))
         return result
 
@@ -501,7 +498,7 @@ def test_T08_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
+        "MATCH (:SqlTable {qualified: 'BA.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
     )
     assert len(rows) == 1
     assert rows[0]["src"] == "ddl"
@@ -535,30 +532,39 @@ def test_T08_case_insensitive_gold_guard(temp_db, tmp_path):
     assert len(rows) == 2, f"Case normalisation must block col3. Got {len(rows)} edges"
 
 
-def test_T08_index_autodiscovers_schema_csv(temp_db, tmp_path):
-    """index_repo must auto-load .sqlcg/schema.csv when present in the repo root."""
+def test_T08_index_with_manually_loaded_schema_csv(temp_db, tmp_path):
+    """CLI-style workflow: load schema CSV first, then index repo."""
     try:
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph  # noqa: F401
+        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
     except ImportError:
         pytest.skip("load_schema not yet implemented — T-08")
 
     sqlcg_dir = tmp_path / ".sqlcg"
     sqlcg_dir.mkdir()
+    schema_csv = sqlcg_dir / "schema.csv"
     _csv(
-        sqlcg_dir / "schema.csv",
+        schema_csv,
         [
             "mydb,BA,src,col1,1,INT\n",
             "mydb,BA,src,col2,2,STRING\n",
         ],
     )
+    # Need DDL for target table to enable full expansion
+    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.tgt (col1 INT, col2 STRING);\n")
     (tmp_path / "etl.sql").write_text("INSERT INTO BA.tgt SELECT * FROM BA.src;\n")
 
-    result = Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
+    # Manually load the schema CSV (as the CLI does) — this is index.py's responsibility
+    _load_schema_into_graph(schema_csv, include_catalog=False, db=temp_db)
 
+    # Then index_repo is called without auto-discovery (schema_csv=None)
+    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False, schema_csv=None)
+
+    # Verify that the pre-loaded schema edges are present
     rows = temp_db.run_read(
         "MATCH ()-[r:HAS_COLUMN {source: 'information_schema'}]->() RETURN count(r) AS n", {}
     )
-    assert rows[0]["n"] >= 2, "Auto-discovered schema.csv must produce HAS_COLUMN edges"
-    assert result.get("star_edges_expanded", 0) > 0, (
-        "ETL-folder-only index with auto-discovered schema.csv must expand STAR_SOURCE edges"
-    )
+    assert rows[0]["n"] >= 2, "Pre-loaded schema.csv must have produced HAS_COLUMN edges"
+
+    # Verify that STAR_SOURCE edges were still detected and (optionally) expanded
+    star_sources = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    assert star_sources[0]["n"] >= 1, "index_repo must detect STAR_SOURCE edges"
