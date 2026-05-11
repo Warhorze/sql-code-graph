@@ -19,10 +19,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import sqlglot
-import sqlglot.expressions as exp
-from sqlglot.lineage import lineage as sg_lineage
-
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
 from sqlcg.parsers.snowflake_parser import SnowflakeParser
@@ -41,24 +37,6 @@ class CommandFallbackCapture(logging.Handler):
             self.warnings.append(msg)
 
 
-def _load_schema_dict(csv_path: Path) -> dict:
-    """Build a sqlglot-compatible schema dict from an INFORMATION_SCHEMA CSV.
-
-    Returns {table_schema: {table_name: [col_name, ...]}} keyed by lowercased parts.
-    """
-    import csv
-
-    schema: dict = {}
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            db = row["TABLE_SCHEMA"].lower()
-            table = row["TABLE_NAME"].lower()
-            col = row["COLUMN_NAME"].lower()
-            schema.setdefault(db, {}).setdefault(table, []).append(col)
-    return schema
-
-
 def collect_parse_errors(
     corpus_dir: str,
     dialect: str = "snowflake",
@@ -67,7 +45,11 @@ def collect_parse_errors(
     slow_threshold: float = 1.0,
     schema_csv: str | None = None,
 ) -> None:
-    """Scan a SQL corpus and collect error statistics.
+    """Scan a SQL corpus and collect error statistics from production parser output.
+
+    This script measures errors that the production parser (AnsiParser/SnowflakeParser)
+    has already recorded in parsed.errors, along with edge counts from parsed.statements.
+    It does NOT run its own sg_lineage; instead it classifies the parser's error messages.
 
     Args:
         corpus_dir: Path to directory tree of .sql files (recursive)
@@ -75,23 +57,13 @@ def collect_parse_errors(
         output: Path to write JSON results
         max_files: Max number of files to process (None = all)
         slow_threshold: Files taking longer than this many seconds are flagged
-        schema_csv: Optional path to INFORMATION_SCHEMA CSV; if provided, schema is
-            passed to sg_lineage() to improve column qualification
+        schema_csv: Optional path to INFORMATION_SCHEMA CSV to load into SchemaResolver
+            so the parser sees the same schema the experiment is measuring
     """
     corpus_path = Path(corpus_dir)
     if not corpus_path.is_dir():
         print(f"Error: {corpus_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
-
-    schema: dict = {}
-    if schema_csv:
-        csv_path = Path(schema_csv)
-        if not csv_path.is_file():
-            print(f"Error: schema CSV not found: {schema_csv}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Loading schema from {schema_csv}...")
-        schema = _load_schema_dict(csv_path)
-        print(f"  Loaded {sum(len(v) for v in schema.values())} tables from {len(schema)} schemas.")
 
     # Discover all .sql files
     print(f"Scanning {corpus_dir} for .sql files...")
@@ -104,18 +76,33 @@ def collect_parse_errors(
         print(f"Processing first {max_files} files.")
     print()
 
-    # Set up sqlglot logger capture
+    # Set up sqlglot logger capture for E3 (Command fallback warnings)
     handler = CommandFallbackCapture()
     logging.getLogger("sqlglot").addHandler(handler)
 
-    # Initialize parser
+    # Initialize parser with SchemaResolver
     resolver = SchemaResolver(dialect=dialect if dialect != "ansi" else None)
+
+    # Load INFORMATION_SCHEMA into SchemaResolver so parser has access to schema
+    if schema_csv:
+        csv_path = Path(schema_csv)
+        if not csv_path.is_file():
+            print(f"Error: schema CSV not found: {schema_csv}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Loading schema from {schema_csv}...")
+        try:
+            num_tables = resolver.add_information_schema(csv_path)
+            print(f"  Loaded {num_tables} tables from INFORMATION_SCHEMA.")
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     if dialect == "snowflake":
         parser = SnowflakeParser(resolver)
     else:
         parser = AnsiParser(resolver)
 
-    # Error categories
+    # Error categories (E1–E8 from ARCHITECTURE_REVIEW.md § 12.1)
     errors = {
         "E1": {"count": 0, "example_files": [], "example_messages": []},
         "E2": {"count": 0, "example_files": [], "example_messages": []},
@@ -127,14 +114,25 @@ def collect_parse_errors(
         "E8": {"count": 0, "example_files": [], "example_messages": []},
     }
 
+    # Error prefix histogram (top 20 prefixes)
+    error_prefix_histogram: dict[str, int] = {}
+
     # Timing and success tracking
     per_file_times: list[float] = []
     slow_files: list[dict[str, Any]] = []
     success_edges = 0
+    placeholder_edges = 0
     files_with_success = 0
     total_statements = 0
-    total_cols_processed = 0
-    total_e2_skipped = 0
+
+    # New counters for T-01–T-05 observability
+    t02_fallback_attempts = 0
+    t03_pure_ddl_skips = 0
+    t04_recovery_primary_failures = 0
+    t04_recovery_chunk_failures = 0
+    scripting_block_files = 0
+    star_skip = 0
+    e5_statement_count = 0  # Separate bucket for statement-level E5 errors
 
     # Per-file timing bucket
     files_ok = 0
@@ -253,125 +251,101 @@ def collect_parse_errors(
                     if len(errors["E5"]["example_messages"]) < 5:
                         errors["E5"]["example_messages"].append(error_msg)
 
-        # Extract column lineage from each statement
+        # Classify errors from the production parser's output
+        file_had_success = False
+        for error_msg in parsed.errors:
+            # Record error prefix histogram (first two colon segments)
+            prefix = error_msg.split(":")[0]
+            if ":" in error_msg:
+                prefix = ":".join(error_msg.split(":")[:2])
+            error_prefix_histogram[prefix] = error_prefix_histogram.get(prefix, 0) + 1
+
+            # Classify errors into E1–E8 buckets
+            if error_msg.startswith("col_lineage_skip:expr_no_name"):
+                # E2: expression has no resolvable name (after T-02 fallback skip)
+                errors["E2"]["count"] += 1
+                if len(errors["E2"]["example_files"]) < 10:
+                    errors["E2"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                if len(errors["E2"]["example_messages"]) < 5:
+                    errors["E2"]["example_messages"].append(error_msg)
+
+            elif error_msg.startswith("col_lineage_attempt:expr_fallback:"):
+                # T-02 fallback attempt: informational, NOT an error
+                t02_fallback_attempts += 1
+
+            elif error_msg.startswith("col_lineage_skip:dynamic_source"):
+                # E8: root returned but no edges from dynamic sources
+                errors["E8"]["count"] += 1
+                if len(errors["E8"]["example_files"]) < 10:
+                    errors["E8"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                if len(errors["E8"]["example_messages"]) < 5:
+                    errors["E8"]["example_messages"].append(error_msg)
+
+            elif error_msg.startswith("col_lineage_skip:star:"):
+                # Star projection skip
+                star_skip += 1
+
+            elif error_msg.startswith("col_lineage:tree_walk:"):
+                # E7: tree_walk failure
+                errors["E7"]["count"] += 1
+                if len(errors["E7"]["example_files"]) < 10:
+                    errors["E7"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                if len(errors["E7"]["example_messages"]) < 5:
+                    errors["E7"]["example_messages"].append(error_msg)
+
+            elif error_msg.startswith("col_lineage:statement:"):
+                # E5: statement-level lineage error (separate from column-level)
+                e5_statement_count += 1
+                errors["E5"]["count"] += 1
+                if len(errors["E5"]["example_files"]) < 10:
+                    errors["E5"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                if len(errors["E5"]["example_messages"]) < 5:
+                    errors["E5"]["example_messages"].append(error_msg)
+
+            elif error_msg.startswith("col_lineage:"):
+                # E5: column-level lineage exception. Check for E1 pattern (qualified column with dot).
+                if "Cannot find column" in error_msg and "." in error_msg:
+                    # Heuristic for E1: qualified column names (db.col or table.col)
+                    errors["E1"]["count"] += 1
+                    if len(errors["E1"]["example_files"]) < 10:
+                        errors["E1"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                    if len(errors["E1"]["example_messages"]) < 5:
+                        errors["E1"]["example_messages"].append(error_msg)
+                else:
+                    # E5: general lineage extraction error
+                    errors["E5"]["count"] += 1
+                    if len(errors["E5"]["example_files"]) < 10:
+                        errors["E5"]["example_files"].append(str(file_path.relative_to(corpus_path)))
+                    if len(errors["E5"]["example_messages"]) < 5:
+                        errors["E5"]["example_messages"].append(error_msg)
+
+            elif error_msg.startswith("parse_recovery:primary:"):
+                # T-04: recovery from primary parse failure
+                t04_recovery_primary_failures += 1
+
+            elif error_msg.startswith("parse_recovery:chunk:"):
+                # T-04: recovery from chunk parse failure
+                t04_recovery_chunk_failures += 1
+
+            elif error_msg.startswith("parse_mode:pure_ddl_skip"):
+                # T-03: pure-DDL file early skip
+                t03_pure_ddl_skips += 1
+
+            elif error_msg.startswith("parse_mode:scripting_block"):
+                # Scripting block fallback
+                scripting_block_files += 1
+
+        # Count edges from parsed.statements
         file_had_success = False
         for stmt in parsed.statements:
-            if not stmt.column_lineage:
-                # Try to extract column lineage inline
-                try:
-                    # Rerun _extract_column_lineage to count errors and E8
-                    stmt_obj = None
-                    # We need to re-parse to get the AST, use the sql text
-                    try:
-                        stmts = sqlglot.parse(stmt.sql, dialect=dialect)
-                        if stmts and stmts[0]:
-                            stmt_obj = stmts[0]
-                    except Exception:
-                        pass
+            for edge in stmt.column_lineage:
+                if edge.confidence > 0.0:
+                    success_edges += 1
+                    file_had_success = True
+                elif edge.confidence == 0.0:
+                    placeholder_edges += 1
 
-                    if stmt_obj:
-                        # Extract column expressions
-                        col_expressions = []
-                        if isinstance(stmt_obj, exp.Select):
-                            col_expressions = stmt_obj.expressions
-                        elif isinstance(stmt_obj, exp.Create) and isinstance(
-                            stmt_obj.expression, exp.Select
-                        ):
-                            col_expressions = stmt_obj.expression.expressions
-                        elif isinstance(stmt_obj, exp.Insert) and isinstance(
-                            stmt_obj.expression, exp.Select
-                        ):
-                            col_expressions = stmt_obj.expression.expressions
-
-                        for col_expr in col_expressions:
-                            total_cols_processed += 1
-
-                            # Determine col_name
-                            if col_expr.alias:
-                                col_name = col_expr.alias
-                            elif isinstance(col_expr, exp.Column):
-                                col_name = col_expr.name
-                            else:
-                                # E2: expression with no resolvable name
-                                errors["E2"]["count"] += 1
-                                total_e2_skipped += 1
-                                if len(errors["E2"]["example_files"]) < 10:
-                                    errors["E2"]["example_files"].append(
-                                        str(file_path.relative_to(corpus_path))
-                                    )
-                                if len(errors["E2"]["example_messages"]) < 5:
-                                    ex_str = col_expr.sql(dialect=dialect)
-                                    if len(ex_str) > 100:
-                                        ex_str = ex_str[:100] + "..."
-                                    errors["E2"]["example_messages"].append(ex_str)
-                                continue
-
-                            # Try sg_lineage
-                            try:
-                                if isinstance(stmt_obj, exp.Select):
-                                    body = stmt_obj
-                                elif isinstance(stmt_obj, exp.Create) and isinstance(
-                                    stmt_obj.expression, exp.Select
-                                ):
-                                    body = stmt_obj.expression
-                                elif isinstance(stmt_obj, exp.Insert) and isinstance(
-                                    stmt_obj.expression, exp.Select
-                                ):
-                                    body = stmt_obj.expression
-                                else:
-                                    continue
-
-                                root = sg_lineage(col_name, body, schema=schema, dialect=dialect)
-
-                                if root:
-                                    # Check if edges were produced
-                                    new_edges = parser._lineage_node_to_edges(
-                                        root,
-                                        dst_col_name=col_name,
-                                        dst_table=None,
-                                        path=file_path,
-                                        out=parsed,
-                                    )
-                                    if new_edges:
-                                        success_edges += len(new_edges)
-                                        file_had_success = True
-                                    else:
-                                        # E8: root but no edges
-                                        errors["E8"]["count"] += 1
-                                        if len(errors["E8"]["example_files"]) < 10:
-                                            errors["E8"]["example_files"].append(
-                                                str(file_path.relative_to(corpus_path))
-                                            )
-                                        if len(errors["E8"]["example_messages"]) < 5:
-                                            msg = f"col={col_name} root has no leaf sources"
-                                            errors["E8"]["example_messages"].append(msg)
-
-                            except Exception as exc:
-                                exc_str = str(exc)
-
-                                # Disambiguate E1 vs E5
-                                if "Cannot find column" in exc_str and "." in col_name:
-                                    errors["E1"]["count"] += 1
-                                    if len(errors["E1"]["example_files"]) < 10:
-                                        errors["E1"]["example_files"].append(
-                                            str(file_path.relative_to(corpus_path))
-                                        )
-                                    if len(errors["E1"]["example_messages"]) < 5:
-                                        errors["E1"]["example_messages"].append(col_name)
-                                else:
-                                    # E5: lineage_other
-                                    errors["E5"]["count"] += 1
-                                    if len(errors["E5"]["example_files"]) < 10:
-                                        errors["E5"]["example_files"].append(
-                                            str(file_path.relative_to(corpus_path))
-                                        )
-                                    if len(errors["E5"]["example_messages"]) < 5:
-                                        if len(exc_str) > 100:
-                                            exc_str = exc_str[:100] + "..."
-                                        errors["E5"]["example_messages"].append(exc_str)
-
-                except Exception:
-                    pass  # Skip file if something goes wrong
+            total_statements += 1
 
         if file_had_success:
             files_with_success += 1
@@ -419,14 +393,26 @@ def collect_parse_errors(
         "dialect": dialect,
         "total_files": len(sql_files),
         "total_statements": total_statements,
-        "total_columns_processed": total_cols_processed,
         "runtime_seconds": round(total_time, 1),
         "error_summary": errors,
         "success_edges": success_edges,
+        "placeholder_edges": placeholder_edges,
         "files_with_success": files_with_success,
         "files_ok": files_ok,
         "files_degraded": files_degraded,
         "files_failed": files_failed,
+        # T-01–T-05 observability counters
+        "t02_fallback_attempts": t02_fallback_attempts,
+        "t03_pure_ddl_skips": t03_pure_ddl_skips,
+        "t04_recovery_primary_failures": t04_recovery_primary_failures,
+        "t04_recovery_chunk_failures": t04_recovery_chunk_failures,
+        "scripting_block_files": scripting_block_files,
+        "star_skip": star_skip,
+        "e5_statement_count": e5_statement_count,
+        # Error prefix histogram (top 20)
+        "error_prefix_histogram": dict(
+            sorted(error_prefix_histogram.items(), key=lambda x: x[1], reverse=True)[:20]
+        ),
         "slow_files": slow_files[:20],  # Top 20 slowest files
         "per_file_timing_p50_ms": round(p50 * 1000, 1),
         "per_file_timing_p95_ms": round(p95 * 1000, 1),
@@ -440,32 +426,38 @@ def collect_parse_errors(
 
     # Print summary
     print("\n=== Error Frequency Table ===")
-    total_col_exprs = total_cols_processed
-    if total_col_exprs == 0:
-        total_col_exprs = 1  # Avoid division by zero
+    print("Note: E3 measures parse-time Command warnings, NOT lineage-blocking events.")
+    print("      T-03 deliberately does not reduce E3 by design.")
+    print()
     n1, n2, n3, n4, n5 = (errors[k]["count"] for k in ("E1", "E2", "E3", "E4", "E5"))
-    e1_pct = 100 * n1 / total_col_exprs
-    e2_pct = 100 * n2 / total_col_exprs
-    e5_pct = 100 * n5 / total_col_exprs
     e3_files = len(set(errors["E3"]["example_files"]))
     e4_files = len(set(errors["E4"]["example_files"]))
-    print(f"E1  alias_col_ref      {n1:6d} occurrences ({e1_pct:5.1f}% of col exprs)")
-    print(f"E2  expr_no_name       {n2:6d} occurrences ({e2_pct:5.1f}% of col exprs)  <- skipped")
-    print(f"E3  command_fallback   {n3:6d} occurrences (Command fallback in {e3_files:3d} files)")
+    print(f"E1  alias_col_ref      {n1:6d} occurrences")
+    print(f"E2  expr_no_name       {n2:6d} occurrences  (pure skip, not fallback)")
+    print(f"E3  command_fallback   {n3:6d} occurrences (in {e3_files:3d} files)")
     print(f"E4  parse_failure      {n4:6d} occurrences ({e4_files:3d} files, full skip)")
-    print(f"E5  lineage_other      {n5:6d} occurrences ({e5_pct:5.1f}% of col exprs)")
-    e6_note = f"from {len(schema)} schemas" if schema else "schema was empty in this run"
-    print(f"E6  schema_mismatch    {errors['E6']['count']:6d} occurrences ({e6_note})")
+    print(f"E5  lineage_other      {n5:6d} occurrences (statement-level: {e5_statement_count})")
+    print(f"E6  schema_mismatch    {errors['E6']['count']:6d} occurrences")
     print(f"E7  tree_walk_fail     {errors['E7']['count']:6d} occurrences")
     print(f"E8  no_edges_from_root {errors['E8']['count']:6d} occurrences")
 
-    print("\n=== Success ===")
+    print("\n=== T-01–T-05 Observability ===")
+    print(f"T-02 fallback attempts     {t02_fallback_attempts:6d} (best-effort expr name extraction)")
+    print(f"T-03 pure-DDL skips        {t03_pure_ddl_skips:6d} (early exit, no lineage)")
+    print(f"T-04 recovery primary      {t04_recovery_primary_failures:6d} (Snowflake dialect recovery)")
+    print(f"T-04 recovery chunk        {t04_recovery_chunk_failures:6d} (per-statement fallback)")
+    print(f"Scripting blocks           {scripting_block_files:6d} (fallback mode)")
+    print(f"Star projection skips      {star_skip:6d} (unresolved SELECT *)")
+
+    print("\n=== Edge Count ===")
     total_files = len(sql_files)
-    pct_resolved = 100 * files_with_success / total_files if total_files else 0
-    print(
-        f"sg_lineage edges emitted:  {success_edges:,} "
-        f"(from {files_with_success} of {total_files} files — {pct_resolved:.1f}% resolved)"
-    )
+    total_edges = success_edges + placeholder_edges
+    pct_success = 100 * success_edges / total_edges if total_edges else 0
+    print(f"Success edges (confidence > 0.0):     {success_edges:6d}")
+    print(f"Placeholder edges (confidence == 0.0): {placeholder_edges:6d}")
+    print(f"Total edges:                           {total_edges:6d} ({pct_success:.1f}% success)")
+    pct_files = 100 * files_with_success / total_files if total_files else 0
+    print(f"Files with success edges:  {files_with_success} of {total_files} ({pct_files:.1f}%)")
 
     print("\n=== File Quality ===")
     print(f"Files parsed OK (FULL):    {files_ok}")
