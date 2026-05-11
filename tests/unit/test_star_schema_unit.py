@@ -1,9 +1,6 @@
 """Unit tests for STAR_SOURCE graph schema additions.
 
-Sprint: sprint_star_resolution.md  Tickets: T-02, T-07
-
 These tests verify schema.py enum values, schema.cypher DDL, and db info output.
-All are xfail until the sprint implementation lands.
 """
 
 import pytest
@@ -24,12 +21,12 @@ def test_rel_type_star_source_enum_value():
 
 
 def test_schema_version_is_two():
-    """SCHEMA_VERSION must be '2' after T-02."""
+    """SCHEMA_VERSION must be '2'."""
     from sqlcg.core.schema import SCHEMA_VERSION
 
     assert SCHEMA_VERSION == "2", (
         f"Expected SCHEMA_VERSION='2', got {SCHEMA_VERSION!r}. "
-        "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py as part of T-02."
+        "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py."
     )
 
 
@@ -39,7 +36,7 @@ def test_star_source_rel_table_in_schema_cypher():
 
     assert "STAR_SOURCE" in SCHEMA_DDL, (
         "STAR_SOURCE REL TABLE not found in schema.cypher. "
-        "Add it after the COLUMN_LINEAGE block as described in T-02."
+        "Add it after the COLUMN_LINEAGE block in schema.cypher."
     )
     # Verify it has the required columns
     assert "qualifier" in SCHEMA_DDL
@@ -117,7 +114,7 @@ def test_star_source_rel_has_correct_properties():
 
 
 # ---------------------------------------------------------------------------
-# T-07 — db info surfaces star metrics
+# db info surfaces star metrics
 # ---------------------------------------------------------------------------
 
 
@@ -160,11 +157,11 @@ def test_star_metrics_in_info_output():
     assert result.exit_code == 0
     assert "STAR_SOURCE edges" in result.output, (
         "db info must print 'STAR_SOURCE edges' count. "
-        "Add the COUNT_STAR_SOURCES_QUERY call in T-07."
+        "Add the COUNT_STAR_SOURCES_QUERY call in the db info command."
     )
     assert "STAR_EXPANSION lineage edges" in result.output, (
         "db info must print 'STAR_EXPANSION lineage edges' count. "
-        "Add the COUNT_STAR_EXPANSIONS_QUERY call in T-07."
+        "Add the COUNT_STAR_EXPANSIONS_QUERY call in the db info command."
     )
     # Values must appear — exact substring match not just "no exception"
     assert "3" in result.output

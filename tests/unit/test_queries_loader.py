@@ -1,17 +1,14 @@
 """Unit tests for the Cypher query loader (queries.py / queries.cypher).
 
-Sprint: sprint_star_resolution.md  Ticket: T-09
-
 These tests verify that all named constants load from queries.cypher and
-that the loader contract is respected. They pass once T-09 lands (loader
-already wired if queries.cypher exists) and serve as a regression guard
+that the loader contract is respected. They serve as a regression guard
 against accidental Cypher re-embedding in Python.
 """
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# T-09 — loader contract
+# loader contract
 # ---------------------------------------------------------------------------
 
 
@@ -61,13 +58,12 @@ def test_queries_cypher_file_exists():
 
     cypher_path = Path(_qmod.__file__).parent / "queries.cypher"
     assert cypher_path.exists(), (
-        f"queries.cypher not found at {cypher_path}. "
-        "T-09 requires all Cypher to live in queries.cypher."
+        f"queries.cypher not found at {cypher_path}. All Cypher must live in queries.cypher."
     )
 
 
 def test_no_raw_cypher_in_queries_py():
-    """queries.py must not contain embedded Cypher strings after T-09."""
+    """queries.py must not contain embedded Cypher strings."""
     from pathlib import Path
 
     import sqlcg.core.queries as _qmod
@@ -77,12 +73,12 @@ def test_no_raw_cypher_in_queries_py():
     for kw in cypher_keywords:
         assert kw not in source, (
             f"Found embedded Cypher keyword '{kw}' in queries.py. "
-            "All Cypher must live in queries.cypher (T-09)."
+            "All Cypher must live in queries.cypher."
         )
 
 
 def test_sprint05_query_constants_load():
-    """Sprint-05 query constants (T-05, T-07) must also load from queries.cypher."""
+    """Star expansion query constants must also load from queries.cypher."""
     from sqlcg.core import queries
 
     sprint05_constants = [
@@ -92,9 +88,7 @@ def test_sprint05_query_constants_load():
     ]
     for name in sprint05_constants:
         value = getattr(queries, name, None)
-        assert value is not None, (
-            f"queries.{name} is missing — T-05/T-07 query not yet added to queries.cypher"
-        )
+        assert value is not None, f"queries.{name} is missing — not yet added to queries.cypher"
         assert isinstance(value, str) and value.strip(), f"queries.{name} is empty"
 
 

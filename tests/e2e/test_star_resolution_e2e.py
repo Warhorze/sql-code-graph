@@ -1,10 +1,4 @@
-"""E2E tests for star-projection resolution using the star_corpus fixture.
-
-Sprint: sprint_star_resolution.md  Ticket: T-05 (e2e)
-
-Uses the synthesised tests/fixtures/star_corpus/ corpus which is a required
-deliverable of the sprint. All tests are xfail until the sprint lands.
-"""
+"""E2E tests for star-projection resolution using the star_corpus fixture."""
 
 from pathlib import Path
 
@@ -80,8 +74,8 @@ def test_star_source_edges_visible_in_corpus(indexed_star_corpus):
 
     rows = db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
     assert rows[0]["n"] >= 1, (
-        "No STAR_SOURCE edges found. Parser must emit StarSource markers (T-03) "
-        "and indexer must upsert them (T-04)."
+        "No STAR_SOURCE edges found. Parser must emit StarSource markers "
+        "and indexer must upsert them."
     )
 
 
@@ -107,5 +101,5 @@ def test_ddl_columns_persisted_in_corpus(indexed_star_corpus):
     rows = db.run_read("MATCH (:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn) RETURN count(c) AS n", {})
     assert rows[0]["n"] >= 3, (
         f"Expected >= 3 SqlColumn nodes (one per DDL column). Got {rows[0]['n']}. "
-        "DDL column extraction (T-01) must be wired into _upsert_parsed_file."
+        "DDL column extraction must be wired into _upsert_parsed_file."
     )

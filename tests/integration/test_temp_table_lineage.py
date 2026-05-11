@@ -6,8 +6,8 @@ from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
 
 
-class TestT03TempTableSourceAccumulation:
-    """T-03: Test temp table source accumulation for column lineage."""
+class TestTempTableSourceAccumulation:
+    """Test temp table source accumulation for column lineage."""
 
     def test_temp_chain_resolves_to_real_table(self):
         """Test that temp table chains resolve lineage back to the real table.

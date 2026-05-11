@@ -1,11 +1,4 @@
-"""Unit tests for star-projection resolution data models and parser behaviour.
-
-Sprint: sprint_star_resolution.md  Tickets: T-01, T-02, T-03
-
-These tests are marked xfail because the implementation does not exist yet.
-They will automatically flip to XPASS (and must be promoted to plain passes)
-once the sprint lands.
-"""
+"""Unit tests for star-projection resolution data models and parser behaviour."""
 
 import dataclasses
 from pathlib import Path

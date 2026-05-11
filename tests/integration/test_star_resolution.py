@@ -1,9 +1,6 @@
 """Integration tests for star-projection graph resolution.
 
-Sprint: sprint_star_resolution.md  Tickets: T-01, T-04, T-05, T-06
-
-All tests are xfail until the full sprint implementation lands.
-They use a real in-memory KuzuDB and cover the complete data path:
+All tests use a real in-memory KuzuDB and cover the complete data path:
   parser -> indexer -> graph -> expansion Cypher -> COLUMN_LINEAGE edges.
 
 REGRESSION GUARD: test_star_expansion_creates_edges and
@@ -38,7 +35,7 @@ def star_repo(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-01 — DDL column definitions persisted to graph
+# DDL column definitions persisted to graph
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +71,7 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
 
 
 def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
-    """index_repo summary must include columns_defined count after T-01."""
+    """index_repo summary must include columns_defined count."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.t (a INT, b INT, c INT);\n")
     result = Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
@@ -85,7 +82,7 @@ def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-04 — STAR_SOURCE edges persisted to graph
+# STAR_SOURCE edges persisted to graph
 # ---------------------------------------------------------------------------
 
 
@@ -130,7 +127,7 @@ def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-05 — Expansion Cypher creates COLUMN_LINEAGE edges
+# Expansion Cypher creates COLUMN_LINEAGE edges
 # ---------------------------------------------------------------------------
 
 
@@ -251,7 +248,7 @@ def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-06 — reindex_file cleans up stale STAR_SOURCE edges
+# reindex_file cleans up stale STAR_SOURCE edges
 # ---------------------------------------------------------------------------
 
 
@@ -316,7 +313,7 @@ def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-05 — expansion query method contract
+# expansion query method contract
 # ---------------------------------------------------------------------------
 
 
@@ -340,7 +337,7 @@ def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-01 — Duplicate DDL detection
+# Duplicate DDL detection
 # ---------------------------------------------------------------------------
 
 
@@ -360,7 +357,7 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     ]
     assert len(dup_warnings) >= 1, (
         "Expected a logger.warning about duplicate DDL for BA.src. "
-        "Add the duplicate-DDL guard to _upsert_parsed_file as described in T-01."
+        "Add the duplicate-DDL guard to _upsert_parsed_file."
     )
     # The warning must mention both files so the user can locate the conflict
     warn_text = " ".join(dup_warnings)
@@ -422,12 +419,12 @@ def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-08 — load-schema writes authoritative HAS_COLUMN edges
+# load-schema writes authoritative HAS_COLUMN edges
 # ---------------------------------------------------------------------------
 
 
 def _get_load_fn():
-    """Return a testable load-schema callable, or skip if T-08 is not yet implemented."""
+    """Return a testable load-schema callable, or skip if load_schema is not yet implemented."""
     try:
         from sqlcg.cli.commands.load_schema import load_schema_cmd_test
 
@@ -442,7 +439,7 @@ def _get_load_fn():
 
         return _wrap
     except ImportError:
-        pytest.skip("load_schema module not yet implemented — T-08")
+        pytest.skip("load_schema module not yet implemented")
 
 
 def _csv(path, rows):
@@ -450,7 +447,7 @@ def _csv(path, rows):
     path.write_text(header + "".join(rows), encoding="utf-8")
 
 
-def test_T08_load_schema_writes_has_column(temp_db, tmp_path):
+def test_load_schema_writes_has_column(temp_db, tmp_path):
     """load_schema must write HAS_COLUMN edges tagged source='information_schema'."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -470,7 +467,7 @@ def test_T08_load_schema_writes_has_column(temp_db, tmp_path):
     assert all(r["src"] == "information_schema" for r in rows)
 
 
-def test_T08_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
+def test_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
     """DDL indexing must not overwrite information_schema HAS_COLUMN edges."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -487,7 +484,7 @@ def test_T08_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
     assert all(r["src"] == "information_schema" for r in rows)
 
 
-def test_T08_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
+def test_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     """A CSV covering only one table must leave uncovered tables' DDL columns intact."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -504,7 +501,7 @@ def test_T08_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     assert rows[0]["src"] == "ddl"
 
 
-def test_T08_load_schema_idempotent(temp_db, tmp_path):
+def test_load_schema_idempotent(temp_db, tmp_path):
     """Running load_schema twice on the same CSV must not create duplicate edges."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -516,7 +513,7 @@ def test_T08_load_schema_idempotent(temp_db, tmp_path):
     assert rows[0]["n"] == 2, f"Must not duplicate edges. Got {rows[0]['n']}"
 
 
-def test_T08_case_insensitive_gold_guard(temp_db, tmp_path):
+def test_case_insensitive_gold_guard(temp_db, tmp_path):
     """Upper-case CSV names must match lower-case DDL via normalisation."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -532,12 +529,12 @@ def test_T08_case_insensitive_gold_guard(temp_db, tmp_path):
     assert len(rows) == 2, f"Case normalisation must block col3. Got {len(rows)} edges"
 
 
-def test_T08_index_with_manually_loaded_schema_csv(temp_db, tmp_path):
+def test_index_with_manually_loaded_schema_csv(temp_db, tmp_path):
     """CLI-style workflow: load schema CSV first, then index repo."""
     try:
         from sqlcg.cli.commands.load_schema import _load_schema_into_graph
     except ImportError:
-        pytest.skip("load_schema not yet implemented — T-08")
+        pytest.skip("load_schema not yet implemented")
 
     sqlcg_dir = tmp_path / ".sqlcg"
     sqlcg_dir.mkdir()

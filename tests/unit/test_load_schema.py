@@ -1,13 +1,11 @@
 """Unit tests for load_schema command helpers.
 
-Sprint: sprint_star_resolution.md  Ticket: T-08
-
 All tests cover the _make_qualified helper and command registration.
 """
 
 
 # ---------------------------------------------------------------------------
-# T-08 — _make_qualified helper
+# _make_qualified helper
 # ---------------------------------------------------------------------------
 
 
@@ -42,7 +40,7 @@ def test_qualified_name_empty_catalog_excluded():
 
 
 def test_load_schema_cmd_registered_in_app():
-    """load-schema must appear in the CLI help output after T-08."""
+    """load-schema must appear in the CLI help output."""
     from typer.testing import CliRunner
 
     from sqlcg.cli.main import app
