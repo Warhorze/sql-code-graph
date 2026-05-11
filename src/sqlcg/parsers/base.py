@@ -539,9 +539,19 @@ class SqlParser(ABC):
                         out.errors.append("col_lineage_skip:star:<empty_name>")
                         continue
                 else:
-                    # Expression with no resolvable name (e.g. ROUND(...), CAST(...))
-                    # — sg_lineage requires a plain column name, skip these
-                    continue
+                    # Best-effort: try .alias, then .name, then str representation.
+                    # sg_lineage may still fail; the existing exception handler records it.
+                    col_name = (
+                        col_expr.alias
+                        or (col_expr.name if hasattr(col_expr, "name") else None)
+                        or str(col_expr)[:40]
+                    )
+                    if not col_name or col_name == "*":
+                        out.errors.append("col_lineage_skip:expr_no_name:<empty>")
+                        continue
+                    out.errors.append(
+                        f"col_lineage_attempt:expr_fallback:{type(col_expr).__name__}"
+                    )
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
                 if schema:
