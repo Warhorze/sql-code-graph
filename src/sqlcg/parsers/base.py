@@ -455,6 +455,7 @@ class SqlParser(ABC):
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
+        schema_sources: dict[str, str] | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
 
@@ -472,6 +473,7 @@ class SqlParser(ABC):
             dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
+            schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
 
         Returns:
             LineageExtraction with edges and star_sources
@@ -571,8 +573,13 @@ class SqlParser(ABC):
                         continue
 
                 try:
+                    combined_sources = {**(sources or {}), **(schema_sources or {})}
                     root = sg_lineage(
-                        col_name, body, schema=schema, sources=sources or {}, dialect=self.DIALECT
+                        col_name,
+                        body,
+                        schema=schema,
+                        sources=combined_sources,
+                        dialect=self.DIALECT,
                     )
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges

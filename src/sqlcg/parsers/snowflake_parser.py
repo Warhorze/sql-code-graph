@@ -99,6 +99,9 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
+        # Compute schema sources once per file
+        schema_sources = self._schema.as_sources_dict() if self._schema else {}
+
         # Initialize sources_map for temp table resolution
         sources_map: dict[str, Any] = {}
 
@@ -121,7 +124,13 @@ class SnowflakeParser(AnsiParser):
                     try:
                         # Call parent's _parse_statement method
                         query_node: Any = AnsiParser._parse_statement(  # type: ignore
-                            self, stmt, path, stmt_index, out, sources_map
+                            self,
+                            stmt,
+                            path,
+                            stmt_index,
+                            out,
+                            sources_map,
+                            schema_sources=schema_sources,
                         )
                         # Mark as parse_failed since we're in scripting mode
                         query_node.parse_failed = True

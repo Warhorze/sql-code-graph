@@ -191,6 +191,34 @@ class SchemaResolver:
                 self._cache = self._build_dict()
             return copy.deepcopy(self._cache)
 
+    def as_sources_dict(self) -> dict[str, str]:
+        """Return a sources= dict for sg_lineage(): {table_name: synthetic_SELECT}.
+
+        For each table known to the resolver, emits a minimal:
+            SELECT col1, col2, ... FROM table_name
+        This lets qualify() inside sg_lineage() expand CTE references to cross-file
+        views whose columns are known from INFORMATION_SCHEMA but whose SQL body is
+        not available in the current file.
+
+        Returns:
+            Dict mapping table_name (last component) to a synthetic SELECT SQL string.
+            Keys are lowercased to match sqlglot's qualify() normalisation.
+        """
+        with self._lock:
+            result: dict[str, str] = {}
+            for (_, db, name), cols in self._tables.items():
+                if not cols:
+                    continue
+                col_list = ", ".join(cols)
+                qualified = f"{db}.{name}" if db else name
+                # Key is the bare table name (lowercased) — sqlglot expand() uses
+                # the scope name which comes from the CTE or alias, not the full path.
+                result[name.lower()] = f"SELECT {col_list} FROM {qualified}"
+                # Also register under schema.table key for fully-qualified CTE sources
+                if db:
+                    result[f"{db}.{name}".lower()] = f"SELECT {col_list} FROM {qualified}"
+            return result
+
     def _build_dict(self) -> dict:
         """Build the nested schema dictionary (called only under self._lock).
 

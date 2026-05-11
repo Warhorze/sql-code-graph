@@ -1,9 +1,9 @@
 ## Current State
 
-agent: architect-reviewer (E4/E5 open questions resolved, ARCHITECTURE_REVIEW.md updated)
-plan: plan/investigation_e5_e4.md (investigation complete)
-status: Q-12-1 and Q-12-2 closed; § 12.4 re-ranked; § 12.6 replaced with findings; ready for sprint-planner
-branch: feat/sprint-05-t03-t07
+agent: developer (sprint-06 implementation starting)
+plan: plan/sprint_06_lineage_coverage.md (approved, no blocking questions)
+status: T-01 implementation starting (SchemaResolver.as_sources_dict + sg_lineage wiring)
+branch: feat/sprint-06
 date: 2026-05-11
 
 Session summary:

@@ -69,6 +69,9 @@ class AnsiParser(SqlParser):
             except Exception:
                 file_scopes.append(None)
 
+        # Compute schema sources once per file
+        schema_sources = self._schema.as_sources_dict() if self._schema else {}
+
         # Initialize sources_map to accumulate temp table definitions
         sources_map: dict[str, Any] = {}
 
@@ -80,7 +83,13 @@ class AnsiParser(SqlParser):
             try:
                 scope = file_scopes[stmt_index] if stmt_index < len(file_scopes) else None
                 query_node = self._parse_statement(
-                    stmt, path, stmt_index, out, sources_map, scope=scope
+                    stmt,
+                    path,
+                    stmt_index,
+                    out,
+                    sources_map,
+                    scope=scope,
+                    schema_sources=schema_sources,
                 )
                 out.statements.append(query_node)
 
@@ -121,6 +130,7 @@ class AnsiParser(SqlParser):
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
+        schema_sources: dict[str, str] | None = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -131,6 +141,7 @@ class AnsiParser(SqlParser):
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
+            schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
 
         Returns:
             QueryNode with extracted metadata
@@ -180,7 +191,14 @@ class AnsiParser(SqlParser):
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
         extraction = self._extract_column_lineage(
-            stmt, path, out, schema, dst_table=target, sources=sources_map, query_sources=sources
+            stmt,
+            path,
+            out,
+            schema,
+            dst_table=target,
+            sources=sources_map,
+            query_sources=sources,
+            schema_sources=schema_sources,
         )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
