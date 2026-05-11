@@ -24,6 +24,13 @@ def test_failed_parse_gets_failed_quality():
         mock_backend.transaction.return_value.__enter__ = MagicMock(return_value=None)
         mock_backend.transaction.return_value.__exit__ = MagicMock(return_value=None)
 
+        def run_read_side_effect(query, _params):
+            if "HAS_COLUMN" in query:  # gold_tables query
+                return []
+            return []
+
+        mock_backend.run_read = MagicMock(side_effect=run_read_side_effect)
+
         # Create a SQL file with invalid syntax to trigger parse failure
         bad_sql_file = temp_path / "bad.sql"
         bad_sql_file.write_text("INVALID SQL HERE @@@@")
@@ -60,6 +67,13 @@ def test_quality_distribution_in_summary():
         mock_backend.transaction.return_value.__enter__ = MagicMock(return_value=None)
         mock_backend.transaction.return_value.__exit__ = MagicMock(return_value=None)
 
+        def run_read_side_effect(query, _params):
+            if "HAS_COLUMN" in query:  # gold_tables query
+                return []
+            return []
+
+        mock_backend.run_read = MagicMock(side_effect=run_read_side_effect)
+
         # Index the repo
         indexer = Indexer()
         result = indexer.index_repo(
@@ -74,10 +88,12 @@ def test_quality_distribution_in_summary():
 
         # Quality should have these keys
         expected_keys = {"full", "table_only", "scripting_fallback", "failed"}
-        assert set(quality.keys()) == expected_keys, \
+        assert set(quality.keys()) == expected_keys, (
             f"Expected keys {expected_keys}, got {set(quality.keys())}"
+        )
 
         # Counts should be non-negative integers
         for key, count in quality.items():
-            assert isinstance(count, int) and count >= 0, \
+            assert isinstance(count, int) and count >= 0, (
                 f"Quality[{key}] should be non-negative int, got {count}"
+            )

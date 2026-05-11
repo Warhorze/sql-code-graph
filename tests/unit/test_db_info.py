@@ -23,6 +23,10 @@ class TestDbInfoHealthChecks:
 
             # Return 0 for all node counts
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 0}]
                 return [{"count": 0}]
@@ -49,6 +53,10 @@ class TestDbInfoHealthChecks:
 
             # Return Repo and SqlQuery, but 0 SqlColumn
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:
@@ -78,6 +86,10 @@ class TestDbInfoHealthChecks:
 
             # Return non-zero counts for all
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:
@@ -110,6 +122,10 @@ class TestDbInfoHealthChecks:
 
             # Return various counts with COLUMN_LINEAGE edges
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:

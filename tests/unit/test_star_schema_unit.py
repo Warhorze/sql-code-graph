@@ -10,7 +10,6 @@ import pytest
 
 from sqlcg.core.kuzu_backend import KuzuBackend
 
-
 # ---------------------------------------------------------------------------
 # T-02 — SCHEMA_VERSION bump and RelType.STAR_SOURCE enum
 # ---------------------------------------------------------------------------
@@ -68,29 +67,39 @@ def test_star_source_rel_has_correct_properties():
     try:
         db.init_schema()
         # Create source nodes for the edge
-        db.upsert_node("SqlQuery", "q:0", {
-            "id": "q:0",
-            "file_path": "f.sql",
-            "statement_index": 0,
-            "sql": "INSERT INTO t SELECT * FROM s",
-            "kind": "INSERT",
-            "target_table": "BA.tgt",
-            "parse_failed": False,
-            "confidence": 1.0,
-            "parsing_mode": "sqlglot",
-        })
-        db.upsert_node("SqlTable", "BA.src", {
-            "qualified": "BA.src",
-            "name": "src",
-            "catalog": "",
-            "db": "BA",
-            "kind": "TABLE",
-            "defined_in_file": "",
-        })
+        db.upsert_node(
+            "SqlQuery",
+            "q:0",
+            {
+                "id": "q:0",
+                "file_path": "f.sql",
+                "statement_index": 0,
+                "sql": "INSERT INTO t SELECT * FROM s",
+                "kind": "INSERT",
+                "target_table": "BA.tgt",
+                "parse_failed": False,
+                "confidence": 1.0,
+                "parsing_mode": "sqlglot",
+            },
+        )
+        db.upsert_node(
+            "SqlTable",
+            "BA.src",
+            {
+                "qualified": "BA.src",
+                "name": "src",
+                "catalog": "",
+                "db": "BA",
+                "kind": "TABLE",
+                "defined_in_file": "",
+            },
+        )
         # Upsert the STAR_SOURCE edge — must not raise
         db.upsert_edge(
-            "SqlQuery", "q:0",
-            "SqlTable", "BA.src",
+            "SqlQuery",
+            "q:0",
+            "SqlTable",
+            "BA.src",
             "STAR_SOURCE",
             {"qualifier": "<unqualified>", "target_table": "BA.tgt", "confidence": 0.8},
         )
@@ -112,7 +121,6 @@ def test_star_source_rel_has_correct_properties():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="db info star metrics not yet implemented — T-07", strict=True)
 def test_star_metrics_in_info_output():
     """db info must print STAR_SOURCE edges and STAR_EXPANSION lineage edge counts."""
     from unittest.mock import MagicMock, patch

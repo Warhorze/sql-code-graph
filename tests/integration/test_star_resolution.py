@@ -256,7 +256,6 @@ def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_clears_star_source_when_star_removed(temp_db, tmp_path):
     """After removing SELECT * from an ETL file, reindex must leave zero STAR_SOURCE edges."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -277,7 +276,6 @@ def test_reindex_clears_star_source_when_star_removed(temp_db, tmp_path):
     assert rows2[0]["n"] == 0, "STAR_SOURCE edge must be gone after reindex removes the SELECT *"
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_re_expands_star_sources(temp_db, tmp_path):
     """After reindex of an ETL file, STAR_EXPANSION edges must be re-created."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT, b INT);\n")

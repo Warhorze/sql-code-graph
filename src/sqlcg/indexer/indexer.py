@@ -167,8 +167,9 @@ class Indexer:
 
             self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
 
-            # Re-run star expansion after re-indexing (idempotent via MERGE)
-            self._expand_star_sources(db)
+        # Re-run star expansion after re-indexing (idempotent via MERGE)
+        # Call this outside the transaction
+        self._expand_star_sources(db)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
@@ -257,6 +258,9 @@ class Indexer:
             for s in parsed.statements
             if s.target and s.kind in ("CREATE_TABLE", "CREATE_VIEW") and s.defined_columns
         }
+
+        # Compute set of defined table IDs for quick lookup
+        defined_table_ids = {t.full_id for t in parsed.defined_tables}
 
         # Upsert DDL columns and HAS_COLUMN edges
         for table in parsed.defined_tables:
@@ -434,6 +438,22 @@ class Indexer:
                 )
                 counts["star_sources"] = counts.get("star_sources", 0) + 1
 
+            # Upsert target table node (if not already a defined_table)
+            # so that star expansion can create destination columns
+            if stmt.target and stmt.target.full_id not in defined_table_ids:
+                db.upsert_node(
+                    NodeLabel.TABLE,
+                    stmt.target.full_id,
+                    {
+                        "qualified": stmt.target.full_id,
+                        "name": stmt.target.name,
+                        "catalog": stmt.target.catalog or "",
+                        "db": stmt.target.db or "",
+                        "kind": "TABLE",
+                        "defined_in_file": "",
+                    },
+                )
+
         return counts
 
     def _upsert_all(self, results: list[ParsedFile], db: GraphBackend) -> None:
@@ -461,9 +481,8 @@ class Indexer:
         )
         before_count = before[0]["n"] if before else 0
 
-        # Run the expansion query
-        with db.transaction():
-            db.run_read(EXPAND_STAR_SOURCES_QUERY, {})
+        # Run the expansion query (without explicit transaction, as caller may already be in one)
+        db.run_read(EXPAND_STAR_SOURCES_QUERY, {})
 
         # Count COLUMN_LINEAGE edges after expansion
         after = db.run_read(

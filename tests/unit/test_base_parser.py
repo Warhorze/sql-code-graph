@@ -44,8 +44,8 @@ class TestExtractColumnLineageExceptions:
             )
 
             # Assert exactly one zero-confidence edge returned
-            assert len(edges) == 1
-            assert edges[0].confidence == 0.0
+            assert len(edges.edges) == 1
+            assert edges.edges[0].confidence == 0.0
 
     def test_outer_statement_exception_recorded(self, caplog):
         """Test that outer statement exceptions are recorded in col_lineage:statement."""
@@ -64,7 +64,7 @@ class TestExtractColumnLineageExceptions:
         edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=bad_schema)
 
         # The method should handle the exception gracefully
-        assert isinstance(edges, list)
+        assert isinstance(edges.edges, list)
 
     def test_sg_lineage_success_returns_edges(self):
         """When sg_lineage returns a root node, edges must be emitted — not an empty list.
@@ -76,13 +76,13 @@ class TestExtractColumnLineageExceptions:
         stmt = parse_one("SELECT col1 FROM t")
         out = ParsedFile(path=Path("test.sql"), dialect=None)
 
-        edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
+        result = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
 
-        assert len(edges) > 0, (
+        assert len(result.edges) > 0, (
             "Expected at least one LineageEdge for SELECT col1 FROM t, got none. "
             "The tree walker in _lineage_node_to_edges must emit edges for leaf nodes."
         )
-        assert all(e.confidence > 0.0 for e in edges), (
+        assert all(e.confidence > 0.0 for e in result.edges), (
             "Edges from a successful sg_lineage call must have confidence > 0."
         )
 
