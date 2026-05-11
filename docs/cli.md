@@ -13,6 +13,7 @@ bash scripts/generate_cli_docs.sh
 | Command | Description |
 | --- | --- |
 | `index` | Index SQL files in a directory. |
+| `load-schema` | Load production column schema from an INFORMATION_SCHEMA CSV. |
 | `watch` | Watch a directory and re-index on SQL file changes. |
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
@@ -62,9 +63,48 @@ Index SQL files in a directory.
 | --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
 | --timeout-per-file | INTEGER | No | No | 30 | Timeout per file in seconds |
+| --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
 | --no-ddl | BOOLEAN | No | No | False | Skip DDL statements (not yet fully implemented) |
-| --schema-from-info-schema | TEXT | No | No |  | (Not yet implemented) |
+| --schema-from-info-schema | TEXT | No | No |  | Path to INFORMATION_SCHEMA.COLUMNS CSV (overrides .sqlcg/schema.csv convention). |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
+
+## `sqlcg load-schema`
+
+```bash
+sqlcg load-schema [OPTIONS] CSV_PATH
+```
+
+Load production column schema from an INFORMATION_SCHEMA CSV.
+
+Writes HAS_COLUMN edges tagged source='information_schema'. Run this before
+'sqlcg index' so DDL-inferred columns are suppressed for covered tables.
+Idempotent: safe to run multiple times.
+
+For automatic pickup, place the CSV at <repo>/.sqlcg/schema.csv — 'sqlcg index'
+will load it without needing this command explicitly.
+
+Generate the CSV from Snowflake:
+
+    SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME,
+           COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+    ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+
+Export as CSV and drop at .sqlcg/schema.csv in your SQL repo root.
+
+Args:
+    csv_path: Path to INFORMATION_SCHEMA.COLUMNS CSV file
+    include_catalog: If True, use 3-part qualified names (catalog.schema.table)
+
+Raises:
+    SystemExit: On any error (via typer.Exit)
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --include-catalog | BOOLEAN | No | No | False | Prefix qualified names with TABLE_CATALOG (use for 3-part references). |
 
 ## `sqlcg watch`
 
@@ -210,7 +250,7 @@ Initialise the graph database (idempotent).
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| _none_ |  |  |  |  |  |
+| --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
 
 ## `sqlcg db reset`
 
