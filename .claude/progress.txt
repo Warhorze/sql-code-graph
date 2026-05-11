@@ -1,9 +1,9 @@
 ## Current State
 
-agent: architect-reviewer (parsing errors experiment findings recorded)
-plan: plan/sprint_05_star_resolution.md
-status: T-01, T-02, T-09 complete (PR #16) | T-08 complete (PR #17) | T-03–T-07 complete (PR pending)
-branch: feat/sprint-05-t03-t07 (based on feat/sprint-05-star-resolution)
+agent: architect-planner (E4/E5 investigation plan written)
+plan: plan/investigation_e5_e4.md
+status: Investigation plan written; awaiting developer to answer Q-12-1 and Q-12-2
+branch: feat/sprint-05-t03-t07
 date: 2026-05-11
 
 Session summary:
@@ -47,3 +47,11 @@ Wiring checklist status: All verified
   - Star metrics (COUNT_STAR_SOURCES_QUERY, COUNT_STAR_EXPANSIONS_QUERY) integrated into db info
 
 No deviations from plan.
+
+Handoff — architect-planner (2026-05-11):
+  - Wrote plan/investigation_e5_e4.md — 1–2 hour investigation for Q-12-1 and Q-12-2
+  - Pre-read results_full.json: E4 files are 5 ETL + 1 DDL (path-based, needs file inspection to confirm);
+    E5 example messages are all "Cannot find column '<plain col>' in query." (needs wider sample to confirm single type)
+  - Plan provides step-by-step instructions, exact fields to record, and success criteria
+  - Next: developer inspects the 6 E4 files and widens E5 sample; architect-reviewer closes § 12.6;
+    sprint-planner writes fix tickets
