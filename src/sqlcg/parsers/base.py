@@ -509,10 +509,11 @@ class SqlParser(ABC):
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
             schema_sources: Map of table names to synthetic SELECT bodies from INFORMATION_SCHEMA
-            scope: Pre-built sqlglot Scope for this statement (optional optimization).
+            scope: Pre-built sqlglot Scope for the query body (optional optimization).
                 When provided, sg_lineage() will reuse this scope instead of re-qualifying.
-                The scope must be built from the same body as passed to sg_lineage().
-                Passing an incorrect scope will produce wrong lineage silently.
+                If not provided, a scope will be built from the extracted body before each
+                lineage extraction. The scope must be built from the same body as passed to
+                sg_lineage(). Passing an incorrect scope will produce wrong lineage silently.
 
         Returns:
             LineageExtraction with edges and star_sources
@@ -548,6 +549,13 @@ class SqlParser(ABC):
                 col_expressions = body.expressions
             else:
                 return LineageExtraction(edges=edges, star_sources=star_sources)
+
+            # Build scope once from the body for all-column reuse (T-05 optimization)
+            # Defer scope building to just before the column loop to ensure sources
+            # are expanded first (avoid rebuilding for each column, but only build
+            # after sources are known)
+            body_scope = None
+            combined_sources = {**(sources or {}), **(schema_sources or {})}
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -622,8 +630,47 @@ class SqlParser(ABC):
                         continue
 
                 try:
-                    combined_sources = {**(sources or {}), **(schema_sources or {})}
-                    # Only pass scope if it's non-None (optimization for reuse)
+                    # Build scope on first column for reuse across all columns (T-05)
+                    # This skips redundant qualify() calls inside sg_lineage()
+                    if body_scope is None and scope is None:
+                        try:
+                            from sqlglot.optimizer.qualify import qualify
+                            from sqlglot.optimizer.scope import build_scope
+
+                            # Expand sources first (same as sg_lineage does)
+                            expanded_body = body
+                            if combined_sources:
+                                # Cast sources to Query type for expansion
+                                sources_to_expand = {}
+                                for k, v in combined_sources.items():
+                                    if isinstance(v, exp.Query):
+                                        sources_to_expand[k] = v
+                                    else:
+                                        # For non-Query objects, try to use as-is
+                                        # (sg_lineage's expand will handle type checking)
+                                        sources_to_expand[k] = v  # type: ignore
+
+                                expanded_body = exp.expand(
+                                    body,
+                                    sources_to_expand,  # type: ignore
+                                    dialect=self.DIALECT,
+                                    copy=True,
+                                )
+
+                            # Qualify the expanded body to prepare for scope building
+                            qualified_body = qualify(
+                                expanded_body,
+                                dialect=self.DIALECT,
+                                schema=schema,
+                                validate_qualify_columns=False,
+                                identify=False,
+                            )
+                            body_scope = build_scope(qualified_body)
+                        except Exception:
+                            # If scope building fails, sg_lineage will fall back
+                            body_scope = None
+
+                    # Only pass body_scope if it's non-None (optimization for reuse)
                     sg_kwargs = {
                         "schema": schema,
                         "sources": combined_sources,
@@ -631,6 +678,8 @@ class SqlParser(ABC):
                     }
                     if scope is not None:
                         sg_kwargs["scope"] = scope
+                    elif body_scope is not None:
+                        sg_kwargs["scope"] = body_scope
                     root = sg_lineage(col_name, body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges

@@ -44,12 +44,11 @@ class AnsiParser(SqlParser):
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
 
-        # Parse all statements in the file
-        try:
-            statements = sqlglot.parse(sql, dialect=self.DIALECT)
-        except Exception as exc:
-            logger.warning("Failed to parse file %s: %s", path, exc)
-            out.errors.append(f"parse_error:{exc}")
+        # Parse all statements in the file using the hook (allows subclass overrides)
+        statements, parse_errors = self._do_parse(sql)
+        out.errors.extend(parse_errors)
+        if not statements:
+            logger.warning("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
             return out
 
@@ -230,7 +229,6 @@ class AnsiParser(SqlParser):
                 sources=sources_map,
                 query_sources=sources,
                 schema_sources=schema_sources,
-                # scope=root_scope,  # TODO: T-05 scope optimization
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
