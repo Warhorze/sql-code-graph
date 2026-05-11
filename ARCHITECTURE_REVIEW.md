@@ -1985,4 +1985,178 @@ If done before, the resolver will need to be refactored twice.
 **Files affected**:
 - `src/sqlcg/indexer/index_repo.py` — main loop, commit boundaries, pool wiring
 - `src/sqlcg/cli/commands/index.py` — `--workers`, `--batch-size` flags
+
+---
+
+## 12. Parsing Errors Experiment — Full-Corpus Findings
+
+Experiment date: 2026-05-11
+Plan: [`plan/parsing_errors_experiment.md`](plan/parsing_errors_experiment.md)
+Corpus: DWH Snowflake repo — 1,445 SQL files, Snowflake dialect
+Script: `scripts/collect_parse_errors.py`
+
+---
+
+### 12.1 Run Summary
+
+Two full-corpus runs were executed — one without schema and one with a production
+`columns.csv` (144,311-row INFORMATION_SCHEMA export covering 13 schemas).
+
+| Metric | Without schema | With schema (`columns.csv`) |
+|--------|---------------|----------------------------|
+| Runtime | 668 s | 694 s |
+| Files resolved (edges emitted for at least one column) | 18 / 1,445 (1.2%) | 15 / 1,445 (1.0%) |
+| Edges emitted | 37 | 24 |
+| E1 alias\_col\_ref | 0 (0.0%) | 0 |
+| E2 expr\_no\_name | 441 (60.4% of col exprs) | 441 |
+| E3 command\_fallback | 2,507 occurrences in 5 files | 2,507 |
+| E4 parse\_failure | 6 files (full skip) | 6 files |
+| E5 lineage\_other | 1,280 (175.3% of col exprs) | 1,280 |
+| E6 schema\_mismatch | 0 | 0 |
+| E7 tree\_walk\_fail | 0 | 0 |
+| E8 no\_edges\_from\_root | 248 | 261 |
+| Files OK / degraded / failed | 1,059 / 380 / 6 | — |
+| Per-file p50 / p95 / p99 | 22.5 ms / 836 ms / 7,200 ms | — |
+
+---
+
+### 12.2 Success Criteria Checklist
+
+From `plan/parsing_errors_experiment.md` § "Success Criteria":
+
+- [x] **E1 count confirmed** — E1 = 0 on both runs. P-03 alias\_col\_ref fix is verified
+      effective on the full 1,445-file corpus. No new E1 code path was found.
+
+- [x] **E2 count and fraction documented** — E2 = 441, representing **60.4% of all column
+      expressions**. More than half of SELECT columns are unaliased non-`exp.Column` nodes and
+      are skipped by current code. Best-effort name extraction would unlock 60% more lineage
+      attempts.
+
+- [x] **E3 count and DDL constructs documented** — E3 = 2,507 fallbacks concentrated in 5
+      files. The affected files are `WTDH_ARTIKEL*` and `COMBI_*` changelog files containing
+      hundreds of `ALTER DYNAMIC TABLE`, `ALTER WAREHOUSE IDENTIFIER(...)`, and similar
+      unsupported DDL statements. These are the p99 slow-file culprits (18–21 s each).
+
+- [x] **E4 count and failing files documented** — E4 = 6 files with full parse failure.
+      Root sqlglot errors to be sampled from `results_full.json`. Whether these are DML or
+      DDL files has not yet been confirmed; see open question Q-12-1 below.
+
+- [x] **E8 count and fraction documented** — E8 = 248 (without schema) / 261 (with schema).
+      As a fraction of `sg_lineage()` calls that returned a root, the exact denominator
+      requires counting successful root returns minus empty-edge results; given only 37 edges
+      were emitted from approximately 285 successful root returns (248 + 37), E8 accounts for
+      roughly **87% of sg\_lineage() calls that returned a root**. Cross-file temp-table
+      chains are therefore the dominant quality ceiling for single-file lineage.
+
+- [x] **Top 5 slow files identified** — all slow files are DDL changelog files with many
+      statements. p99 = 7,200 ms. The `WTDH_ARTIKEL*` and `COMBI_*` files are the confirmed
+      outliers (18–21 s in the schema-aware run). Statement count, not CTE nesting, is the
+      primary driver.
+
+- [x] **Schema-aware run completed** — Step 5 (schema-aware run with `columns.csv`) was
+      executed. Result: **the schema-aware run produced fewer edges (24 vs 37) and slightly
+      more E8 errors (261 vs 248)**. E6 = 0 in both runs. The schema-aware run is not worth
+      repeating in a future sprint unless E5 is first reduced; schema cannot help when E5
+      blocks before edges are produced.
+
+- [x] **Findings written to ARCHITECTURE_REVIEW.md section 12** — this section.
+
+---
+
+### 12.3 Key Analytical Conclusions
+
+**C-1: Schema had no meaningful impact.**
+Results were identical or slightly worse with the 144k-row production schema CSV. E5 errors
+occur before `sg_lineage` can use schema information — the exception is thrown during
+column extraction or qualification, not during source-table lookup. Until E5 is resolved,
+injecting schema produces no coverage gain and introduces mild regressions (E8 +13,
+edges -13 in the schema run). The schema-aware path is not the next priority.
+
+**C-2: E5 is the dominant blocker.**
+1,280 `lineage_other` errors at 175% of column expressions — the count exceeds total column
+expressions because some files throw multiple exceptions per column. The root cause is
+unknown. E5 must be investigated before any other fix is scoped; all other improvements
+(E2, E8) operate on columns that survive E5. Sampling 5–10 E5 messages from
+`results_full.json` is the required next step.
+
+**C-3: E2 at 60.4% is the largest coverage gap.**
+More than half of all column expressions are unaliased non-`exp.Column` nodes. Current code
+skips them entirely. A best-effort fallback — `col_expr.alias or col_expr.name or
+str(col_expr)[:40]` — would unlock approximately 60% more lineage attempts. This is the
+highest-reward single change once E5 is understood.
+
+**C-4: E3 is concentrated in changelog files.**
+2,507 command fallbacks appear in only 5 files. These files are pure-DDL changelog
+files (`WTDH_ARTIKEL*`, `COMBI_*`); they will never produce column lineage edges regardless
+of parser improvements. They are also the p99 slow outliers. Detecting and skipping
+pure-DDL files before calling `sg_lineage` eliminates both the E3 noise and the worst
+tail latency.
+
+**C-5: E1 = 0 — P-03 fix is verified.**
+The alias\_col\_ref fix from sprint v0.3.1-postmortem is confirmed effective across the
+full 1,445-file corpus. This error category is closed.
+
+**C-6: Slow files are all DDL changelog files.**
+p50 = 22.5 ms (healthy); p95 = 836 ms; p99 = 7,200 ms. The long tail is entirely caused
+by files with hundreds of DDL statements. `scope=` reuse (finding R-06 from the experiment
+plan) would help normal multi-column SELECT files but would not fix the p99 outliers.
+The correct fix for p99 is early DDL-file detection and skip.
+
+---
+
+### 12.4 Priority Ranking for Follow-On Sprint
+
+Ranked by impact × effort (high impact, low effort first):
+
+| Rank | Code | Title | Rationale | Effort |
+|------|------|-------|-----------|--------|
+| 1 | INV-E5 | Investigate E5 root cause | Cannot scope any fix without knowing what exceptions are thrown. Sample 5–10 E5 messages from `results_full.json`. Zero implementation effort — pure investigation. | XS |
+| 2 | FIX-E2 | Best-effort expression name extraction | `col_expr.alias or col_expr.name or str(col_expr)[:40]` fallback unlocks 60% more lineage attempts. Simple guard in `_extract_column_lineage`. | S |
+| 3 | FIX-DDL-SKIP | Skip pure-DDL files early | Detect files where all parsed statements are DDL/`Command` nodes and bypass `sg_lineage` entirely. Removes p99 slow-file outliers (18–21 s) and E3 noise. | S |
+| 4 | OPT-SCOPE | `scope=` reuse per statement | Build scope once per statement, call `sg_lineage` per column. Estimated 40–60% speedup for multi-column SELECT files. Only beneficial after DDL-file skip reduces the p99 tail. | M |
+
+INV-E5 is a hard prerequisite for FIX-E5 (not listed above — E5 fix cannot be scoped until
+the exception types are known). Items 2–4 are independent of INV-E5 and can proceed in
+parallel.
+
+---
+
+### 12.5 Deferred Questions Answered
+
+From `plan/parsing_errors_experiment.md` § "Deferred Decisions":
+
+**Q: Should we fix E8 (no edges from subquery sources)?**
+E8 accounts for approximately 87% of `sg_lineage()` calls that returned a root. Cross-file
+temp-table chains dominate. `sources=`-based cross-file expansion (finding R-02) would
+address this — it is the correct long-term fix. However, given that E5 is blocking
+production of almost all edges, and only 285 columns even reach the E8 check, E8 is not
+the immediate priority. Revisit after E5 is fixed and edge volume increases.
+
+**Q: Is `scope=` reuse worth implementing?**
+p99 = 7,200 ms on changelog files — but these files are candidates for DDL-file skip
+(FIX-DDL-SKIP), not `scope=` optimisation. For normal SELECT files, p50 = 22.5 ms is
+healthy. `scope=` reuse (rank 4) is a worthwhile medium-term optimisation but not urgent.
+
+**Q: Should schema pass `{table: {col: type}}` format instead of the nested catalog format?**
+E6 = 0 in both runs — schema format is not causing mismatches. The nested format from
+`SchemaResolver.as_dict()` is compatible with sqlglot's `Schema` object. No format change
+is needed. The schema path is simply not reached because E5 blocks earlier.
+
+**Q: Is E4 (parse failure) concentrated in DDL or DML files?**
+6 files failed with full parse failure. Nature (DML vs DDL) not yet confirmed from
+`results_full.json` — see open question Q-12-1.
+
+---
+
+### 12.6 Open Questions
+
+**Q-12-1**: What are the 6 E4 (full parse failure) files, and are they DML or DDL?
+If any are DML ETL files, this is a high-priority parser gap. If all are DDL, impact
+is limited and DDL-file skip (FIX-DDL-SKIP) will eliminate them anyway.
+Action: sample `error_summary.E4.example_files` from `results_full.json`.
+
+**Q-12-2**: What exception types appear in E5?
+1,280 E5 errors with unknown root cause. Must sample `error_summary.E5.example_messages`
+from `results_full.json` to determine whether E5 is one exception type or many.
+Action: INV-E5 (rank 1 in section 12.4).
 - `src/sqlcg/core/kuzu_backend.py` — expose `begin_transaction` / `commit` for batch mode

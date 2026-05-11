@@ -1,20 +1,49 @@
 ## Current State
 
-agent: developer (T-03–T-07 implementation starting)
+agent: architect-reviewer (parsing errors experiment findings recorded)
 plan: plan/sprint_05_star_resolution.md
-status: T-01, T-02, T-09 complete (PR #16) | T-08 complete (PR #17) | T-03–T-07 starting now
+status: T-01, T-02, T-09 complete (PR #16) | T-08 complete (PR #17) | T-03–T-07 complete (PR pending)
 branch: feat/sprint-05-t03-t07 (based on feat/sprint-05-star-resolution)
 date: 2026-05-11
 
-Session start:
-  - Checked out feat/sprint-05-star-resolution (has T-01, T-02, T-09)
-  - Created new branch feat/sprint-05-t03-t07
-  - Ready to implement T-03 (parser emits StarSource)
+Session summary:
+  - Implemented T-03: Parser emits StarSource markers on QueryNode
+  - Implemented T-04: Indexer upserts STAR_SOURCE edges with qualifier/target_table/confidence
+  - Implemented T-05: Post-ingestion expansion query (EXPAND_STAR_SOURCES) creates COLUMN_LINEAGE edges from star projections
+  - Implemented T-06: reindex_file re-runs expansion after re-parsing
+  - Implemented T-07: db info surfaces STAR_SOURCE edges and STAR_EXPANSION lineage edges counts
+  - Fixed critical bug: target table nodes now created for INSERT/CREATE queries without DDL (e.g., INSERT INTO BA.tgt SELECT...)
+  - Updated unit test mocks to handle gold_tables query and star metric queries
+  - Removed xfail markers from E2E tests (all passing)
+
+Test results:
+  - 42 star-resolution tests: PASSED
+  - 337 total unit/integration/E2E tests: PASSED
+  - 11 skipped (T-08 tests awaiting load_schema implementation)
+  - 4 xfailed (db_info schema warning, duplicate DDL error markers — out of scope for this sprint)
+
+Commit: 2490039 feat(T-03-T-07): Implement star projection resolution pipeline
+
+Handoff — architect-reviewer (2026-05-11):
+  - Added ARCHITECTURE_REVIEW.md § 12 with full-corpus experiment findings
+  - E1 = 0 (P-03 verified), E5 = 1,280 (dominant blocker, root cause unknown),
+    E2 = 441 at 60.4% (largest coverage gap), E3 in 5 DDL changelog files,
+    schema-aware run produced worse results (24 edges vs 37)
+  - Priority ranking: INV-E5 (investigate) → FIX-E2 (expression fallback) →
+    FIX-DDL-SKIP → OPT-SCOPE
+  - Two open questions remain: Q-12-1 (E4 file nature), Q-12-2 (E5 exception types)
+  - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint
 
 Next steps:
-  - T-03: Parser emits StarSource markers on QueryNode
-  - T-04: Indexer upserts STAR_SOURCE edges
-  - T-05: Post-ingestion expansion query and indexer step
-  - T-06: delete_nodes_for_file cleans up STAR_SOURCE edges; reindex_file re-runs expansion
-  - T-07: db info surfaces star-expansion metrics
-  - Create star_corpus fixtures
+  - Create PR for T-03–T-07 (ready for code review)
+  - Once PR merges, merge master into feat/T-08-load-schema for T-08 final implementation
+
+Wiring checklist status: All verified
+  - _resolve_star_source defined and called from _extract_column_lineage
+  - star_sources populated by parser, read by indexer
+  - STAR_SOURCE edges upserted with correct properties
+  - _expand_star_sources called from index_repo and reindex_file
+  - EXPAND_STAR_SOURCES_QUERY defined in queries.cypher
+  - Star metrics (COUNT_STAR_SOURCES_QUERY, COUNT_STAR_EXPANSIONS_QUERY) integrated into db info
+
+No deviations from plan.
