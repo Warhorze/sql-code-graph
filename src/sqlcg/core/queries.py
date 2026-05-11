@@ -1,82 +1,36 @@
-"""Centralized Cypher query strings for graph operations."""
+"""Cypher query loader. All query strings live in queries.cypher."""
 
-from sqlcg.core.schema import NodeLabel, RelType
+import re
+from pathlib import Path
 
-# Scope is bounded by exact path match; APOC procedures are not required.
-# Delete Column nodes for tables defined in a file
-DELETE_COLUMNS_FOR_FILE = (
-    f"MATCH (f:{NodeLabel.FILE} {{path: $path}})"
-    f"<-[:{RelType.DEFINED_IN}]-(t:{NodeLabel.TABLE})"
-    f"-[:{RelType.HAS_COLUMN}]->(c:{NodeLabel.COLUMN})"
-    " DETACH DELETE c"
-)
+_CYPHER_FILE = Path(__file__).parent / "queries.cypher"
 
-# Delete Query nodes and their edges
-DELETE_QUERIES_FOR_FILE = (
-    f"MATCH (f:{NodeLabel.FILE} {{path: $path}})"
-    f"<-[:{RelType.QUERY_DEFINED_IN}]-(q:{NodeLabel.QUERY})"
-    " DETACH DELETE q"
-)
 
-# Delete Table nodes defined in a file
-DELETE_TABLES_FOR_FILE = (
-    f"MATCH (f:{NodeLabel.FILE} {{path: $path}})"
-    f"<-[:{RelType.DEFINED_IN}]-(t:{NodeLabel.TABLE})"
-    " DETACH DELETE t"
-)
+def _load() -> dict[str, str]:
+    """Load named Cypher blocks from queries.cypher.
 
-# Delete the File node itself
-DELETE_FILE = f"MATCH (f:{NodeLabel.FILE} {{path: $path}}) DETACH DELETE f"
+    Format: blocks are separated by lines matching "-- BLOCK_NAME" at the start.
+    Each block name becomes a key in the returned dict.
+    """
+    text = _CYPHER_FILE.read_text(encoding="utf-8")
+    blocks = re.split(r"^--\s+(\w+)\s*$", text, flags=re.MULTILINE)
+    return {blocks[i]: blocks[i + 1].strip() for i in range(1, len(blocks), 2)}
 
-# Find views that depend on tables defined in a file
-STALE_VIEWS_QUERY = (
-    f"MATCH (f:{NodeLabel.FILE} {{path: $path}})"
-    f"<-[:{RelType.DEFINED_IN}]-(t:{NodeLabel.TABLE})"
-    f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY})"
-    f"-[:{RelType.DECLARES}]->(v:{NodeLabel.TABLE} {{kind: 'VIEW'}})"
-    " RETURN DISTINCT v.qualified AS view_name"
-)
 
-# Get all files in a repo by path prefix
-INDEX_REPO_FILES_QUERY = (
-    "MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path"
-)
+_Q = _load()
 
-# Trace upstream lineage of a column
-TRACE_COLUMN_LINEAGE_QUERY = (
-    "MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn) "
-    "RETURN src.id AS id, src.col_name AS col_name"
-)
-
-# Find table usages in queries
-FIND_TABLE_USAGES_QUERY = (
-    "MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)"
-    "-[:QUERY_DEFINED_IN]->(f:File) "
-    "RETURN f.path AS file, q.sql AS sql, q.kind AS kind"
-)
-
-# Get downstream column dependencies
-GET_DOWNSTREAM_DEPENDENCIES_QUERY = (
-    "MATCH (src:SqlColumn {id: $id})-[:COLUMN_LINEAGE]->(dst:SqlColumn) "
-    "RETURN dst.id AS id, dst.col_name AS col_name"
-)
-
-# Get upstream column dependencies
-GET_UPSTREAM_DEPENDENCIES_QUERY = (
-    "MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn) "
-    "RETURN src.id AS id, src.col_name AS col_name"
-)
-
-# Search SQL patterns in indexed queries
-SEARCH_SQL_PATTERN_QUERY = (
-    "MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File) "
-    "WHERE contains(q.sql, $query) "
-    "RETURN f.path AS file, q.sql AS sql, q.kind AS kind "
-    "LIMIT $limit"
-)
-
-# List dialects and repos
-LIST_DIALECTS_AND_REPOS_QUERY = (
-    "MATCH (r:Repo)<-[:BELONGS_TO]-(f:File) "
-    "RETURN r.path AS path, r.name AS name, collect(DISTINCT f.dialect) AS dialects"
-)
+DELETE_COLUMNS_FOR_FILE = _Q["DELETE_COLUMNS_FOR_FILE"]
+DELETE_QUERIES_FOR_FILE = _Q["DELETE_QUERIES_FOR_FILE"]
+DELETE_TABLES_FOR_FILE = _Q["DELETE_TABLES_FOR_FILE"]
+DELETE_FILE = _Q["DELETE_FILE"]
+STALE_VIEWS_QUERY = _Q["STALE_VIEWS"]
+INDEX_REPO_FILES_QUERY = _Q["INDEX_REPO_FILES"]
+TRACE_COLUMN_LINEAGE_QUERY = _Q["TRACE_COLUMN_LINEAGE"]
+FIND_TABLE_USAGES_QUERY = _Q["FIND_TABLE_USAGES"]
+GET_DOWNSTREAM_DEPENDENCIES_QUERY = _Q["GET_DOWNSTREAM_DEPENDENCIES"]
+GET_UPSTREAM_DEPENDENCIES_QUERY = _Q["GET_UPSTREAM_DEPENDENCIES"]
+SEARCH_SQL_PATTERN_QUERY = _Q["SEARCH_SQL_PATTERN"]
+LIST_DIALECTS_AND_REPOS_QUERY = _Q["LIST_DIALECTS_AND_REPOS"]
+EXPAND_STAR_SOURCES_QUERY = _Q["EXPAND_STAR_SOURCES"]
+COUNT_STAR_SOURCES_QUERY = _Q["COUNT_STAR_SOURCES"]
+COUNT_STAR_EXPANSIONS_QUERY = _Q["COUNT_STAR_EXPANSIONS"]

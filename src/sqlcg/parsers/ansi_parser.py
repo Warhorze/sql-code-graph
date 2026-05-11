@@ -179,9 +179,16 @@ class AnsiParser(SqlParser):
 
         # Extract column lineage
         schema = self._schema.as_dict() if self._schema else {}
-        column_lineage = self._extract_column_lineage(
-            stmt, path, out, schema, dst_table=target, sources=sources_map
+        extraction = self._extract_column_lineage(
+            stmt, path, out, schema, dst_table=target, sources=sources_map, query_sources=sources
         )
+        column_lineage = extraction.edges
+        star_sources = extraction.star_sources
+
+        # Extract defined columns for CREATE TABLE statements
+        defined_columns: list[str] = []
+        if isinstance(stmt, exp.Create) and stmt.kind == "TABLE":
+            defined_columns = self._extract_defined_columns(stmt)
 
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)
@@ -198,6 +205,8 @@ class AnsiParser(SqlParser):
             parse_failed=parse_failed,
             confidence=confidence,
             parsing_mode="sqlglot",
+            defined_columns=defined_columns,
+            star_sources=star_sources,
         )
 
     @staticmethod
@@ -232,6 +241,24 @@ class AnsiParser(SqlParser):
             return None
 
         return AnsiParser._convert_table_expr_to_ref(insert_stmt.this)
+
+    @staticmethod
+    def _extract_defined_columns(create_stmt: exp.Create) -> list[str]:
+        """Extract column names from a CREATE TABLE statement.
+
+        Args:
+            create_stmt: CREATE expression (must be a TABLE create)
+
+        Returns:
+            List of column names in source order (as they appear in the SQL)
+        """
+        columns: list[str] = []
+        # Find all ColumnDef nodes in the CREATE statement
+        for col_def in create_stmt.find_all(exp.ColumnDef):
+            col_name = col_def.this.name if col_def.this else None
+            if col_name:
+                columns.append(col_name)
+        return columns
 
     @staticmethod
     def _fallback_table_scan(stmt: Any) -> list[TableRef]:

@@ -1,0 +1,70 @@
+## Current State
+
+agent: architect-reviewer (E4/E5 open questions resolved, ARCHITECTURE_REVIEW.md updated)
+plan: plan/investigation_e5_e4.md (investigation complete)
+status: Q-12-1 and Q-12-2 closed; § 12.4 re-ranked; § 12.6 replaced with findings; ready for sprint-planner
+branch: feat/sprint-05-t03-t07
+date: 2026-05-11
+
+Session summary:
+  - Implemented T-03: Parser emits StarSource markers on QueryNode
+  - Implemented T-04: Indexer upserts STAR_SOURCE edges with qualifier/target_table/confidence
+  - Implemented T-05: Post-ingestion expansion query (EXPAND_STAR_SOURCES) creates COLUMN_LINEAGE edges from star projections
+  - Implemented T-06: reindex_file re-runs expansion after re-parsing
+  - Implemented T-07: db info surfaces STAR_SOURCE edges and STAR_EXPANSION lineage edges counts
+  - Fixed critical bug: target table nodes now created for INSERT/CREATE queries without DDL (e.g., INSERT INTO BA.tgt SELECT...)
+  - Updated unit test mocks to handle gold_tables query and star metric queries
+  - Removed xfail markers from E2E tests (all passing)
+
+Test results:
+  - 42 star-resolution tests: PASSED
+  - 337 total unit/integration/E2E tests: PASSED
+  - 11 skipped (T-08 tests awaiting load_schema implementation)
+  - 4 xfailed (db_info schema warning, duplicate DDL error markers — out of scope for this sprint)
+
+Commit: 2490039 feat(T-03-T-07): Implement star projection resolution pipeline
+
+Handoff — architect-reviewer (2026-05-11):
+  - Added ARCHITECTURE_REVIEW.md § 12 with full-corpus experiment findings
+  - E1 = 0 (P-03 verified), E5 = 1,280 (dominant blocker, root cause unknown),
+    E2 = 441 at 60.4% (largest coverage gap), E3 in 5 DDL changelog files,
+    schema-aware run produced worse results (24 edges vs 37)
+  - Priority ranking: INV-E5 (investigate) → FIX-E2 (expression fallback) →
+    FIX-DDL-SKIP → OPT-SCOPE
+  - Two open questions remain: Q-12-1 (E4 file nature), Q-12-2 (E5 exception types)
+  - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint
+
+Next steps:
+  - Create PR for T-03–T-07 (ready for code review)
+  - Once PR merges, merge master into feat/T-08-load-schema for T-08 final implementation
+
+Wiring checklist status: All verified
+  - _resolve_star_source defined and called from _extract_column_lineage
+  - star_sources populated by parser, read by indexer
+  - STAR_SOURCE edges upserted with correct properties
+  - _expand_star_sources called from index_repo and reindex_file
+  - EXPAND_STAR_SOURCES_QUERY defined in queries.cypher
+  - Star metrics (COUNT_STAR_SOURCES_QUERY, COUNT_STAR_EXPANSIONS_QUERY) integrated into db info
+
+No deviations from plan.
+
+Handoff — architect-planner (2026-05-11):
+  - Wrote plan/investigation_e5_e4.md — 1–2 hour investigation for Q-12-1 and Q-12-2
+  - Pre-read results_full.json: E4 files are 5 ETL + 1 DDL (path-based, needs file inspection to confirm);
+    E5 example messages are all "Cannot find column '<plain col>' in query." (needs wider sample to confirm single type)
+  - Plan provides step-by-step instructions, exact fields to record, and success criteria
+  - Next: developer inspects the 6 E4 files and widens E5 sample; architect-reviewer closes § 12.6;
+    sprint-planner writes fix tickets
+
+Handoff — architect-reviewer (2026-05-11):
+  - Closed Q-12-1 (E4): all 6 files are DML; three sqlglot dialect gaps confirmed
+    (IF NOT EXISTS as If(), unexpected token, UNPIVOT unsupported). FIX-E4 raised
+    as separate medium-priority ticket.
+  - Closed Q-12-2 (E5): single homogeneous exception type confirmed across 50 samples
+    ("Cannot find column '<COLUMN>' in query."); root cause is qualify() failing to
+    expand cross-file CTEs when source tables absent from schema=. Fix direction: pass
+    information-schema as sources= to sg_lineage(). FIX-E5 moved to rank 1 (high priority).
+  - Updated ARCHITECTURE_REVIEW.md § 12.4 (priority table re-ranked, FIX-E5 now rank 1,
+    FIX-E4 added at rank 4), § 12.5 (E4 deferred question answered), § 12.6 (open
+    questions replaced with full documented findings).
+  - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint.

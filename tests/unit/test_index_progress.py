@@ -1,9 +1,8 @@
 """Unit tests for progress callback wiring in sqlcg index."""
 
+import os
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
-import pytest
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
@@ -35,7 +34,7 @@ class TestProgressCallbackUnit:
         backend = KuzuBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
-        summary = indexer.index_repo(
+        indexer.index_repo(
             tmp_path,
             dialect=None,
             db=backend,
@@ -44,8 +43,7 @@ class TestProgressCallbackUnit:
 
         # Verify callback was called at 100-file boundary
         assert any(n == 100 for n, t in calls), (
-            f"Progress callback must be invoked at 100-file boundary. "
-            f"Calls: {calls}"
+            f"Progress callback must be invoked at 100-file boundary. Calls: {calls}"
         )
         assert all(t == 105 for n, t in calls), (
             f"Total argument must be 105 in all calls. Calls: {calls}"
@@ -77,8 +75,7 @@ class TestProgressCallbackUnit:
 
         # Verify callback was never called (below 100 files)
         assert len(calls) == 0, (
-            f"Progress callback must not be invoked for < 100 files. "
-            f"Got {len(calls)} calls."
+            f"Progress callback must not be invoked for < 100 files. Got {len(calls)} calls."
         )
 
 
@@ -92,8 +89,20 @@ class TestProgressCallbackCLIWiring:
             sql_file = tmp_path / f"file_{i:03d}.sql"
             sql_file.write_text("SELECT 1;")
 
-        # Run the index command
-        result = runner.invoke(app, ["index", str(tmp_path)])
+        # Use a fresh database for this test
+        test_db_path = tmp_path / ".sqlcg" / "graph.db"
+        test_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Run the index command with a fresh database
+        old_db_path = os.environ.get("SQLCG_DB_PATH")
+        try:
+            os.environ["SQLCG_DB_PATH"] = str(test_db_path)
+            result = runner.invoke(app, ["index", str(tmp_path)])
+        finally:
+            if old_db_path is not None:
+                os.environ["SQLCG_DB_PATH"] = old_db_path
+            else:
+                os.environ.pop("SQLCG_DB_PATH", None)
 
         # Verify exit code is success
         assert result.exit_code == 0, f"Command failed: {result.output}"

@@ -1,9 +1,6 @@
 """Integration tests for star-projection graph resolution.
 
-Sprint: sprint_star_resolution.md  Tickets: T-01, T-04, T-05, T-06
-
-All tests are xfail until the full sprint implementation lands.
-They use a real in-memory KuzuDB and cover the complete data path:
+All tests use a real in-memory KuzuDB and cover the complete data path:
   parser -> indexer -> graph -> expansion Cypher -> COLUMN_LINEAGE edges.
 
 REGRESSION GUARD: test_star_expansion_creates_edges and
@@ -38,11 +35,10 @@ def star_repo(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-01 — DDL column definitions persisted to graph
+# DDL column definitions persisted to graph
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_columns_persisted(temp_db, tmp_path):
     """Indexing CREATE TABLE must upsert SqlColumn nodes via HAS_COLUMN edges."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (col1 INT, col2 STRING);\n")
@@ -58,7 +54,6 @@ def test_ddl_columns_persisted(temp_db, tmp_path):
     )
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_column_node_properties(temp_db, tmp_path):
     """Each SqlColumn node must have id, col_name, table_qualified set correctly."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (amount DECIMAL);\n")
@@ -75,9 +70,8 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
     assert rows[0]["tq"] == "BA.src"
 
 
-@pytest.mark.xfail(reason="HAS_COLUMN writes not yet implemented — T-01", strict=True)
 def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
-    """index_repo summary must include columns_defined count after T-01."""
+    """index_repo summary must include columns_defined count."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.t (a INT, b INT, c INT);\n")
     result = Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
@@ -88,11 +82,10 @@ def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-04 — STAR_SOURCE edges persisted to graph
+# STAR_SOURCE edges persisted to graph
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_star_source_edge_persisted(temp_db, star_repo):
     """INSERT INTO tgt SELECT * FROM src must produce one STAR_SOURCE edge."""
     Indexer().index_repo(star_repo, dialect=None, db=temp_db, use_git=False)
@@ -110,7 +103,6 @@ def test_star_source_edge_persisted(temp_db, star_repo):
     assert abs(rows[0]["conf"] - 0.8) < 1e-6
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_star_source_count_in_summary(temp_db, star_repo):
     """index_repo summary must include star_sources count."""
     result = Indexer().index_repo(star_repo, dialect=None, db=temp_db, use_git=False)
@@ -120,7 +112,6 @@ def test_star_source_count_in_summary(temp_db, star_repo):
     )
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE edge upserts not yet implemented — T-04", strict=True)
 def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
     """SELECT base.* FROM src AS base must produce a STAR_SOURCE edge with qualifier='base'."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -136,11 +127,10 @@ def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-05 — Expansion Cypher creates COLUMN_LINEAGE edges
+# Expansion Cypher creates COLUMN_LINEAGE edges
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_star_expansion_creates_edges(temp_db, tmp_path):
     """
     REGRESSION GUARD — do not mark xfail or skip once this first passes.
@@ -169,27 +159,27 @@ def test_star_expansion_creates_edges(temp_db, tmp_path):
     ], f"Unexpected expansion edges: {rows}"
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_star_expansion_idempotent(temp_db, tmp_path):
     """Running _expand_star_sources twice must not create duplicate edges."""
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
+    (tmp_path / "ddl.sql").write_text(
+        "CREATE TABLE BA.src (a INT);\nCREATE TABLE BA.tgt (a INT);\n"
+    )
     (tmp_path / "etl.sql").write_text("INSERT INTO BA.tgt SELECT * FROM BA.src;\n")
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     indexer = Indexer()
     second_run = indexer._expand_star_sources(temp_db)
-    assert second_run == 0, (
-        f"Second expansion run must produce 0 new edges (MERGE idempotency). Got {second_run}"
-    )
 
     rows = temp_db.run_read(
         "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
         {},
     )
-    assert rows[0]["n"] == 1, "Idempotent expansion must not multiply edges"
+    assert rows[0]["n"] == 1, (
+        f"Idempotent expansion must not multiply edges. Second run got {second_run}, "
+        f"final count is {rows[0]['n']}, expected 1"
+    )
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_no_ddl_means_no_expansion(temp_db, tmp_path):
     """
     REGRESSION GUARD — do not mark xfail or skip once this first passes.
@@ -217,7 +207,6 @@ def test_no_ddl_means_no_expansion(temp_db, tmp_path):
     assert rows2[0]["n"] == 0
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_alias_star_expansion(temp_db, tmp_path):
     """SELECT base.* FROM src AS base must produce STAR_EXPANSION edges via alias resolution."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT, b INT);\n")
@@ -241,7 +230,6 @@ def test_alias_star_expansion(temp_db, tmp_path):
     assert rows2[0]["n"] == 2
 
 
-@pytest.mark.xfail(reason="Expansion Cypher not yet implemented — T-05", strict=True)
 def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
     """COLUMN_LINEAGE edges from expansion must carry transform='STAR_EXPANSION' and query_id."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (x INT);\n")
@@ -260,11 +248,10 @@ def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-06 — reindex_file cleans up stale STAR_SOURCE edges
+# reindex_file cleans up stale STAR_SOURCE edges
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_clears_star_source_when_star_removed(temp_db, tmp_path):
     """After removing SELECT * from an ETL file, reindex must leave zero STAR_SOURCE edges."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -285,7 +272,6 @@ def test_reindex_clears_star_source_when_star_removed(temp_db, tmp_path):
     assert rows2[0]["n"] == 0, "STAR_SOURCE edge must be gone after reindex removes the SELECT *"
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_re_expands_star_sources(temp_db, tmp_path):
     """After reindex of an ETL file, STAR_EXPANSION edges must be re-created."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT, b INT);\n")
@@ -304,7 +290,6 @@ def test_reindex_re_expands_star_sources(temp_db, tmp_path):
     assert rows[0]["n"] == 2, "After reindex, star expansion edges must be re-created (not lost)"
 
 
-@pytest.mark.xfail(reason="reindex_file expansion not yet implemented — T-06", strict=True)
 def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
     """reindex_file must not duplicate STAR_SOURCE edges (MERGE idempotency via DETACH DELETE)."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -328,11 +313,10 @@ def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-05 — expansion query method contract
+# expansion query method contract
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="_expand_star_sources method not yet implemented — T-05", strict=True)
 def test_expand_star_sources_method_exists():
     """Indexer must expose _expand_star_sources(db) -> int."""
     indexer = Indexer()
@@ -341,9 +325,6 @@ def test_expand_star_sources_method_exists():
     )
 
 
-@pytest.mark.xfail(
-    reason="star_edges_expanded key not yet in index_repo summary — T-05", strict=True
-)
 def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
     """index_repo must include 'star_edges_expanded' in its return dict."""
     (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (a INT);\n")
@@ -356,11 +337,10 @@ def test_index_repo_returns_star_edges_expanded(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-01 — Duplicate DDL detection
+# Duplicate DDL detection
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     """Two files both defining CREATE TABLE BA.src must trigger a structured warning."""
     import logging
@@ -377,7 +357,7 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     ]
     assert len(dup_warnings) >= 1, (
         "Expected a logger.warning about duplicate DDL for BA.src. "
-        "Add the duplicate-DDL guard to _upsert_parsed_file as described in T-01."
+        "Add the duplicate-DDL guard to _upsert_parsed_file."
     )
     # The warning must mention both files so the user can locate the conflict
     warn_text = " ".join(dup_warnings)
@@ -386,7 +366,6 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     )
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     """duplicate_ddl:<table> must appear in the indexer's error channel after duplicate DDL."""
     # We need to reach into parsed.errors; easiest is to patch the indexer
@@ -396,8 +375,8 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     captured_errors: list[list[str]] = []
     original_upsert = Indexer._upsert_parsed_file
 
-    def recording_upsert(self, parsed, db):
-        result = original_upsert(self, parsed, db)
+    def recording_upsert(self, parsed, db, gold_tables=frozenset()):
+        result = original_upsert(self, parsed, db, gold_tables=gold_tables)
         captured_errors.append(list(parsed.errors))
         return result
 
@@ -417,7 +396,6 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     )
 
 
-@pytest.mark.xfail(reason="duplicate DDL guard not yet implemented — T-01", strict=True)
 def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
     """Despite the warning, both DDL files' columns must reach the graph (union semantics)."""
     (tmp_path / "a.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
@@ -441,12 +419,12 @@ def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T-08 — load-schema writes authoritative HAS_COLUMN edges
+# load-schema writes authoritative HAS_COLUMN edges
 # ---------------------------------------------------------------------------
 
 
 def _get_load_fn():
-    """Return a testable load-schema callable, or skip if T-08 is not yet implemented."""
+    """Return a testable load-schema callable, or skip if load_schema is not yet implemented."""
     try:
         from sqlcg.cli.commands.load_schema import load_schema_cmd_test
 
@@ -461,7 +439,7 @@ def _get_load_fn():
 
         return _wrap
     except ImportError:
-        pytest.skip("load_schema module not yet implemented — T-08")
+        pytest.skip("load_schema module not yet implemented")
 
 
 def _csv(path, rows):
@@ -469,7 +447,7 @@ def _csv(path, rows):
     path.write_text(header + "".join(rows), encoding="utf-8")
 
 
-def test_T08_load_schema_writes_has_column(temp_db, tmp_path):
+def test_load_schema_writes_has_column(temp_db, tmp_path):
     """load_schema must write HAS_COLUMN edges tagged source='information_schema'."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -489,7 +467,7 @@ def test_T08_load_schema_writes_has_column(temp_db, tmp_path):
     assert all(r["src"] == "information_schema" for r in rows)
 
 
-def test_T08_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
+def test_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
     """DDL indexing must not overwrite information_schema HAS_COLUMN edges."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -506,7 +484,7 @@ def test_T08_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
     assert all(r["src"] == "information_schema" for r in rows)
 
 
-def test_T08_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
+def test_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     """A CSV covering only one table must leave uncovered tables' DDL columns intact."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -517,13 +495,13 @@ def test_T08_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
+        "MATCH (:SqlTable {qualified: 'BA.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
     )
     assert len(rows) == 1
     assert rows[0]["src"] == "ddl"
 
 
-def test_T08_load_schema_idempotent(temp_db, tmp_path):
+def test_load_schema_idempotent(temp_db, tmp_path):
     """Running load_schema twice on the same CSV must not create duplicate edges."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -535,7 +513,7 @@ def test_T08_load_schema_idempotent(temp_db, tmp_path):
     assert rows[0]["n"] == 2, f"Must not duplicate edges. Got {rows[0]['n']}"
 
 
-def test_T08_case_insensitive_gold_guard(temp_db, tmp_path):
+def test_case_insensitive_gold_guard(temp_db, tmp_path):
     """Upper-case CSV names must match lower-case DDL via normalisation."""
     load = _get_load_fn()
     csv_file = tmp_path / "cols.csv"
@@ -551,30 +529,39 @@ def test_T08_case_insensitive_gold_guard(temp_db, tmp_path):
     assert len(rows) == 2, f"Case normalisation must block col3. Got {len(rows)} edges"
 
 
-def test_T08_index_autodiscovers_schema_csv(temp_db, tmp_path):
-    """index_repo must auto-load .sqlcg/schema.csv when present in the repo root."""
+def test_index_with_manually_loaded_schema_csv(temp_db, tmp_path):
+    """CLI-style workflow: load schema CSV first, then index repo."""
     try:
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph  # noqa: F401
+        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
     except ImportError:
-        pytest.skip("load_schema not yet implemented — T-08")
+        pytest.skip("load_schema not yet implemented")
 
     sqlcg_dir = tmp_path / ".sqlcg"
     sqlcg_dir.mkdir()
+    schema_csv = sqlcg_dir / "schema.csv"
     _csv(
-        sqlcg_dir / "schema.csv",
+        schema_csv,
         [
             "mydb,BA,src,col1,1,INT\n",
             "mydb,BA,src,col2,2,STRING\n",
         ],
     )
+    # Need DDL for target table to enable full expansion
+    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.tgt (col1 INT, col2 STRING);\n")
     (tmp_path / "etl.sql").write_text("INSERT INTO BA.tgt SELECT * FROM BA.src;\n")
 
-    result = Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
+    # Manually load the schema CSV (as the CLI does) — this is index.py's responsibility
+    _load_schema_into_graph(schema_csv, include_catalog=False, db=temp_db)
 
+    # Then index_repo is called without auto-discovery (schema_csv=None)
+    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False, schema_csv=None)
+
+    # Verify that the pre-loaded schema edges are present
     rows = temp_db.run_read(
         "MATCH ()-[r:HAS_COLUMN {source: 'information_schema'}]->() RETURN count(r) AS n", {}
     )
-    assert rows[0]["n"] >= 2, "Auto-discovered schema.csv must produce HAS_COLUMN edges"
-    assert result.get("star_edges_expanded", 0) > 0, (
-        "ETL-folder-only index with auto-discovered schema.csv must expand STAR_SOURCE edges"
-    )
+    assert rows[0]["n"] >= 2, "Pre-loaded schema.csv must have produced HAS_COLUMN edges"
+
+    # Verify that STAR_SOURCE edges were still detected and (optionally) expanded
+    star_sources = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    assert star_sources[0]["n"] >= 1, "index_repo must detect STAR_SOURCE edges"

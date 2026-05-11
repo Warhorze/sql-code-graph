@@ -23,6 +23,10 @@ class TestDbInfoHealthChecks:
 
             # Return 0 for all node counts
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 0}]
                 return [{"count": 0}]
@@ -49,6 +53,10 @@ class TestDbInfoHealthChecks:
 
             # Return Repo and SqlQuery, but 0 SqlColumn
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:
@@ -78,6 +86,10 @@ class TestDbInfoHealthChecks:
 
             # Return non-zero counts for all
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:
@@ -110,6 +122,10 @@ class TestDbInfoHealthChecks:
 
             # Return various counts with COLUMN_LINEAGE edges
             def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                    return [{"n": 0}]
                 if "Repo" in query:
                     return [{"count": 1}]
                 elif "SqlQuery" in query:
@@ -128,3 +144,40 @@ class TestDbInfoHealthChecks:
             assert result.exit_code == 0
             assert "COLUMN_LINEAGE edges:" in result.output
             assert "0" in result.output
+
+    def test_star_metrics_in_info_output(self):
+        """Test that db info output contains STAR_SOURCE edges and STAR_EXPANSION metrics."""
+        runner = CliRunner()
+
+        with patch("sqlcg.cli.commands.db.get_backend") as mock_get_backend:
+            mock_backend = MagicMock()
+            mock_backend.__enter__.return_value = mock_backend
+            mock_backend.__exit__.return_value = None
+            mock_backend.get_schema_version.return_value = "1.0"
+
+            # Return counts including star metrics
+            def run_read_side_effect(query, _params):
+                if "HAS_COLUMN" in query:  # gold_tables query
+                    return []
+                if "STAR_SOURCE" in query:
+                    return [{"n": 5}]
+                if "STAR_EXPANSION" in query:
+                    return [{"n": 10}]
+                if "Repo" in query:
+                    return [{"count": 1}]
+                elif "SqlQuery" in query:
+                    return [{"count": 10}]
+                elif "SqlColumn" in query:
+                    return [{"count": 50}]
+                elif "COLUMN_LINEAGE" in query:
+                    return [{"count": 25}]
+                return [{"count": 0}]
+
+            mock_backend.run_read.side_effect = run_read_side_effect
+            mock_get_backend.return_value = mock_backend
+
+            result = runner.invoke(app, ["info"])
+
+            assert result.exit_code == 0
+            assert "STAR_SOURCE edges:" in result.output
+            assert "STAR_EXPANSION lineage edges:" in result.output

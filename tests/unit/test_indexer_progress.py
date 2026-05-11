@@ -36,6 +36,13 @@ def test_progress_callback_invoked_at_100_file_boundary():
         mock_backend.transaction.return_value.__enter__ = MagicMock(return_value=None)
         mock_backend.transaction.return_value.__exit__ = MagicMock(return_value=None)
 
+        def run_read_side_effect(query, _params):
+            if "HAS_COLUMN" in query:  # gold_tables query
+                return []
+            return []
+
+        mock_backend.run_read = MagicMock(side_effect=run_read_side_effect)
+
         # Index the repo with progress callback
         indexer = Indexer()
         indexer.index_repo(
@@ -50,8 +57,9 @@ def test_progress_callback_invoked_at_100_file_boundary():
 
         # Check that at least one call records reaching exactly 100 files
         current_values = [c for c, t in callback_calls]
-        assert any(c == 100 for c in current_values), \
+        assert any(c == 100 for c in current_values), (
             f"Progress callback should be invoked at 100-file boundary. Got calls: {callback_calls}"
+        )
 
         # Verify total is correct
         for _current, total in callback_calls:

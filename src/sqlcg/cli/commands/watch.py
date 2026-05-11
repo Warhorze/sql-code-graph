@@ -29,6 +29,17 @@ def watch_cmd(  # noqa: B008
     with get_backend() as backend:
         backend.init_schema()
 
+        # Check schema version — must match current build
+        from sqlcg.core.schema import SCHEMA_VERSION
+
+        stored = backend.get_schema_version()
+        if stored != SCHEMA_VERSION:
+            console.print(
+                f"[red]Database schema is v{stored}; this build requires v{SCHEMA_VERSION}. "
+                "Run 'sqlcg db reset && sqlcg db init' to re-initialize.[/red]"
+            )
+            raise typer.Exit(1)
+
         indexer = Indexer()
 
         # Initial full index

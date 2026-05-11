@@ -113,10 +113,20 @@ def db_info() -> None:
         edges_count = edges_result[0]["count"] if edges_result else 0
         console.print(f"  COLUMN_LINEAGE edges: {edges_count}")
 
+        # Print star resolution metrics (T-07)
+        from sqlcg.core.queries import COUNT_STAR_EXPANSIONS_QUERY, COUNT_STAR_SOURCES_QUERY
+
+        star_source_result = backend.run_read(COUNT_STAR_SOURCES_QUERY, {})
+        star_source_count = star_source_result[0]["n"] if star_source_result else 0
+        console.print(f"  STAR_SOURCE edges: {star_source_count}")
+
+        star_expansion_result = backend.run_read(COUNT_STAR_EXPANSIONS_QUERY, {})
+        star_expansion_count = star_expansion_result[0]["n"] if star_expansion_result else 0
+        console.print(f"  STAR_EXPANSION lineage edges: {star_expansion_count}")
+
         # Print parsing mode distribution
         mode_query = (
-            "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt "
-            "ORDER BY cnt DESC"
+            "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC"
         )
         mode_rows = backend.run_read(mode_query, {})
         if mode_rows and "mode" in mode_rows[0]:

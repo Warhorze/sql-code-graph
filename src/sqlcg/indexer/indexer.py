@@ -31,6 +31,7 @@ class Indexer:
         timeout_per_file: int = 30,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
+        schema_csv: Path | None = None,
     ) -> dict:
         """Full two-pass index. Returns summary dict.
 
@@ -44,11 +45,19 @@ class Indexer:
                 indexing to tracked files; falls back to rglob when git
                 is unavailable or the directory is not a git repository.
             progress_callback: Optional callback(n, total) invoked every 100 files
+            schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
+                auto-discovers <path>/.sqlcg/schema.csv if present.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
             lineage_edges_created, quality
         """
+        # Load explicit INFORMATION_SCHEMA CSV if provided
+        if schema_csv and schema_csv.exists():
+            from sqlcg.cli.commands.load_schema import _load_schema_into_graph
+
+            _load_schema_into_graph(schema_csv, include_catalog=False, db=db)
+
         spec = load_ignore_spec(path)
         schema_resolver = SchemaResolver(dialect=dialect)
         parser = get_parser(dialect, schema_resolver)
@@ -95,9 +104,20 @@ class Indexer:
                 logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
                 pass2_results.append(parsed)
 
+        # Load gold tables (information_schema-backed tables) before upserting
+        # to suppress DDL columns for tables with production-verified schemas
+        gold_rows = db.run_read(
+            "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
+            "RETURN DISTINCT t.qualified AS q",
+            {},
+        )
+        gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
+
         # Upsert all results and count quality distribution
         tables_found = 0
         lineage_edges = 0
+        star_sources_found = 0
+        columns_defined = 0
         quality_counts = {
             "full": 0,
             "table_only": 0,
@@ -107,20 +127,28 @@ class Indexer:
         for parsed in pass2_results:
             try:
                 with db.transaction():
-                    counts = self._upsert_parsed_file(parsed, db)
+                    counts = self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
                 tables_found += counts["tables"]
                 lineage_edges += counts["edges"]
+                star_sources_found += counts.get("star_sources", 0)
+                columns_defined += counts.get("columns_defined", 0)
                 quality_key = parsed.parse_quality.value.lower()
                 quality_counts[quality_key] += 1
             except Exception as exc:
                 logger.warning("Failed to upsert %s: %s — skipping", parsed.path, exc)
                 quality_counts["failed"] += 1
 
+        # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
+        star_edges_expanded = self._expand_star_sources(db)
+
         return {
             "files_parsed": len(pass2_results),
             "parse_errors": parse_errors,
             "tables_found": tables_found,
             "lineage_edges_created": lineage_edges,
+            "columns_defined": columns_defined,
+            "star_sources": star_sources_found,
+            "star_edges_expanded": star_edges_expanded,
             "quality": quality_counts,
         }
 
@@ -140,10 +168,23 @@ class Indexer:
             parser = get_parser(dialect, schema_resolver)
             sql = Path(file_path).read_text(encoding="utf-8")
             parsed = parser.parse_file(Path(file_path), sql)
-            self._upsert_parsed_file(parsed, db)
+
+            # Load gold tables for this re-index call
+            gold_rows = db.run_read(
+                "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
+                "RETURN DISTINCT t.qualified AS q",
+                {},
+            )
+            gold_tables = frozenset(row["q"] for row in gold_rows)
+
+            self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
+
+        # Re-run star expansion after re-indexing and all stale views are processed
+        # Call this outside the transaction
+        self._expand_star_sources(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
         """Parse one file, with optional timeout.
@@ -170,17 +211,29 @@ class Indexer:
                 out.errors.append(f"timeout:{timeout}s")
                 return out
 
-    def _upsert_parsed_file(self, parsed: ParsedFile, db: GraphBackend) -> dict:
+    @staticmethod
+    def _qid(full_id: str) -> str:
+        """Canonical graph key for a table/column: lowercased full_id."""
+        return full_id.lower()
+
+    def _upsert_parsed_file(
+        self,
+        parsed: ParsedFile,
+        db: GraphBackend,
+        gold_tables: frozenset[str] = frozenset(),
+    ) -> dict:
         """Map ParsedFile → graph nodes/edges.
 
         Args:
             parsed: ParsedFile to upsert
             db: GraphBackend instance
+            gold_tables: Set of table full_ids with information_schema-backed columns
+                        (skip DDL column writes for these tables)
 
         Returns:
-            Dict with keys: tables, edges
+            Dict with keys: tables, edges, columns_defined
         """
-        counts = {"tables": 0, "edges": 0}
+        counts = {"tables": 0, "edges": 0, "columns_defined": 0}
 
         # Upsert File node
         db.upsert_node(
@@ -192,8 +245,26 @@ class Indexer:
             },
         )
 
-        # Upsert defined tables
+        # Upsert defined tables (with duplicate DDL detection)
         for table in parsed.defined_tables:
+            # Guard: detect duplicate DDL for the same table across files
+            existing = db.run_read(
+                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
+                {"qid": table.full_id},
+            )
+            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
+                logger.warning(
+                    "Table %s already defined in %s — %s will add columns to the union; "
+                    "star expansion may include columns from the earlier DDL file",
+                    table.full_id,
+                    existing[0]["f"],
+                    parsed.path_str,
+                )
+                if hasattr(parsed, "errors"):
+                    parsed.errors.append(
+                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
+                    )
+
             db.upsert_node(
                 NodeLabel.TABLE,
                 table.full_id,
@@ -215,6 +286,54 @@ class Indexer:
                 {},
             )
             counts["tables"] += 1
+
+        # Build a map of target.full_id -> QueryNode for column lookup
+        defined_by_query = {
+            s.target.full_id: s
+            for s in parsed.statements
+            if s.target and s.kind in ("CREATE_TABLE", "CREATE_VIEW") and s.defined_columns
+        }
+
+        # Compute set of defined table IDs for quick lookup
+        defined_table_ids = {t.full_id for t in parsed.defined_tables}
+
+        # Upsert DDL columns and HAS_COLUMN edges
+        for table in parsed.defined_tables:
+            # Check if this table is covered by information_schema (gold table)
+            if table.full_id in gold_tables:
+                logger.debug(
+                    "Skipping DDL columns for %s — information_schema takes precedence",
+                    table.full_id,
+                )
+                continue
+
+            qnode = defined_by_query.get(table.full_id)
+            if not qnode:
+                continue
+
+            for col_name in qnode.defined_columns:
+                col_id = f"{table.full_id}.{col_name}"
+                db.upsert_node(
+                    NodeLabel.COLUMN,
+                    col_id,
+                    {
+                        "id": col_id,
+                        "col_name": col_name,
+                        "table_qualified": table.full_id,
+                        "catalog": table.catalog or "",
+                        "db": table.db or "",
+                        "table_name": table.name,
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.TABLE,
+                    table.full_id,
+                    NodeLabel.COLUMN,
+                    col_id,
+                    RelType.HAS_COLUMN,
+                    {"source": "ddl"},
+                )
+                counts["columns_defined"] += 1
 
         # Upsert query nodes
         for i, stmt in enumerate(parsed.statements):
@@ -308,6 +427,50 @@ class Indexer:
                 )
                 counts["edges"] += 1
 
+            # STAR_SOURCE edges for graph-backend expansion
+            for star in stmt.star_sources:
+                db.upsert_node(
+                    NodeLabel.TABLE,
+                    star.source.full_id,
+                    {
+                        "qualified": star.source.full_id,
+                        "name": star.source.name,
+                        "catalog": star.source.catalog or "",
+                        "db": star.source.db or "",
+                        "kind": "TABLE",
+                        "defined_in_file": "",
+                    },
+                )
+                db.upsert_edge(
+                    NodeLabel.QUERY,
+                    query_id,
+                    NodeLabel.TABLE,
+                    star.source.full_id,
+                    RelType.STAR_SOURCE,
+                    {
+                        "qualifier": star.qualifier or "<unqualified>",
+                        "target_table": stmt.target.full_id if stmt.target else "",
+                        "confidence": 0.8,
+                    },
+                )
+                counts["star_sources"] = counts.get("star_sources", 0) + 1
+
+            # Upsert target table node (if not already a defined_table)
+            # so that star expansion can create destination columns
+            if stmt.target and stmt.target.full_id not in defined_table_ids:
+                db.upsert_node(
+                    NodeLabel.TABLE,
+                    stmt.target.full_id,
+                    {
+                        "qualified": stmt.target.full_id,
+                        "name": stmt.target.name,
+                        "catalog": stmt.target.catalog or "",
+                        "db": stmt.target.db or "",
+                        "kind": "TABLE",
+                        "defined_in_file": "",
+                    },
+                )
+
         return counts
 
     def _upsert_all(self, results: list[ParsedFile], db: GraphBackend) -> None:
@@ -319,6 +482,34 @@ class Indexer:
         """
         for parsed in results:
             self._upsert_parsed_file(parsed, db)
+
+    def _expand_star_sources(self, db: GraphBackend) -> int:
+        """Run the post-ingestion star expansion query.
+
+        Returns:
+            Number of COLUMN_LINEAGE edges created by the expansion
+        """
+        from sqlcg.core.queries import EXPAND_STAR_SOURCES_QUERY
+
+        # Count COLUMN_LINEAGE edges before expansion
+        before = db.run_read(
+            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+            {},
+        )
+        before_count = before[0]["n"] if before else 0
+
+        # Run the expansion query (without explicit transaction, as caller may already be in one)
+        db.run_read(EXPAND_STAR_SOURCES_QUERY, {})
+
+        # Count COLUMN_LINEAGE edges after expansion
+        after = db.run_read(
+            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+            {},
+        )
+        after_count = after[0]["n"] if after else 0
+
+        # Return the number of new edges created
+        return max(0, after_count - before_count)
 
     def _reindex_view_definition(
         self, view_name: str, db: GraphBackend, dialect: str | None

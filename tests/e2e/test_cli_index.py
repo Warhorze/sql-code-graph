@@ -42,20 +42,20 @@ def test_index_synthetic_fixtures(tmp_path, monkeypatch):
     assert "Indexed" in result.output
 
 
-def test_index_schema_from_info_schema_exits_nonzero(tmp_path, monkeypatch):
-    """Test that --schema-from-info-schema exits with error."""
+def test_index_schema_from_info_schema_exits_nonzero_on_missing_csv(tmp_path, monkeypatch):
+    """--schema-from-info-schema exits non-zero when the CSV file does not exist."""
     monkeypatch.setenv("SQLCG_DB_PATH", str(tmp_path / "test.db"))
 
     fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
     if not fixtures_path.exists():
         pytest.skip("Synthetic fixtures not found")
 
+    runner.invoke(app, ["db", "init"])
     result = runner.invoke(
         app,
-        ["index", str(fixtures_path), "--schema-from-info-schema", "x.csv"],
+        ["index", str(fixtures_path), "--schema-from-info-schema", str(tmp_path / "missing.csv")],
     )
     assert result.exit_code != 0
-    assert "not yet implemented" in result.output.lower()
 
 
 def test_find_table_after_index(tmp_path, monkeypatch):

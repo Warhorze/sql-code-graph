@@ -3,11 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
-from sqlcg.parsers.base import ParsedFile
 
 
 class TestColumnLineageWiring:
@@ -30,7 +27,7 @@ class TestColumnLineageWiring:
         with patch.object(parser, "_extract_column_lineage", side_effect=tracking_extract):
             sql = "CREATE VIEW revenue AS SELECT amount, customer_id FROM orders"
             path = tmp_path / "test.sql"
-            out = parser.parse_file(path, sql)
+            parser.parse_file(path, sql)
 
         # Verify _extract_column_lineage was called at least once
         assert call_count >= 1, (

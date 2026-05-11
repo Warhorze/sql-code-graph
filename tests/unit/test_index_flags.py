@@ -39,6 +39,7 @@ def test_index_quiet_flag_suppresses_summary():
                 "sqlcg.cli.commands.index.get_dialect"
             ) as mock_get_dialect:
                 mock_backend = MagicMock()
+                mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
                 mock_get_backend.return_value.__enter__.return_value = mock_backend
 
                 mock_indexer = MagicMock()

@@ -131,16 +131,53 @@ class SchemaResolver:
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
             logger.warning("Failed to load dbt manifest %s: %s", manifest_path, exc)
 
-    def add_information_schema(self, csv_path: str | Path) -> None:
-        """Load table schemas from an information_schema CSV.
+    def add_information_schema(self, csv_path: str | Path) -> int:
+        """Load table schemas from an INFORMATION_SCHEMA.COLUMNS CSV.
+
+        Expected columns: TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME,
+        COLUMN_NAME, ORDINAL_POSITION. Returns the number of tables loaded.
 
         Args:
             csv_path: Path to CSV file
 
+        Returns:
+            Number of tables loaded
+
         Raises:
-            NotImplementedError: This feature is deferred to v2.
+            ValueError: If CSV is missing required columns
         """
-        raise NotImplementedError("--schema-from-info-schema is not yet implemented (v2)")
+        import csv as _csv
+
+        required = {
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "ORDINAL_POSITION",
+        }
+        tables: dict[tuple[str | None, str | None, str], list[tuple[int, str]]] = {}
+
+        with open(Path(csv_path), newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+                missing = required - set(reader.fieldnames or [])
+                raise ValueError(f"CSV missing required columns: {missing}")
+            for row in reader:
+                key = (
+                    None,  # catalog excluded; resolver uses 2-part (schema.table) keys
+                    row["TABLE_SCHEMA"] or None,
+                    row["TABLE_NAME"],
+                )
+                tables.setdefault(key, []).append(
+                    (int(row["ORDINAL_POSITION"]), row["COLUMN_NAME"])
+                )
+
+        with self._lock:
+            for key, cols in tables.items():
+                self._tables[key] = [c for _, c in sorted(cols)]
+            self._cache = None
+
+        return len(tables)
 
     def as_dict(self) -> dict:
         """Return the schema as a nested dict: {catalog: {db: {table: [cols]}}}.

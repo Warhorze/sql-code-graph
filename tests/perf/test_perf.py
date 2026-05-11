@@ -15,8 +15,8 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
 def test_artikel_under_9s():
     """Test that 45-statement fixture parses under 9 seconds.
 
-    Baseline (before T-04): 14.2s
-    Target (after T-04): < 9.0s (≥36% reduction)
+    Baseline: 14.2s
+    Target: < 9.0s (≥36% reduction)
 
     This uses a synthetic fixture mimicking WTDH_ARTIKEL.sql structure
     to avoid committing production files.

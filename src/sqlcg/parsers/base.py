@@ -122,6 +122,32 @@ class LineageEdge:
         )
 
 
+@dataclass(frozen=True)
+class StarSource:
+    """A SELECT * marker for graph-backend resolution.
+
+    Attributes:
+        source: The TableRef the star projects (e.g. 'BA.source_table' or alias)
+        qualifier: The alias used in the SQL (None for bare 'SELECT *')
+    """
+
+    source: TableRef
+    qualifier: str | None = None
+
+
+@dataclass(frozen=True)
+class LineageExtraction:
+    """Result of column lineage extraction, including both edges and star markers.
+
+    Attributes:
+        edges: List of LineageEdge objects extracted from the statement
+        star_sources: List of StarSource markers for SELECT * projections
+    """
+
+    edges: list[LineageEdge]
+    star_sources: list[StarSource]
+
+
 @dataclass
 class QueryNode:
     """A parsed SQL query node (mutable by design for pass-2 patching).
@@ -158,6 +184,8 @@ class QueryNode:
     parse_failed: bool = False
     confidence: float = 1.0
     parsing_mode: str = "sqlglot"
+    star_sources: list[StarSource] = field(default_factory=list)
+    defined_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -426,7 +454,8 @@ class SqlParser(ABC):
         schema: dict | None,
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
-    ) -> list[LineageEdge]:
+        query_sources: list["TableRef"] | None = None,
+    ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
 
         On sqlglot.lineage failure: log WARNING, append to ParsedFile.errors,
@@ -442,18 +471,20 @@ class SqlParser(ABC):
             schema: Schema dict from _schema.as_dict()
             dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
             sources: Map of table names to SELECT bodies for temp table resolution
+            query_sources: List of TableRef for source tables used for star resolution
 
         Returns:
-            List of LineageEdge objects
+            LineageExtraction with edges and star_sources
         """
         import sqlglot.expressions as exp
         from sqlglot.lineage import lineage as sg_lineage
 
         edges: list[LineageEdge] = []
+        star_sources: list[StarSource] = []
 
         # Only extract column lineage for certain statement types
         if not isinstance(stmt, (exp.Select, exp.Insert, exp.Create)):
-            return edges
+            return LineageExtraction(edges=edges, star_sources=star_sources)
 
         # Extract column references from SELECT list or target
         try:
@@ -475,7 +506,7 @@ class SqlParser(ABC):
                 body = stmt.expression
                 col_expressions = body.expressions
             else:
-                return edges
+                return LineageExtraction(edges=edges, star_sources=star_sources)
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -485,6 +516,17 @@ class SqlParser(ABC):
                 ):
                     qualifier = col_expr.table if isinstance(col_expr, exp.Column) else None
                     out.errors.append(f"col_lineage_skip:star:{qualifier or '<unqualified>'}")
+
+                    # NEW: also record a StarSource for graph-backend expansion.
+                    # Resolve the source table by alias match, fall back to first source.
+                    star_src_table = self._resolve_star_source(
+                        qualifier=qualifier or None,
+                        sources=query_sources or [],
+                    )
+                    if star_src_table is not None:
+                        star_sources.append(
+                            StarSource(source=star_src_table, qualifier=qualifier or None)
+                        )
                     continue
 
                 if col_expr.alias:
@@ -575,4 +617,32 @@ class SqlParser(ABC):
             )
             out.errors.append(f"col_lineage:statement:{exc}")
 
-        return edges
+        return LineageExtraction(edges=edges, star_sources=star_sources)
+
+    def _resolve_star_source(
+        self,
+        qualifier: str | None,
+        sources: list["TableRef"],
+    ) -> "TableRef | None":
+        """Match a star qualifier (alias) to one of the statement's source tables.
+
+        Returns the matched TableRef, or the first source as a fallback when the
+        qualifier doesn't match any alias and the SELECT has at least one source.
+        Returns None when there are no sources to attach the star to.
+
+        Args:
+            qualifier: The alias used in the SQL (e.g., 'base' for SELECT base.*)
+            sources: List of source TableRef objects from the statement
+
+        Returns:
+            Matched TableRef, first source as fallback, or None if no sources
+        """
+        if not sources:
+            return None
+        if qualifier:
+            q_lower = qualifier.lower()
+            for s in sources:
+                # alias match on TableRef.alias OR name match (e.g. SELECT BA.src.*)
+                if (s.alias and s.alias.lower() == q_lower) or s.name.lower() == q_lower:
+                    return s
+        return sources[0]

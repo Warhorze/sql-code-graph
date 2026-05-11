@@ -1,22 +1,17 @@
 """Unit tests for STAR_SOURCE graph schema additions.
 
-Sprint: sprint_star_resolution.md  Tickets: T-02, T-07
-
 These tests verify schema.py enum values, schema.cypher DDL, and db info output.
-All are xfail until the sprint implementation lands.
 """
 
 import pytest
 
 from sqlcg.core.kuzu_backend import KuzuBackend
 
-
 # ---------------------------------------------------------------------------
 # T-02 — SCHEMA_VERSION bump and RelType.STAR_SOURCE enum
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="RelType.STAR_SOURCE not yet added — T-02", strict=True)
 def test_rel_type_star_source_enum_value():
     """RelType must expose STAR_SOURCE = 'STAR_SOURCE' after T-02."""
     from sqlcg.core.schema import RelType
@@ -25,25 +20,23 @@ def test_rel_type_star_source_enum_value():
     assert RelType.STAR_SOURCE == "STAR_SOURCE"
 
 
-@pytest.mark.xfail(reason="SCHEMA_VERSION not yet bumped — T-02", strict=True)
 def test_schema_version_is_two():
-    """SCHEMA_VERSION must be '2' after T-02."""
+    """SCHEMA_VERSION must be '2'."""
     from sqlcg.core.schema import SCHEMA_VERSION
 
     assert SCHEMA_VERSION == "2", (
         f"Expected SCHEMA_VERSION='2', got {SCHEMA_VERSION!r}. "
-        "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py as part of T-02."
+        "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py."
     )
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet in schema.cypher — T-02", strict=True)
 def test_star_source_rel_table_in_schema_cypher():
     """schema.cypher must contain the STAR_SOURCE REL TABLE definition."""
     from sqlcg.core.schema import SCHEMA_DDL
 
     assert "STAR_SOURCE" in SCHEMA_DDL, (
         "STAR_SOURCE REL TABLE not found in schema.cypher. "
-        "Add it after the COLUMN_LINEAGE block as described in T-02."
+        "Add it after the COLUMN_LINEAGE block in schema.cypher."
     )
     # Verify it has the required columns
     assert "qualifier" in SCHEMA_DDL
@@ -51,7 +44,6 @@ def test_star_source_rel_table_in_schema_cypher():
     assert "confidence" in SCHEMA_DDL
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet created by init_schema — T-02", strict=True)
 def test_star_source_table_created_in_fresh_db():
     """init_schema() on a fresh in-memory DB must create the STAR_SOURCE REL TABLE."""
     db = KuzuBackend(":memory:")
@@ -66,36 +58,45 @@ def test_star_source_table_created_in_fresh_db():
         db.close()
 
 
-@pytest.mark.xfail(reason="STAR_SOURCE REL TABLE not yet created by init_schema — T-02", strict=True)
 def test_star_source_rel_has_correct_properties():
     """The STAR_SOURCE REL TABLE must accept qualifier, target_table, confidence writes."""
     db = KuzuBackend(":memory:")
     try:
         db.init_schema()
         # Create source nodes for the edge
-        db.upsert_node("SqlQuery", "q:0", {
-            "id": "q:0",
-            "file_path": "f.sql",
-            "statement_index": 0,
-            "sql": "INSERT INTO t SELECT * FROM s",
-            "kind": "INSERT",
-            "target_table": "BA.tgt",
-            "parse_failed": False,
-            "confidence": 1.0,
-            "parsing_mode": "sqlglot",
-        })
-        db.upsert_node("SqlTable", "BA.src", {
-            "qualified": "BA.src",
-            "name": "src",
-            "catalog": "",
-            "db": "BA",
-            "kind": "TABLE",
-            "defined_in_file": "",
-        })
+        db.upsert_node(
+            "SqlQuery",
+            "q:0",
+            {
+                "id": "q:0",
+                "file_path": "f.sql",
+                "statement_index": 0,
+                "sql": "INSERT INTO t SELECT * FROM s",
+                "kind": "INSERT",
+                "target_table": "BA.tgt",
+                "parse_failed": False,
+                "confidence": 1.0,
+                "parsing_mode": "sqlglot",
+            },
+        )
+        db.upsert_node(
+            "SqlTable",
+            "BA.src",
+            {
+                "qualified": "BA.src",
+                "name": "src",
+                "catalog": "",
+                "db": "BA",
+                "kind": "TABLE",
+                "defined_in_file": "",
+            },
+        )
         # Upsert the STAR_SOURCE edge — must not raise
         db.upsert_edge(
-            "SqlQuery", "q:0",
-            "SqlTable", "BA.src",
+            "SqlQuery",
+            "q:0",
+            "SqlTable",
+            "BA.src",
             "STAR_SOURCE",
             {"qualifier": "<unqualified>", "target_table": "BA.tgt", "confidence": 0.8},
         )
@@ -113,11 +114,10 @@ def test_star_source_rel_has_correct_properties():
 
 
 # ---------------------------------------------------------------------------
-# T-07 — db info surfaces star metrics
+# db info surfaces star metrics
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(reason="db info star metrics not yet implemented — T-07", strict=True)
 def test_star_metrics_in_info_output():
     """db info must print STAR_SOURCE edges and STAR_EXPANSION lineage edge counts."""
     from unittest.mock import MagicMock, patch
@@ -157,11 +157,11 @@ def test_star_metrics_in_info_output():
     assert result.exit_code == 0
     assert "STAR_SOURCE edges" in result.output, (
         "db info must print 'STAR_SOURCE edges' count. "
-        "Add the COUNT_STAR_SOURCES_QUERY call in T-07."
+        "Add the COUNT_STAR_SOURCES_QUERY call in the db info command."
     )
     assert "STAR_EXPANSION lineage edges" in result.output, (
         "db info must print 'STAR_EXPANSION lineage edges' count. "
-        "Add the COUNT_STAR_EXPANSIONS_QUERY call in T-07."
+        "Add the COUNT_STAR_EXPANSIONS_QUERY call in the db info command."
     )
     # Values must appear — exact substring match not just "no exception"
     assert "3" in result.output

@@ -44,8 +44,8 @@ class TestExtractColumnLineageExceptions:
             )
 
             # Assert exactly one zero-confidence edge returned
-            assert len(edges) == 1
-            assert edges[0].confidence == 0.0
+            assert len(edges.edges) == 1
+            assert edges.edges[0].confidence == 0.0
 
     def test_outer_statement_exception_recorded(self, caplog):
         """Test that outer statement exceptions are recorded in col_lineage:statement."""
@@ -64,7 +64,7 @@ class TestExtractColumnLineageExceptions:
         edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=bad_schema)
 
         # The method should handle the exception gracefully
-        assert isinstance(edges, list)
+        assert isinstance(edges.edges, list)
 
     def test_sg_lineage_success_returns_edges(self):
         """When sg_lineage returns a root node, edges must be emitted — not an empty list.
@@ -76,13 +76,13 @@ class TestExtractColumnLineageExceptions:
         stmt = parse_one("SELECT col1 FROM t")
         out = ParsedFile(path=Path("test.sql"), dialect=None)
 
-        edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
+        result = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
 
-        assert len(edges) > 0, (
+        assert len(result.edges) > 0, (
             "Expected at least one LineageEdge for SELECT col1 FROM t, got none. "
             "The tree walker in _lineage_node_to_edges must emit edges for leaf nodes."
         )
-        assert all(e.confidence > 0.0 for e in edges), (
+        assert all(e.confidence > 0.0 for e in result.edges), (
             "Edges from a successful sg_lineage call must have confidence > 0."
         )
 
@@ -103,8 +103,8 @@ class TestE8DynamicSourceMarker:
         )
 
 
-class TestT01ErrorPropagation:
-    """T-01: Test error propagation from _parse_statement to ParsedFile."""
+class TestErrorPropagation:
+    """Test error propagation from _parse_statement to ParsedFile."""
 
     def test_parse_file_with_clean_ctas_no_errors(self):
         """Test that a clean CTAS produces no col_lineage errors.
@@ -124,7 +124,7 @@ class TestT01ErrorPropagation:
     def test_parse_file_can_call_with_out_parameter(self):
         """Test that _parse_statement receives and uses the out parameter.
 
-        This verifies that T-01 implementation passes the out parameter correctly
+        Verifies that _parse_statement passes the out parameter correctly
         so that errors from _extract_column_lineage are appended to the caller's
         ParsedFile object instead of being discarded.
         """
@@ -139,8 +139,8 @@ class TestT01ErrorPropagation:
         assert parsed.statements[0].kind == "SELECT"
 
 
-class TestT03TempTableSources:
-    """T-03: Test temp table source accumulation in _parse_statement."""
+class TestTempTableSources:
+    """Test temp table source accumulation in _parse_statement."""
 
     def test_sources_parameter_passed_to_extract_column_lineage(self):
         """Test that _parse_statement passes sources to _extract_column_lineage.
@@ -158,8 +158,8 @@ class TestT03TempTableSources:
         assert len(parsed.statements) == 1
 
 
-class TestT02StarColumnSkip:
-    """T-02: Test star column skip in _extract_column_lineage."""
+class TestStarColumnSkip:
+    """Test star column skip in _extract_column_lineage."""
 
     def test_qualified_star_produces_skip_marker(self):
         """Test that qualified star (base.*) is skipped with error marker.
@@ -168,7 +168,7 @@ class TestT02StarColumnSkip:
         Assert:
         - parsed.errors contains one entry starting with col_lineage_skip:star:base
         - No entry starts with col_lineage:
-        (Note: column x won't produce edges until T-03 adds sources_map)
+        (Note: column x won't produce edges without a sources_map)
         """
         schema = SchemaResolver()
         parser = AnsiParser(schema)
