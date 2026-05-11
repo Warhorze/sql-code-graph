@@ -1,12 +1,26 @@
 ## Current State
 
-agent: developer (sprint-06 implementation starting)
-plan: plan/sprint_06_lineage_coverage.md (approved, no blocking questions)
-status: T-01 implementation starting (SchemaResolver.as_sources_dict + sg_lineage wiring)
+agent: developer (post-sprint 06 fixes and tests)
+plan: plan/sprint_06_lineage_coverage.md (implemented; three follow-up fixes completed)
+status: Three developer tasks complete — script rewrite, T-05 deviation doc, T-01 sources fix
 branch: feat/sprint-06
 date: 2026-05-11
 
-Session summary:
+Session 2 summary (2026-05-11, post-sprint):
+  - TASK 1: Rewrote scripts/collect_parse_errors.py to measure production parser output
+    instead of calling sg_lineage independently. Deleted problematic 256-374 block that
+    re-ran sg_lineage without T-01–T-05 parameters. Script now classifies errors from
+    parsed.errors and counts edges from parsed.statements, making metrics reflect actual
+    parser behavior with schema_sources and T-02/T-03/T-04 fixes in place.
+  - TASK 2: Investigated T-05 scope wiring and documented deviation. Found that passing
+    pre-built scope from statement would cause scope-mismatch bugs for CREATE/INSERT with
+    inner SELECTs. Chose option (b): rely on body_scope built locally from extracted body.
+    Added comments and test to verify behavior.
+  - TASK 3: Identified T-01 sources mismatch hypothesis and fixed by parsing synthetic
+    SELECTs once at construction time. as_sources_dict() now returns dict[str, exp.Select]
+    instead of dict[str, str]. Added regression guard test per sprint plan. All 406 tests pass.
+
+Session 1 summary (previous):
   - Implemented T-03: Parser emits StarSource markers on QueryNode
   - Implemented T-04: Indexer upserts STAR_SOURCE edges with qualifier/target_table/confidence
   - Implemented T-05: Post-ingestion expansion query (EXPAND_STAR_SOURCES) creates COLUMN_LINEAGE edges from star projections
