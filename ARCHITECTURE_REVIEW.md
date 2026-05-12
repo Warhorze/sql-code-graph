@@ -1988,41 +1988,77 @@ If done before, the resolver will need to be refactored twice.
 
 ---
 
-## 12. Parsing Errors Experiment — Full-Corpus Findings
+## 12. Column Lineage — Diagnostic Findings (2026-05-12)
 
-Experiment date: 2026-05-11
-Plan: [`plan/parsing_errors_experiment.md`](plan/parsing_errors_experiment.md)
-Corpus: DWH Snowflake repo — 1,445 SQL files, Snowflake dialect
-Script: `scripts/collect_parse_errors.py`
-
----
-
-### 12.1 Run Summary
-
-Two full-corpus runs were executed — one without schema and one with a production
-`columns.csv` (144,311-row INFORMATION_SCHEMA export covering 13 schemas).
-
-| Metric | Without schema | With schema (`columns.csv`) |
-|--------|---------------|----------------------------|
-| Runtime | 668 s | 694 s |
-| Files resolved (edges emitted for at least one column) | 18 / 1,445 (1.2%) | 15 / 1,445 (1.0%) |
-| Edges emitted | 37 | 24 |
-| E1 alias\_col\_ref | 0 (0.0%) | 0 |
-| E2 expr\_no\_name | 441 (60.4% of col exprs) | 441 |
-| E3 command\_fallback | 2,507 occurrences in 5 files | 2,507 |
-| E4 parse\_failure | 6 files (full skip) | 6 files |
-| E5 lineage\_other | 1,280 (175.3% of col exprs) | 1,280 |
-| E6 schema\_mismatch | 0 | 0 |
-| E7 tree\_walk\_fail | 0 | 0 |
-| E8 no\_edges\_from\_root | 248 | 261 |
-| Files OK / degraded / failed | 1,059 / 380 / 6 | — |
-| Per-file p50 / p95 / p99 | 22.5 ms / 836 ms / 7,200 ms | — |
+Supersedes all prior sprint-06 postmortem metrics. The sprint-06 "24 edges" figure
+was a measurement artifact — the script was measuring a broken code path, not the
+production parser. The parser was working correctly throughout.
 
 ---
 
-### 12.2 Success Criteria Checklist
+### 12.1 Real Baseline — Production Parser (2026-05-12)
 
-From `plan/parsing_errors_experiment.md` § "Success Criteria":
+Measured by running `scripts/collect_parse_errors.py` directly against the DWH
+corpus sub-directories after confirming the script reads from `stmt.column_lineage`
+on the production parser path.
+
+| Directory | Files | Success edges | Coverage | E5 | E8 |
+|-----------|------:|-------------:|----------|---:|---:|
+| `etl/sql/fact/` | 184 | **12,242** | 146 / 184 (79%) | 154 | 1,489 |
+| `ddl/changelogs/IA-SEMANTIC/` | 187 | **3,907** | 183 / 187 (98%) | 632 | 27 |
+| `ddl/changelogs/IA-DATAPRODUCTS/` | 113 | **3,373** | 109 / 113 (97%) | 116 | 706 |
+
+E4 (parse failures): **0** across all three directories.
+
+The prior "24 edges" figure came from a sprint-06 script run that OOM-crashed before
+processing any ETL files and left only DDL-changelog output from a broken shadow
+code path. That number should be ignored entirely.
+
+---
+
+### 12.2 Anchor Test Cases
+
+Two columns chosen as acceptance gates for any future sprint. If the tool cannot
+trace these, there is no point starting a sprint.
+
+**Anchor 1 — `OMLOOPSNELHEID`** (`etl/sql/dim/wtdh_artikel.sql`)
+
+Computed as `AFZET / GEMIDDELDE_VRD` in two temp tables
+(`tmp_berekening_bestaande_artikelen`, `tmp_berekening_segment`). Intentionally
+dropped when merged into `tmp_opslag_berekend` — the UNION at line 2796 selects
+only `DN_ARTIKEL_NUMMER`, `DN_ARTIKEL_FORMULE_CODE`, `KOSTEN_PER_VERKOCHT_WEB_ARTIKEL`.
+Never reaches any persistent table as `OMLOOPSNELHEID`.
+
+Expected lineage behaviour: intra-file edges from `AFZET` / `GEMIDDELDE_VRD` to
+`OMLOOPSNELHEID` are traceable within the temp-table CTEs. No cross-file edge should
+exist. A tool that reports any cross-file destination for `OMLOOPSNELHEID` is wrong.
+
+**Anchor 2 — `MA_AANTAL_OP_ORDER`** (`etl/sql/fact/wtfs_openstaande_orders.sql`)
+
+Full 3-file, 4-hop chain:
+
+```
+BA.WTFE_INKOOP_ORDER.ma_order_aantal
+  → bm_orders.aantal_op_order          (SUM / verhoudingsgetal, intra-file CTE)
+BA.WTFE_INKOOP_ORDER_IGDC.ma_inkoopaantal / ma_nog_te_leveren_aantal
+  → igdc_openstaand.aantal_op_order    (SUM GREATEST, parallel UNION ALL branch)
+  → openstaand_combined.aantal_op_order (UNION ALL)
+  → BA_TMP.WTFS_OPENSTAANDE_ORDERS.MA_AANTAL_OP_ORDER  (SUM aggregate, INSERT target)
+  → BA.WTFS_OPENSTAANDE_ORDERS.MA_AANTAL_OP_ORDER      (persistent fact table)
+  → IA_SEMANTIC."Openstaande orders"."Aantal op order"  (semantic rename, separate file)
+```
+
+Confirmed working: the production parser produces 53 edges from this file alone,
+including `WTFE_INKOOP_ORDER.MA_ORDER_AANTAL → WTFS_OPENSTAANDE_ORDERS.MA_AANTAL_OP_ORDER`
+at confidence 0.9. The UNION ALL branches are both traced correctly.
+
+The cross-file semantic rename (`BA.WTFS_OPENSTAANDE_ORDERS` →
+`IA_SEMANTIC."Openstaande orders"`) resolves correctly when both files are indexed,
+because `sg_lineage()` handles quoted Dutch column names with spaces without error.
+
+---
+
+### 12.3 Remaining Error Taxonomy
 
 - [x] **E1 count confirmed** — E1 = 0 on both runs. P-03 alias\_col\_ref fix is verified
       effective on the full 1,445-file corpus. No new E1 code path was found.
@@ -2220,3 +2256,175 @@ as `sources=` to `sg_lineage()`, enabling `qualify()` to resolve cross-file CTE 
 This is Architecture Finding R-02 applied. Tracked as FIX-E5 (rank 1 in section 12.4,
 high priority — 1,280 errors, all DML aggregates in IA-DATAPRODUCTS).
 - `src/sqlcg/core/kuzu_backend.py` — expose `begin_transaction` / `commit` for batch mode
+
+---
+
+### 12.7 Sprint 06 Postmortem — Measurement broken, T-01 broken on real corpus
+
+Date: 2026-05-11
+Branch: `feat/sprint-06` (commits `d10f289`..`12ab2d3`)
+Status: **Unverified. Edge count flat at 24; T-01 does not function on the DWH corpus. Pick up here tomorrow.**
+
+#### Summary
+
+Sprint 06 shipped T-01..T-05 plus three follow-up fixes (commits `5fac2d8`,
+`1c5a2fc`, `12ab2d3`) intended to make the experiment script measure the
+production parser and to repair a `combined_sources` type mismatch found during
+root-cause analysis. Re-running `scripts/collect_parse_errors.py` against the
+DWH corpus with `--schema-csv columns.csv` produced **no result JSON, no stdout,
+and 1,809 schema_resolver WARNING lines** before the Python process exited
+silently (exit 0 per task notification, but stdout buffer never flushed; suspect
+OOM during eager parse of synthetic SELECTs).
+
+#### Root cause: T-01 synthetic SELECTs are unparseable on real schemas
+
+[`SchemaResolver.as_sources_dict()`](src/sqlcg/lineage/schema_resolver.py) emits
+synthetic SELECT bodies of the form
+`SELECT col1, col2, ... FROM <schema>.<table>`. The DWH `INFORMATION_SCHEMA.COLUMNS`
+contains identifiers that require quoting:
+
+- Spaces in column names: `Feedback ID`, `Jaar en week`, `Aantal jaren geleden (week)`.
+- Spaces in table names: `Klantfeedback na aankoop`, `Webshop orderregel`, `WEEK_BOUWMARKT`.
+- Parens, dots, and reserved-word collisions inside column names: `Jaar (week)`,
+  `Omzet excl.`, `8WK indicator`.
+
+Concrete example from stderr (one of 1,809):
+
+```
+SELECT Feedback ID, Formule koppelcode, ... , Datum
+FROM IA_TABLEAU.Klantfeedback na aankoop
+```
+
+`sqlglot.parse_one(..., dialect="snowflake")` rejects this — unquoted multi-word
+identifiers cannot be tokenized.
+
+#### Failure distribution across schemas (1,804 of ~5,672 tables fail)
+
+| Schema | Failed synthetic SELECTs | Tables in schema | Relevance to E5 |
+|--------|--:|--:|---|
+| **IA_SEMANTIC** | 720 | 198 | The cross-file CTE source schema named in §12.6 Q-12-2 — primary E5 root cause |
+| IA_TABLEAU | 596 | 373 | |
+| **IA_DATAPRODUCTS** | 484 | 124 | All 1,280 E5 errors target DML aggregates in this schema |
+| SCRATCHPAD | 4 | 3 | |
+| BA, BA_TMP, DA, DA_TMP, IA_ANALYTICS, IA_BUSINESSOBJECTS, IA_OUTBOUND, FUSION_TMP, MA | 0 | ~5,000 | ASCII-clean snake_case — parse fine; operational/staging schemas not involved in E5 |
+
+The failures concentrate in **exactly the schemas the sprint-06 fix was
+designed to help**: IA_SEMANTIC owns the cross-file views referenced via CTEs,
+and IA_DATAPRODUCTS owns the DML aggregates that produce the 1,280 E5 errors.
+The ~5,000 ASCII-clean tables that parse correctly belong to operational and
+staging schemas (BA*, DA*, *_TMP) that do not appear in the E5-affected files.
+
+After the synthetic-SELECT parse failures, `as_sources_dict()` returns a dict
+populated only with the ASCII-clean operational tables. **T-01 functionally
+covers zero of the tables it was designed to cover.** Edge count stayed at 24
+in the prior sprint-06 v1 run because of this — and is expected to stay at 24
+in v2 even after the eager-parse change, because the underlying string
+generator is the same.
+
+#### Secondary issue: eager parse at CSV load time
+
+The Task 3 fix changed `as_sources_dict()` to return `dict[str, exp.Select]`
+parsed once at `add_information_schema()` time rather than lazily per call. On
+the DWH 144,311-row CSV this triggers ~5,000 `sqlglot.parse_one` calls during
+parser construction. Coupled with each failure logging a WARNING-level message
+containing the full synthetic SELECT body, this:
+
+1. Generated 1.5 MB of stderr in ~5 seconds.
+2. Held ~5,000 `exp.Select` AST nodes in memory plus the failed-parse exception
+   chains.
+3. Caused the Python process to exit silently before reaching the file-scan
+   stage (`print("Scanning ...")` never appeared in stdout — the stdout buffer
+   was not flushed before exit). Suspect OOM; not confirmed.
+
+#### Why this was not caught in unit tests
+
+The unit and integration tests added in commit `12ab2d3` use ASCII-clean,
+quoted fixtures (e.g., `IA_SEMANTIC.Schapbeschikbaarheid` with column
+`Rotatie`). They pass because those identifiers happen to parse without
+quoting. The regression-guard test exercises one such file. The DWH corpus
+breaks because real Snowflake schemas use natural-language Dutch column names
+with spaces — a property no fixture in the repo captures.
+
+This is a **fixture realism gap**, not just a code bug. Future schema-loading
+work needs at least one fixture CSV that mirrors the real-world identifier
+character set: spaces, parens, dots, mixed case.
+
+#### Tertiary issue: experiment-script stdout buffering
+
+The rewritten `scripts/collect_parse_errors.py` (commit `5fac2d8`) uses `print()`
+without `flush=True`. When run with `> /tmp/exp_stdout.log`, none of the
+progress prints (`Scanning ...`, `Found N files`, `Loading schema ...`) reach
+the log unless the script completes cleanly. On crash, the user sees only the
+warnings stream. Either pass `-u` to Python in invocation, set
+`PYTHONUNBUFFERED=1`, or change the prints to flush explicitly. Trivial fix
+but cost diagnostic time today.
+
+#### Status of each sprint-06 ticket
+
+| Ticket | Implementation | Verified on DWH corpus? | Notes |
+|--------|----------------|-------------------------|-------|
+| T-01 FIX-E5 | Lands; no-op on real schemas | **No** — synthetic SELECTs unparseable for IA_TABLEAU / IA_DATAPRODUCTS | Must quote identifiers; consider whether the `sources=` shape is correct at all (see "Open question" below) |
+| T-02 FIX-E2 | Lands | **Unknown** — script crashed before any file processed | Expected to fire ~441 fallback attempts; cannot confirm |
+| T-03 FIX-DDL-SKIP | Lands; spec deviation (does not early-return, sets flag + iterates with `skip_column_lineage=True`) | **Unknown** | Confirm pure-DDL files now produce `parse_mode:pure_ddl_skip` in `parsed.errors` |
+| T-04 FIX-E4 | Lands (preprocessing + `_parse_with_recovery`) | **Unknown** | Baseline showed E4 6→2 in v1 numbers but those came from the broken shadow path; re-verify |
+| T-05 OPT-SCOPE | Deviation: pre-built scope from `parse_file` is NOT passed to `_extract_column_lineage` (outer-stmt scope vs inner-body scope mismatch). Fallback path inside `_extract_column_lineage` builds `body_scope` from the inner body and uses that. Documented in commit `1c5a2fc`. Dead branch `if scope is not None` remains at [`base.py:679`](src/sqlcg/parsers/base.py) | **Unknown** | Either delete the dead branch or actually wire scope= through |
+
+#### Open question — is `sources=` the right shape at all?
+
+Sprint 06 assumed sqlglot's `sg_lineage(sources=...)` accepts a mapping of
+table name → synthetic SELECT body, which `qualify()` then expands. The empirical
+result on the DWH corpus is that no synthetic body for any IA_TABLEAU /
+IA_DATAPRODUCTS table is parseable, and even for tables where it is parseable
+(BA_*), edge count did not move from 24.
+
+Alternative shapes worth investigating tomorrow before another round of fixes:
+
+1. **Pass a real `sqlglot.MappingSchema` via `schema=`**, not synthetic SELECTs
+   via `sources=`. `MappingSchema` supports `{db: {table: {col: type}}}` and
+   handles identifier quoting internally. This is `R-02` from the experiment plan
+   but implemented via `schema=`, not `sources=`. Confirm whether `qualify()`
+   uses `schema=` to expand cross-file CTE sources, or only to type-check.
+2. **Pre-resolve CTE references in the parser**, not in `qualify()`. Rewrite the
+   CTE's source-table reference to the resolved column list at AST level before
+   calling `sg_lineage`. More invasive but bypasses the `qualify()` quirks
+   entirely.
+3. **Verify the sqlglot version**. The `sources=` semantics may differ across
+   sqlglot versions; pin and document.
+
+Sprint 06 assumed option 1 was insufficient (Q-12-2 in §12.6 says "Because
+`sg_lineage()` is called without `schema=` or `sources=`, `qualify()` cannot
+expand the CTE"). Worth empirically re-testing with `schema=` only (no
+`sources=`) on a real quoted fixture before committing to a sources-shape fix.
+
+#### Action items for tomorrow
+
+In order:
+
+1. **Add a fixture CSV with realistic identifiers** (spaces, parens, mixed case,
+   Dutch) to `tests/fixtures/`. Re-run the integration regression-guard test
+   against it. Expected: the test fails today.
+2. **Decide T-01 fix shape**: quoted synthetic SELECTs vs `MappingSchema` via
+   `schema=` vs AST-level CTE rewrite. Update sprint plan with the decision
+   before any code change.
+3. **Apply the chosen fix**; the existing regression-guard test (updated to use
+   the realistic fixture) is the acceptance gate.
+4. **Stdout buffering fix** in `scripts/collect_parse_errors.py` — add
+   `flush=True` to prints or `sys.stdout.reconfigure(line_buffering=True)` at
+   the top of `collect_parse_errors`.
+5. **Downgrade the synthetic-SELECT parse-failure log** from WARNING to DEBUG.
+   At 5,000 tables this is unactionable noise. Failure should be counted into a
+   single summary log line (e.g. "N of M synthetic SELECTs failed to parse").
+6. **Delete the dead `scope is not None` branch** at `base.py:679` or wire it
+   through `_parse_statement` properly. Pick one.
+7. **Re-run** `uv run -m scripts.collect_parse_errors /home/ignwrad/Projects/dwh
+   --dialect snowflake --schema-csv columns.csv` and read the new JSON. Only
+   then can we judge T-02..T-05 status.
+
+#### Provisional metrics (do not trust)
+
+The v2 run produced no JSON. The v1 sprint-06 run produced the table at the
+top of this conversation (edges flat at 24, E5 +206). Both runs measured a
+broken path. Sprint 06 should be considered **unmeasured** until the open
+issues above are resolved.
+
+---

@@ -1,12 +1,26 @@
 ## Current State
 
-agent: architect-reviewer (E4/E5 open questions resolved, ARCHITECTURE_REVIEW.md updated)
-plan: plan/investigation_e5_e4.md (investigation complete)
-status: Q-12-1 and Q-12-2 closed; § 12.4 re-ranked; § 12.6 replaced with findings; ready for sprint-planner
-branch: feat/sprint-05-t03-t07
-date: 2026-05-11
+agent: developer (test suite implementation)
+plan: plan/snowflake_en_test_suite.md (REVIEWED AND APPROVED)
+status: Implementation complete — Phase 0/1/2 finished, all tests pass, ready for PR
+branch: feat/sprint-06
+date: 2026-05-12 (session 3)
 
-Session summary:
+Session 2 summary (2026-05-11, post-sprint):
+  - TASK 1: Rewrote scripts/collect_parse_errors.py to measure production parser output
+    instead of calling sg_lineage independently. Deleted problematic 256-374 block that
+    re-ran sg_lineage without T-01–T-05 parameters. Script now classifies errors from
+    parsed.errors and counts edges from parsed.statements, making metrics reflect actual
+    parser behavior with schema_sources and T-02/T-03/T-04 fixes in place.
+  - TASK 2: Investigated T-05 scope wiring and documented deviation. Found that passing
+    pre-built scope from statement would cause scope-mismatch bugs for CREATE/INSERT with
+    inner SELECTs. Chose option (b): rely on body_scope built locally from extracted body.
+    Added comments and test to verify behavior.
+  - TASK 3: Identified T-01 sources mismatch hypothesis and fixed by parsing synthetic
+    SELECTs once at construction time. as_sources_dict() now returns dict[str, exp.Select]
+    instead of dict[str, str]. Added regression guard test per sprint plan. All 406 tests pass.
+
+Session 1 summary (previous):
   - Implemented T-03: Parser emits StarSource markers on QueryNode
   - Implemented T-04: Indexer upserts STAR_SOURCE edges with qualifier/target_table/confidence
   - Implemented T-05: Post-ingestion expansion query (EXPAND_STAR_SOURCES) creates COLUMN_LINEAGE edges from star projections
@@ -68,3 +82,90 @@ Handoff — architect-reviewer (2026-05-11):
     FIX-E4 added at rank 4), § 12.5 (E4 deferred question answered), § 12.6 (open
     questions replaced with full documented findings).
   - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint.
+
+Session 3 summary (2026-05-12, developer implementation):
+  - Implemented plan/snowflake_en_test_suite.md in three phases
+  - Phase 0: Created 4 new directories with empty __init__.py (anchors, E2, E3, E4)
+  - Phase 1: Anchor tests (2 sprint gates for lineage work)
+    * Anchor 1 (OMLOOPSNELHEID): PASSED (1 test validates temp-table column drop)
+    * Anchor 2 (MA_AANTAL_OP_ORDER): 6 links, 6 xfail (E5 blocker, progress meter)
+  - Phase 2: 13 E-code tests with 2-4 tests each (total 34 PASSED)
+    * E2 (expressions): 3 tests, 3 fixtures
+    * E3 (DDL-only): 3 tests, 3 fixtures
+    * E4 (dialect gaps): 4 tests, 4 fixtures
+    * E5 (CTE missing source): 3 tests, 3 fixtures
+    * E8 (dynamic sources): 3 tests, 3 fixtures
+    * E12 (LATERAL FLATTEN): 2 tests, 2 fixtures
+    * E16 (MERGE): 2 tests, 2 fixtures
+    * E18 (IFF/DECODE): 3 tests, 3 fixtures
+    * E21 (alias chains): 2 tests, 2 fixtures
+    * E23 (stored procs): 2 tests, 2 fixtures
+    * E25 (cross-db): 2 tests, 2 fixtures
+    * E27 (UDF): 2 tests, 2 fixtures
+    * E36 (temp tables): 2 tests, 2 fixtures
+
+  Test results:
+  - 34 E-code tests: PASSED
+  - 40 gate tests (discovery + acceptance): PASSED
+  - 6 Anchor 2 links: XFAILED with strict=True (expected, E5 blocker)
+  - Full test suite: 480 passed, 2 skipped, 7 xfailed, 1 warning
+  - Zero unexpected failures
+
+  Implementation notes:
+  - All assertions on observable output only (edges, parse_quality, errors)
+  - Case sensitivity enforced (.upper() normalization per plan Conventions §6)
+  - Conditional assertions for parser behavior variation
+  - INVERSION TARGET comments document improvement paths
+  - No fixture larger than 30 lines (per plan constraints)
+  - All tests use parse() and edges() helpers from conftest.py
+  - Tests documented with clear docstrings and intent comments
+
+  Commits:
+  - 3c2155d: Phase 1 (anchors)
+  - a201b2a: Phase 2 (per-E-code tests)
+
+  Next: Create PR to master with test suite and this session summary.
+
+Handoff — plan-reviewer (2026-05-12):
+  agent: plan-reviewer
+  plan: plan/snowflake_en_test_suite.md
+  status: READY FOR IMPLEMENTATION (with corrections committed to plan)
+
+  Issues found and fixed in the plan:
+    BLOCKER-1 (E3 quality assertion wrong): ALTER DYNAMIC TABLE → exp.Command →
+      parse_quality = SCRIPTING_FALLBACK, not TABLE_ONLY. Plan updated to allow both.
+    BLOCKER-2 (E16 edge assertion always fails): MERGE produces zero column lineage.
+      Plan's "assert at least one edge exists" would always fail. Fixed to assert
+      edges(result) == [] with INVERSION TARGET.
+    BLOCKER-3 (E36 single-file fixture misdiagnoses bug): sources_map carries the CTAS
+      body forward within a file; E36 IS resolved intra-file. Plan had wrong absent-edge
+      assertion. Fixed to assert correct intra-file edges and reframe INVERSION TARGET
+      as a two-file cross-file test.
+    BLOCKER-4 (E5 placeholder assertion wrong): CTE resolves to TABLE_NOT_IN_SCHEMA
+      with confidence=0.9, not confidence=0.0. Plan's placeholder count assertion
+      always zero. Fixed to assert edge IS present with correct src_table name.
+    BLOCKER-5 (case-sensitivity of edge tuples): sqlglot normalises bare unquoted
+      identifiers to UPPERCASE in LineageNode. All lowercase tuple assertions ("src",
+      "a", ...) would fail silently. Added Conventions §6 case-sensitivity rule and
+      corrected all illustrative tuples.
+    WARNING-1 (E4 fixture intent vs. preprocessing): IF NOT EXISTS and UNPIVOT are
+      stripped by _preprocess_snowflake_sql before reaching sqlglot. Updated E4 test
+      spec to reflect that these fixtures document preprocessing coverage, not raw
+      dialect failures. Assertion updated to include SCRIPTING_FALLBACK in quality set
+      and use edges(result) == [] (not errors >= 1 for all three uniformly).
+    WARNING-2 (E18 xfail not needed): IFF extracts all three arguments as edges.
+      Both branches ARE captured. Removed xfail path; test is now a positive assertion.
+    WARNING-3 (E21 xfail not needed): sqlglot resolves alias chain correctly back to
+      src.A for column c. Removed zero-confidence placeholder fallback path; test is
+      a positive assertion.
+    WARNING-4 (E23 xfail not needed): scripting block path successfully extracts the
+      INSERT DML and produces the expected edge. Corrected to positive assertion.
+    WARNING-5 (E25 assertion wrong): cross-db ref produces an edge with bare table name
+      TBL, not no edge. INVERSION TARGET updated to assert qualified name preservation.
+    NOTE-1 (E5 dir already exists): All E5-E36 dirs already exist with empty __init__.py.
+      Phase 0 step clarified to cover only the 4 truly new dirs.
+    NOTE-2 (ParseQuality.SCRIPTING_FALLBACK missing from Conventions): Added as valid
+      fourth enum value in the Conventions section (was only three listed).
+    NOTE-3 (Anchor 2 add_create_table wiring): Clarified that setup requires
+      sqlglot.parse() to get the AST node, not parser.parse_file() which returns
+      a ParsedFile. Method signature confirmed (takes exp.Create AST node).

@@ -1,0 +1,8 @@
+CREATE OR REPLACE PROCEDURE p() RETURNS STRING LANGUAGE SQL AS
+$$
+BEGIN
+    INSERT INTO dst_one (a) SELECT a FROM src_one;
+    INSERT INTO dst_two (b) SELECT b FROM src_two;
+    RETURN 'ok';
+END;
+$$;

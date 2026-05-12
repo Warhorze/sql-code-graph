@@ -218,3 +218,110 @@ class TestSchemaResolver:
         assert schema["BA"]["src"] == ["a"], (
             "Second add_information_schema call must not duplicate columns"
         )
+
+    # -----------------------------------------------------------------------
+    # T-01 — as_sources_dict() for sg_lineage() integration
+    # -----------------------------------------------------------------------
+
+    def test_as_sources_dict_returns_empty_for_empty_schema(self):
+        """Empty resolver returns empty dict."""
+        resolver = SchemaResolver()
+        result = resolver.as_sources_dict()
+        assert result == {}
+
+    def test_as_sources_dict_single_table(self, tmp_path):
+        """Single table returns SELECT statement keyed by name and schema.name."""
+        csv_file = tmp_path / "schema.csv"
+        csv_file.write_text(
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION\n"
+            "dwh,BA,orders,id,1\n"
+            "dwh,BA,orders,amount,2\n",
+            encoding="utf-8",
+        )
+        resolver = SchemaResolver()
+        resolver.add_information_schema(csv_file)
+
+        result = resolver.as_sources_dict()
+
+        import sqlglot.expressions as exp
+
+        # Expect both bare name and schema.name keys (lowercased)
+        assert "orders" in result
+        assert "ba.orders" in result
+
+        # Values should be parsed exp.Select nodes, not strings
+        assert isinstance(result["orders"], exp.Select)
+        assert isinstance(result["ba.orders"], exp.Select)
+        # Verify the SELECT nodes have the correct structure
+        assert str(result["orders"]).upper() == "SELECT id, amount FROM BA.orders".upper()
+
+    def test_as_sources_dict_excludes_tables_with_no_columns(self):
+        """Tables with empty column lists are excluded."""
+        resolver = SchemaResolver()
+        # Manually add a table with no columns
+        resolver._tables[(None, "schema", "empty_table")] = []
+        resolver._tables[(None, "schema", "full_table")] = ["col1"]
+
+        result = resolver.as_sources_dict()
+
+        # empty_table should not appear
+        assert "empty_table" not in result
+        assert "schema.empty_table" not in result
+        # full_table should appear
+        assert "full_table" in result
+        assert "schema.full_table" in result
+
+    def test_as_sources_dict_multiple_schemas(self, tmp_path):
+        """Tables across multiple schemas are keyed separately."""
+        csv_file = tmp_path / "schema.csv"
+        csv_file.write_text(
+            "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION\n"
+            "dwh,IA_SEMANTIC,view1,col1,1\n"
+            "dwh,BA,table1,col2,1\n",
+            encoding="utf-8",
+        )
+        resolver = SchemaResolver()
+        resolver.add_information_schema(csv_file)
+
+        result = resolver.as_sources_dict()
+
+        import sqlglot.expressions as exp
+
+        # Both tables present with schema-qualified keys
+        assert "ia_semantic.view1" in result
+        assert "ba.table1" in result
+        # Values should be parsed exp.Select nodes, not strings
+        assert isinstance(result["ia_semantic.view1"], exp.Select)
+        assert isinstance(result["ba.table1"], exp.Select)
+        # Verify the SELECT nodes have the correct structure
+        assert (
+            str(result["ia_semantic.view1"]).upper() == "SELECT col1 FROM IA_SEMANTIC.view1".upper()
+        )
+        assert str(result["ba.table1"]).upper() == "SELECT col2 FROM BA.table1".upper()
+
+    def test_as_sources_dict_thread_safe(self):
+        """as_sources_dict() is thread-safe."""
+        import threading
+
+        resolver = SchemaResolver()
+        resolver._tables[(None, "s1", "t1")] = ["a", "b"]
+        resolver._tables[(None, "s2", "t2")] = ["c"]
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def call_as_sources_dict():
+            barrier.wait()  # Synchronize thread execution
+            results.append(resolver.as_sources_dict())
+
+        t1 = threading.Thread(target=call_as_sources_dict)
+        t2 = threading.Thread(target=call_as_sources_dict)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert len(results) == 2
+        assert results[0] == results[1]
+        assert "t1" in results[0]
+        assert "t2" in results[0]

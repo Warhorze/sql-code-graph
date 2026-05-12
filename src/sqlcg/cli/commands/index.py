@@ -30,7 +30,7 @@ def index_cmd(  # noqa: B008
         "Set to 256-512 on memory-constrained machines.",
     ),
     no_ddl: bool = typer.Option(  # noqa: B008
-        False, "--no-ddl", help="Skip DDL statements (not yet fully implemented)"
+        False, "--no-ddl", help="Skip table-node upserts for DDL-only files"
     ),
     schema_from_info_schema: str | None = typer.Option(  # noqa: B008
         None,
@@ -42,9 +42,6 @@ def index_cmd(  # noqa: B008
     ),
 ) -> None:
     """Index SQL files in a directory."""
-    # TODO: wire no_ddl through to the indexer once it supports the parameter
-    if no_ddl:
-        console.print("[yellow]Note: --no-ddl is not yet fully implemented[/yellow]")
 
     # Set buffer pool size via env var if specified
     if buffer_pool_size > 0:
@@ -136,6 +133,7 @@ def index_cmd(  # noqa: B008
             timeout_per_file,
             progress_callback=_make_progress_callback(total_files),
             schema_csv=None,
+            no_ddl=no_ddl,
         )
         console.print()  # newline after carriage return progress line
 

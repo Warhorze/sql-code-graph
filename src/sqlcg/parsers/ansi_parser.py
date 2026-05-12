@@ -44,14 +44,18 @@ class AnsiParser(SqlParser):
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
 
-        # Parse all statements in the file
-        try:
-            statements = sqlglot.parse(sql, dialect=self.DIALECT)
-        except Exception as exc:
-            logger.warning("Failed to parse file %s: %s", path, exc)
-            out.errors.append(f"parse_error:{exc}")
+        # Parse all statements in the file using the hook (allows subclass overrides)
+        statements, parse_errors = self._do_parse(sql)
+        out.errors.extend(parse_errors)
+        if not statements:
+            logger.warning("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
             return out
+
+        # Check for pure-DDL files (still parse table definitions but skip lineage)
+        is_pure_ddl = self._is_pure_ddl_file(statements)
+        if is_pure_ddl:
+            out.errors.append("parse_mode:pure_ddl_skip")
 
         # Check for scripting fallback
         for stmt in statements:
@@ -69,6 +73,9 @@ class AnsiParser(SqlParser):
             except Exception:
                 file_scopes.append(None)
 
+        # Compute schema sources once per file
+        schema_sources = self._schema.as_sources_dict() if self._schema else {}
+
         # Initialize sources_map to accumulate temp table definitions
         sources_map: dict[str, Any] = {}
 
@@ -80,7 +87,14 @@ class AnsiParser(SqlParser):
             try:
                 scope = file_scopes[stmt_index] if stmt_index < len(file_scopes) else None
                 query_node = self._parse_statement(
-                    stmt, path, stmt_index, out, sources_map, scope=scope
+                    stmt,
+                    path,
+                    stmt_index,
+                    out,
+                    sources_map,
+                    scope=scope,
+                    schema_sources=schema_sources,
+                    skip_column_lineage=is_pure_ddl,
                 )
                 out.statements.append(query_node)
 
@@ -113,6 +127,24 @@ class AnsiParser(SqlParser):
 
         return out
 
+    def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:
+        """Parse SQL text into statements, returning both statements and any parse errors.
+
+        This method is a hook that can be overridden by subclasses (e.g., SnowflakeParser)
+        to implement dialect-specific recovery or pre-processing logic.
+
+        Args:
+            sql: SQL text to parse
+
+        Returns:
+            Tuple of (statements list, error strings list). Errors are non-fatal;
+            recovery may have collected partial statements even on parse failure.
+        """
+        try:
+            return sqlglot.parse(sql, dialect=self.DIALECT), []
+        except Exception as exc:
+            return [], [f"parse_error:{exc}"]
+
     def _parse_statement(
         self,
         stmt: Any,
@@ -121,6 +153,8 @@ class AnsiParser(SqlParser):
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
+        schema_sources: dict[str, Any] | None = None,
+        skip_column_lineage: bool = False,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -131,6 +165,8 @@ class AnsiParser(SqlParser):
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
+            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
+            skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
 
         Returns:
             QueryNode with extracted metadata
@@ -177,11 +213,23 @@ class AnsiParser(SqlParser):
         if target:
             sources = [src for src in sources if src.full_id != target.full_id]
 
-        # Extract column lineage
-        schema = self._schema.as_dict() if self._schema else {}
-        extraction = self._extract_column_lineage(
-            stmt, path, out, schema, dst_table=target, sources=sources_map, query_sources=sources
-        )
+        # Extract column lineage (skip for pure-DDL files)
+        if skip_column_lineage:
+            from sqlcg.parsers.base import LineageExtraction
+
+            extraction = LineageExtraction(edges=[], star_sources=[])
+        else:
+            schema = self._schema.as_dict() if self._schema else {}
+            extraction = self._extract_column_lineage(
+                stmt,
+                path,
+                out,
+                schema,
+                dst_table=target,
+                sources=sources_map,
+                query_sources=sources,
+                schema_sources=schema_sources,
+            )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
 

@@ -1,0 +1,1 @@
+ALTER DYNAMIC TABLE my_table RESUME;

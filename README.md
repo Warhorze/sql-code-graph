@@ -1,5 +1,18 @@
 # sql-code-graph
 
+> **Pre-1.0 — expect breaking changes.** APIs, CLI flags, and graph schema may
+> change between releases without a deprecation period. Pin to an exact version
+> in production. Re-indexing is always the migration path.
+
+> **Dialect coverage.** This tool has been developed and tested against a
+> production Snowflake data warehouse with ~1,400 SQL files. Other dialects
+> (`bigquery`, `postgres`, `ansi`, `tsql`) are wired up but have not been
+> exercised against a real corpus — edge cases will surface. If you use sqlcg
+> with a non-Snowflake dialect and hit parse failures or missing lineage, please
+> [open an issue](https://github.com/Warhorze/sql-code-graph/issues) with a
+> minimal reproducer; we want to support other dialects but need a corpus to
+> develop against.
+
 SQL lineage and dependency analysis as an MCP server for Claude Code.
 
 Indexes a directory of `.sql` files into a graph database and exposes lineage
@@ -218,7 +231,18 @@ sqlcg version                          # show installed version
 
 ## Supported dialects
 
-`snowflake` · `bigquery` · `postgres` · `ansi` · `tsql` · `dbt` (via optional extra)
+| Dialect | Status |
+|---------|--------|
+| `snowflake` | Tested against a production DWH (~1,400 files) |
+| `bigquery` | Wired up, untested against a real corpus |
+| `postgres` | Wired up, untested against a real corpus |
+| `ansi` | Wired up, untested against a real corpus |
+| `tsql` | Wired up, untested against a real corpus |
+| `dbt` | Via optional extra, untested against a real corpus |
+
+If you use a non-Snowflake dialect and run into issues, open an issue with a
+minimal SQL reproducer. Contributions of test fixtures from real (anonymised)
+corpora are especially welcome.
 
 ## Development
 
