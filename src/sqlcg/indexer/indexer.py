@@ -110,9 +110,12 @@ class Indexer:
 
         # Pass 2: resolve cross-file references
         pass2_results: list[ParsedFile] = []
+        pass2_skipped = 0
         for parsed in pass1_results:
             try:
                 resolved = aggregator.resolve_pass2(parser, parsed)
+                if resolved is parsed:  # identity = no re-parse happened
+                    pass2_skipped += 1
                 pass2_results.append(resolved)
             except Exception as exc:
                 logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
@@ -184,6 +187,7 @@ class Indexer:
 
         return {
             "files_parsed": len(pass2_results),
+            "pass2_skipped": pass2_skipped,
             "parse_errors": parse_errors,
             "tables_found": nonlocal_counts["tables"],
             "lineage_edges_created": nonlocal_counts["edges"],

@@ -42,6 +42,33 @@ class CrossFileAggregator:
                 if key:
                     self.cross_file_sources[key] = stmt_node.defined_body
 
+    def _needs_pass2(self, parsed: ParsedFile) -> bool:
+        """Return True iff pass-2 re-parse would see new schema context for this file.
+
+        A file benefits from pass 2 iff at least one of its statement sources or
+        cross-file dependency references a table registered by another file's
+        pass-1 result (self.sources) or a CTAS body harvested from another file
+        (self.cross_file_sources).
+
+        Files that reference only same-file tables, or only tables absent from
+        both registries, gain nothing — pass 1 already had all the schema context
+        available. Skipping the re-parse for these files is observably equivalent
+        to keeping it (verified by the equivalence test in tests/unit/test_aggregator_skip.py).
+        """
+        same_file_table_ids = {t.full_id for t in parsed.defined_tables}
+        same_file_bare_names = {t.name.lower() for t in parsed.defined_tables}
+
+        for stmt in parsed.statements:
+            for src in stmt.sources:
+                # Cross-file by full_id?
+                if src.full_id in self.sources and src.full_id not in same_file_table_ids:
+                    return True
+                # Cross-file by bare name (CTAS body lookup)?
+                bare = (src.name or "").lower()
+                if bare and bare in self.cross_file_sources and bare not in same_file_bare_names:
+                    return True
+        return False
+
     def resolve_pass2(self, parser, parsed: ParsedFile) -> ParsedFile:
         """Re-parse with cross-file schema context.
 
@@ -51,14 +78,25 @@ class CrossFileAggregator:
 
         Returns:
             ParsedFile from pass 2 with resolved cross-file references,
-            or the pass-1 result if the file cannot be re-read.
+            or the pass-1 result if skip predicate determines no re-parse is needed
+            or if the file cannot be re-read.
 
         Raises:
             No exceptions are raised; file read errors are logged as WARNING
             and the pass-1 result is returned unchanged.
+
+        Note:
+            This method returns the exact same ParsedFile object (via `return parsed`)
+            on the skip path. This identity semantics are used by callers to track
+            which files were skipped (resolved is parsed). Do not introduce a .copy()
+            on the skip path — that would break the identity check.
         """
         # Register view sources for schema resolution
         parser._schema.add_view_sources(self.sources)
+
+        if not self._needs_pass2(parsed):
+            # File has no cross-file dependencies — pass-1 result is already final.
+            return parsed
 
         try:
             sql = parsed.path.read_text(encoding="utf-8")
