@@ -64,7 +64,7 @@ Index SQL files in a directory.
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
 | --timeout-per-file | INTEGER | No | No | 30 | Timeout per file in seconds |
 | --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
-| --no-ddl | BOOLEAN | No | No | False | Skip DDL statements (not yet fully implemented) |
+| --no-ddl | BOOLEAN | No | No | False | Skip table-node upserts for DDL-only files |
 | --schema-from-info-schema | TEXT | No | No |  | Path to INFORMATION_SCHEMA.COLUMNS CSV (overrides .sqlcg/schema.csv convention). |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
 
