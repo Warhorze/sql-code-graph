@@ -526,6 +526,19 @@ class SqlParser(ABC):
         edges: list[LineageEdge] = []
         star_sources: list[StarSource] = []
 
+        # NEW (T-07-06): Record MERGE statements explicitly as deferred.
+        # sqlglot's lineage() API does not handle MERGE branches; implementing
+        # multi-branch lineage is deferred (see plan/sprint_07_open_ecodes.md § T-07-06).
+        if isinstance(stmt, exp.Merge):
+            dst_name = None
+            if stmt.this is not None:
+                try:
+                    dst_name = stmt.this.name
+                except Exception:
+                    dst_name = None
+            out.errors.append(f"col_lineage_skip:merge_branch:{dst_name or '<unknown>'}")
+            return LineageExtraction(edges=edges, star_sources=star_sources)
+
         # Only extract column lineage for certain statement types
         if not isinstance(stmt, (exp.Select, exp.Insert, exp.Create)):
             return LineageExtraction(edges=edges, star_sources=star_sources)
@@ -558,6 +571,24 @@ class SqlParser(ABC):
             # after sources are known)
             body_scope = None
             combined_sources = {**(sources or {}), **(schema_sources or {})}
+
+            # NEW (T-07-02): Add CTE bodies to combined_sources so that outer columns
+            # can resolve through CTE names. This makes CTE-to-CTE chains resolvable.
+            # Example: WITH x AS (SELECT a FROM src), y AS (SELECT a FROM x)
+            # When processing the outer SELECT referencing y, we need both x and y
+            # to be in combined_sources so sqlglot can expand them.
+            if isinstance(body, exp.Select) and body.args.get("with_"):
+                with_clause = body.args.get("with_")
+                if with_clause and hasattr(with_clause, "expressions"):
+                    cte_expressions = getattr(with_clause, "expressions", None)
+                    if cte_expressions:
+                        for cte in cte_expressions:
+                            cte_alias = cte.alias
+                            # Accept both Select and Union as CTE bodies
+                            if cte_alias and isinstance(cte.this, (exp.Select, exp.Union)):
+                                # Use lowercase key to match the sources_map convention
+                                key = cte_alias.lower()
+                                combined_sources[key] = cte.this
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -723,6 +754,89 @@ class SqlParser(ABC):
                             confidence=0.0,
                         )
                     )
+
+            # NEW: Extract column lineage for CTE projections as additional destinations
+            # (Step 2.1 of T-07-02 — FIX-E5-XFILE-CHAIN).
+            # CTEs are intermediate destinations in the lineage chain. We emit edges
+            # from sources into each CTE's projected columns, so that queries selecting
+            # from the CTE can resolve through the CTE name as an intermediate table.
+            # Example: WITH x AS (SELECT a FROM src) SELECT a FROM x
+            # produces edges: (SRC, A, x, a) + (SRC, A, <output>, a)
+            if isinstance(body, exp.Select) and body.args.get("with_"):
+                with_clause = body.args.get("with_")
+                if with_clause and hasattr(with_clause, "expressions"):
+                    cte_expressions = getattr(with_clause, "expressions", None)
+                    if cte_expressions:
+                        for cte in cte_expressions:
+                            cte_alias = cte.alias
+                            if not cte_alias:
+                                continue
+                            # Treat the CTE as a synthetic destination table
+                            cte_dst_table = TableRef(name=cte_alias)
+                            # The CTE's body is its SELECT expression (or UNION ALL, etc.)
+                            cte_body = cte.this
+                            # Accept both Select and other query types like Union
+                            if not isinstance(cte_body, (exp.Select, exp.Union)):
+                                continue
+
+                            # For each projection in the CTE, extract lineage
+                            cte_projections = cte_body.expressions
+                            for cte_col_expr in cte_projections:
+                                # Skip stars in CTEs
+                                if isinstance(cte_col_expr, exp.Star) or (
+                                    isinstance(cte_col_expr, exp.Column)
+                                    and isinstance(cte_col_expr.this, exp.Star)
+                                ):
+                                    continue
+                                # Extract column name (alias or raw column name)
+                                cte_col_name = (
+                                    cte_col_expr.alias
+                                    if cte_col_expr.alias
+                                    else (
+                                        cte_col_expr.name
+                                        if isinstance(cte_col_expr, exp.Column)
+                                        else str(cte_col_expr)[:40]
+                                    )
+                                )
+                                if not cte_col_name or cte_col_name == "*":
+                                    continue
+                                try:
+                                    # Serialize to SQL string before sg_lineage.
+                                    # Must serialize: passing the AST subtree causes a segfault
+                                    # (parent pointers create cycles in sqlglot's qualify()).
+                                    cte_body_sql = cte_body.sql(dialect=self.DIALECT)
+                                    # Pass schema but not sources to avoid circular references
+                                    sg_kwargs = {
+                                        "schema": schema,
+                                        "dialect": self.DIALECT,
+                                    }
+                                    root = sg_lineage(cte_col_name, cte_body_sql, **sg_kwargs)
+                                    if root:
+                                        # Emit edges with dst = CTE name
+                                        cte_edges = self._lineage_node_to_edges(
+                                            root,
+                                            dst_col_name=cte_col_name,
+                                            dst_table=cte_dst_table,
+                                            path=path,
+                                            out=out,
+                                        )
+                                        # Tag edges as CTE projections
+                                        # (transform is read-only, so create new edges)
+                                        for edge in cte_edges:
+                                            tagged_edge = LineageEdge(
+                                                src=edge.src,
+                                                dst=edge.dst,
+                                                transform="CTE_PROJECTION",
+                                                confidence=edge.confidence,
+                                            )
+                                            edges.append(tagged_edge)
+                                except Exception:
+                                    self._log.debug(
+                                        "CTE lineage failed: %s/%s/%s",
+                                        path,
+                                        cte_alias,
+                                        cte_col_name,
+                                    )
 
         except Exception as exc:
             self._log.warning(

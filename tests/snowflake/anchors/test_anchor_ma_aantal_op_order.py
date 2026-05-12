@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import sqlglot
 
+from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.snowflake_parser import SnowflakeParser
 
@@ -26,7 +27,12 @@ from sqlcg.parsers.snowflake_parser import SnowflakeParser
 # Shared fixtures for all 6 link tests
 @pytest.fixture(scope="module")
 def chain_edges():
-    """Parse all three chain files and return aggregated edges."""
+    """Parse all three chain files and return aggregated edges.
+
+    Wires CrossFileAggregator to enable cross-file CTAS propagation (T-07-01),
+    so that the semantic view (fixture_semantic.sql) can resolve the temp table
+    wtfs_openstaande_orders defined in fixture_etl.sql.
+    """
     source_path = Path(__file__).parent / "fixture_source.sql"
     source_sql = source_path.read_text()
 
@@ -36,10 +42,15 @@ def chain_edges():
         resolver.add_create_table(stmt)
 
     parser = SnowflakeParser(schema_resolver=resolver)
+    aggregator = CrossFileAggregator()
 
     etl_path = Path(__file__).parent / "fixture_etl.sql"
     etl_sql = etl_path.read_text()
     etl_result = parser.parse_file(etl_path, etl_sql)
+    aggregator.register_pass1(etl_result)
+
+    # Wire cross-file sources (T-07-01) so the semantic view can see the ETL's temp table
+    resolver.register_cross_file_sources(aggregator.cross_file_sources)
 
     semantic_path = Path(__file__).parent / "fixture_semantic.sql"
     semantic_sql = semantic_path.read_text()

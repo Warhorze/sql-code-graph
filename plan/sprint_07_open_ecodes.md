@@ -1182,3 +1182,26 @@ None at plan-time. All design choices are resolved against verified source code 
 If T-07-02 step 2.4 reveals a quoted-identifier bug that is too large to fix inside this
 sprint, the developer must surface a blocking question rather than silently leaving the
 link 6 xfail in place.
+
+---
+
+## Deviations
+
+### T-07-02: CTE iteration implemented but complex chains remain unresolved
+
+- **Reason**: CTE iteration code was implemented (Step 2.1) and seeded combined_sources with CTE bodies. However, sqlglot.lineage() cannot trace aggregations (SUM, COUNT, etc.) or UNION ALLs within CTE bodies when those CTEs reference other CTEs. The anchor test fixture involves CTE chains with aggregations, which hit this sqlglot limitation.
+
+- **Change**: 
+  * CTE iteration loop added to `_extract_column_lineage` (lines 765-844 in base.py)
+  * combined_sources seeded with CTE bodies from the WITH clause (lines 580-589 in base.py)
+  * CTE projections emitted as `LineageEdge` with `transform="CTE_PROJECTION"` (but still don't resolve complex chains)
+  * MERGE early-return and E25 qualifier fixes completed as planned
+  * E12, E16, E27 DEFER tickets completed as planned
+
+- **Impact**: 
+  * T-07-02 anchor tests remain XFAIL (all 6 links)
+  * T-07-03, T-07-04, T-07-05, T-07-06 completed and passing
+  * Sprint gate (6 anchor links) is not met, but 4 of 6 tickets (T-07-03 through T-07-06) are complete
+  * No regression in existing tests (all 359 unit/integration tests pass)
+
+- **Date**: 2026-05-12
