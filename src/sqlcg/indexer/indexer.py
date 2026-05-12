@@ -8,6 +8,7 @@ from pathlib import Path
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.queries import STALE_VIEWS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.indexer.error_classify import _classify_error
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -185,6 +186,33 @@ class Indexer:
         # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
         star_edges_expanded = self._expand_star_sources(db)
 
+        # Classify all errors into buckets for measurement and reporting
+        error_summary: dict[str, int] = {
+            "E1": 0,
+            "E2": 0,
+            "E3": 0,
+            "E5": 0,
+            "E8": 0,
+            "timeout": 0,
+            "pure_ddl_skip": 0,
+            "func_fallback": 0,
+            "qualify_failed": 0,
+            "other": 0,
+        }
+        for parsed in pass2_results:
+            for msg in parsed.errors:
+                bucket = _classify_error(msg)
+                if bucket in error_summary:
+                    error_summary[bucket] += 1
+
+        # Emit summary log line
+        summary_parts = [f"{k}: {v}" for k, v in error_summary.items() if v > 0]
+        logger.info(
+            "Indexing complete: %d files — %s",
+            len(pass2_results),
+            ", ".join(summary_parts) if summary_parts else "(no errors)",
+        )
+
         return {
             "files_parsed": len(pass2_results),
             "pass2_skipped": pass2_skipped,
@@ -195,6 +223,7 @@ class Indexer:
             "star_sources": nonlocal_counts["star_sources"],
             "star_edges_expanded": star_edges_expanded,
             "quality": nonlocal_counts["quality"],
+            "error_summary": error_summary,
             "batch_size": batch_size,
         }
 

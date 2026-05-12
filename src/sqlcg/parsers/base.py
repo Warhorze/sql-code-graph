@@ -753,7 +753,7 @@ class SqlParser(ABC):
                                 col_name,
                             )
                 except Exception as exc:
-                    self._log.warning(
+                    self._log.debug(
                         "column lineage extraction failed: file=%s col=%s error=%s",
                         path,
                         col_name,
@@ -901,7 +901,7 @@ class SqlParser(ABC):
                         pass
 
         except Exception as exc:
-            self._log.warning(
+            self._log.debug(
                 "column lineage extraction failed for entire statement: file=%s error=%s",
                 path,
                 exc,
