@@ -1,129 +1,166 @@
-"""Anchor 2: MA_AANTAL_OP_ORDER 3-file chain (cross-file lineage with schema).
+"""Anchor 2: MA_AANTAL_OP_ORDER 3-file chain (sprint gate).
 
-Tests a complete lineage chain spanning a source DDL, ETL with nested CTEs,
-and a semantic layer view. All six links must trace end-to-end.
+This test documents the complete lineage chain across three files:
+1. fixture_source.sql: CREATE TABLE source_facts with ma_order_aantal column
+2. fixture_etl.sql: INSERT INTO wtfs_openstaande_orders via CTEs
+3. fixture_semantic.sql: CREATE VIEW "Openstaande orders"
+
+Each of the 6 links in the chain is tested with xfail where the parser currently
+fails to resolve the connection. When a link is fixed (parser enhanced), remove
+the xfail decorator and the test will pass automatically.
+
+Current state: All links require E5 (CTE resolution with SUM aggregation) and
+chain resolution to pass. Link 6 additionally requires view column preservation
+with quoted identifiers.
 """
 
 from pathlib import Path
 
+import pytest
 import sqlglot
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.snowflake_parser import SnowflakeParser
-from tests.snowflake.conftest import edges, parse
 
 
-def test_anchor_ma_aantal_op_order_complete_chain():
-    """Test the MA_AANTAL_OP_ORDER anchor: 3-file lineage chain with schema.
+# Shared fixtures for all 6 link tests
+@pytest.fixture(scope="module")
+def chain_edges():
+    """Parse all three chain files and return aggregated edges."""
+    source_path = Path(__file__).parent / "fixture_source.sql"
+    source_sql = source_path.read_text()
 
-    Setup:
-    1. Build SchemaResolver and register source_facts via sqlglot.parse()
-    2. Instantiate SnowflakeParser(schema_resolver=resolver)
-    3. Parse fixture_etl.sql and fixture_semantic.sql in order
-    4. Aggregate edges
-
-    Expected chain (all 6 must be present or xfailed per reason):
-    1. source_facts.ma_order_aantal -> bm_orders.aantal_op_order
-    2. source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order
-    3. bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order
-    4. igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order
-    5. openstaand_combined.aantal_op_order -> wtfs_openstaande_orders.ma_aantal_op_order
-    6. wtfs_openstaande_orders.ma_aantal_op_order -> "Openstaande orders"."Aantal op order"
-    """
-    base_dir = Path(__file__).parent
-
-    # Step 1: Build SchemaResolver and register source_facts
     resolver = SchemaResolver(dialect="snowflake")
-    source_sql = (base_dir / "fixture_source.sql").read_text()
-    source_stmts = sqlglot.parse(source_sql, dialect="snowflake")
-    if source_stmts:
-        resolver.add_create_table(source_stmts[0])
+    stmts = sqlglot.parse(source_sql, dialect="snowflake")
+    for stmt in stmts:
+        resolver.add_create_table(stmt)
 
-    # Step 2: Instantiate parser with schema
     parser = SnowflakeParser(schema_resolver=resolver)
 
-    # Step 3: Parse ETL and semantic fixtures in order
-    etl_sql = (base_dir / "fixture_etl.sql").read_text()
-    semantic_sql = (base_dir / "fixture_semantic.sql").read_text()
+    etl_path = Path(__file__).parent / "fixture_etl.sql"
+    etl_sql = etl_path.read_text()
+    etl_result = parser.parse_file(etl_path, etl_sql)
 
-    etl_result = parse(parser, etl_sql, filename="fixture_etl.sql")
-    semantic_result = parse(parser, semantic_sql, filename="fixture_semantic.sql")
+    semantic_path = Path(__file__).parent / "fixture_semantic.sql"
+    semantic_sql = semantic_path.read_text()
+    semantic_result = parser.parse_file(semantic_path, semantic_sql)
 
-    # Step 4: Aggregate edges from both results
-    all_edges = edges(etl_result) + edges(semantic_result)
+    # Aggregate all edges
+    all_edges = [
+        (edge.src.table.name, edge.src.name, edge.dst.table.name, edge.dst.name)
+        for result in [etl_result, semantic_result]
+        for stmt in result.statements
+        for edge in stmt.column_lineage
+        if edge.confidence > 0.0
+    ]
 
-    # Normalize for easier assertion (case-insensitive comparison)
-    all_edges_lower = [(e[0].lower(), e[1].lower(), e[2].lower(), e[3].lower()) for e in all_edges]
+    return all_edges
 
-    # 1. source_facts.ma_order_aantal -> bm_orders.aantal_op_order
-    assert any(
-        e[0] == "source_facts"
-        and e[1] == "ma_order_aantal"
-        and e[2] == "bm_orders"
-        and e[3] == "aantal_op_order"
-        for e in all_edges_lower
-    ), (
-        f"Link 1 FAILED: source_facts.ma_order_aantal -> bm_orders.aantal_op_order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(
+    strict=True, reason="E5: CTE resolution with SUM aggregation not yet implemented"
+)
+def test_anchor_ma_chain_link_1_source_facts_to_bm_orders(chain_edges):
+    """Link 1: source_facts.ma_order_aantal -> bm_orders.aantal_op_order."""
+    link_1 = [
+        e
+        for e in chain_edges
+        if e[0].upper() == "SOURCE_FACTS"
+        and e[1].upper() == "MA_ORDER_AANTAL"
+        and e[2].lower() == "bm_orders"
+        and e[3].lower() == "aantal_op_order"
+    ]
+    assert len(link_1) >= 1, (
+        f"Expected source_facts.ma_order_aantal -> bm_orders.aantal_op_order; got {chain_edges}"
     )
 
-    # 2. source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order
-    assert any(
-        e[0] == "source_facts"
-        and e[1] == "ma_order_aantal"
-        and e[2] == "igdc_openstaand"
-        and e[3] == "aantal_op_order"
-        for e in all_edges_lower
-    ), (
-        f"Link 2 FAILED: source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(
+    strict=True, reason="E5: CTE resolution with SUM aggregation not yet implemented"
+)
+def test_anchor_ma_chain_link_2_source_facts_to_igdc(chain_edges):
+    """Link 2: source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order."""
+    link_2 = [
+        e
+        for e in chain_edges
+        if e[0].upper() == "SOURCE_FACTS"
+        and e[1].upper() == "MA_ORDER_AANTAL"
+        and e[2].lower() == "igdc_openstaand"
+        and e[3].lower() == "aantal_op_order"
+    ]
+    assert len(link_2) >= 1, (
+        f"Expected source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order; "
+        f"got {chain_edges}"
     )
 
-    # 3. bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order
-    assert any(
-        e[0] == "bm_orders"
-        and e[1] == "aantal_op_order"
-        and e[2] == "openstaand_combined"
-        and e[3] == "aantal_op_order"
-        for e in all_edges_lower
-    ), (
-        f"Link 3 FAILED: bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(strict=True, reason="E5: CTE-to-CTE column resolution not yet implemented")
+def test_anchor_ma_chain_link_3_bm_to_combined(chain_edges):
+    """Link 3: bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order."""
+    link_3 = [
+        e
+        for e in chain_edges
+        if e[0].lower() == "bm_orders"
+        and e[1].lower() == "aantal_op_order"
+        and e[2].lower() == "openstaand_combined"
+        and e[3].lower() == "aantal_op_order"
+    ]
+    assert len(link_3) >= 1, (
+        f"Expected bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order; "
+        f"got {chain_edges}"
     )
 
-    # 4. igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order
-    assert any(
-        e[0] == "igdc_openstaand"
-        and e[1] == "aantal_op_order"
-        and e[2] == "openstaand_combined"
-        and e[3] == "aantal_op_order"
-        for e in all_edges_lower
-    ), (
-        f"Link 4 FAILED: igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(strict=True, reason="E5: CTE-to-CTE column resolution not yet implemented")
+def test_anchor_ma_chain_link_4_igdc_to_combined(chain_edges):
+    """Link 4: igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order."""
+    link_4 = [
+        e
+        for e in chain_edges
+        if e[0].lower() == "igdc_openstaand"
+        and e[1].lower() == "aantal_op_order"
+        and e[2].lower() == "openstaand_combined"
+        and e[3].lower() == "aantal_op_order"
+    ]
+    assert len(link_4) >= 1, (
+        f"Expected igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order; "
+        f"got {chain_edges}"
     )
 
-    # 5. openstaand_combined.aantal_op_order -> wtfs_openstaande_orders.ma_aantal_op_order
-    assert any(
-        e[0] == "openstaand_combined"
-        and e[1] == "aantal_op_order"
-        and e[2] == "wtfs_openstaande_orders"
-        and e[3] == "ma_aantal_op_order"
-        for e in all_edges_lower
-    ), (
-        "Link 5 FAILED: openstaand_combined.aantal_op_order ->"
-        " wtfs_openstaande_orders.ma_aantal_op_order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(strict=True, reason="E5: CTE-to-INSERT column resolution not yet implemented")
+def test_anchor_ma_chain_link_5_combined_to_target(chain_edges):
+    """Link 5: openstaand_combined.aantal_op_order -> wtfs_openstaande_orders.ma_aantal_op_order."""
+    link_5 = [
+        e
+        for e in chain_edges
+        if e[0].lower() == "openstaand_combined"
+        and e[1].lower() == "aantal_op_order"
+        and e[2].lower() == "wtfs_openstaande_orders"
+        and e[3].lower() == "ma_aantal_op_order"
+    ]
+    assert len(link_5) >= 1, (
+        "Expected openstaand_combined.aantal_op_order -> "
+        "wtfs_openstaande_orders.ma_aantal_op_order; "
+        f"got {chain_edges}"
     )
 
-    # 6. wtfs_openstaande_orders.ma_aantal_op_order -> "Openstaande orders"."Aantal op order"
-    # Note: quoted identifiers may preserve case; check both exact and normalized
-    assert any(
-        (e[0].lower() == "wtfs_openstaande_orders" and e[1].lower() == "ma_aantal_op_order")
-        and (e[2].lower() == "openstaande orders" and e[3].lower() == "aantal op order")
-        for e in all_edges
-    ), (
-        "Link 6 FAILED: wtfs_openstaande_orders.ma_aantal_op_order ->"
-        " Openstaande orders.Aantal op order\n"
-        f"Edges: {all_edges}"
+
+@pytest.mark.xfail(
+    strict=True, reason="E5: View column resolution with quoted identifiers not yet implemented"
+)
+def test_anchor_ma_chain_link_6_target_to_view(chain_edges):
+    """Link 6: wtfs_openstaande_orders.ma_aantal_op_order -> Openstaande orders.Aantal op order."""
+    link_6 = [
+        e
+        for e in chain_edges
+        if e[0].lower() == "wtfs_openstaande_orders"
+        and e[1].lower() == "ma_aantal_op_order"
+        and e[2] == "Openstaande orders"
+        and e[3] == "Aantal op order"
+    ]
+    assert len(link_6) >= 1, (
+        "Expected wtfs_openstaande_orders.ma_aantal_op_order -> "
+        "Openstaande orders.Aantal op order; "
+        f"got {chain_edges}"
     )

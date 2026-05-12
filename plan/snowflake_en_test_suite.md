@@ -157,9 +157,6 @@ only). No re-creation needed; just add fixture SQL and test files.
 
 **Fixture**: `tests/snowflake/anchors/fixture_omloopsnelheid.sql`
 
-Required SQL shape (developer writes the exact statement; this is the shape
-that reliably triggers the pattern):
-
 ```sql
 CREATE TEMP TABLE tmp_a AS
 SELECT
@@ -208,15 +205,47 @@ existing temp-CTE bug; mark with `# INVERSION TARGET` and ship anyway.
 
 **Fixtures**:
 
-- `tests/snowflake/anchors/fixture_source.sql` — a single
-  `CREATE TABLE source_facts (ma_order_aantal NUMBER, verhoudingsgetal NUMBER, ...)`.
-- `tests/snowflake/anchors/fixture_etl.sql` — two CTEs (`bm_orders`,
-  `igdc_openstaand`) computing
-  `SUM(ma_order_aantal / NULLIF(verhoudingsgetal, 0)) AS aantal_op_order`
-  from `source_facts`, then `UNION ALL` into `openstaand_combined` CTE, then
-  `INSERT INTO wtfs_openstaande_orders (ma_aantal_op_order) SELECT SUM(aantal_op_order) FROM openstaand_combined`.
-- `tests/snowflake/anchors/fixture_semantic.sql` — semantic view
-  `CREATE VIEW "Openstaande orders" AS SELECT ma_aantal_op_order AS "Aantal op order" FROM wtfs_openstaande_orders`.
+`tests/snowflake/anchors/fixture_source.sql`:
+
+```sql
+CREATE TABLE source_facts (
+    ma_order_aantal NUMBER,
+    verhoudingsgetal NUMBER,
+    order_type STRING,
+    order_date DATE
+);
+```
+
+`tests/snowflake/anchors/fixture_etl.sql`:
+
+```sql
+INSERT INTO wtfs_openstaande_orders (ma_aantal_op_order)
+WITH bm_orders AS (
+    SELECT SUM(ma_order_aantal / NULLIF(verhoudingsgetal, 0)) AS aantal_op_order
+    FROM source_facts
+    WHERE order_type = 'BM'
+),
+igdc_openstaand AS (
+    SELECT SUM(ma_order_aantal / NULLIF(verhoudingsgetal, 0)) AS aantal_op_order
+    FROM source_facts
+    WHERE order_type = 'IGDC'
+),
+openstaand_combined AS (
+    SELECT aantal_op_order FROM bm_orders
+    UNION ALL
+    SELECT aantal_op_order FROM igdc_openstaand
+)
+SELECT SUM(aantal_op_order) FROM openstaand_combined;
+```
+
+`tests/snowflake/anchors/fixture_semantic.sql`:
+
+```sql
+CREATE OR REPLACE VIEW "Openstaande orders" AS
+SELECT
+    ma_aantal_op_order AS "Aantal op order"
+FROM wtfs_openstaande_orders;
+```
 
 **Test**: `tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py`
 
@@ -280,10 +309,29 @@ src_col `"X"` and `"Y"`, dst_col `"my_col"`, dst_table `"<output>"` (no INSERT
 target). Tuples from `edges()` are:
 `("SRC", "X", "<output>", "my_col")` and `("SRC", "Y", "<output>", "my_col")`.
 
-- Assert `len([e for e in edges(result) if e[3] == "my_col"]) >= 1`.
-- Assert `any(e[1].upper() == "X" and e[3] == "my_col" for e in edges(result))`.
-- Assert `any(e[1].upper() == "Y" and e[3] == "my_col" for e in edges(result))`.
-  This documents that an aliased binary expression is NOT silently skipped.
+Test functions:
+
+1. `test_e2_binary_add_alias` — uses `e2_expr_alias.sql` above.
+   - Assert `len([e for e in edges(result) if e[3] == "my_col"]) >= 1`.
+   - Assert `any(e[1].upper() == "X" and e[3] == "my_col" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "Y" and e[3] == "my_col" for e in edges(result))`.
+     This documents that an aliased binary expression is NOT silently skipped.
+
+2. `test_e2_arithmetic_alias` — second fixture
+   `tests/snowflake/E2/e2_multiply_alias.sql`:
+   ```sql
+   SELECT price * qty AS revenue FROM sales;
+   ```
+   - Assert `any(e[1].upper() == "PRICE" and e[3] == "revenue" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "QTY" and e[3] == "revenue" for e in edges(result))`.
+
+3. `test_e2_function_alias` — third fixture
+   `tests/snowflake/E2/e2_function_alias.sql`:
+   ```sql
+   SELECT UPPER(name) AS name_upper FROM customers;
+   ```
+   - Assert `any(e[1].upper() == "NAME" and e[3] == "name_upper" for e in edges(result))`.
+   - Assert `any(e[0].upper() == "CUSTOMERS" for e in edges(result))`.
 
 #### Step 2.2 — E3: DDL-only file
 
@@ -300,11 +348,31 @@ and falls back to `exp.Command`. `AnsiParser.parse_file` sets
 `parse_quality = ParseQuality.SCRIPTING_FALLBACK` when any `Command` node is
 present in the statement list. The returned quality is NOT `TABLE_ONLY`.
 
-- Assert `edges(result) == []`.
-- Assert `result.parse_quality in {ParseQuality.TABLE_ONLY, ParseQuality.SCRIPTING_FALLBACK}`
-  (file parsed, no lineage expected; do not allow `FAILED` — that would be a
-  regression). Both values are acceptable DDL-only outcomes.
-- Assert no entry in `result.errors` contains "Exception" or "crash".
+Test functions:
+
+1. `test_e3_alter_dynamic_table` — uses `e3_ddl_only.sql` above.
+   - Assert `edges(result) == []`.
+   - Assert `result.parse_quality in {ParseQuality.TABLE_ONLY, ParseQuality.SCRIPTING_FALLBACK}`
+     (file parsed, no lineage expected; do not allow `FAILED` — that would be a
+     regression). Both values are acceptable DDL-only outcomes.
+   - Assert no entry in `result.errors` contains "Exception" or "crash".
+
+2. `test_e3_alter_table` — second fixture
+   `tests/snowflake/E3/e3_alter_table.sql`:
+   ```sql
+   ALTER TABLE t ADD COLUMN new_col INT;
+   ```
+   - Assert `edges(result) == []`.
+   - Assert `result.parse_quality in {ParseQuality.TABLE_ONLY, ParseQuality.SCRIPTING_FALLBACK}`.
+   - Assert no exception text in errors.
+
+3. `test_e3_create_sequence` — third fixture
+   `tests/snowflake/E3/e3_create_sequence.sql`:
+   ```sql
+   CREATE SEQUENCE my_seq START 1 INCREMENT 1;
+   ```
+   - Assert `edges(result) == []`.
+   - Assert `result.parse_quality in {ParseQuality.TABLE_ONLY, ParseQuality.SCRIPTING_FALLBACK}`.
 
 #### Step 2.3 — E4: Three dialect-gap fixtures
 
@@ -318,10 +386,16 @@ present in the statement list. The returned quality is NOT `TABLE_ONLY`.
   UNPIVOT(sales FOR month IN (jan, feb, mar));
   ```
 - `tests/snowflake/E4/e4_unexpected_token.sql`: a short procedural block known
-  to trigger an "Unexpected token" error in sqlglot's Snowflake dialect — the
-  developer should grep the corpus's parse-error log
-  ([`plan/sprint_06_lineage_coverage.md`](sprint_06_lineage_coverage.md)) for
-  the exact pattern and reproduce minimally.
+  to trigger an "Unexpected token" error in sqlglot's Snowflake dialect:
+  ```sql
+  DECLARE x INT DEFAULT 0;
+  BEGIN
+      LET x := 1;
+      RETURN x;
+  END;
+  ```
+  The `LET x := 1` assignment inside a `BEGIN`/`END` scripting block reliably
+  triggers an unexpected-token error in sqlglot's Snowflake dialect parser.
 
 **IMPORTANT — known preprocessing**: `SnowflakeParser._preprocess_snowflake_sql`
 already handles `IF NOT EXISTS` (strips it) and `UNPIVOT` (strips the clause).
@@ -335,17 +409,30 @@ After preprocessing:
 - `e4_unexpected_token.sql` must be a pattern that preprocessing does NOT fix
   (grep the parse-error log for a non-UNPIVOT, non-IF-NOT-EXISTS failure).
 
-**Test** `test_e4.py` (parametrize over the 3 fixtures):
+**Test** `test_e4.py`:
 
-- Assert `parse_file` returns a `ParsedFile` (does not raise).
-- Assert `result.parse_quality in {ParseQuality.FAILED, ParseQuality.TABLE_ONLY,
-  ParseQuality.SCRIPTING_FALLBACK}` — all three indicate no full lineage.
-- Assert `len(result.errors) >= 1` and each error is a non-empty string.
-- Assert `edges(result) == []` — broken/stripped files must not produce
-  high-confidence lineage. (The `edges()` helper already filters `confidence > 0`.)
-- For `e4_if_not_exists` and `e4_unpivot`: add a comment documenting that
-  preprocessing transforms these patterns before they reach sqlglot, so the
-  "failure" is handled gracefully, not hard-errored.
+1. `test_e4_dialect_gap[fixture]` — parametrized over the 3 fixtures above
+   (`e4_if_not_exists`, `e4_unpivot`, `e4_unexpected_token`):
+   - Assert `parse_file` returns a `ParsedFile` (does not raise).
+   - Assert `result.parse_quality in {ParseQuality.FAILED, ParseQuality.TABLE_ONLY,
+     ParseQuality.SCRIPTING_FALLBACK}` — all three indicate no full lineage.
+   - Assert `len(result.errors) >= 1` and each error is a non-empty string.
+   - Assert `edges(result) == []` — broken/stripped files must not produce
+     high-confidence lineage. (The `edges()` helper already filters `confidence > 0`.)
+   - For `e4_if_not_exists` and `e4_unpivot`: add a comment documenting that
+     preprocessing transforms these patterns before they reach sqlglot, so the
+     "failure" is handled gracefully, not hard-errored.
+
+2. `test_e4_execute_immediate` — fourth fixture
+   `tests/snowflake/E4/e4_execute_immediate.sql`:
+   ```sql
+   EXECUTE IMMEDIATE 'SELECT 1';
+   ```
+   - Assert `parse_file` returns a `ParsedFile` (does not raise).
+   - Assert `edges(result) == []` — runtime SQL strings cannot be parsed for
+     lineage.
+   - Assert `result.parse_quality in {ParseQuality.FAILED, ParseQuality.TABLE_ONLY,
+     ParseQuality.SCRIPTING_FALLBACK}`.
 
 #### Step 2.4 — E5: CTE referencing missing source
 
@@ -366,16 +453,41 @@ is emitted. The edge IS present in `edges(result)`.
 The plan's original assertion (`confidence == 0.0` placeholders) does not match
 actual behaviour. Correct assertion:
 
-- Use a freshly-built `SchemaResolver()` with **no** schema loaded.
-- Assert `len(edges(result)) >= 1` — the CTE resolves, and an edge is present.
-- Assert `any(e[0].upper() == "TABLE_NOT_IN_SCHEMA" for e in edges(result))` —
-  the source is traceable to the missing table, confirming CTE resolution works.
-- Add:
-  ```python
-  # INVERSION TARGET: when E5 cross-file resolution lands, assert
-  # the src_table resolves to the *actual* file-qualified table, not
-  # the raw name from the missing schema reference.
-  ```
+Test functions:
+
+1. `test_e5_cte_missing_source` — uses `e5_cte_missing_source.sql` above.
+   - Use a freshly-built `SchemaResolver()` with **no** schema loaded.
+   - Assert `len(edges(result)) >= 1` — the CTE resolves, and an edge is present.
+   - Assert `any(e[0].upper() == "TABLE_NOT_IN_SCHEMA" for e in edges(result))` —
+     the source is traceable to the missing table, confirming CTE resolution works.
+   - Add:
+     ```python
+     # INVERSION TARGET: when E5 cross-file resolution lands, assert
+     # the src_table resolves to the *actual* file-qualified table, not
+     # the raw name from the missing schema reference.
+     ```
+
+2. `test_e5_multi_cte` — second fixture
+   `tests/snowflake/E5/e5_multi_cte.sql`:
+   ```sql
+   WITH x AS (SELECT a FROM absent_one),
+        y AS (SELECT b FROM absent_two)
+   SELECT x.a, y.b FROM x JOIN y ON x.a = y.b;
+   ```
+   - Build `SchemaResolver()` with no schema.
+   - Assert `any(e[0].upper() == "ABSENT_ONE" for e in edges(result))`.
+   - Assert `any(e[0].upper() == "ABSENT_TWO" for e in edges(result))`.
+   - Both absent tables appear as bare src names.
+
+3. `test_e5_nested_cte` — third fixture
+   `tests/snowflake/E5/e5_nested_cte.sql`:
+   ```sql
+   WITH inner_cte AS (SELECT a FROM absent_root),
+        outer_cte AS (SELECT a FROM inner_cte)
+   SELECT a FROM outer_cte;
+   ```
+   - Assert `any(e[0].upper() == "ABSENT_ROOT" for e in edges(result))` — the
+     nested CTE resolves all the way down to the absent source.
 
 #### Step 2.5 — E8: Dynamic / literal sources
 
@@ -394,10 +506,29 @@ FROM dual;
 Actual behaviour (verified): `parse_quality = TABLE_ONLY`, zero high-confidence
 edges, errors contain `col_lineage_skip:dynamic_source:ts_col` etc.
 
-- Assert `edges(result) == []`.
-- Assert `any("dynamic_source" in err for err in result.errors)` — confirms the
-  skip is intentional and recorded, not a silent drop.
-- This is **expected correct behaviour**. No `# INVERSION TARGET`.
+Test functions:
+
+1. `test_e8_dynamic_sources` — uses `e8_dynamic_sources.sql` above.
+   - Assert `edges(result) == []`.
+   - Assert `any("dynamic_source" in err for err in result.errors)` — confirms the
+     skip is intentional and recorded, not a silent drop.
+   - This is **expected correct behaviour**. No `# INVERSION TARGET`.
+
+2. `test_e8_seq_nextval` — second fixture
+   `tests/snowflake/E8/e8_seq_nextval.sql`:
+   ```sql
+   SELECT SEQ.NEXTVAL AS id FROM dual;
+   ```
+   - Assert `[e for e in edges(result) if e[3] == "id"] == []` — sequence
+     reference produces no traceable column lineage.
+
+3. `test_e8_uuid` — third fixture
+   `tests/snowflake/E8/e8_uuid.sql`:
+   ```sql
+   SELECT UUID_STRING() AS uid FROM dual;
+   ```
+   - Assert `[e for e in edges(result) if e[3] == "uid"] == []` —
+     non-deterministic function produces no column lineage.
 
 #### Step 2.6 — E12: LATERAL FLATTEN
 
@@ -410,9 +541,24 @@ FROM tbl, LATERAL FLATTEN(input => arr) f;
 
 **Test** `test_e12.py`:
 
-- Assert `[e for e in edges(result) if e[3] == "col"] == []` OR
-  `any("flatten" in err.lower() for err in result.errors)`.
-- `# INVERSION TARGET: when E12 fixed, assert edge from tbl.arr to (alias).col`.
+Test functions:
+
+1. `test_e12_lateral_flatten` — uses `e12_lateral_flatten.sql` above.
+   - Assert `[e for e in edges(result) if e[3] == "col"] == []` OR
+     `any("flatten" in err.lower() for err in result.errors)`.
+   - `# INVERSION TARGET: when E12 fixed, assert edge from tbl.arr to (alias).col`.
+
+2. `test_e12_json_path` — second fixture
+   `tests/snowflake/E12/e12_json_path.sql`:
+   ```sql
+   SELECT src:address:city::STRING AS city FROM customer_raw;
+   ```
+   - Pin current behaviour: assert `[e for e in edges(result) if e[3] == "city"] == []`
+     OR `any(e[1].upper() == "SRC" and e[3] == "city" for e in edges(result))` —
+     whichever the parser produces. Document the actual behaviour in the test
+     docstring.
+   - `# INVERSION TARGET: when E12 semi-structured JSON path resolution lands,`
+     `assert edge from customer_raw.src to (output).city`.
 
 #### Step 2.7 — E16: MERGE multi-branch
 
@@ -433,10 +579,26 @@ not extract column lineage from MERGE branches at all.
 The plan's original assertion "at least one edge exists" would always fail.
 Correct assertion:
 
-- Assert `edges(result) == []` — this pins the current zero-lineage state.
-- `# INVERSION TARGET: when E16 fixed, assert at least one edge with`
-  `dst_table == "DST" and dst_col == "col" from src.col_a (MATCHED branch)`
-  `and src.col_b (NOT MATCHED branch) — srcs == {"COL_A", "COL_B"}`.
+Test functions:
+
+1. `test_e16_merge_match_and_insert` — uses `e16_merge.sql` above.
+   - Assert `edges(result) == []` — this pins the current zero-lineage state.
+   - `# INVERSION TARGET: when E16 fixed, assert at least one edge with`
+     `dst_table == "DST" and dst_col == "col" from src.col_a (MATCHED branch)`
+     `and src.col_b (NOT MATCHED branch) — srcs == {"COL_A", "COL_B"}`.
+
+2. `test_e16_merge_delete` — second fixture
+   `tests/snowflake/E16/e16_merge_delete.sql`:
+   ```sql
+   MERGE INTO dst USING src ON dst.id = src.id
+   WHEN MATCHED AND src.active = 0 THEN DELETE
+   WHEN MATCHED THEN UPDATE SET col = src.col_a
+   WHEN NOT MATCHED THEN INSERT (col) VALUES (src.col_b);
+   ```
+   - Assert `edges(result) == []` — DELETE branch added; still zero edges
+     because MERGE column lineage is not extracted.
+   - `# INVERSION TARGET: when E16 fixed, the DELETE branch should not produce`
+     `column edges, but UPDATE and INSERT branches should.`
 
 #### Step 2.8 — E18: IFF / DECODE
 
@@ -452,11 +614,36 @@ Actual behaviour (verified): sqlglot extracts edges for all three arguments
 of IFF (condition `x` and both branches `a`, `b`). All edges present with
 `confidence = 0.9`. Src table is `"SRC"` (uppercase).
 
-- Assert `any(e[1].upper() == "A" and e[3] == "col" for e in edges(result))`.
-- Assert `any(e[1].upper() == "B" and e[3] == "col" for e in edges(result))`.
-- No `xfail` needed — this is currently correct behaviour.
-- Note in test docstring: "IFF both branches produce edges; this is working as
-  of the current sqlglot version. If a future version regresses, add xfail."
+Test functions:
+
+1. `test_e18_iff` — uses `e18_iff_decode.sql` above.
+   - Assert `any(e[1].upper() == "A" and e[3] == "col" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "B" and e[3] == "col" for e in edges(result))`.
+   - No `xfail` needed — this is currently correct behaviour.
+   - Note in test docstring: "IFF both branches produce edges; this is working as
+     of the current sqlglot version. If a future version regresses, add xfail."
+
+2. `test_e18_decode` — second fixture
+   `tests/snowflake/E18/e18_decode.sql`:
+   ```sql
+   SELECT DECODE(status, 'A', active_col, 'B', backup_col, default_col) AS result
+   FROM src;
+   ```
+   - Assert `any(e[1].upper() == "ACTIVE_COL" and e[3] == "result" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "BACKUP_COL" and e[3] == "result" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "DEFAULT_COL" and e[3] == "result" for e in edges(result))`.
+   - If any branch is silently dropped, pin the actual behaviour and add
+     `# INVERSION TARGET: when E18 DECODE default branch lands, assert all`
+     `branches produce edges`.
+
+3. `test_e18_nvl2` — third fixture
+   `tests/snowflake/E18/e18_nvl2.sql`:
+   ```sql
+   SELECT NVL2(nullable_col, a, b) AS result FROM src;
+   ```
+   - Assert `any(e[1].upper() == "A" and e[3] == "result" for e in edges(result))`.
+   - Assert `any(e[1].upper() == "B" and e[3] == "result" for e in edges(result))`.
+   - Pin whether `nullable_col` also produces a lineage edge (predicate column).
 
 #### Step 2.9 — E21: Alias forward reference
 
@@ -473,11 +660,25 @@ Actual behaviour (verified): sqlglot resolves `c` back through the expression
 and `("SRC", "A", "<output>", "C")`. Column `c` traces back to `src.A` (not a
 forward-reference bug), destination column name is `"C"` (uppercase).
 
-- Assert `any(e[3].upper() == "C" for e in edges(result))` — at least one edge
-  to `c` exists.
-- Assert `any(e[1].upper() == "A" and e[3].upper() == "C" for e in edges(result))` —
-  the alias chain resolves correctly to the original source.
-- No `xfail` needed — currently working.
+Test functions:
+
+1. `test_e21_alias_forward_ref` — uses `e21_alias_forward_ref.sql` above.
+   - Assert `any(e[3].upper() == "C" for e in edges(result))` — at least one edge
+     to `c` exists.
+   - Assert `any(e[1].upper() == "A" and e[3].upper() == "C" for e in edges(result))` —
+     the alias chain resolves correctly to the original source.
+   - No `xfail` needed — currently working.
+
+2. `test_e21_three_level_chain` — second fixture
+   `tests/snowflake/E21/e21_three_level_chain.sql`:
+   ```sql
+   SELECT a AS b, b + 1 AS c, c * 2 AS d FROM src;
+   ```
+   - Assert `any(e[1].upper() == "A" and e[3].upper() == "D" for e in edges(result))` —
+     three-hop alias chain `a → b → c → d` resolves all the way back to `a`.
+   - If the chain breaks at any level, pin actual behaviour and add
+     `# INVERSION TARGET: when E21 multi-hop alias chains land, assert d traces`
+     `to src.a end-to-end`.
 
 #### Step 2.10 — E23: Stored procedure body
 
@@ -501,9 +702,29 @@ to `_parse_scripting_file` → `_EMBEDDED_DML` regex extracts the INSERT → edg
 on `query_node.confidence`, but `LineageEdge.confidence` itself is 0.9 from the
 lineage walk). `parse_quality = SCRIPTING_FALLBACK`.
 
-- Assert `any(e[0].upper() == "SRC" and e[1].upper() == "A" and e[2] == "dst" and e[3] == "a" for e in edges(result))`.
-- Assert `result.parse_quality == ParseQuality.SCRIPTING_FALLBACK`.
-- No `xfail` needed — currently working.
+Test functions:
+
+1. `test_e23_single_insert` — uses `e23_stored_proc.sql` above.
+   - Assert `any(e[0].upper() == "SRC" and e[1].upper() == "A" and e[2] == "dst" and e[3] == "a" for e in edges(result))`.
+   - Assert `result.parse_quality == ParseQuality.SCRIPTING_FALLBACK`.
+   - No `xfail` needed — currently working.
+
+2. `test_e23_multiple_inserts` — second fixture
+   `tests/snowflake/E23/e23_stored_proc_multi.sql`:
+   ```sql
+   CREATE OR REPLACE PROCEDURE p() RETURNS STRING LANGUAGE SQL AS
+   $$
+   BEGIN
+       INSERT INTO dst_one (a) SELECT a FROM src_one;
+       INSERT INTO dst_two (b) SELECT b FROM src_two;
+       RETURN 'ok';
+   END;
+   $$;
+   ```
+   - Assert `any(e[0].upper() == "SRC_ONE" and e[2] == "dst_one" for e in edges(result))`.
+   - Assert `any(e[0].upper() == "SRC_TWO" and e[2] == "dst_two" for e in edges(result))`.
+   - Both INSERT edges must be captured (regex must not stop at first match).
+   - Assert `result.parse_quality == ParseQuality.SCRIPTING_FALLBACK`.
 
 #### Step 2.11 — E25: Cross-database reference
 
@@ -521,30 +742,66 @@ and db parts are NOT preserved in the `src.table.name` of the `LineageEdge`
 (because `TableRef.name` is just the bare table name). Source is traceable
 but NOT qualified.
 
-- Assert `len(edges(result)) >= 1` — a bare-name edge IS produced.
-- Assert `any(e[0].upper() == "TBL" for e in edges(result))` — bare table name
-  is present.
-- Assert `not any(e[0] == "other_db.public.tbl" for e in edges(result))` —
-  fully-qualified name is NOT preserved (this is the E25 bug).
-- `# INVERSION TARGET: when E25 cross-db resolution lands, assert`
-  `src_table carries the fully-qualified "other_db.public.tbl" name`.
+Test functions:
+
+1. `test_e25_three_part_qualifier` — uses `e25_cross_db.sql` above.
+   - Assert `len(edges(result)) >= 1` — a bare-name edge IS produced.
+   - Assert `any(e[0].upper() == "TBL" for e in edges(result))` — bare table name
+     is present.
+   - Assert `not any(e[0] == "other_db.public.tbl" for e in edges(result))` —
+     fully-qualified name is NOT preserved (this is the E25 bug).
+   - `# INVERSION TARGET: when E25 cross-db resolution lands, assert`
+     `src_table carries the fully-qualified "other_db.public.tbl" name`.
+
+2. `test_e25_two_part_qualifier` — second fixture
+   `tests/snowflake/E25/e25_two_part.sql`:
+   ```sql
+   SELECT a FROM other_schema.tbl;
+   ```
+   - Assert `len(edges(result)) >= 1` — bare-name edge IS produced.
+   - Assert `any(e[0].upper() == "TBL" for e in edges(result))` — bare table name
+     appears.
+   - Pin whether the schema part is preserved by checking
+     `any("OTHER_SCHEMA" in e[0].upper() for e in edges(result))` and document
+     the actual result. If schema is dropped, add
+     `# INVERSION TARGET: when E25 schema qualifier lands, assert src_table`
+     `carries "other_schema.tbl"`.
 
 #### Step 2.12 — E27: UDF as column source
 
 **Fixture** `tests/snowflake/E27/e27_udf.sql`:
 
 ```sql
+-- my_udf is intentionally undefined: no CREATE FUNCTION statement exists
+-- in this fixture or in any loaded schema. The missing UDF definition is
+-- deliberate — the test pins parser behaviour when a UDF reference cannot
+-- be resolved.
 SELECT my_udf(src_col) AS dst_col FROM src;
 ```
 
 **Test** `test_e27.py`:
 
-- Compute `dst_edges = [e for e in edges(result) if e[3] == "dst_col"]`.
-- Pin current behaviour: assert `dst_edges == []`
-  (the parser does not see through the UDF boundary), OR if it captures the
-  arg-as-source, assert `any(e[1].upper() == "SRC_COL" for e in dst_edges)`.
-- `# INVERSION TARGET: when E27 fixed, assert edge with src_col == "SRC_COL"`
-  `and dst_col == "dst_col" from src table`.
+Test functions:
+
+1. `test_e27_udf` — uses `e27_udf.sql` above.
+   - Compute `dst_edges = [e for e in edges(result) if e[3] == "dst_col"]`.
+   - Pin current behaviour: assert `dst_edges == []`
+     (the parser does not see through the UDF boundary), OR if it captures the
+     arg-as-source, assert `any(e[1].upper() == "SRC_COL" for e in dst_edges)`.
+   - `# INVERSION TARGET: when E27 fixed, assert edge with src_col == "SRC_COL"`
+     `and dst_col == "dst_col" from src table`.
+
+2. `test_e27_nested_udf` — second fixture
+   `tests/snowflake/E27/e27_nested_udf.sql`:
+   ```sql
+   -- outer_udf and inner_udf are intentionally undefined.
+   SELECT outer_udf(inner_udf(src_col)) AS dst_col FROM src;
+   ```
+   - Compute `dst_edges = [e for e in edges(result) if e[3] == "dst_col"]`.
+   - Pin current behaviour: assert `dst_edges == []` OR
+     `any(e[1].upper() == "SRC_COL" for e in dst_edges)`.
+   - `# INVERSION TARGET: when E27 fixed, nested UDFs should still resolve to`
+     `src.src_col → (output).dst_col`.
 
 #### Step 2.13 — E36: Cross-statement temp table (highest priority)
 
@@ -569,15 +826,33 @@ that edge does NOT appear; what appears is the transitive resolution
 
 Corrected assertions:
 
-- Assert `any(e[0].upper() == "SRC" and e[2] == "t" for e in edges(result))` —
-  the CTAS edge `SRC.A → t.a` is present.
-- Assert `any(e[0].upper() == "SRC" and e[2] == "dst" for e in edges(result))` —
-  the resolved INSERT edge `SRC.A → dst.a` is also present (sources_map resolved `t`).
-- Assert `not any(e[0] == "t" for e in edges(result))` — `t` never appears as
-  a *source* table in any edge (it is expanded, not forwarded raw).
-- `# INVERSION TARGET: when E36 cross-file temp-table lands, write a two-file`
-  `test where fixture_a.sql creates the TEMP TABLE and fixture_b.sql INSERTs`
-  `from it, and assert the cross-file edge appears`.
+Test functions:
+
+1. `test_e36_temp_table` — uses `e36_temp_table.sql` above.
+   - Assert `any(e[0].upper() == "SRC" and e[2] == "t" for e in edges(result))` —
+     the CTAS edge `SRC.A → t.a` is present.
+   - Assert `any(e[0].upper() == "SRC" and e[2] == "dst" for e in edges(result))` —
+     the resolved INSERT edge `SRC.A → dst.a` is also present (sources_map resolved `t`).
+   - Assert `not any(e[0] == "t" for e in edges(result))` — `t` never appears as
+     a *source* table in any edge (it is expanded, not forwarded raw).
+   - `# INVERSION TARGET: when E36 cross-file temp-table lands, write a two-file`
+     `test where fixture_a.sql creates the TEMP TABLE and fixture_b.sql INSERTs`
+     `from it, and assert the cross-file edge appears`.
+
+2. `test_e36_multiple_temp_uses` — second fixture
+   `tests/snowflake/E36/e36_temp_multi_use.sql`:
+   ```sql
+   CREATE TEMP TABLE t AS SELECT a, b FROM src;
+   INSERT INTO dst_one (a) SELECT a FROM t;
+   INSERT INTO dst_two (b) SELECT b FROM t;
+   ```
+   - Assert `any(e[0].upper() == "SRC" and e[2] == "dst_one" for e in edges(result))` —
+     first INSERT resolves through `t`.
+   - Assert `any(e[0].upper() == "SRC" and e[2] == "dst_two" for e in edges(result))` —
+     second INSERT also resolves through `t` (sources_map entry must persist
+     across multiple consumer statements).
+   - Assert `not any(e[0] == "t" for e in edges(result))` — `t` is expanded in
+     both consumer INSERTs.
 
 Note: the E36 bug is a **cross-file** problem. A single-file fixture shows
 working intra-file resolution. The inversion target must use a two-file setup.
@@ -592,7 +867,9 @@ working intra-file resolution. The inversion target must use a two-file setup.
   or are wrapped behind an `if`-branch with a parametrized expected state. No
   `pytest.skip` — skipped tests rot.
 - **Discovery sanity**: `uv run pytest tests/snowflake --collect-only` must
-  show all 13 E-code modules plus 2 anchor modules.
+  show all 13 E-code modules plus 2 anchor modules. The total collected test
+  function count must be at least 33 (sum of per-E-code minimums above plus
+  the 2 anchor tests).
 - **Single-test invocation**: every test ID must run individually, e.g.
   `uv run pytest tests/snowflake/E36/test_e36.py::test_e36_temp_table -x`.
 
@@ -604,8 +881,23 @@ working intra-file resolution. The inversion target must use a two-file setup.
 - [ ] Anchor 2 asserts all 6 links of the MA_AANTAL_OP_ORDER chain (failing
       links use `pytest.mark.xfail` with E-code reason).
 - [ ] Each of E2, E3, E4, E5, E8, E12, E16, E18, E21, E23, E25, E27, E36 has
-      its own `tests/snowflake/E{n}/e{n}_*.sql` fixture and `test_e{n}.py`.
-- [ ] E4 has three separate fixtures driven by `@pytest.mark.parametrize`.
+      its own `tests/snowflake/E{n}/` directory with at least one `e{n}_*.sql`
+      fixture and a `test_e{n}.py` module.
+- [ ] Each `test_e{n}.py` contains at least 2 test functions (E4 has 4, E5 has
+      3, E8 has 3, E18 has 3). Specific minimum per E-code:
+      E2 ≥ 3, E3 ≥ 3, E4 ≥ 4 (3 parametrized + execute_immediate), E5 ≥ 3,
+      E8 ≥ 3, E12 ≥ 2, E16 ≥ 2, E18 ≥ 3, E21 ≥ 2, E23 ≥ 2, E25 ≥ 2, E27 ≥ 2,
+      E36 ≥ 2.
+- [ ] Additional fixture SQL files exist for each added test function that does
+      not reuse the original fixture (e.g. `e2_multiply_alias.sql`,
+      `e2_function_alias.sql`, `e3_alter_table.sql`, `e3_create_sequence.sql`,
+      `e4_execute_immediate.sql`, `e5_multi_cte.sql`, `e5_nested_cte.sql`,
+      `e8_seq_nextval.sql`, `e8_uuid.sql`, `e12_json_path.sql`,
+      `e16_merge_delete.sql`, `e18_decode.sql`, `e18_nvl2.sql`,
+      `e21_three_level_chain.sql`, `e23_stored_proc_multi.sql`,
+      `e25_two_part.sql`, `e27_nested_udf.sql`, `e36_temp_multi_use.sql`).
+- [ ] E4 has three parametrized fixtures plus the standalone
+      `test_e4_execute_immediate` test.
 - [ ] Every failure-documentation test (E12, E16, E25, E27, E36, and any
       xfail in Anchors) carries the exact comment
       `# INVERSION TARGET: when E{n} ...`.
