@@ -2,7 +2,7 @@
 
 agent: developer (test suite implementation)
 plan: plan/snowflake_en_test_suite.md (REVIEWED AND APPROVED)
-status: Phase 0 scaffold → Phase 1 anchors → Phase 2 per-E-code tests (in progress)
+status: Implementation complete — Phase 0/1/2 finished, all tests pass, ready for PR
 branch: feat/sprint-06
 date: 2026-05-12 (session 3)
 
@@ -82,6 +82,49 @@ Handoff — architect-reviewer (2026-05-11):
     FIX-E4 added at rank 4), § 12.5 (E4 deferred question answered), § 12.6 (open
     questions replaced with full documented findings).
   - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint.
+
+Session 3 summary (2026-05-12, developer implementation):
+  - Implemented plan/snowflake_en_test_suite.md in three phases
+  - Phase 0: Created 4 new directories with empty __init__.py (anchors, E2, E3, E4)
+  - Phase 1: Anchor tests (2 sprint gates for lineage work)
+    * Anchor 1 (OMLOOPSNELHEID): PASSED (1 test validates temp-table column drop)
+    * Anchor 2 (MA_AANTAL_OP_ORDER): 6 links, 6 xfail (E5 blocker, progress meter)
+  - Phase 2: 13 E-code tests with 2-4 tests each (total 34 PASSED)
+    * E2 (expressions): 3 tests, 3 fixtures
+    * E3 (DDL-only): 3 tests, 3 fixtures
+    * E4 (dialect gaps): 4 tests, 4 fixtures
+    * E5 (CTE missing source): 3 tests, 3 fixtures
+    * E8 (dynamic sources): 3 tests, 3 fixtures
+    * E12 (LATERAL FLATTEN): 2 tests, 2 fixtures
+    * E16 (MERGE): 2 tests, 2 fixtures
+    * E18 (IFF/DECODE): 3 tests, 3 fixtures
+    * E21 (alias chains): 2 tests, 2 fixtures
+    * E23 (stored procs): 2 tests, 2 fixtures
+    * E25 (cross-db): 2 tests, 2 fixtures
+    * E27 (UDF): 2 tests, 2 fixtures
+    * E36 (temp tables): 2 tests, 2 fixtures
+
+  Test results:
+  - 34 E-code tests: PASSED
+  - 40 gate tests (discovery + acceptance): PASSED
+  - 6 Anchor 2 links: XFAILED with strict=True (expected, E5 blocker)
+  - Full test suite: 480 passed, 2 skipped, 7 xfailed, 1 warning
+  - Zero unexpected failures
+
+  Implementation notes:
+  - All assertions on observable output only (edges, parse_quality, errors)
+  - Case sensitivity enforced (.upper() normalization per plan Conventions §6)
+  - Conditional assertions for parser behavior variation
+  - INVERSION TARGET comments document improvement paths
+  - No fixture larger than 30 lines (per plan constraints)
+  - All tests use parse() and edges() helpers from conftest.py
+  - Tests documented with clear docstrings and intent comments
+
+  Commits:
+  - 3c2155d: Phase 1 (anchors)
+  - a201b2a: Phase 2 (per-E-code tests)
+
+  Next: Create PR to master with test suite and this session summary.
 
 Handoff — plan-reviewer (2026-05-12):
   agent: plan-reviewer
