@@ -1,9 +1,60 @@
 ## Current State
 
-agent: developer
-plan: plan/sprint_09_lineage_coverage.md
+agent: architect-planner
+plan: plan/fix_dynamic_table_parsing.md
+feature: fix-dynamic-table-parsing
 date: 2026-05-12
-status: IMPLEMENTATION COMPLETE (6 of 6 tickets complete: T-09-01, T-09-02, T-09-06, T-09-03, T-09-04, T-09-05)
+status: PLAN CREATED — READY FOR REVIEW
+
+
+Handoff — plan-reviewer (2026-05-12):
+  agent: plan-reviewer
+  plan: plan/fix_schema_case_mismatch.md
+  status: READY FOR IMPLEMENTATION (plan created, failing acceptance tests committed)
+
+  No existing plan file existed — this was an ad-hoc inline fix request.
+  Plan file created: plan/fix_schema_case_mismatch.md
+
+  Issues found and resolved:
+
+  BLOCKER-1 (AC-5 test triggers sqlglot segfault):
+    The full parse_file path with UPPERCASE mapping_schema keys causes a segfault inside
+    sqlglot exp.expand() at base.py:647. This is the real bug that Fix 1 corrects.
+    The acceptance test was restructured to test the observable logic in isolation
+    (pre-fix and post-fix check semantics directly) so the test is a clean FAIL, not
+    a crash. The plan documents the segfault as confirming the severity of the bug.
+
+  BLOCKER-2 (Fix 1 breaks two existing tests):
+    test_add_information_schema_populates_tables asserts 'BA' in schema (uppercase).
+    test_T09_01_mapping_schema_returns_depth3_dict asserts 'DWH_PRD', 'BA', 'X' (uppercase).
+    Both WILL break after Fix 1 because as_dict() and mapping_schema() will return lowercase
+    keys. Plan updated with explicit developer instructions to update these test assertions.
+
+  WARNING-1 (Fix 3 set comprehension performance):
+    {c.lower() for c in table_cols} is rebuilt per column in the inner loop. Documented
+    in the plan with guidance: do not pre-optimise, but cache if profiling shows it is hot.
+
+  Answers to reviewer questions:
+  Q1 (Fix 1 breaks existing lookups?): YES — two existing tests use uppercase CSV fixtures
+     and assert uppercase keys. Developer must update those assertions.
+  Q2 (Fix 2 sqlglot dialect interaction?): No issue. Double-quoted identifiers are valid
+     ANSI and in all supported dialects. qualify() resolves by name, not quoting.
+  Q3 (mapping_schema() case gap not covered?): Partially covered. Quoted identifiers in
+     SQL (e.g. MY_TABLE) produce uppercase LineageNode.name — Fix 1 produces lowercase
+     set entries — mismatch → confidence=0.7 not 1.0. Documented as known limitation,
+     out of scope.
+  Q4 (Tests to update): test_add_information_schema_populates_tables and
+     test_T09_01_mapping_schema_returns_depth3_dict need assertion case corrections.
+  Q5 (Ordering): Fix 1 first, update broken tests, then Fix 2 and Fix 3 independently.
+
+  Failing acceptance tests committed:
+    tests/unit/test_fix_schema_case_mismatch.py — 7 tests
+    FAILED (3): fix1 as_dict uppercase, fix1 mapping_schema uppercase, fix2 space in column
+    PASSED (4): fix2 table name space, fix3 case-insensitive logic, fix3 absent col, fix1 regression
+
+  Test run: 3 FAILED, 4 PASSED — confirmed red before implementation.
+  Commits: 7835ebf (plan), 5dab023 (tests)
+
 
 Completed tickets (committed):
   - T-09-02 (FIX-DDL-SKIP): Renamed pure_ddl_skip marker → col_lineage_skip:pure_ddl_file
