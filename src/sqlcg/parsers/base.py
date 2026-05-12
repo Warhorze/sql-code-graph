@@ -529,6 +529,7 @@ class SqlParser(ABC):
         # NEW (T-07-06): Record MERGE statements explicitly as deferred.
         # sqlglot's lineage() API does not handle MERGE branches; implementing
         # multi-branch lineage is deferred (see plan/sprint_07_open_ecodes.md § T-07-06).
+        # TODO: Remove when sqlglot adds MERGE lineage support (T-07-06).
         if isinstance(stmt, exp.Merge):
             dst_name = None
             if stmt.this is not None:
@@ -791,7 +792,9 @@ class SqlParser(ABC):
                             else:
                                 projection_source = cte_body
 
-                            # For each projection in the CTE, extract lineage
+                            # For each projection in the CTE, extract lineage.
+                            # Only iterate projections from left branch for column names, but pass
+                            # entire Union body to sg_lineage so sqlglot resolves both branches.
                             cte_projections = projection_source.expressions
                             for cte_col_expr in cte_projections:
                                 # Skip stars in CTEs
