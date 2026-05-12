@@ -10,10 +10,11 @@ class TestExpressionNameExtraction:
     """Test best-effort fallback for extracting names from unaliased expressions."""
 
     def test_unaliased_function_expression_attempts_lineage(self):
-        """Unaliased function expression must attempt lineage, not skip silently.
+        """Unaliased function expression is skipped with T-09-03 func_fallback guard.
 
-        Before fix: ROUND(amount, 2) was skipped with no error marker
-        After fix: should attempt lineage and record col_lineage_attempt:expr_fallback:Round
+        Before T-09-03: ROUND(amount, 2) would attempt lineage via str() fallback
+        After T-09-03: unaliased function expressions emit col_lineage_skip:func_fallback
+            and do NOT attempt lineage (they produce no useful output column name).
         """
         sql = "CREATE VIEW v AS SELECT ROUND(amount, 2) FROM orders;"
         parser = AnsiParser(SchemaResolver())
@@ -26,9 +27,9 @@ class TestExpressionNameExtraction:
         assert not any("col_lineage_skip:expr_no_name" in e for e in errors), (
             "Old blanket skip marker must be removed"
         )
-        # Must contain the new fallback marker (actual type depends on sqlglot's function class)
-        assert any("col_lineage_attempt:expr_fallback:" in e for e in errors), (
-            "Must record fallback attempt for non-Column expressions"
+        # Must contain the new T-09-03 func_fallback guard (for unaliased functions)
+        assert any("col_lineage_skip:func_fallback:" in e for e in errors), (
+            "Must record func_fallback skip for unaliased function expressions (T-09-03)"
         )
 
     def test_star_expressions_still_skipped(self):
@@ -48,7 +49,12 @@ class TestExpressionNameExtraction:
         )
 
     def test_cast_expression_fallback_records_type(self):
-        """CAST(col AS type) expression must attempt and record type."""
+        """CAST(col AS type) expression emits func_fallback skip (T-09-03).
+
+        Unaliased CAST is a function-like expression that produces no useful
+        output column name (the SQL is the name). T-09-03 skips these with
+        col_lineage_skip:func_fallback.
+        """
         sql = "CREATE VIEW v AS SELECT CAST(id AS VARCHAR) FROM orders;"
         parser = AnsiParser(SchemaResolver())
 
@@ -56,9 +62,9 @@ class TestExpressionNameExtraction:
 
         assert len(parsed.statements) > 0
         errors = parsed.errors
-        # Must record some expression fallback (Casting or Cast depending on sqlglot version)
-        assert any("col_lineage_attempt:expr_fallback:" in e for e in errors), (
-            "Must record fallback for CAST expressions"
+        # Must record the func_fallback skip (T-09-03) instead of attempting fallback
+        assert any("col_lineage_skip:func_fallback:" in e for e in errors), (
+            "Must skip func_fallback for unaliased CAST expressions (T-09-03)"
         )
 
     def test_aliased_expression_skips_fallback(self):
