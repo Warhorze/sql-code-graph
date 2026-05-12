@@ -3,7 +3,7 @@
 agent: developer
 plan: plan/sprint_09_lineage_coverage.md
 date: 2026-05-12
-status: IMPLEMENTATION IN PROGRESS (3 of 6 tickets complete; 3 remaining: T-09-05, T-09-03, T-09-04)
+status: IMPLEMENTATION COMPLETE (6 of 6 tickets complete: T-09-01, T-09-02, T-09-06, T-09-03, T-09-04, T-09-05)
 
 Completed tickets (committed):
   - T-09-02 (FIX-DDL-SKIP): Renamed pure_ddl_skip marker → col_lineage_skip:pure_ddl_file
@@ -12,10 +12,45 @@ Completed tickets (committed):
 
 Test status: 388 passed, 2 skipped, 1 xfailed (all T-09-01/02/06 tests PASS)
 
-Remaining tickets:
-  - T-09-03 (FIX-E2-FUNC-FALLBACK): Guard unaliased function fallback
-  - T-09-04 (SUBPROC-ISOLATE): Replace ThreadPoolExecutor with multiprocessing.Process
-  - T-09-05 (E-CODE-FIXTURES): Date-function + aggregate fixtures
+Session 8 summary (2026-05-12, developer implementation — T-09-03, T-09-04, T-09-05):
+
+COMPLETED:
+  - T-09-03 (FIX-E2-FUNC-FALLBACK): Unaliased function guard
+    * Guard detects function calls (contains "(") and emits col_lineage_skip:func_fallback
+    * Does not enter sg_lineage for unaliased functions (no output column name)
+    * Aliased functions still resolve normally
+    * Tests: 4 date function tests + updates to T-02 tests
+
+  - T-09-04 (SUBPROC-ISOLATE): Subprocess isolation with multiprocessing
+    * Replaced ThreadPoolExecutor with multiprocessing.Process + spawn context
+    * Module-level _subprocess_parse_worker function (pickle-safe)
+    * Hard SIGKILL on timeout: proc.kill() -> proc.join(timeout=5)
+    * ParsedFile round-trips through multiprocessing.Queue
+    * On timeout: returns < 8s for 2s timeout (proven in tests)
+    * On timeout=0: bypasses subprocess, runs in-process
+    * Tests: 6 scenarios (slow, fast, exception, timeout=0, empty result, pickle)
+    * Updated T-03 tests to use module-level parser classes
+
+  - T-09-05 (E-CODE-FIXTURES): Acceptance gate fixtures
+    * Date functions (4 fixtures): unaliased DATE, aliased DATE, YEAR, DATEDIFF
+    * Aggregates (3 fixtures): SUM present, SUM CASE WHEN, SUM absent cross-schema
+    * Tests assert: unaliased → skip markers, aliased → edges, no E2/E5 errors
+    * All 7 fixtures + 7 tests PASS
+
+Test Results (Session 8 only):
+  - 21 new + updated tests PASS (T-09-03/04/05 + T-02/T-03 updates)
+  - 388 existing tests still passing (no regression)
+  - All pyright type checks pass
+  - All ruff lint checks pass
+
+Wiring verification (all complete):
+  - T-09-03: grep confirms "col_lineage_skip:func_fallback" in base.py
+  - T-09-04: grep confirms zero ThreadPoolExecutor refs, multiprocessing.Process present
+  - T-09-05: fixtures under tests/snowflake/E_date_functions/ and E_aggregates/
+
+Commits:
+  - 87badf2: fix(T-09-03): FIX-E2-FUNC-FALLBACK + test(T-09-05) fixtures + feat(T-09-04) subprocess
+  - f1eddf6: fix: Update T-02/T-03 tests for T-09-03/T-09-04 changes
 
 Handoff — plan-reviewer (2026-05-12):
   agent: plan-reviewer
