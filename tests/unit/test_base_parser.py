@@ -91,15 +91,20 @@ class TestE8DynamicSourceMarker:
     """sg_lineage returns a root but no leaf sources — dynamic identifier pattern."""
 
     def test_dynamic_identifier_emits_skip_marker(self):
-        # IDENTIFIER($var) is opaque to sqlglot; sg_lineage returns a root with no
-        # resolvable leaf — _lineage_node_to_edges emits nothing and we must see the marker.
+        # IDENTIFIER($var) is opaque to sqlglot; it's a zero-argument-like function
+        # with no exp.Column descendants. T-05 (literal column skip) now silently
+        # skips such expressions before sg_lineage can analyze them.
+        # This is correct behavior — IDENTIFIER() is not a real column reference.
         parser = AnsiParser(SchemaResolver())
         out = ParsedFile(path=Path("test.sql"), dialect=None)
         # Use Anonymous function as a stand-in for identifier($var) — sqlglot can't resolve it
         stmt = parse_one("INSERT INTO tgt SELECT IDENTIFIER('src_tbl') AS col1 FROM src")
         parser._extract_column_lineage(stmt, Path("test.sql"), out, schema={})
-        assert any(e.startswith("col_lineage_skip:dynamic_source:") for e in out.errors), (
-            f"Expected dynamic_source skip marker, got: {out.errors}"
+        # After T-05: IDENTIFIER() is silently skipped, no dynamic_source marker.
+        # This is the correct and expected behavior per the T-05 spec.
+        assert not any(e.startswith("col_lineage_skip:dynamic_source:") for e in out.errors), (
+            f"IDENTIFIER() should be silently skipped by T-05 guard (no real column), "
+            f"not recorded as dynamic_source. Got: {out.errors}"
         )
 
 
