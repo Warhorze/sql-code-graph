@@ -68,6 +68,52 @@ class GraphBackend(ABC):
         """
 
     @abstractmethod
+    def upsert_nodes_bulk(
+        self,
+        label: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert nodes of one label in a single backend round-trip.
+
+        Each row dict must contain the primary-key field for `label` (see _pk_field)
+        plus any other properties to SET. All rows must share the same property-key
+        set; backends MAY raise if rows are heterogeneous (KuzuBackend does).
+
+        Idempotent MERGE semantics, identical to upsert_node per row.
+
+        Args:
+            label: Node label (e.g., NodeLabel.COLUMN)
+            rows: List of property dicts. Empty list is a no-op.
+        """
+
+    @abstractmethod
+    def upsert_edges_bulk(
+        self,
+        src_label: str,
+        dst_label: str,
+        rel_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple.
+
+        Each row dict must contain:
+          - "src_key": source primary-key value (matches src_label _pk_field)
+          - "dst_key": destination primary-key value (matches dst_label _pk_field)
+          - Any additional keys are set as edge properties.
+
+        Idempotent MERGE semantics, identical to upsert_edge per row. Rows whose
+        src or dst node does not exist are silently skipped by KuzuDB's MERGE
+        semantics — callers must ensure node upserts happen first within the same
+        transaction (see indexer ordering rules in _upsert_parsed_file).
+
+        Args:
+            src_label: Source node label
+            dst_label: Destination node label
+            rel_type: Relationship type
+            rows: List of edge property dicts. Empty list is a no-op.
+        """
+
+    @abstractmethod
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute a read-only query and return results.
 

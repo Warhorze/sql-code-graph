@@ -206,6 +206,93 @@ class KuzuBackend(GraphBackend):
             logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
+    def upsert_nodes_bulk(self, label: str, rows: list[dict[str, Any]]) -> None:
+        """Bulk-upsert nodes of one label in a single backend round-trip."""
+        if not rows:
+            return
+        # Validate all property keys across all rows (same guard as upsert_node)
+        for row in rows:
+            self._validate_props(row)
+
+        pk_field = self._pk_field(label)
+        # Determine the property key set from the first row; require homogeneity.
+        keys = list(rows[0].keys())
+        if pk_field not in keys:
+            raise ValueError(
+                f"upsert_nodes_bulk({label}): every row must include primary key '{pk_field}'"
+            )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != set(keys):
+                raise ValueError(
+                    f"upsert_nodes_bulk({label}): row {i} has property keys "
+                    f"{sorted(row.keys())}, expected {sorted(keys)}"
+                )
+
+        set_keys = [k for k in keys if k != pk_field]
+        # UNWIND $rows AS row MERGE (n:Label {pk: row.pk}) SET n.k = row.k, ...
+        query = f"UNWIND $rows AS row MERGE (n:{label} {{{pk_field}: row.{pk_field}}})"
+        if set_keys:
+            set_parts = [f"n.{k} = row.{k}" for k in set_keys]
+            query += f" SET {', '.join(set_parts)}"
+
+        try:
+            self._conn.execute(query, {"rows": rows})
+        except Exception as e:
+            logger.error(f"upsert_nodes_bulk failed: {label} ({len(rows)} rows): {e}")
+            raise
+
+    def upsert_edges_bulk(
+        self,
+        src_label: str,
+        dst_label: str,
+        rel_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple."""
+        if not rows:
+            return
+        for row in rows:
+            # src_key/dst_key are not graph properties; validate the remainder.
+            props = {k: v for k, v in row.items() if k not in ("src_key", "dst_key")}
+            self._validate_props(props)
+
+        src_pk = self._pk_field(src_label)
+        dst_pk = self._pk_field(dst_label)
+
+        keys = list(rows[0].keys())
+        for required in ("src_key", "dst_key"):
+            if required not in keys:
+                raise ValueError(
+                    f"upsert_edges_bulk({src_label}->{rel_type}->{dst_label}): "
+                    f"every row must include '{required}'"
+                )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != set(keys):
+                raise ValueError(
+                    f"upsert_edges_bulk: row {i} has property keys {sorted(row.keys())}, "
+                    f"expected {sorted(keys)}"
+                )
+
+        prop_keys = [k for k in keys if k not in ("src_key", "dst_key")]
+        query = (
+            f"UNWIND $rows AS row "
+            f"MATCH (src:{src_label} {{{src_pk}: row.src_key}}) "
+            f"MATCH (dst:{dst_label} {{{dst_pk}: row.dst_key}}) "
+            f"MERGE (src)-[r:{rel_type}]->(dst)"
+        )
+        if prop_keys:
+            set_parts = [f"r.{k} = row.{k}" for k in prop_keys]
+            query += f" SET {', '.join(set_parts)}"
+
+        try:
+            self._conn.execute(query, {"rows": rows})
+        except Exception as e:
+            logger.error(
+                f"upsert_edges_bulk failed: {src_label}->{rel_type}->{dst_label} "
+                f"({len(rows)} rows): {e}"
+            )
+            raise
+
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute a read-only query and return results."""
         try:

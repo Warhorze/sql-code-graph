@@ -279,7 +279,7 @@ class Indexer:
         db: GraphBackend,
         gold_tables: frozenset[str] = frozenset(),
     ) -> dict:
-        """Map ParsedFile → graph nodes/edges.
+        """Map ParsedFile → graph nodes/edges using bulk upsert.
 
         Args:
             parsed: ParsedFile to upsert
@@ -288,21 +288,28 @@ class Indexer:
                         (skip DDL column writes for these tables)
 
         Returns:
-            Dict with keys: tables, edges, columns_defined
+            Dict with keys: tables, edges, columns_defined, star_sources
         """
-        counts = {"tables": 0, "edges": 0, "columns_defined": 0}
+        counts = {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
 
-        # Upsert File node
-        db.upsert_node(
-            NodeLabel.FILE,
-            parsed.path_str,
-            {
-                "path": parsed.path_str,
-                "dialect": parsed.dialect or "",
-            },
-        )
+        # --- Phase A: collect rows from parsed model ---
 
-        # Upsert defined tables (with duplicate DDL detection)
+        file_rows: list[dict] = []
+        table_rows: list[dict] = []  # NodeLabel.TABLE
+        column_rows: list[dict] = []  # NodeLabel.COLUMN
+        query_rows: list[dict] = []  # NodeLabel.QUERY
+
+        defined_in_edges: list[dict] = []  # TABLE -> FILE
+        has_column_edges: list[dict] = []  # TABLE -> COLUMN
+        query_defined_in_edges: list[dict] = []  # QUERY -> FILE
+        selects_from_edges: list[dict] = []  # QUERY -> TABLE
+        column_lineage_edges: list[dict] = []  # COLUMN -> COLUMN
+        star_source_edges: list[dict] = []  # QUERY -> TABLE
+
+        # File node
+        file_rows.append({"path": parsed.path_str, "dialect": parsed.dialect or ""})
+
+        # Defined tables
         for table in parsed.defined_tables:
             # Guard: detect duplicate DDL for the same table across files
             existing = db.run_read(
@@ -322,9 +329,7 @@ class Indexer:
                         f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
                     )
 
-            db.upsert_node(
-                NodeLabel.TABLE,
-                table.full_id,
+            table_rows.append(
                 {
                     "qualified": table.full_id,
                     "name": table.name,
@@ -332,16 +337,9 @@ class Indexer:
                     "db": table.db or "",
                     "kind": "TABLE",
                     "defined_in_file": parsed.path_str,
-                },
+                }
             )
-            db.upsert_edge(
-                NodeLabel.TABLE,
-                table.full_id,
-                NodeLabel.FILE,
-                parsed.path_str,
-                RelType.DEFINED_IN,
-                {},
-            )
+            defined_in_edges.append({"src_key": table.full_id, "dst_key": parsed.path_str})
             counts["tables"] += 1
 
         # Build a map of target.full_id -> QueryNode for column lookup
@@ -354,7 +352,7 @@ class Indexer:
         # Compute set of defined table IDs for quick lookup
         defined_table_ids = {t.full_id for t in parsed.defined_tables}
 
-        # Upsert DDL columns and HAS_COLUMN edges
+        # DDL columns and HAS_COLUMN edges
         for table in parsed.defined_tables:
             # Check if this table is covered by information_schema (gold table)
             if table.full_id in gold_tables:
@@ -370,9 +368,7 @@ class Indexer:
 
             for col_name in qnode.defined_columns:
                 col_id = f"{table.full_id}.{col_name}"
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    col_id,
+                column_rows.append(
                     {
                         "id": col_id,
                         "col_name": col_name,
@@ -380,24 +376,17 @@ class Indexer:
                         "catalog": table.catalog or "",
                         "db": table.db or "",
                         "table_name": table.name,
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.TABLE,
-                    table.full_id,
-                    NodeLabel.COLUMN,
-                    col_id,
-                    RelType.HAS_COLUMN,
-                    {"source": "ddl"},
+                has_column_edges.append(
+                    {"src_key": table.full_id, "dst_key": col_id, "source": "ddl"}
                 )
                 counts["columns_defined"] += 1
 
-        # Upsert query nodes
+        # Query nodes and related edges
         for i, stmt in enumerate(parsed.statements):
             query_id = f"{parsed.path_str}:{i}"
-            db.upsert_node(
-                NodeLabel.QUERY,
-                query_id,
+            query_rows.append(
                 {
                     "id": query_id,
                     "file_path": parsed.path_str,
@@ -408,22 +397,13 @@ class Indexer:
                     "parse_failed": stmt.parse_failed,
                     "confidence": stmt.confidence,
                     "parsing_mode": stmt.parsing_mode,
-                },
+                }
             )
-            db.upsert_edge(
-                NodeLabel.QUERY,
-                query_id,
-                NodeLabel.FILE,
-                parsed.path_str,
-                RelType.QUERY_DEFINED_IN,
-                {},
-            )
+            query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
 
             # Source table edges
             for src_table in stmt.sources:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    src_table.full_id,
+                table_rows.append(
                     {
                         "qualified": src_table.full_id,
                         "name": src_table.name,
@@ -431,24 +411,15 @@ class Indexer:
                         "db": src_table.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.QUERY,
-                    query_id,
-                    NodeLabel.TABLE,
-                    src_table.full_id,
-                    RelType.SELECTS_FROM,
-                    {},
-                )
+                selects_from_edges.append({"src_key": query_id, "dst_key": src_table.full_id})
 
             # Column lineage edges
             for edge in stmt.column_lineage:
                 src_id = edge.src.full_id
                 dst_id = edge.dst.full_id
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    src_id,
+                column_rows.append(
                     {
                         "id": src_id,
                         "col_name": edge.src.name,
@@ -456,11 +427,9 @@ class Indexer:
                         "catalog": edge.src.table.catalog or "",
                         "db": edge.src.table.db or "",
                         "table_name": edge.src.table.name,
-                    },
+                    }
                 )
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    dst_id,
+                column_rows.append(
                     {
                         "id": dst_id,
                         "col_name": edge.dst.name,
@@ -468,27 +437,22 @@ class Indexer:
                         "catalog": edge.dst.table.catalog or "",
                         "db": edge.dst.table.db or "",
                         "table_name": edge.dst.table.name,
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.COLUMN,
-                    src_id,
-                    NodeLabel.COLUMN,
-                    dst_id,
-                    RelType.COLUMN_LINEAGE,
+                column_lineage_edges.append(
                     {
+                        "src_key": src_id,
+                        "dst_key": dst_id,
                         "transform": edge.transform,
                         "confidence": edge.confidence,
                         "query_id": query_id,
-                    },
+                    }
                 )
                 counts["edges"] += 1
 
             # STAR_SOURCE edges for graph-backend expansion
             for star in stmt.star_sources:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    star.source.full_id,
+                table_rows.append(
                     {
                         "qualified": star.source.full_id,
                         "name": star.source.name,
@@ -496,28 +460,23 @@ class Indexer:
                         "db": star.source.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.QUERY,
-                    query_id,
-                    NodeLabel.TABLE,
-                    star.source.full_id,
-                    RelType.STAR_SOURCE,
+                star_source_edges.append(
                     {
+                        "src_key": query_id,
+                        "dst_key": star.source.full_id,
                         "qualifier": star.qualifier or "<unqualified>",
                         "target_table": stmt.target.full_id if stmt.target else "",
                         "confidence": 0.8,
-                    },
+                    }
                 )
-                counts["star_sources"] = counts.get("star_sources", 0) + 1
+                counts["star_sources"] += 1
 
             # Upsert target table node (if not already a defined_table)
             # so that star expansion can create destination columns
             if stmt.target and stmt.target.full_id not in defined_table_ids:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    stmt.target.full_id,
+                table_rows.append(
                     {
                         "qualified": stmt.target.full_id,
                         "name": stmt.target.name,
@@ -525,8 +484,38 @@ class Indexer:
                         "db": stmt.target.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
+
+        # --- Phase B: deduplicate rows within each group ---
+        # Cypher MERGE is idempotent under deduplication, but we deduplicate in Python
+        # to reduce payload size
+        table_rows = list({r["qualified"]: r for r in table_rows}.values())
+        column_rows = list({r["id"]: r for r in column_rows}.values())
+        query_rows = list({r["id"]: r for r in query_rows}.values())
+
+        # --- Phase C: flush in dependency order (nodes before their edges) ---
+        db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)
+        db.upsert_nodes_bulk(NodeLabel.TABLE, table_rows)
+        db.upsert_nodes_bulk(NodeLabel.COLUMN, column_rows)
+        db.upsert_nodes_bulk(NodeLabel.QUERY, query_rows)
+
+        db.upsert_edges_bulk(NodeLabel.TABLE, NodeLabel.FILE, RelType.DEFINED_IN, defined_in_edges)
+        db.upsert_edges_bulk(
+            NodeLabel.TABLE, NodeLabel.COLUMN, RelType.HAS_COLUMN, has_column_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.FILE, RelType.QUERY_DEFINED_IN, query_defined_in_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.TABLE, RelType.SELECTS_FROM, selects_from_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.COLUMN, NodeLabel.COLUMN, RelType.COLUMN_LINEAGE, column_lineage_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.TABLE, RelType.STAR_SOURCE, star_source_edges
+        )
 
         return counts
 

@@ -110,6 +110,30 @@ class Neo4jBackend(GraphBackend):
             logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
+    def upsert_nodes_bulk(self, label: str, rows: list[dict[str, Any]]) -> None:
+        """Bulk-upsert nodes of one label.
+
+        Neo4j adapter is not currently implemented. Use KuzuBackend instead.
+        """
+        raise NotImplementedError(
+            "Neo4j bulk upsert is not yet implemented. Use KuzuBackend instead."
+        )
+
+    def upsert_edges_bulk(
+        self,
+        src_label: str,
+        dst_label: str,
+        rel_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple.
+
+        Neo4j adapter is not currently implemented. Use KuzuBackend instead.
+        """
+        raise NotImplementedError(
+            "Neo4j bulk upsert is not yet implemented. Use KuzuBackend instead."
+        )
+
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute a read-only query and return results."""
         try:
