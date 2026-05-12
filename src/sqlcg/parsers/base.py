@@ -612,6 +612,15 @@ class SqlParser(ABC):
                         )
                     continue
 
+                # Skip pure-literal expressions — NULL, numeric/string literals, zero-argument
+                # functions like CURRENT_TIMESTAMP(), and arithmetic on literals only. None of
+                # these have a source column, so the downstream sg_lineage(...) call would raise
+                # "Cannot find column '<literal>' in query" and emit a noise error (E1).
+                # An expression containing at least one real exp.Column descendant is NOT skipped
+                # and reaches the regular code path unchanged.
+                if not list(col_expr.find_all(exp.Column)):
+                    continue
+
                 if col_expr.alias:
                     col_name = col_expr.alias
                 elif isinstance(col_expr, exp.Column):
