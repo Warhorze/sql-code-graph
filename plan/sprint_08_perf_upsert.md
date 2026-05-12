@@ -291,6 +291,9 @@ The current method does an inline call sequence. Replace with a row-collection p
 
 ```python
 def _upsert_parsed_file(self, parsed, db, gold_tables=frozenset()) -> dict:
+    # NOTE: the pre-T-01 counts dict (indexer.py line 278) omits "star_sources";
+    #       the rewrite initialises it here so _flush_batch can use counts["star_sources"]
+    #       without the .get() workaround that currently exists at line 160.
     counts = {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
 
     file_rows: list[dict] = []
@@ -374,7 +377,7 @@ Before opening the PR, run (all must succeed):
 - `grep -n "upsert_nodes_bulk\|upsert_edges_bulk" src/sqlcg/core/graph_db.py` — abstract declarations
 - `grep -n "def upsert_nodes_bulk\|def upsert_edges_bulk" src/sqlcg/core/kuzu_backend.py` — implementations
 - `grep -n "upsert_nodes_bulk\|upsert_edges_bulk" src/sqlcg/indexer/indexer.py` — at least 10 call sites in `_upsert_parsed_file` (4 node groups + 6 edge groups). **Critical**: a function defined but never called is a zero-value delivery.
-- `grep -cn "db.upsert_node(\|db.upsert_edge(" src/sqlcg/indexer/indexer.py` — must return zero in `_upsert_parsed_file` after rewrite (the only remaining call sites should be in `_reindex_view_definition` and `_expand_star_sources`, which are NOT touched by T-01).
+- `grep -cn "db.upsert_node(\|db.upsert_edge(" src/sqlcg/indexer/indexer.py` — must return 0 after rewrite. **Verified**: all 15 pre-T-01 call sites are inside `_upsert_parsed_file` only; `_reindex_view_definition` and `_expand_star_sources` use `run_read` only and contain zero `upsert_node`/`upsert_edge` calls. After the rewrite the count must be exactly 0.
 - `grep -n "TODO" src/sqlcg/indexer/indexer.py src/sqlcg/core/kuzu_backend.py` — zero matches in the happy path.
 
 #### Files affected
@@ -475,6 +478,10 @@ def _needs_pass2(self, parsed: ParsedFile) -> bool:
                 return True
     return False
 ```
+
+**Important scope limitation — CTE names are not in `stmt.sources`**:
+
+The `stmt.sources` list contains `TableRef` objects for tables referenced in `FROM`/`JOIN` clauses. CTE-based references (where a CTE name shadows a real table) are stored in `stmt.ctes`, not `stmt.sources`. If a file defines a CTE that references a cross-file table, `stmt.sources` will contain the real table the CTE body selects from (populated by the parser), so the predicate will correctly detect it. However, a file that uses a CTE whose *definition* is held in `self.cross_file_sources` (a CTAS CTE body from another file) will only be detected via the bare-name check on `stmt.sources`. If the cross-file CTAS body is referenced by CTE name and the CTE name does not appear in `stmt.sources`, the predicate may return False (false negative). The equivalence test in Scenario D must include a cross-file CTE body reference to verify this path.
 
 **Step 2.2 — Use the predicate in `resolve_pass2`**
 
@@ -630,6 +637,10 @@ def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> Pars
         # because the process-wide thread cap is bounded by indexer concurrency=1.
         executor.shutdown(wait=False, cancel_futures=True)
 ```
+
+**Note on the `finally` block — success path vs. timeout path**:
+
+`executor.shutdown(wait=False, cancel_futures=True)` is called unconditionally in the `finally` block for both the success path and the timeout path. On the success path, `future` is already resolved when `future.result(timeout=timeout)` returns, so `cancel_futures=True` is a no-op and `wait=False` means the executor's internal cleanup happens asynchronously. In practice, since the one worker thread has already finished, this is instantaneous. The plan's inline comment ("On the success path: a normal shutdown(wait=True) is fine and fast") is accurate — using `wait=False` here is safe but slightly diverges from the comment's intent. If strict cleanup on the success path is desired, branch on a `timed_out` flag; however, the current unconditional design is simpler and passes Scenario B.
 
 **Caveat for the developer**: Python threads cannot be force-killed. Orphaning a slow-parser thread is the best we can do at this layer. The thread leaks until the sqlglot call returns naturally — typically seconds to minutes after the timeout. For the worst-case file (sprint-06 baseline: 22.74 s for `ODS_WORKAROUND_ARTIKELDIMENSIE_CONCEPT.sql`) at a 30 s timeout, the leak is bounded; at a 5 s timeout it may linger up to ~18 s. Acceptable per the architecture review.
 
@@ -916,8 +927,9 @@ Create `tests/unit/test_literal_column_skip.py`:
   SQL: `INSERT INTO db.s.t (a) SELECT COALESCE(src.col, 0) FROM db.s.src`.
   Assertion: ≥ 1 lineage edge produced with source `src.col` (the function call has a real `Column` descendant, so the guard lets it through to `sg_lineage`).
 
-- **Scenario H — Corpus-level signal**:
+- **Scenario H — Corpus-level signal** *(manual verification only — not a CI test)*:
   Index the sprint-07 changelogs corpus subset (or a representative 10-file fixture containing at least one `INSERT … SELECT NULL`) and assert that the parsed-file errors contain zero `col_lineage:NULL` entries (was 1,148 in baseline). This is verified at the parser level — does not require a graph backend.
+  **This scenario requires the live DWH corpus and MUST NOT be added as an automated test file.** It is verified only during the T-04 measurement run. Do not add a CI test for Scenario H.
 
 #### Acceptance criteria
 

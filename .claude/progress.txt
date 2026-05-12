@@ -210,3 +210,8 @@ Handoff — plan-reviewer (2026-05-12):
     NOTE-3 (Anchor 2 add_create_table wiring): Clarified that setup requires
       sqlglot.parse() to get the AST node, not parser.parse_file() which returns
       a ParsedFile. Method signature confirmed (takes exp.Create AST node).
+
+Handoff — plan-reviewer (2026-05-12):
+  agent: plan-reviewer
+  plan: plan/sprint_08_perf_upsert.md
+  status: READY FOR IMPLEMENTATION (with corrections committed to plan)
