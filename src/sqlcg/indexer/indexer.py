@@ -72,6 +72,9 @@ class Indexer:
 
         spec = load_ignore_spec(path)
         schema_resolver = SchemaResolver(dialect=dialect)
+        # T-09-01: Load information schema into schema_resolver for qualify-once pattern
+        if schema_csv and schema_csv.exists():
+            schema_resolver.add_information_schema(schema_csv)
         parser = get_parser(dialect, schema_resolver)
         aggregator = CrossFileAggregator()
 

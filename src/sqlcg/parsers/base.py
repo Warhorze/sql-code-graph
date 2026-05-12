@@ -6,6 +6,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# T-09-01: Import qualify and build_scope at module level so they can be mocked
+from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
+from sqlglot.optimizer.scope import build_scope as sqlglot_build_scope
+
+# Aliases for clarity in qualify-once pattern
+qualify = sqlglot_qualify
+build_scope = sqlglot_build_scope
+
 if TYPE_CHECKING:
     from sqlcg.lineage.schema_resolver import SchemaResolver
 
@@ -394,6 +402,7 @@ class SqlParser(ABC):
         dst_table: "TableRef | None",
         path: Path,
         out: ParsedFile,
+        mapping_schema_tables: set[tuple[str | None, str | None, str]] | None = None,
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -405,15 +414,24 @@ class SqlParser(ABC):
         Each leaf in the tree represents a source column. The walk stops at
         nodes whose source is a Table (a real table reference, not a CTE alias).
 
+        T-09-01: Confidence scoring based on mapping_schema presence.
+        - Source table is in mapping_schema → confidence=1.0
+        - Source table is not in mapping_schema (inferred) → confidence=0.7
+
         Args:
             root: The LineageNode returned by sg_lineage()
             dst_col_name: The output column name (destination)
+            dst_table: Target table for the destination column
             path: Source file path (for error recording)
             out: ParsedFile for error recording
+            mapping_schema_tables: Set of (catalog, db, table) tuples from mapping_schema.
+                When None, defaults to empty set (all edges get confidence 0.7).
 
         Returns:
             List of LineageEdge objects (may be empty if tree is malformed)
         """
+        if mapping_schema_tables is None:
+            mapping_schema_tables = set()
 
         edges: list[LineageEdge] = []
         visited: set[int] = set()  # guard against cycles
@@ -439,12 +457,21 @@ class SqlParser(ABC):
                         else dst_col_name
                     )
                     dst_tbl = dst_table if dst_table else TableRef(name="<output>")
+
+                    # T-09-01: Determine confidence based on schema presence
+                    # Check if source table is in mapping_schema
+                    schema_key = (src_table_ref.catalog, src_table_ref.db, src_table_ref.name)
+                    if schema_key in mapping_schema_tables:
+                        confidence = 1.0
+                    else:
+                        confidence = 0.7
+
                     edges.append(
                         LineageEdge(
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=0.9,
+                            confidence=confidence,
                         )
                     )
                 except Exception as exc:
@@ -492,15 +519,15 @@ class SqlParser(ABC):
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
         schema_sources: dict[str, Any] | None = None,
-        scope: Any | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
 
-        On sqlglot.lineage failure: log WARNING, append to ParsedFile.errors,
-        emit LineageEdge with confidence=0.0, continue (do NOT raise or skip silently).
+        T-09-01: Implements qualify-once pattern. The body is qualified exactly once
+        (not per column), and the scope is built and cached for reuse across all
+        column extraction calls within a single statement.
 
-        For columns not found in the schema, emits edges with reduced confidence (0.5)
-        rather than skipping silently (only applies when schema is non-empty).
+        On sqlglot.lineage failure: log DEBUG, append to ParsedFile.errors,
+        emit LineageEdge with confidence=0.0, continue (do NOT raise or skip silently).
 
         Args:
             stmt: sqlglot AST node (Select/Insert/Create)
@@ -511,11 +538,6 @@ class SqlParser(ABC):
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
             schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
-            scope: Pre-built sqlglot Scope for the query body (optional optimization).
-                When provided, sg_lineage() will reuse this scope instead of re-qualifying.
-                If not provided, a scope will be built from the extracted body before each
-                lineage extraction. The scope must be built from the same body as passed to
-                sg_lineage(). Passing an incorrect scope will produce wrong lineage silently.
 
         Returns:
             LineageExtraction with edges and star_sources
@@ -566,11 +588,10 @@ class SqlParser(ABC):
             else:
                 return LineageExtraction(edges=edges, star_sources=star_sources)
 
-            # Build scope once from the body for all-column reuse (T-05 optimization)
-            # Defer scope building to just before the column loop to ensure sources
-            # are expanded first (avoid rebuilding for each column, but only build
-            # after sources are known)
-            body_scope = None
+            # T-09-01: Qualify body once and cache scope for reuse across all columns.
+            # Replaces the per-column qualify() call that previously dominated wall-time
+            # on wide SELECT files (live profiling 2026-05-12: 176-col file × 11 joins
+            # → 7-minute stagnation with old per-column pattern).
             combined_sources = {**(sources or {}), **(schema_sources or {})}
 
             # NEW (T-07-02): Add CTE bodies to combined_sources so that outer columns
@@ -590,6 +611,59 @@ class SqlParser(ABC):
                                 # Use lowercase key to match the sources_map convention
                                 key = cte_alias.lower()
                                 combined_sources[key] = cte.this
+
+            # T-09-01: Qualify the body once and cache the scope for reuse across all columns.
+            # This replaces the per-column qualify() rebuild that was happening inside
+            # sg_lineage for every column (see historic code around line 688).
+            mapping_schema = (
+                self._schema.mapping_schema()
+                if hasattr(self, "_schema") and self._schema is not None
+                else {}
+            )
+
+            # T-09-01: Extract the set of (catalog, db, table) tuples from mapping_schema
+            # for confidence scoring in _lineage_node_to_edges.
+            mapping_schema_tables: set[tuple[str | None, str | None, str]] = set()
+            for catalog, db_dict in (mapping_schema or {}).items():
+                if isinstance(db_dict, dict):
+                    for db, table_dict in db_dict.items():
+                        if isinstance(table_dict, dict):
+                            for table_name in table_dict.keys():
+                                mapping_schema_tables.add((catalog, db, table_name))
+
+            # Get qualified body and cached scope
+            qualified_body = body
+            cached_scope = None
+            try:
+                # Expand sources first to inline CTE/temp table definitions
+                expanded_body = body
+                if combined_sources:
+                    sources_to_expand = {
+                        k: v
+                        for k, v in combined_sources.items()
+                        if hasattr(v, "args")  # Filter for AST nodes
+                    }
+                    if sources_to_expand:
+                        expanded_body = exp.expand(
+                            body, sources_to_expand, dialect=self.DIALECT, copy=True
+                        )
+                # Qualify with mapping_schema + infer_schema=True for cross-schema CTE resolution
+                qualified_body = qualify(
+                    expanded_body,
+                    dialect=self.DIALECT,
+                    schema=mapping_schema if mapping_schema else None,  # type: ignore
+                    validate_qualify_columns=False,
+                    infer_schema=True,
+                )
+                # Build scope once for reuse
+                cached_scope = build_scope(qualified_body)
+            except Exception as exc:
+                # qualify() may fail on dialect edge cases; record and fall back to the
+                # raw body. sg_lineage will attempt its own internal qualification per
+                # column — slow but correct.
+                out.errors.append(f"col_lineage_skip:qualify_failed:{type(exc).__name__}")
+                qualified_body = body
+                cached_scope = None
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -676,65 +750,12 @@ class SqlParser(ABC):
                         continue
 
                 try:
-                    # Build scope on first column for reuse across all columns (T-05 optimization).
-                    # NOTE: We build body_scope locally from the extracted body rather than
-                    # using a pre-built scope from the statement, because CREATE/INSERT statements
-                    # have their scope rooted at the outer statement, but the body passed here
-                    # is the inner SELECT. Reusing the outer scope would produce incorrect
-                    # qualification. The pre-built scope from parse_file would only be useful
-                    # if we had a mechanism to extract the matching inner scope, which is
-                    # complex and not yet implemented (see sprint_06 T-05 deviation for details).
-                    if body_scope is None and scope is None:
-                        try:
-                            from sqlglot.optimizer.qualify import qualify
-                            from sqlglot.optimizer.scope import build_scope
-
-                            # Expand sources first (same as sg_lineage does)
-                            expanded_body = body
-                            if combined_sources:
-                                # Cast sources to Query type for expansion
-                                sources_to_expand = {}
-                                for k, v in combined_sources.items():
-                                    if isinstance(v, exp.Query):
-                                        sources_to_expand[k] = v
-                                    else:
-                                        # For non-Query objects, try to use as-is
-                                        # (sg_lineage's expand will handle type checking)
-                                        sources_to_expand[k] = v  # type: ignore
-
-                                expanded_body = exp.expand(
-                                    body,
-                                    sources_to_expand,  # type: ignore
-                                    dialect=self.DIALECT,
-                                    copy=True,
-                                )
-
-                            # Qualify the expanded body to prepare for scope building
-                            qualified_body = qualify(
-                                expanded_body,
-                                dialect=self.DIALECT,
-                                schema=schema,
-                                validate_qualify_columns=False,
-                                identify=False,
-                            )
-                            body_scope = build_scope(qualified_body)
-                        except Exception:
-                            # If scope building fails, sg_lineage will fall back
-                            body_scope = None
-
-                    # Only pass body_scope if it's non-None (optimization for reuse).
-                    # schema is NOT passed: resolver.as_dict() returns {table:[cols]}
-                    # which has nesting depth 1, causing sqlglot nesting-level errors.
-                    # sqlglot resolves column lineage structurally without schema.
-                    sg_kwargs = {
-                        "sources": combined_sources,
-                        "dialect": self.DIALECT,
-                    }
-                    if scope is not None:
-                        sg_kwargs["scope"] = scope
-                    elif body_scope is not None:
-                        sg_kwargs["scope"] = body_scope
-                    root = sg_lineage(col_name, body, **sg_kwargs)
+                    # T-09-01: Use the pre-qualified body and cached scope (built once before
+                    # the column loop, not per column). This is the qualify-once pattern.
+                    sg_kwargs = {"sources": combined_sources, "dialect": self.DIALECT}
+                    if cached_scope is not None:
+                        sg_kwargs["scope"] = cached_scope
+                    root = sg_lineage(col_name, qualified_body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
                         new_edges = self._lineage_node_to_edges(
@@ -743,6 +764,7 @@ class SqlParser(ABC):
                             dst_table=dst_table,
                             path=path,
                             out=out,
+                            mapping_schema_tables=mapping_schema_tables,
                         )
                         edges.extend(new_edges)
                         if not new_edges:
@@ -845,6 +867,7 @@ class SqlParser(ABC):
                                             dst_table=cte_dst_table,
                                             path=path,
                                             out=out,
+                                            mapping_schema_tables=mapping_schema_tables,
                                         )
                                         # Tag edges as CTE projections
                                         # (transform is read-only, so create new edges)
@@ -895,6 +918,7 @@ class SqlParser(ABC):
                                 dst_table=dst_table,
                                 path=path,
                                 out=out,
+                                mapping_schema_tables=mapping_schema_tables,
                             )
                             edges.extend(new_edges)
                     except Exception:

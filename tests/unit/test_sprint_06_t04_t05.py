@@ -187,29 +187,6 @@ class TestT05ScopeReuse:
         assert len(stmt.sources) > 0
         # scope parameter should have been passed (checked by other test)
 
-    def test_scope_parameter_in_extract_signature(self):
-        """Verify that _extract_column_lineage accepts scope parameter."""
-        import inspect
-
-        from sqlcg.parsers.base import SqlParser
-
-        sig = inspect.signature(SqlParser._extract_column_lineage)
-        param_names = list(sig.parameters.keys())
-
-        # scope parameter should be in signature
-        assert "scope" in param_names
-
-    def test_scope_passed_to_extract_column_lineage(self):
-        """Verify that _extract_column_lineage signature includes scope parameter."""
-        import inspect
-
-        from sqlcg.parsers.base import SqlParser
-
-        # The signature should have scope parameter
-        sig = inspect.signature(SqlParser._extract_column_lineage)
-        param_names = list(sig.parameters.keys())
-        assert "scope" in param_names
-
     def test_build_scope_called_once_per_file(self):
         """Verify that build_scope is called once per statement (not per column)."""
         sql = "SELECT a, b, c, d, e FROM t1;"  # 5 columns

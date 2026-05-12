@@ -1,6 +1,5 @@
 """Unit tests for SQL base parser (parsers/base.py)."""
 
-import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,12 +35,9 @@ class TestExtractColumnLineageExceptions:
             assert len(out.errors) > 0
             assert any("col_lineage:bad_col:mock lineage failure" in str(e) for e in out.errors)
 
-            # Assert WARNING was logged
-            assert any(
-                "column lineage extraction failed" in record.message
-                for record in caplog.records
-                if record.levelno == logging.WARNING
-            )
+            # Note: T-09-06 demotes per-column errors to DEBUG.
+            # The actual logging is tested in test_T09_06_log_verbosity.py.
+            # This test primarily checks that the error is recorded in out.errors.
 
             # Assert exactly one zero-confidence edge returned
             assert len(edges.edges) == 1

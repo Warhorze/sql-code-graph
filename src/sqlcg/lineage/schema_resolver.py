@@ -36,6 +36,8 @@ class SchemaResolver:
         self._tables: dict[tuple[str | None, str | None, str], list[str]] = {}
         self._view_bodies: dict[str, Any] = {}  # str -> ParsedFile
         self._cross_file_sources: dict[str, Any] = {}  # str -> exp.Select for CTAS
+        # T-09-01: Track catalog per (db, table) for mapping_schema() reconstruction
+        self._table_catalogs: dict[tuple[str | None, str | None], str | None] = {}
         self._lock = threading.Lock()
         self._cache: dict | None = None
 
@@ -161,7 +163,7 @@ class SchemaResolver:
         COLUMN_NAME, ORDINAL_POSITION. Returns the number of tables loaded.
 
         Args:
-            csv_path: Path to CSV file
+            csv_path: Path to CSV file or file-like object (io.StringIO, etc.)
 
         Returns:
             Number of tables loaded
@@ -180,27 +182,47 @@ class SchemaResolver:
         }
         tables: dict[tuple[str | None, str | None, str], list[tuple[int, str]]] = {}
 
-        with open(Path(csv_path), newline="", encoding="utf-8") as f:
+        # Handle both file paths and file-like objects
+        if isinstance(csv_path, (str, Path)):
+            f = open(Path(csv_path), newline="", encoding="utf-8")
+            should_close = True
+        else:
+            # Assume it's a file-like object
+            f = csv_path
+            should_close = False
+
+        catalogs: dict[tuple[str | None, str | None], str | None] = {}
+        try:
             reader = _csv.DictReader(f)
             if reader.fieldnames is None or not required.issubset(reader.fieldnames):
                 missing = required - set(reader.fieldnames or [])
                 raise ValueError(f"CSV missing required columns: {missing}")
             for row in reader:
-                key = (
-                    None,  # catalog excluded; resolver uses 2-part (schema.table) keys
-                    row["TABLE_SCHEMA"] or None,
-                    row["TABLE_NAME"],
-                )
-                tables.setdefault(key, []).append(
+                # Store 2-part keys (db, table) in _tables for backward compat
+                # T-09-01: Also track catalog separately for mapping_schema()
+                db_name = row["TABLE_SCHEMA"] or None
+                table_name = row["TABLE_NAME"]
+                key_2part = (db_name, table_name)
+                key_3part = (None, db_name, table_name)
+                tables.setdefault(key_3part, []).append(
                     (int(row["ORDINAL_POSITION"]), row["COLUMN_NAME"])
                 )
+                # Track catalog for later reconstruction in mapping_schema()
+                catalogs[key_2part] = row["TABLE_CATALOG"] or None
+        finally:
+            if should_close:
+                f.close()
 
         with self._lock:
             for key, cols in tables.items():
                 self._tables[key] = [c for _, c in sorted(cols)]
+                # Track catalog using (db, table) tuple
+                db_name = key[1]
+                table_name = key[2]
+                self._table_catalogs[(db_name, table_name)] = catalogs[(db_name, table_name)]
             self._cache = None
 
-        return len(tables)
+        return len(catalogs)
 
     def as_dict(self) -> dict:
         """Return the schema as a nested dict: {catalog: {db: {table: [cols]}}}.
@@ -256,6 +278,51 @@ class SchemaResolver:
                     logger.warning(f"Failed to parse synthetic SELECT for {qualified}: {sql}")
 
             return result
+
+    def mapping_schema(self) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
+        """Return schema in sqlglot's mapping_schema format.
+
+        Shape: ``{catalog: {db: {table: {col: type}}}}``. Used by qualify() to
+        resolve cross-schema column references during pass-2 lineage extraction.
+
+        Distinct from as_dict(), which returns the depth-1 ``{table: [cols]}``
+        shape used by parser-internal source maps (see base.py).
+
+        Empty dict when no schema has been loaded — qualify() then operates in
+        infer-only mode (validate_qualify_columns=False + infer_schema=True),
+        which is the small-repo default.
+
+        Returns:
+            Nested dictionary {catalog: {db: {table: {col: type}}}}.
+            Column types are all "UNKNOWN" (type is not validated by qualify).
+        """
+        with self._lock:
+            out: dict = {}
+            for (cat, db, name), cols in self._tables.items():
+                # Skip entries without a schema
+                if not db:
+                    continue
+
+                # T-09-01: Use tracked catalog from add_information_schema if available,
+                # otherwise use the (cat, db) key's catalog (which should be None for
+                # backward compat entries). For entries loaded from CSV, we look up
+                # the catalog from _table_catalogs using (db, name) key.
+                catalog = self._table_catalogs.get((db, name), cat)
+                if not catalog:
+                    # Entries without a catalog cannot be represented in mapping_schema
+                    continue
+
+                # Build nested structure
+                if catalog not in out:
+                    out[catalog] = {}
+                if db not in out[catalog]:
+                    out[catalog][db] = {}
+
+                # Add table with column->type mapping
+                col_dict = {col: "UNKNOWN" for col in cols}
+                out[catalog][db][name] = col_dict
+
+            return out
 
     def _build_dict(self) -> dict:
         """Build the nested schema dictionary (called only under self._lock).
