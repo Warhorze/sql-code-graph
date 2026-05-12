@@ -303,7 +303,7 @@ def collect_parse_errors(
                     errors["E5"]["example_messages"].append(error_msg)
 
             elif error_msg.startswith("col_lineage:"):
-                # E5: column-level lineage exception. Check for E1 pattern (qualified column with dot).
+                # E5: column-level lineage exception. Check for E1 (qualified column with dot).
                 if "Cannot find column" in error_msg and "." in error_msg:
                     # Heuristic for E1: qualified column names (db.col or table.col)
                     errors["E1"]["count"] += 1
@@ -442,9 +442,9 @@ def collect_parse_errors(
     print(f"E8  no_edges_from_root {errors['E8']['count']:6d} occurrences")
 
     print("\n=== T-01–T-05 Observability ===")
-    print(f"T-02 fallback attempts     {t02_fallback_attempts:6d} (best-effort expr name extraction)")
+    print(f"T-02 fallback attempts     {t02_fallback_attempts:6d} (expr name fallback)")
     print(f"T-03 pure-DDL skips        {t03_pure_ddl_skips:6d} (early exit, no lineage)")
-    print(f"T-04 recovery primary      {t04_recovery_primary_failures:6d} (Snowflake dialect recovery)")
+    print(f"T-04 recovery primary      {t04_recovery_primary_failures:6d} (Snowflake recovery)")
     print(f"T-04 recovery chunk        {t04_recovery_chunk_failures:6d} (per-statement fallback)")
     print(f"Scripting blocks           {scripting_block_files:6d} (fallback mode)")
     print(f"Star projection skips      {star_skip:6d} (unresolved SELECT *)")
