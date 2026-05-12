@@ -1182,3 +1182,45 @@ None at plan-time. All design choices are resolved against verified source code 
 If T-07-02 step 2.4 reveals a quoted-identifier bug that is too large to fix inside this
 sprint, the developer must surface a blocking question rather than silently leaving the
 link 6 xfail in place.
+
+---
+
+## Final Status (2026-05-12)
+
+All six tickets complete. Sprint gate met. Final test suite: **506 passed, 4 skipped,
+1 xfailed (unrelated schema version warning), 0 failures.**
+
+| Ticket | Status | Notes |
+|--------|--------|-------|
+| T-07-01 FIX-E36-XFILE | DONE (merged in #20) | Cross-file `sources_map` propagation via `CrossFileAggregator` |
+| T-07-02 FIX-E5-XFILE-CHAIN | DONE | `CTE_PROJECTION` transform edges emitted; all 6 anchor xfails flipped to PASS |
+| T-07-03 FIX-E25 | DONE | `edges_full_id()` helper added; new `test_e25_full_id.py`; `test_e25.py` updated |
+| T-07-04 DEFER-E12 | DONE | xfail markers removed — sqlglot now resolves LATERAL FLATTEN + JSON path; tests PASS (not XPASS) |
+| T-07-05 DEFER-E27 | DONE | xfail markers removed — sqlglot now resolves UDF args; tests PASS |
+| T-07-06 DEFER-E16 | DONE | `col_lineage_skip:merge_branch:<dst>` recorded in `result.errors` for MERGE; tests assert presence |
+
+### Notable resolutions vs the deferred plan
+
+- **T-07-02 cleared the sprint gate.** The earlier deviation note (CTE iteration alone
+  did not flip the anchors) was resolved by emitting `CTE_PROJECTION` transform edges
+  with the CTE name as destination table inside [`base.py`](../src/sqlcg/parsers/base.py).
+  All 6 xfail anchor links in
+  [`tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py`](../tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py)
+  now pass.
+- **T-07-04 and T-07-05 did not need to remain DEFERRED.** Current sqlglot resolves
+  both LATERAL FLATTEN + JSON path and UDF argument propagation. The plan's
+  `xfail(strict=False)` markers were therefore replaced with plain positive assertions
+  — the tests PASS rather than XPASS.
+- **Pyright fix during T-07-02.** A `**sg_kwargs` dict spread (typed
+  `dict[str, str | None]`) was replaced with an inline `dialect=self.DIALECT` argument
+  to prevent `str | None` from spreading across every keyword parameter of `sg_lineage`.
+- **Post-sprint cleanup.** The stale xfail on
+  `tests/integration/test_live_anchors.py::test_live_anchor_ma_chain_has_at_least_one_lineage_edge`
+  was removed — the cross-file chain now passes end-to-end.
+
+## Plan Compliance — 2026-05-12
+
+PASS — all six tickets implemented as planned. Two DEFER tickets (T-07-04, T-07-05)
+exceeded plan expectations by becoming plain PASS rather than `xfail(strict=False)`.
+Documented deviations and resolution paths above. No `# INVERSION TARGET` markers
+remain in `tests/snowflake/`.

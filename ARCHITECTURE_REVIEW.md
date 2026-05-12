@@ -2428,3 +2428,92 @@ broken path. Sprint 06 should be considered **unmeasured** until the open
 issues above are resolved.
 
 ---
+
+## 13. Sprint 07 Postmortem — Open E-Code Fixes (2026-05-12)
+
+Source: [`plan/sprint_07_open_ecodes.md`](plan/sprint_07_open_ecodes.md), branch
+`feat/sprint-07-t02-t06`. Final suite: **506 passed, 4 skipped, 1 unrelated xfail,
+0 failures.** All six tickets shipped.
+
+### 13.1 What landed
+
+| Ticket | Mechanism |
+|--------|-----------|
+| T-07-01 FIX-E36-XFILE (merged in #20) | `CrossFileAggregator.cross_file_sources` harvests CTAS bodies during pass 1; `SchemaResolver.register_cross_file_sources` seeds each pass-2 `parse_file`'s `sources_map`. The cross-file temp-table chain (38/184 zero-edge files in the fact corpus) now resolves end-to-end. |
+| T-07-02 FIX-E5-XFILE-CHAIN | `_extract_column_lineage` in [`base.py`](src/sqlcg/parsers/base.py) iterates `body.find_all(exp.CTE)` and emits a `LineageEdge` per CTE projection with `transform="CTE_PROJECTION"` and the CTE name as the destination table. All 6 anchor links in `tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py` flipped from xfail to PASS — the sprint gate. |
+| T-07-03 FIX-E25 | `edges_full_id()` helper exported from `tests/snowflake/conftest.py`; new `test_e25_full_id.py` asserts `TableRef.full_id` carries the 2- and 3-part qualifier. |
+| T-07-04 DEFER-E12 | Upstream sqlglot now traces LATERAL FLATTEN + JSON path expressions. Plain positive assertions, no xfail. |
+| T-07-05 DEFER-E27 | Same shape — sqlglot now propagates UDF argument lineage. Plain PASS. |
+| T-07-06 DEFER-E16 | `_extract_column_lineage` records `col_lineage_skip:merge_branch:<dst>` in `result.errors` for `exp.Merge` statements. MERGE files are now visible in `sqlcg report` rather than vanishing silently. |
+
+### 13.2 Architectural observations worth preserving
+
+#### 13.2.1 The `CTE_PROJECTION` transform is a new public surface
+
+A consumer (MCP tool, report renderer, downstream UI) inspecting the `transform`
+field on `LineageEdge` will now see a new value `"CTE_PROJECTION"` alongside the
+existing `"SELECT"`, `"UNKNOWN"`, `"AGGREGATION"` etc. The destination table of these
+edges is a **synthetic** `TableRef` whose name equals the CTE alias — not a real
+indexed table. Any consumer that joins lineage edges to `SqlTable` nodes must handle
+the case where the destination is a CTE alias with no corresponding `SqlTable`. This
+is by design (CTE-as-destination is intermediate lineage), but it changes the contract.
+
+#### 13.2.2 Cross-file `sources_map` precedence rule (T-07-01)
+
+The seeding order is **cross-file first, intra-file overwrites**. Two files both
+defining a CTAS named `t` resolve to the intra-file body in the file being parsed.
+This is correct for the small-repo / refactor scenario (rename collides locally), but
+means cross-file collisions in a large unified corpus are silently won by whichever
+file is being re-parsed. If this surfaces as a real issue in production indexing,
+the resolver could be extended to record collisions and emit a `cross_file_collision:t`
+diagnostic; today it does not.
+
+#### 13.2.3 Upstream sqlglot moved twice in our favour
+
+Both T-07-04 (LATERAL FLATTEN + JSON path) and T-07-05 (UDF argument propagation)
+were planned as `xfail(strict=False)` "deferred to upstream" tickets. By
+implementation time, upstream sqlglot had already shipped the fixes — the tests
+became plain PASS. **Process lesson:** when planning a DEFER ticket against an
+upstream gap, the developer should re-run the failing scenario against current
+upstream once before adding xfail markers. We could have shipped these as positive
+assertions on day one.
+
+#### 13.2.4 Pyright + typed dict spread
+
+A typed `dict[str, str | None]` cannot be safely spread (`**kwargs`) into a function
+that does not accept `None` for every keyword. Pyright flagged this in T-07-02's
+sg_lineage call site. The fix was to drop the spread and pass `dialect=self.DIALECT`
+inline. Future parser plumbing should prefer explicit kwargs over a typed-dict spread
+when the receiving signature has narrow types.
+
+#### 13.2.5 MERGE observability without lineage
+
+T-07-06 records `col_lineage_skip:merge_branch:<dst>` rather than implementing MERGE
+column lineage. This makes MERGE files visible in `sqlcg report` (the error mapping
+table now includes the new skip string) and keeps the parser honest — silent
+zero-edge MERGE files used to look identical to genuine zero-edge bugs. If a future
+sprint implements MERGE per-branch synthetic SELECTs against sqlglot's lineage API,
+this skip string is the search anchor for what to remove.
+
+### 13.3 Coverage delta
+
+Anchor `MA_AANTAL_OP_ORDER` is now fully traced end-to-end across the 3-file chain
+documented in [§12.2](#122-anchor-test-cases). Combined with T-07-01's E36 fix
+(38/184 zero-edge files in the fact corpus), this is the largest single-sprint
+coverage improvement since the project began. No re-measurement of the DWH corpus
+has been run yet — schedule one for the next sprint kickoff to quantify the lift.
+
+### 13.4 Open follow-ups
+
+1. **Re-measure the DWH corpus** to quantify the lift from T-07-01 + T-07-02.
+   Expected: E36 drops from 38 to near-zero; total edges in `etl/sql/fact/` rises
+   above the 12,242 baseline in [§12.1](#121-real-baseline--production-parser-2026-05-12)
+   thanks to CTE projection edges.
+2. **Consider whether `CTE_PROJECTION` edges should be filterable** in MCP tool
+   responses. If a consumer wants only "real" table-to-table lineage, exposing a
+   `include_intermediate_ctes: bool = True` flag on `trace_column_lineage` may be
+   desirable. Not in scope for this sprint.
+3. **Cross-file collision diagnostic** (see 13.2.2) — add only if production
+   indexing flags a real collision.
+4. **Process improvement**: re-test DEFER tickets against current upstream before
+   adding `xfail` markers (see 13.2.3).

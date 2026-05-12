@@ -1,8 +1,9 @@
-"""E27: UDF as column source (partial support documented).
+"""E27: UDF as column source — now resolved by sqlglot.
 
-User-defined functions can produce edges when the parser treats their
-arguments as column references. This test documents the actual behavior
-and marks full UDF support as an inversion target.
+UDF arguments were previously untraceable; sqlglot now produces edges through
+the UDF boundary. These tests assert the expected edges are present.
+
+See plan/sprint_07_open_ecodes.md § T-07-05 for the deferred-decision rationale.
 """
 
 from pathlib import Path
@@ -10,35 +11,23 @@ from pathlib import Path
 from tests.snowflake.conftest import edges, parse
 
 
-def test_e27_udf(parser):
-    """Undefined UDF argument can produce column lineage."""
+def test_e27_udf_edge(parser):
+    """UDF argument produces column lineage through the UDF boundary."""
     sql = Path(__file__).with_name("e27_udf.sql").read_text()
     result = parse(parser, sql, "e27_udf.sql")
 
-    all_edges = edges(result)
-    # The parser may produce: ('SRC', 'SRC_COL', '<output>', 'dst_col')
-    # This shows that the argument column is traced
-    if all_edges:
-        assert any(e[1].upper() == "SRC_COL" and e[3] == "dst_col" for e in all_edges), (
-            f"If edges exist, should reference src_col and dst_col: {all_edges}"
-        )
-    # If no edges, that's also acceptable (UDF boundary not crossed)
-
-    # INVERSION TARGET: when E27 fixed, assert consistent edge from src.src_col
-    # to (output).dst_col through the UDF boundary.
+    edges_list = edges(result)
+    assert any(e[1].upper() == "SRC_COL" and e[3] == "dst_col" for e in edges_list), (
+        f"Expected src.src_col -> dst_col: {edges_list}"
+    )
 
 
-def test_e27_nested_udf(parser):
-    """Nested undefined UDFs can produce edges from the innermost argument."""
+def test_e27_nested_udf_edge(parser):
+    """Nested UDF arguments produce column lineage through the UDF boundary."""
     sql = Path(__file__).with_name("e27_nested_udf.sql").read_text()
     result = parse(parser, sql, "e27_nested_udf.sql")
 
-    all_edges = edges(result)
-    # The parser may trace through all UDF boundaries to the source column
-    if all_edges:
-        assert any(e[1].upper() == "SRC_COL" and e[3] == "dst_col" for e in all_edges), (
-            f"If edges exist, should reference src_col and dst_col: {all_edges}"
-        )
-
-    # INVERSION TARGET: when E27 fixed, nested UDFs should still resolve to
-    # consistent src.src_col → (output).dst_col lineage.
+    edges_list = edges(result)
+    assert any(e[1].upper() == "SRC_COL" and e[3] == "dst_col" for e in edges_list), (
+        f"Expected nested UDFs: src.src_col -> dst_col: {edges_list}"
+    )

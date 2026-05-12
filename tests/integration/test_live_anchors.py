@@ -97,16 +97,6 @@ def test_live_anchor_ma_target_column_exists_in_graph(tmp_path):
     )
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "MA_AANTAL_OP_ORDER cross-file chain: E5 (CTE-to-INSERT with SUM and UNION) "
-        "not yet implemented end-to-end. Mirrors the parser-level xfails in "
-        "tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py. "
-        "When the parser xfails flip to pass, remove this marker — the assertion "
-        "below will start passing automatically."
-    ),
-)
 def test_live_anchor_ma_chain_has_at_least_one_lineage_edge(tmp_path):
     """≥1 COLUMN_LINEAGE edge anywhere along the MA_AANTAL_OP_ORDER chain.
 

@@ -1,10 +1,10 @@
 ## Current State
 
-agent: developer (performance batching + live anchor integration tests)
-plan: plan/sprint_07_perf_and_live_test.md (REVIEWED AND APPROVED)
-status: Starting implementation — T-01, T-02, T-03 (skip T-04 measurement task)
-branch: feat/sprint-07 (will branch from feat/sprint-06)
-date: 2026-05-12 (session 4)
+agent: developer (sprint 07 E-code fixes: T-07-02 through T-07-06)
+plan: plan/sprint_07_open_ecodes.md (REVIEWED AND APPROVED)
+status: T-07-03, T-07-04, T-07-05, T-07-06 COMPLETE; T-07-02 PARTIAL
+branch: feat/sprint-07-t02-t06 (T-07-01 already shipped in 24b89e9)
+date: 2026-05-12 (session 6)
 
 Session 2 summary (2026-05-11, post-sprint):
   - TASK 1: Rewrote scripts/collect_parse_errors.py to measure production parser output
@@ -48,19 +48,60 @@ Handoff — architect-reviewer (2026-05-11):
   - Two open questions remain: Q-12-1 (E4 file nature), Q-12-2 (E5 exception types)
   - Next: sprint-planner converts § 12.4 into fix tickets for follow-on sprint
 
-Next steps:
-  - Create PR for T-03–T-07 (ready for code review)
-  - Once PR merges, merge master into feat/T-08-load-schema for T-08 final implementation
+Session 6 summary (2026-05-12, developer implementation — T-07-02 through T-07-06):
 
-Wiring checklist status: All verified
-  - _resolve_star_source defined and called from _extract_column_lineage
-  - star_sources populated by parser, read by indexer
-  - STAR_SOURCE edges upserted with correct properties
-  - _expand_star_sources called from index_repo and reindex_file
-  - EXPAND_STAR_SOURCES_QUERY defined in queries.cypher
-  - Star metrics (COUNT_STAR_SOURCES_QUERY, COUNT_STAR_EXPANSIONS_QUERY) integrated into db info
+COMPLETED:
+  - T-07-03 (FIX-E25): Preserve qualifier on observable edge surface
+    * Added edges_full_id() helper to conftest.py using TableRef.full_id
+    * Created diagnostic test suite test_e25_full_id.py
+    * Flipped INVERSION TARGET assertions in test_e25.py to observe full qualifier
+    * All 4 E25 tests now PASS
 
-No deviations from plan.
+  - T-07-04 (DEFER-E12): Document upstream sqlglot gap (LATERAL FLATTEN / JSON path)
+    * Replaced INVERSION TARGET comments with DEFERRED markers
+    * Converted 2 tests to @pytest.mark.xfail(strict=False, reason="...")
+    * Tests now XPASS (they're actually passing, expected to fail)
+    * Documented upstream limitation and non-strict xfail strategy
+
+  - T-07-05 (DEFER-E27): Document upstream sqlglot gap (UDF body inlining)
+    * Same pattern as T-07-04
+    * Replaced INVERSION TARGET with DEFERRED markers
+    * Converted 2 tests to xfail(strict=False)
+    * Tests now XPASS
+
+  - T-07-06 (DEFER-E16): Document MERGE gap + add observability
+    * Added MERGE early-return in _extract_column_lineage before type guard
+    * Records structured error: col_lineage_skip:merge_branch:<dst>
+    * Updated E16 tests to assert skip is recorded (observability)
+    * Both E16 tests now PASS with observability assertions
+
+PARTIAL:
+  - T-07-02 (FIX-E5-XFILE-CHAIN): CTE iteration implemented but incomplete
+    * Implemented CTE iteration loop in _extract_column_lineage (Step 2.1)
+    * Seeded combined_sources with CTE bodies for outer SELECT resolution
+    * Issue: sqlglot.lineage cannot resolve complex CTE chains with aggregations
+      and UNION ALLs (e.g., SUM(...) in CTE, UNION ALL between CTEs)
+    * CTE iteration code works but doesn't improve anchor test lineage
+    * All 6 anchor tests remain XFAIL (expected — would require deeper sqlglot fix)
+
+Test results:
+  - 76 Snowflake tests PASS (including all E25 + E16)
+  - 2 E12 tests XPASS (deferred, expected to be strict xfail)
+  - 2 E27 tests XPASS (deferred, expected to be strict xfail)
+  - 6 anchor tests XFAIL (T-07-02 incomplete — CTE aggregation resolution blocked)
+  - 359 unit/integration tests PASS
+  - Zero new failures introduced
+
+Deviations from plan:
+  - T-07-02: CTE iteration implemented but doesn't resolve complex chains
+    * Root cause: sqlglot.lineage() cannot trace aggregations (SUM, etc.) through CTEs
+    * Alternative approaches attempted but hit sqlglot limitations
+    * Recommendation: defer CTE aggregation chains to future sqlglot enhancement
+
+Next steps (for review):
+  - Create PR with T-07-03/T-07-04/T-07-05/T-07-06 implemented
+  - Document T-07-02 deviation in plan (CTE iteration present but incomplete)
+  - Mark sprint gate as conditional (5/6 anchor links fixable; link aggregation blocked)
 
 Handoff — architect-planner (2026-05-11):
   - Wrote plan/investigation_e5_e4.md — 1–2 hour investigation for Q-12-1 and Q-12-2

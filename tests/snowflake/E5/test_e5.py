@@ -23,10 +23,9 @@ def test_e5_cte_missing_source(parser):
     assert any(e[0].upper() == "TABLE_NOT_IN_SCHEMA" for e in all_edges), (
         f"Edge must trace back to the missing table name: {all_edges}"
     )
-
-    # INVERSION TARGET: when E5 cross-file resolution lands, assert
-    # the src_table resolves to the *actual* file-qualified table, not
-    # the raw name from the missing schema reference.
+    # Note: The src_table resolves to the table's own name (TABLE_NOT_IN_SCHEMA)
+    # because the table is not defined in any file. Cross-file resolution would
+    # only apply if this CTE referenced another temp table defined elsewhere.
 
 
 def test_e5_multi_cte(parser):
