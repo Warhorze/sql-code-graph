@@ -76,8 +76,10 @@ class AnsiParser(SqlParser):
         # Compute schema sources once per file
         schema_sources = self._schema.as_sources_dict() if self._schema else {}
 
-        # Initialize sources_map to accumulate temp table definitions
-        sources_map: dict[str, Any] = {}
+        # Initialize sources_map to accumulate temp table definitions.
+        # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
+        xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
+        sources_map: dict[str, Any] = xfile_sources
 
         # Process each statement
         for stmt_index, stmt in enumerate(statements):
@@ -238,6 +240,15 @@ class AnsiParser(SqlParser):
         if isinstance(stmt, exp.Create) and stmt.kind == "TABLE":
             defined_columns = self._extract_defined_columns(stmt)
 
+        # Extract defined body for CTAS statements (CREATE TABLE ... AS SELECT ...)
+        defined_body: Any | None = None
+        if isinstance(stmt, exp.Create):
+            _expr = stmt.expression
+            if isinstance(_expr, exp.Subquery):
+                _expr = _expr.this
+            if isinstance(_expr, exp.Select):
+                defined_body = _expr
+
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)
 
@@ -255,6 +266,7 @@ class AnsiParser(SqlParser):
             parsing_mode="sqlglot",
             defined_columns=defined_columns,
             star_sources=star_sources,
+            defined_body=defined_body,
         )
 
     @staticmethod

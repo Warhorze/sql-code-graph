@@ -1,5 +1,7 @@
 """Cross-file lineage aggregator for two-pass resolution."""
 
+from typing import Any
+
 from sqlcg.parsers.base import ParsedFile
 from sqlcg.utils.logging import getLogger
 
@@ -17,15 +19,28 @@ class CrossFileAggregator:
         """Initialize the aggregator."""
         # Maps table.full_id -> ParsedFile that defines it
         self.sources: dict[str, ParsedFile] = {}
+        # Maps lowercased table name (bare name) -> exp.Select body for CTAS statements.
+        # Populated during register_pass1 and used to seed sources_map in pass 2.
+        self.cross_file_sources: dict[str, Any] = {}
 
     def register_pass1(self, parsed: ParsedFile) -> None:
         """Register a pass-1 result and build view/table source map.
+
+        Also harvests CTAS bodies from statements for cross-file temp-table resolution.
 
         Args:
             parsed: ParsedFile from pass 1
         """
         for table in parsed.defined_tables:
             self.sources[table.full_id] = parsed
+
+        # Harvest CTAS bodies from statements for cross-file resolution.
+        # Key convention matches AnsiParser.parse_file line 109: lowercased bare name.
+        for stmt_node in parsed.statements:
+            if stmt_node.target and stmt_node.defined_body is not None:
+                key = (stmt_node.target.name or "").lower()
+                if key:
+                    self.cross_file_sources[key] = stmt_node.defined_body
 
     def resolve_pass2(self, parser, parsed: ParsedFile) -> ParsedFile:
         """Re-parse with cross-file schema context.

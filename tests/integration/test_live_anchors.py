@@ -17,7 +17,6 @@ import pytest
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.indexer.indexer import Indexer
 
-
 ANCHOR_FIXTURES_DIR = Path(__file__).parent.parent / "snowflake" / "anchors"
 
 
@@ -89,9 +88,7 @@ def test_live_anchor_ma_target_column_exists_in_graph(tmp_path):
     backend, summary = _index(corpus)
 
     rows = backend.run_read(
-        "MATCH (c:SqlColumn) "
-        "WHERE LOWER(c.col_name) = 'ma_aantal_op_order' "
-        "RETURN c.id AS id",
+        "MATCH (c:SqlColumn) WHERE LOWER(c.col_name) = 'ma_aantal_op_order' RETURN c.id AS id",
         {},
     )
     assert len(rows) >= 1, (

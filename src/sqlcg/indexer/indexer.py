@@ -105,6 +105,9 @@ class Indexer:
 
             load_dbt_manifest(dbt_manifest, schema_resolver)
 
+        # Seed cross-file sources for pass-2 re-parsing
+        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+
         # Pass 2: resolve cross-file references
         pass2_results: list[ParsedFile] = []
         for parsed in pass1_results:

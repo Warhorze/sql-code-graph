@@ -35,6 +35,7 @@ class SchemaResolver:
         self.dialect = dialect
         self._tables: dict[tuple[str | None, str | None, str], list[str]] = {}
         self._view_bodies: dict[str, Any] = {}  # str -> ParsedFile
+        self._cross_file_sources: dict[str, Any] = {}  # str -> exp.Select for CTAS
         self._lock = threading.Lock()
         self._cache: dict | None = None
 
@@ -85,6 +86,28 @@ class SchemaResolver:
         with self._lock:
             self._view_bodies.update(sources)
             self._cache = None  # Invalidate cache
+
+    def register_cross_file_sources(self, sources: dict[str, Any]) -> None:
+        """Register CTAS bodies harvested across pass-1 files for cross-file resolution.
+
+        Called once by CrossFileAggregator at the boundary between pass 1 and pass 2.
+        The dict is keyed by lowercased bare table name (matches sources_map convention).
+
+        Args:
+            sources: Mapping of lowercased table names to exp.Select bodies
+        """
+        with self._lock:
+            self._cross_file_sources = dict(sources)
+            self._cache = None  # Invalidate cache
+
+    def cross_file_sources(self) -> dict[str, Any]:
+        """Return a copy of cross-file CTAS bodies for seeding sources_map in pass 2.
+
+        Returns:
+            Dict of lowercased table names to exp.Select bodies
+        """
+        with self._lock:
+            return dict(self._cross_file_sources)
 
     def add_dbt_manifest(self, manifest_path: str | Path) -> None:
         """Load and register schemas from a dbt manifest.

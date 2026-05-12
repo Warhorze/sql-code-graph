@@ -171,6 +171,7 @@ class QueryNode:
         parse_failed: Whether parsing failed (fallback to table-only lineage)
         confidence: Overall confidence score for this query's lineage
         parsing_mode: How the query was parsed (e.g., "sqlglot", "fallback", "scripting")
+        defined_body: For CTAS statements, the exp.Select or exp.Subquery body being created
     """
 
     file: Path
@@ -186,6 +187,7 @@ class QueryNode:
     parsing_mode: str = "sqlglot"
     star_sources: list[StarSource] = field(default_factory=list)
     defined_columns: list[str] = field(default_factory=list)
+    defined_body: Any | None = None
 
 
 @dataclass
