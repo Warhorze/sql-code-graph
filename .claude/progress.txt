@@ -3,9 +3,19 @@
 agent: developer
 plan: plan/sprint_09_lineage_coverage.md
 date: 2026-05-12
-status: IMPLEMENTATION IN PROGRESS
+status: IMPLEMENTATION IN PROGRESS (3 of 6 tickets complete; 3 remaining: T-09-05, T-09-03, T-09-04)
 
-Sequence: T-09-02 (FIX-DDL-SKIP) → T-09-06 (LOG-VERBOSITY) → T-09-01 (PARSER-QUALIFY-ONCE) → T-09-03 → T-09-05 → T-09-04
+Completed tickets (committed):
+  - T-09-02 (FIX-DDL-SKIP): Renamed pure_ddl_skip marker → col_lineage_skip:pure_ddl_file
+  - T-09-06 (LOG-VERBOSITY): Demote per-column WARN→DEBUG; add error_summary; emit "Indexing complete:" log
+  - T-09-01 (PARSER-QUALIFY-ONCE): Qualify-once pattern + mapping_schema + confidence scoring
+
+Test status: 388 passed, 2 skipped, 1 xfailed (all T-09-01/02/06 tests PASS)
+
+Remaining tickets:
+  - T-09-03 (FIX-E2-FUNC-FALLBACK): Guard unaliased function fallback
+  - T-09-04 (SUBPROC-ISOLATE): Replace ThreadPoolExecutor with multiprocessing.Process
+  - T-09-05 (E-CODE-FIXTURES): Date-function + aggregate fixtures
 
 Handoff — plan-reviewer (2026-05-12):
   agent: plan-reviewer

@@ -1,8 +1,8 @@
 """Main indexer orchestrating parsing and graph persistence."""
 
+import multiprocessing as mp
+import queue
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
 from sqlcg.core.graph_db import GraphBackend
@@ -18,6 +18,34 @@ from sqlcg.utils.ignore import load_ignore_spec
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
+
+
+def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
+    """Parse a single file in a subprocess; queue the ParsedFile (or exception).
+
+    parser_cls must be the *class* (pickleable), not an instance. The worker
+    instantiates the parser inside the child process so that any thread-local
+    state from the parent does not leak.
+
+    T-09-04: Parser constructors require a SchemaResolver.
+    The subprocess has no schema loaded (no CSV in the child), so pass a
+    fresh empty resolver. The qualify-once path in the child still calls
+    self._schema.mapping_schema() which returns {} on an empty resolver,
+    giving the same infer-only behaviour as small-repo mode. This is correct
+    because schema context is passed via mapping_schema at the parse_file call
+    site, not via the resolver state when subprocess isolation is active.
+    """
+    try:
+        parser = parser_cls(SchemaResolver(dialect=str(dialect) if dialect else None))
+        out = parser.parse_file(path, sql)
+        q.put(out)
+    except BaseException as exc:
+        # Send the exception back; parent will re-raise.
+        try:
+            q.put(exc)
+        except Exception:
+            # If exc isn't pickleable, send a RuntimeError summary instead.
+            q.put(RuntimeError(f"subprocess parse failed: {type(exc).__name__}: {exc}"))
 
 
 class Indexer:
@@ -265,14 +293,13 @@ class Indexer:
         self._expand_star_sources(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
-        """Parse one file, with optional timeout.
+        """Parse one file, with optional timeout via subprocess isolation.
 
-        On timeout (>0 seconds), the worker thread is abandoned via
-        executor.shutdown(wait=False, cancel_futures=True) so the indexer does not
-        block waiting for a runaway parser to return. The worker may continue
-        running in the background until it naturally completes; its result is
-        discarded. This matches the user expectation that --timeout-per-file
-        is a hard cap on indexing latency per file.
+        T-09-04: Subprocess isolation via multiprocessing.Process + spawn context.
+        When timeout > 0, runs the parser in a separate OS process and sends SIGKILL
+        if the timeout fires. This is the only reliable way to hard-terminate a
+        long-running parser that might be stuck in sqlglot's qualify() or lineage
+        calls. For timeout <= 0, runs in-process (same as the parent).
 
         Args:
             parser: SqlParser instance
@@ -286,23 +313,37 @@ class Indexer:
         if timeout <= 0:
             return parser.parse_file(path, sql)
 
-        executor = ThreadPoolExecutor(max_workers=1)
+        ctx = mp.get_context("spawn")  # avoid fork-inherit pitfalls (KuzuDB connection FD etc.)
+        q: mp.Queue = ctx.Queue(maxsize=1)
+        proc = ctx.Process(
+            target=_subprocess_parse_worker,
+            args=(parser.__class__, parser.DIALECT, path, sql, q),
+            daemon=True,
+        )
+        proc.start()
+        proc.join(timeout=timeout)
+
+        if proc.is_alive():
+            # Hard kill — this is the whole point of T-09-04.
+            proc.kill()  # SIGKILL on POSIX; TerminateProcess on Windows
+            proc.join(timeout=5)
+            logger.warning("Timeout parsing %s (>%ds) — subprocess killed", path, timeout)
+            out = ParsedFile(path=path, dialect=parser.DIALECT)
+            out.errors.append(f"timeout:{timeout}s")
+            return out
+
         try:
-            future = executor.submit(parser.parse_file, path, sql)
-            try:
-                return future.result(timeout=timeout)
-            except FuturesTimeout:
-                logger.warning("Timeout parsing %s (>%ds) — skipping", path, timeout)
-                out = ParsedFile(path=path, dialect=parser.DIALECT)
-                out.errors.append(f"timeout:{timeout}s")
-                return out
-        finally:
-            # On the success path: a normal shutdown(wait=True) is fine and fast.
-            # On the timeout path: shutdown(wait=False, cancel_futures=True) lets the
-            # method return immediately. cancel_futures requires Python 3.9+ (we are 3.12).
-            # The orphaned thread will exit when sqlglot finishes; this is acceptable
-            # because the process-wide thread cap is bounded by indexer concurrency=1.
-            executor.shutdown(wait=False, cancel_futures=True)
+            result = q.get(timeout=2)  # finished — pull the pickled ParsedFile
+        except queue.Empty:
+            logger.warning("Subprocess for %s exited but produced no result", path)
+            out = ParsedFile(path=path, dialect=parser.DIALECT)
+            out.errors.append("subprocess_empty_result")
+            return out
+
+        if isinstance(result, BaseException):
+            # Worker raised — re-raise into the caller (matches pre-T-09-04 thread behaviour).
+            raise result
+        return result
 
     @staticmethod
     def _qid(full_id: str) -> str:

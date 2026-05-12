@@ -703,12 +703,24 @@ class SqlParser(ABC):
                         out.errors.append("col_lineage_skip:star:<empty_name>")
                         continue
                 else:
+                    # T-09-03: Unaliased expression (function call, arithmetic, CASE WHEN, …).
+                    # The historical fallback str(col_expr)[:40] passed garbage like
+                    # "YEAR(BOEKDATUM_FIS)" into sg_lineage and produced E2 noise.
+                    # Record a structured skip and continue — the target column is unnamed,
+                    # so the downstream graph cannot model the lineage anyway.
+                    expr_str = str(col_expr)[:40]
+                    if "(" in expr_str:
+                        # Function call or expression that looks like a function
+                        expr_type = type(col_expr).__name__
+                        out.errors.append(f"col_lineage_skip:func_fallback:{expr_type}")
+                        continue
+
                     # Best-effort: try .alias, then .name, then str representation.
                     # sg_lineage may still fail; the existing exception handler records it.
                     col_name = (
                         col_expr.alias
                         or (col_expr.name if hasattr(col_expr, "name") else None)
-                        or str(col_expr)[:40]
+                        or expr_str
                     )
                     if not col_name or col_name == "*":
                         out.errors.append("col_lineage_skip:expr_no_name:<empty>")
