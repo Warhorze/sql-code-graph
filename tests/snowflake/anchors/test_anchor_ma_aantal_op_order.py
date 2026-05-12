@@ -5,13 +5,7 @@ This test documents the complete lineage chain across three files:
 2. fixture_etl.sql: INSERT INTO wtfs_openstaande_orders via CTEs
 3. fixture_semantic.sql: CREATE VIEW "Openstaande orders"
 
-Each of the 6 links in the chain is tested with xfail where the parser currently
-fails to resolve the connection. When a link is fixed (parser enhanced), remove
-the xfail decorator and the test will pass automatically.
-
-Current state: All links require E5 (CTE resolution with SUM aggregation) and
-chain resolution to pass. Link 6 additionally requires view column preservation
-with quoted identifiers.
+All 6 links resolved by T-07-02 (FIX-E5-XFILE-CHAIN).
 """
 
 from pathlib import Path
@@ -24,7 +18,6 @@ from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.snowflake_parser import SnowflakeParser
 
 
-# Shared fixtures for all 6 link tests
 @pytest.fixture(scope="module")
 def chain_edges():
     """Parse all three chain files and return aggregated edges.
@@ -56,7 +49,6 @@ def chain_edges():
     semantic_sql = semantic_path.read_text()
     semantic_result = parser.parse_file(semantic_path, semantic_sql)
 
-    # Aggregate all edges
     all_edges = [
         (edge.src.table.name, edge.src.name, edge.dst.table.name, edge.dst.name)
         for result in [etl_result, semantic_result]
@@ -68,9 +60,6 @@ def chain_edges():
     return all_edges
 
 
-@pytest.mark.xfail(
-    strict=True, reason="E5: CTE resolution with SUM aggregation not yet implemented"
-)
 def test_anchor_ma_chain_link_1_source_facts_to_bm_orders(chain_edges):
     """Link 1: source_facts.ma_order_aantal -> bm_orders.aantal_op_order."""
     link_1 = [
@@ -86,9 +75,6 @@ def test_anchor_ma_chain_link_1_source_facts_to_bm_orders(chain_edges):
     )
 
 
-@pytest.mark.xfail(
-    strict=True, reason="E5: CTE resolution with SUM aggregation not yet implemented"
-)
 def test_anchor_ma_chain_link_2_source_facts_to_igdc(chain_edges):
     """Link 2: source_facts.ma_order_aantal -> igdc_openstaand.aantal_op_order."""
     link_2 = [
@@ -105,7 +91,6 @@ def test_anchor_ma_chain_link_2_source_facts_to_igdc(chain_edges):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="E5: CTE-to-CTE column resolution not yet implemented")
 def test_anchor_ma_chain_link_3_bm_to_combined(chain_edges):
     """Link 3: bm_orders.aantal_op_order -> openstaand_combined.aantal_op_order."""
     link_3 = [
@@ -122,7 +107,6 @@ def test_anchor_ma_chain_link_3_bm_to_combined(chain_edges):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="E5: CTE-to-CTE column resolution not yet implemented")
 def test_anchor_ma_chain_link_4_igdc_to_combined(chain_edges):
     """Link 4: igdc_openstaand.aantal_op_order -> openstaand_combined.aantal_op_order."""
     link_4 = [
@@ -139,7 +123,6 @@ def test_anchor_ma_chain_link_4_igdc_to_combined(chain_edges):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="E5: CTE-to-INSERT column resolution not yet implemented")
 def test_anchor_ma_chain_link_5_combined_to_target(chain_edges):
     """Link 5: openstaand_combined.aantal_op_order -> wtfs_openstaande_orders.ma_aantal_op_order."""
     link_5 = [
@@ -157,9 +140,6 @@ def test_anchor_ma_chain_link_5_combined_to_target(chain_edges):
     )
 
 
-@pytest.mark.xfail(
-    strict=True, reason="E5: View column resolution with quoted identifiers not yet implemented"
-)
 def test_anchor_ma_chain_link_6_target_to_view(chain_edges):
     """Link 6: wtfs_openstaande_orders.ma_aantal_op_order -> Openstaande orders.Aantal op order."""
     link_6 = [

@@ -634,7 +634,10 @@ class SqlParser(ABC):
                     )
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
-                if schema:
+                # Skip when the expression has an explicit alias — the alias is the
+                # output column name (e.g. view projections), not a source column, so
+                # schema membership is irrelevant and sg_lineage should still run.
+                if schema and not col_expr.alias:
                     table_cols: list[str] | None = None
                     for _scope_name, cols in schema.items():
                         if isinstance(cols, list):
@@ -709,9 +712,11 @@ class SqlParser(ABC):
                             # If scope building fails, sg_lineage will fall back
                             body_scope = None
 
-                    # Only pass body_scope if it's non-None (optimization for reuse)
+                    # Only pass body_scope if it's non-None (optimization for reuse).
+                    # schema is NOT passed: resolver.as_dict() returns {table:[cols]}
+                    # which has nesting depth 1, causing sqlglot nesting-level errors.
+                    # sqlglot resolves column lineage structurally without schema.
                     sg_kwargs = {
-                        "schema": schema,
                         "sources": combined_sources,
                         "dialect": self.DIALECT,
                     }
@@ -775,12 +780,19 @@ class SqlParser(ABC):
                             cte_dst_table = TableRef(name=cte_alias)
                             # The CTE's body is its SELECT expression (or UNION ALL, etc.)
                             cte_body = cte.this
-                            # Accept both Select and other query types like Union
+                            # Accept both Select and Union (UNION ALL / UNION DISTINCT)
                             if not isinstance(cte_body, (exp.Select, exp.Union)):
                                 continue
 
+                            # For Union bodies, use the left branch's projections.
+                            # Union.expressions is always empty; projections are on Union.this.
+                            if isinstance(cte_body, exp.Union):
+                                projection_source = cte_body.this
+                            else:
+                                projection_source = cte_body
+
                             # For each projection in the CTE, extract lineage
-                            cte_projections = cte_body.expressions
+                            cte_projections = projection_source.expressions
                             for cte_col_expr in cte_projections:
                                 # Skip stars in CTEs
                                 if isinstance(cte_col_expr, exp.Star) or (
@@ -805,12 +817,14 @@ class SqlParser(ABC):
                                     # Must serialize: passing the AST subtree causes a segfault
                                     # (parent pointers create cycles in sqlglot's qualify()).
                                     cte_body_sql = cte_body.sql(dialect=self.DIALECT)
-                                    # Pass schema but not sources to avoid circular references
-                                    sg_kwargs = {
-                                        "schema": schema,
-                                        "dialect": self.DIALECT,
-                                    }
-                                    root = sg_lineage(cte_col_name, cte_body_sql, **sg_kwargs)
+                                    # No schema: resolver.as_dict() {table:[cols]} triggers
+                                    # sqlglot nesting-level errors on fresh string parses.
+                                    # sqlglot resolves CTE bodies structurally without schema.
+                                    root = sg_lineage(
+                                        cte_col_name,
+                                        cte_body_sql,
+                                        dialect=self.DIALECT,
+                                    )
                                     if root:
                                         # Emit edges with dst = CTE name
                                         cte_edges = self._lineage_node_to_edges(
@@ -837,6 +851,42 @@ class SqlParser(ABC):
                                         cte_alias,
                                         cte_col_name,
                                     )
+
+            # INSERT column-list aliasing (T-07-02 link 5).
+            # When an INSERT has an explicit column list and the SELECT expression has
+            # no alias (e.g. SELECT SUM(x) FROM cte), the INSERT column at the same
+            # position provides the destination col name. Stripping the WITH clause
+            # stops sg_lineage at the CTE name boundary (doesn't expand into bodies).
+            if isinstance(stmt, exp.Insert) and isinstance(stmt.this, exp.Schema):
+                insert_cols = [c.name for c in stmt.this.expressions]
+                for idx, col_expr in enumerate(col_expressions):
+                    if idx >= len(insert_cols):
+                        break
+                    if col_expr.alias:
+                        continue  # already handled by the main col loop
+                    insert_col = insert_cols[idx]
+                    if not insert_col:
+                        continue
+                    # Build a patched SELECT: strip WITH, alias the expression with the
+                    # INSERT column name so sg_lineage can trace it.
+                    body_no_with = body.copy()
+                    body_no_with.set("with_", None)
+                    aliased = exp.Alias(this=col_expr.copy(), alias=insert_col)
+                    body_no_with.set("expressions", [aliased])
+                    patched_sql = body_no_with.sql(dialect=self.DIALECT)
+                    try:
+                        root = sg_lineage(insert_col, patched_sql, dialect=self.DIALECT)
+                        if root:
+                            new_edges = self._lineage_node_to_edges(
+                                root,
+                                dst_col_name=insert_col,
+                                dst_table=dst_table,
+                                path=path,
+                                out=out,
+                            )
+                            edges.extend(new_edges)
+                    except Exception:
+                        pass
 
         except Exception as exc:
             self._log.warning(
