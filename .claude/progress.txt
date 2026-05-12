@@ -1,5 +1,62 @@
 ## Current State
 
+agent: plan-reviewer
+plan: plan/sprint_09_lineage_coverage.md
+date: 2026-05-12
+
+Handoff — plan-reviewer (2026-05-12):
+  agent: plan-reviewer
+  plan: plan/sprint_09_lineage_coverage.md
+  status: READY FOR IMPLEMENTATION (corrections applied, failing acceptance tests committed)
+
+  Blockers found and fixed:
+    BLOCKER-1: qualify() has no sources= parameter. Code sketch in T-09-01 Step 1.2 was wrong.
+      Fixed: added exp.expand() before qualify(), removed invalid sources= kwarg.
+    BLOCKER-2: schema_resolver.load_from_csv() does not exist. Method is add_information_schema().
+      Fixed: all references corrected throughout T-09-01 and Wiring Checklist.
+    BLOCKER-3: _extract_column_lineage has one call site in ansi_parser.py, not two in
+      base.py/snowflake.py. Fixed: plan corrected to reference ansi_parser.py line 225.
+    BLOCKER-4: _subprocess_parse_worker called parser_cls() with no args. Parser constructors
+      require SchemaResolver. Fixed: worker sketch corrected to instantiate SchemaResolver first.
+
+  Warnings found and fixed:
+    WARNING-1: Indexer has no __init__; schema loading is in index_repo() lines 66-70. Fixed.
+    WARNING-2: QueryNode.defined_body holds sqlglot AST — not pickleable. Added explicit
+      developer instruction to clear defined_body before queuing or confirm via pickle.dumps().
+
+  Notes (no plan change needed):
+    NOTE-1: T-09-05 ordering is intentional; plan-reviewer's pre-impl tests serve as gate.
+    NOTE-2: T-09-02 Scenario D — GRANT SELECT may be exp.Grant not exp.Command in newer sqlglot.
+
+  Also discovered: T-09-02 is substantially pre-implemented (ansi_parser.py already has
+    _is_pure_ddl_file and skip_column_lineage). The gap is the error marker format:
+    current code emits 'parse_mode:pure_ddl_skip'; plan specifies 'col_lineage_skip:pure_ddl_file'.
+    Tests capture this gap.
+
+  Failing acceptance tests written:
+    tests/unit/test_T09_01_qualify_once.py — 5 tests (2 fail, 3 skip pre-impl)
+    tests/unit/test_T09_02_ddl_skip.py — 3 tests (1 fail, 2 pass as regression guards)
+    tests/unit/test_T09_04_subprocess_isolate.py — 3 tests (2 fail, 1 passes as regression guard)
+    tests/unit/test_T09_06_log_verbosity.py — 4 tests (3 fail, 1 skips pre-impl)
+
+  Test run: 8 FAILED, 3 PASSED (regression guards), 4 SKIPPED (missing symbols) — confirmed red.
+
+
+
+Handoff — architect-reviewer (2026-05-12):
+  - Added ARCHITECTURE_REVIEW.md § 14 covering sprint-08 T-01/T-02/T-03/T-05
+  - § 14.1: bulk upsert architecture; homogeneity constraint; Neo4j NotImplementedError
+    stub; T-04 measurement gap flagged as open follow-up
+  - § 14.2: pass-2 skip predicate; CTE scope limitation documented (bodies not in
+    stmt.sources); identity semantics contract highlighted
+  - § 14.3: timeout fix; thread-leak caveat documented (cancel_futures only kills
+    unstarted futures; running thread is abandoned, not killed)
+  - § 14.4: E1 literal-skip; conservative guard correctness; scope boundary
+    (real unresolved-column E1s still visible)
+  - § 14.5: four open follow-ups (T-04 measurement, CTE body coverage, Neo4j bulk,
+    subprocess isolation)
+
+Previous state:
 agent: developer (sprint 08 performance + perf-skip: T-01 through T-05)
 plan: plan/sprint_08_perf_upsert.md (REVIEWED AND APPROVED)
 status: T-03, T-01, T-02, T-05 COMPLETE (4/5 tickets); T-04 measurement pending

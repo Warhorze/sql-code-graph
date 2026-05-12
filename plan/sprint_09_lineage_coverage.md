@@ -7,6 +7,52 @@ Policy: no backward compatibility; re-index is the migration path; no TODO in ha
 
 ---
 
+## Plan Review Notes (plan-reviewer, 2026-05-12)
+
+Status: **READY FOR IMPLEMENTATION** (corrections applied, tests written)
+
+### Corrections Made
+
+**BLOCKER-1 (fixed)** — T-09-01 Step 1.2 code sketch passed `sources=combined_sources`
+to `qualify()`. `qualify()` has no `sources=` parameter (verified: `inspect.signature(qualify)`).
+The existing code correctly calls `exp.expand()` first, then `qualify()`. The plan code
+sketch has been corrected to use `exp.expand()` before `qualify()` and remove the invalid kwarg.
+
+**BLOCKER-2 (fixed)** — T-09-01 Step 1.4 and wiring verification referenced
+`schema_resolver.load_from_csv()`. That method does not exist on `SchemaResolver`. The
+actual method is `add_information_schema()` (confirmed at `schema_resolver.py` line 157).
+All references corrected.
+
+**BLOCKER-3 (fixed)** — T-09-01 Step 1.2 said "update the two call sites in `base.py` /
+`snowflake.py`". Grep confirms there is exactly one non-definition call site, in
+`ansi_parser.py` line 225. `snowflake.py` has no direct call. Corrected to reflect the
+actual call site.
+
+**BLOCKER-4 (fixed)** — T-09-04 `_subprocess_parse_worker` called `parser_cls()` with no
+arguments. Parser constructors require a `SchemaResolver` argument (confirmed from
+`get_parser()` and `AnsiParser.__init__`). The worker sketch has been corrected to
+instantiate a fresh empty `SchemaResolver` and pass it to `parser_cls(schema_resolver)`.
+
+**WARNING-1 (fixed)** — T-09-01 Step 1.4 said to call the method from `Indexer.__init__`.
+`Indexer` has no `__init__` — loading happens in `index_repo()` lines 66-70. Corrected.
+
+**WARNING-2 (fixed)** — T-09-04 Step 4.2 did not call out that `QueryNode.defined_body`
+holds a sqlglot AST node for CTAS statements, which is not guaranteed pickleable. Added
+explicit developer instruction: must confirm via `pickle.dumps(parsed)` in Scenario B, or
+strip `defined_body` before queueing.
+
+**NOTE-1** — T-09-05 says fixtures must "fail before T-09-01 and pass after", yet the
+recommended implementation order puts T-09-05 last. This is correct — the plan-reviewer's
+failing acceptance tests (in `tests/unit/test_qualify_once.py` etc., written before
+implementation) serve as the pre-implementation gate. T-09-05 fixtures are the post-landing
+confirmations. No ordering change needed.
+
+**NOTE-2** — T-09-02 Scenario D asserts `GRANT SELECT` parses as `exp.Command`. In newer
+sqlglot versions `GRANT` may produce `exp.Grant` instead. Developer should verify
+`type(stmts[0])` in the test setup rather than assuming `exp.Command`.
+
+---
+
 ## Summary
 
 Sprint 08 cut per-call KuzuDB round-trips (bulk upsert), made `--timeout-per-file`
@@ -367,12 +413,21 @@ mapping_schema = (
     if hasattr(self, "_schema") and self._schema is not None
     else {}
 )
+# [PLAN-REVIEWER CORRECTION] qualify() has no sources= parameter.
+# exp.expand() must run first to inline combined_sources into the body,
+# then qualify() sees the expanded AST. This matches the existing pattern
+# at base.py lines 693-720 which was already correct.
 try:
+    expanded_body = body
+    if combined_sources:
+        sources_to_expand = {k: v for k, v in combined_sources.items() if hasattr(v, 'args')}
+        if sources_to_expand:
+            import sqlglot.expressions as _exp
+            expanded_body = _exp.expand(body, sources_to_expand, dialect=self.DIALECT, copy=True)
     qualified_body = qualify(
-        body,
+        expanded_body,
         dialect=self.DIALECT,
         schema=mapping_schema,
-        sources=combined_sources or None,
         validate_qualify_columns=False,
         infer_schema=True,
     )
@@ -399,8 +454,10 @@ root = sg_lineage(col_name, qualified_body, **sg_kwargs)
 **The existing `scope` keyword parameter on `_extract_column_lineage` becomes
 unused** — qualify-once removes the caller's ability to pass in a pre-built
 scope (callers always passed `None` anyway; grep-verified). Remove the parameter
-from the signature; update the two call sites in `base.py` /
-`snowflake.py` accordingly.
+from the signature; update the **one call site in [`ansi_parser.py`](../src/sqlcg/parsers/ansi_parser.py)**
+(line ~225) accordingly. The call site is NOT in `base.py` or `snowflake.py` —
+grep-confirmed: `grep -rn '_extract_column_lineage(' src/` returns exactly one
+non-definition hit in `ansi_parser.py`.
 
 **Step 1.3 — Confidence scoring under `infer_schema=True`**
 
@@ -430,9 +487,11 @@ No new constructor argument needed; T-09-01 reuses the existing
 `SchemaResolver` instance. **Critical**: the schema CSV is loaded by
 [`indexer.py` lines 67–70](../src/sqlcg/indexer/indexer.py) into the **graph**,
 not into `SchemaResolver`. The fix is to **also** call
-`schema_resolver.load_from_csv(schema_csv)` at the same point, mirroring the
-graph load. Verify the method exists; if it does not, add a thin wrapper that
-reuses `_load_schema_into_graph`'s CSV parsing — but DO NOT duplicate the parse.
+`schema_resolver.add_information_schema(schema_csv)` at the same point, mirroring
+the graph load. The method **already exists** on `SchemaResolver` (see
+[`schema_resolver.py` line 157](../src/sqlcg/lineage/schema_resolver.py)) — it
+parses the CSV and populates `self._tables`. No new method needed. Do NOT call
+`load_from_csv` — that method does not exist.
 
 Grep-confirm the path used by the indexer:
 
@@ -442,7 +501,8 @@ grep -n "schema.csv\|_load_schema_into_graph\|schema_resolver.load" \
 ```
 
 If `SchemaResolver` lacks a load-from-csv method, add one with grep-confirmed
-call site in the indexer's `__init__` block. **No copying CSV-parsing code** —
+call site in `index_repo()` adjacent to the `_load_schema_into_graph` block
+(lines 66-70 of `indexer.py`). **No copying CSV-parsing code** —
 extract the parse into a shared helper if needed.
 
 **Step 1.5 — Small-repo regression guard**
@@ -462,7 +522,7 @@ post-T-09-01.
 - `grep -n "infer_schema=True" src/sqlcg/parsers/base.py` — exactly one.
 - `grep -n "cached_scope\|qualified_body" src/sqlcg/parsers/base.py` — both names present in the per-column loop.
 - `grep -c "build_scope(qualified_body)" src/sqlcg/parsers/base.py` — exactly one (was previously one per column path).
-- `grep -n "self._schema.load_from_csv\|schema_resolver.load_from_csv" src/sqlcg/indexer/indexer.py` — exactly one call, adjacent to the existing `_load_schema_into_graph` block.
+- `grep -n "schema_resolver.add_information_schema" src/sqlcg/indexer/indexer.py` — exactly one call, adjacent to the existing `_load_schema_into_graph` block.
 - `grep -n "TODO" src/sqlcg/parsers/base.py src/sqlcg/lineage/schema_resolver.py` — no new matches in the happy path.
 
 #### Files affected
@@ -794,7 +854,15 @@ def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
     state from the parent does not leak.
     """
     try:
-        parser = parser_cls()
+        # [PLAN-REVIEWER CORRECTION] Parser constructors require a SchemaResolver.
+        # The subprocess has no schema loaded (no CSV in the child), so pass a
+        # fresh empty resolver. The qualify-once path in the child still calls
+        # self._schema.mapping_schema() which returns {} on an empty resolver,
+        # giving the same infer-only behaviour as small-repo mode. This is correct
+        # because schema context is passed via mapping_schema at the parse_file call
+        # site, not via the resolver state when subprocess isolation is active.
+        from sqlcg.lineage.schema_resolver import SchemaResolver
+        parser = parser_cls(SchemaResolver(dialect=str(dialect) if dialect else None))
         out = parser.parse_file(path, sql)
         q.put(out)
     except BaseException as exc:
@@ -815,6 +883,16 @@ dataclasses must pickle cleanly through the queue. Confirm via a unit test
 mark the field with `repr=False, compare=False, default=None` and rebuild on
 the parent side. **Do not** silently drop fields — the developer must
 explicitly approve any stripping in a separate commit before T-09-04 lands.
+
+**Known pickle risk**: `QueryNode.defined_body` is typed `Any | None` and holds
+a sqlglot `exp.Select` or `exp.Subquery` AST node for CTAS statements. sqlglot
+AST nodes are NOT guaranteed to be pickleable across process boundaries. The
+developer MUST set `stmt.defined_body = None` on each `QueryNode` before the
+`ParsedFile` is queued, OR confirm via `pickle.dumps(parsed)` in Scenario B that
+all fields round-trip cleanly. The `defined_body` field is used only by the
+`CrossFileAggregator` in pass-2; it is populated during pass-1 parsing inside
+the subprocess and returned to the parent, so the parent receives a fully-formed
+object — but only if pickling succeeds.
 
 **Step 4.3 — `spawn` context choice**
 
@@ -1113,7 +1191,7 @@ is the contract.
 
 | Question | T-09-00 | T-09-01 | T-09-02 | T-09-03 | T-09-04 | T-09-05 | T-09-06 |
 |----------|---------|---------|---------|---------|---------|---------|---------|
-| What calls this? | CLI `sqlcg index` (existing). | `parse_file` calls `_extract_column_lineage`; the qualify-once block sits inside `_extract_column_lineage`. `mapping_schema()` is called from `_extract_column_lineage`. `schema_resolver.load_from_csv()` is called from `Indexer.__init__`. | `parse_file` calls `_is_pure_ddl_file` once before the lineage loop. | The unaliased-fallback branch inside `_extract_column_lineage` (replacing the `str(col_expr)[:40]` line). | `index_repo` pass-1 loop calls `_index_single_file`. The module-level `_subprocess_parse_worker` is the subprocess entry point. | The pytest collector under `tests/snowflake/E_date_functions/` and `tests/snowflake/E_aggregates/`. | `index_repo` calls `_classify_error` at end of run. `self._log.debug` replaces `self._log.warning` inline. |
+| What calls this? | CLI `sqlcg index` (existing). | `parse_file` calls `_extract_column_lineage`; the qualify-once block sits inside `_extract_column_lineage`. `mapping_schema()` is called from `_extract_column_lineage`. `schema_resolver.add_information_schema()` is called from `index_repo()` adjacent to the `_load_schema_into_graph` block. | `parse_file` calls `_is_pure_ddl_file` once before the lineage loop. | The unaliased-fallback branch inside `_extract_column_lineage` (replacing the `str(col_expr)[:40]` line). | `index_repo` pass-1 loop calls `_index_single_file`. The module-level `_subprocess_parse_worker` is the subprocess entry point. | The pytest collector under `tests/snowflake/E_date_functions/` and `tests/snowflake/E_aggregates/`. | `index_repo` calls `_classify_error` at end of run. `self._log.debug` replaces `self._log.warning` inline. |
 | Where is the parameter passed? | No new CLI flag. The measurement script writes JSON. | No new CLI flag. `mapping_schema` flows from `SchemaResolver` already attached to the parser as `self._schema`. The schema CSV path is the existing `--schema-csv` indexer argument with `<path>/.sqlcg/schema.csv` fallback (matches `KuzuConfig` convention; see [`indexer.py` line 51](../src/sqlcg/indexer/indexer.py)). | No new parameter. | No new parameter. | The `--timeout-per-file` argument already exists; T-09-04 changes the implementation, not the surface. | No new parameter — fixtures are discovered. | `SQLCG_LOG_LEVEL=DEBUG` is the existing knob — documented in CLAUDE.md. |
 | What constant/path does this align with? | Output filename matches sprint_08 plan Step 4.2: `sprint_08_changelogs_fullindex.json`. Corpus path matches sprint-07 / sprint-08 baseline. | Schema CSV fallback path: `<path>/.sqlcg/schema.csv` per [`indexer.py` line 51](../src/sqlcg/indexer/indexer.py). DEV-MACHINE schema file at `/home/ignwrad/Projects/sql-code-graph/columns.csv` is NOT to be referenced in code or tests — it is a local convenience, not a project constant. | `exp.Command` is sqlglot's canonical class for unparsed statements (used elsewhere in `base.py`). | `exp.Column` is the same canonical class used by the T-05 literal-skip and the star-skip block. | `multiprocessing.get_context("spawn")` is the cross-platform-safe default; no project-level constant. `daemon=True` matches the indexer's run-to-completion semantics. | Fixture directory naming follows the existing `tests/snowflake/E*/` convention (e.g. `tests/snowflake/E8/`). | Error-bucket names match the E{n} taxonomy documented in `.claude/projects/.../project_en_taxonomy.md` (memory) AND in ARCHITECTURE_REVIEW.md § 12.3. The 10 bucket names are the source of truth — no new bucket names introduced without updating both. |
 | Does any TODO remain in the happy path? | No. | No. | No. | No. | No. | No. | No. |
