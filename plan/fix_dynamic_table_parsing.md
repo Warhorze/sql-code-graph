@@ -3,7 +3,7 @@
 **Plan file**: `plan/fix_dynamic_table_parsing.md`
 **Branch**: `feat/fix-schema-case-mismatch` (extends current branch; new branch acceptable if Fix B is split off)
 **Date**: 2026-05-12
-**Status**: PLAN CREATED — awaiting plan-reviewer
+**Status**: REVIEWED — approved with corrections (see plan-reviewer notes below)
 
 This plan addresses two distinct dynamic-table failure modes observed on the DWH
 e2e corpus after the schema case-mismatch fixes (`plan/fix_schema_case_mismatch.md`)
@@ -218,8 +218,15 @@ class TestWithTagStripping:
 
     def test_preprocess_with_tag_preserves_comment(self):
         # A-AC-2
-        ...
-        # Assert that COMMENT 'foo' remains after WITH TAG is stripped.
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+        sql = (
+            'CREATE OR REPLACE DYNAMIC TABLE foo (\n'
+            '    "col" WITH TAG (NS."t"=\'dim\') COMMENT \'desc\'\n'
+            ') TARGET_LAG = \'1 hour\' AS SELECT a FROM src;'
+        )
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper()
+        assert "COMMENT 'desc'" in result
 
     def test_preprocess_with_tag_chained(self):
         # A-AC-3
@@ -256,33 +263,51 @@ Add an integration-style assertion in
 `SnowflakeParser.parse_file` path):
 
 ```python
-    def test_dynamic_table_with_tag_yields_column_lineage(self):
-        # A-AC-6 — observable output check (not just "no exception")
+    def test_dynamic_table_with_tag_wiring(self):
+        # A-AC-6 — two-part check:
+        #   Part 1: _preprocess_snowflake_sql strips WITH TAG from the DDL header.
+        #           This assertion FAILS before Fix A (Gap 4 block absent).
+        #   Part 2: the preprocessed SQL parses through parse_file and produces a
+        #           CREATE_TABLE statement with at least one column_lineage edge,
+        #           confirming the wiring from preprocessor to parser to lineage.
+        #
+        # NOTE: sqlglot can parse small WITH TAG clauses without stalling. The DWH
+        # timeout only triggers on the real 368-line files with many tagged columns.
+        # Part 1 (preprocessor output) is the meaningful gate for this unit test;
+        # Part 2 is a wiring smoke-test only.
         from pathlib import Path
         from sqlcg.lineage.schema_resolver import SchemaResolver
         from sqlcg.parsers.snowflake_parser import SnowflakeParser
 
         sql = (
             'CREATE OR REPLACE DYNAMIC TABLE OUT_TBL (\n'
-            '    "Week koppelcode" WITH TAG (NS."r"=\'dim\') COMMENT \'Week\',\n'
+            '    "Week koppelcode" WITH TAG (IA_DATAPRODUCTS."Semantic role"=\'dimension\') COMMENT \'Week\',\n'
             '    "Amount" COMMENT \'amount\'\n'
             ') TARGET_LAG = \'1 hour\' AS\n'
             'SELECT a AS "Week koppelcode", b AS "Amount" FROM src;'
         )
+        # Part 1: preprocessor must strip WITH TAG — this FAILS before Fix A.
+        preprocessed = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in preprocessed.upper(), (
+            "_preprocess_snowflake_sql did not strip WITH TAG — Gap 4 block missing"
+        )
+        assert "COMMENT \'Week\'" in preprocessed, "COMMENT clause must be preserved"
+        # Part 2: wiring smoke-test — parse produces CREATE_TABLE with lineage.
         parser = SnowflakeParser(SchemaResolver())
         result = parser.parse_file(Path("dyn.sql"), sql)
         assert len(result.statements) >= 1
         stmt = result.statements[0]
         assert stmt.kind == "CREATE_TABLE"
-        # The body produces at least one column lineage edge.
         assert len(stmt.column_lineage) >= 1
 ```
 
-**Why this assertion matters** (per project rule "Tests must assert observable
-output"): it would *not* pass under the current code — the pre-process hangs
-or the parse fails — so reverting Fix A flips this test red. The unit tests
-above check the regex in isolation; this one verifies the wiring through
-`parse_file`.
+**Why Part 1 matters** (per project rule "Tests must assert observable output"):
+`_preprocess_snowflake_sql` currently has no Gap 4 block, so `"WITH TAG" not in
+preprocessed.upper()` fails before Fix A is applied. Reverting Fix A flips this
+assertion red. Part 2 is a smoke-test for the full wiring path; it cannot
+reproduce the DWH timeout in a unit test (that requires a 368-line file). The
+regex unit tests above (A-AC-1 through A-AC-7) provide the primary correctness
+gate; this test verifies the preprocessor is actually called from `parse_file`.
 
 ---
 
@@ -294,6 +319,7 @@ above check the regex in isolation; this one verifies the wiring through
 | Regex uses `re.IGNORECASE` (matches lowercase `with tag` too) | inspection |
 | `"WITH TAG" in sql.upper()` guard present (match the UNPIVOT guard style) | inspection |
 | Method docstring lists "Gap 4: Strip WITH TAG (...)" | grep for `Gap 4` |
+| `SnowflakeParser` class docstring updated to mention Gap 4 (lines 37-40) | grep for `Gap 4` in class docstring |
 | All seven Fix A unit tests are added and pass under `uv run pytest tests/unit/test_sprint_06_t04_t05.py -x` | test runner |
 | No existing test in `tests/unit/test_sprint_06_t04_t05.py` regresses | full file run green |
 | `uv run pyright` passes with zero new errors | type checker |

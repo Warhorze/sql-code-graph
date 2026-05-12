@@ -1,10 +1,49 @@
 ## Current State
 
-agent: architect-planner
+agent: plan-reviewer
 plan: plan/fix_dynamic_table_parsing.md
 feature: fix-dynamic-table-parsing
 date: 2026-05-12
-status: PLAN CREATED — READY FOR REVIEW
+status: REVIEWED — READY FOR IMPLEMENTATION (corrections applied, failing tests committed)
+
+
+Handoff — plan-reviewer (2026-05-12):
+  agent: plan-reviewer
+  plan: plan/fix_dynamic_table_parsing.md
+  status: READY FOR IMPLEMENTATION (corrections applied, failing acceptance tests committed)
+
+  Scope: Fix A (WITH TAG strip) only. Fix B is design-only; no implementation tests needed now.
+
+  Issues found and resolved:
+
+  BLOCKER-1 (A-AC-6 test passes before the fix):
+    The plan's original A-AC-6 test SQL used WITH TAG (NS."r"='dim'). Verified via
+    uv run python that sqlglot parses this small clause without stalling — the test
+    produced 2 column_lineage edges even before Fix A. The plan's claim "it would not
+    pass under the current code" was incorrect. Root cause: the DWH timeout only
+    triggers on the real 368-line files; small test SQL does not reproduce it.
+    Fix: A-AC-6 now has two parts. Part 1 asserts "WITH TAG" not in the preprocessed
+    output of _preprocess_snowflake_sql — this DOES fail before Fix A (confirmed in
+    test run: FAILED). Part 2 remains as a wiring smoke-test. Rationale added inline.
+
+  WARNING-1 (A-AC-2 test stub was empty):
+    test_preprocess_with_tag_preserves_comment had only "..." as its body. Would pass
+    trivially before the fix. Fixed: added concrete SQL fixture and asserts
+    "COMMENT 'desc'" in result after WITH TAG is stripped.
+
+  NOTE-1 (class docstring not mentioned in wiring checklist):
+    SnowflakeParser class docstring (lines 37-40) lists Gaps 1/2/3 only. The plan's
+    wiring checklist only mentioned the method docstring. Added a checklist item:
+    "SnowflakeParser class docstring updated to mention Gap 4".
+
+  Failing acceptance tests committed:
+    tests/unit/test_sprint_06_t04_t05.py — 7 new tests (TestWithTagStripping class)
+    FAILED (6): AC1 simple removal, AC2 comment preserved, AC3 chained, AC4 nested
+                function, AC6 wiring (Part 1), AC7 masking policy (regression guard)
+    PASSED (1): AC5 no-WITH-TAG unchanged (correct — this is a regression guard)
+    Total file: 6 FAILED, 21 passed (zero regressions)
+
+  Test run: 6 FAILED, 1 PASSED (new), 21 PASSED (existing) — confirmed red before Fix A.
 
 
 Handoff — plan-reviewer (2026-05-12):
