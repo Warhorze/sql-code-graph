@@ -231,6 +231,13 @@ class Indexer:
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
         """Parse one file, with optional timeout.
 
+        On timeout (>0 seconds), the worker thread is abandoned via
+        executor.shutdown(wait=False, cancel_futures=True) so the indexer does not
+        block waiting for a runaway parser to return. The worker may continue
+        running in the background until it naturally completes; its result is
+        discarded. This matches the user expectation that --timeout-per-file
+        is a hard cap on indexing latency per file.
+
         Args:
             parser: SqlParser instance
             path: Path to the file
@@ -243,8 +250,9 @@ class Indexer:
         if timeout <= 0:
             return parser.parse_file(path, sql)
 
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(parser.parse_file, path, sql)
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(parser.parse_file, path, sql)
             try:
                 return future.result(timeout=timeout)
             except FuturesTimeout:
@@ -252,6 +260,13 @@ class Indexer:
                 out = ParsedFile(path=path, dialect=parser.DIALECT)
                 out.errors.append(f"timeout:{timeout}s")
                 return out
+        finally:
+            # On the success path: a normal shutdown(wait=True) is fine and fast.
+            # On the timeout path: shutdown(wait=False, cancel_futures=True) lets the
+            # method return immediately. cancel_futures requires Python 3.9+ (we are 3.12).
+            # The orphaned thread will exit when sqlglot finishes; this is acceptable
+            # because the process-wide thread cap is bounded by indexer concurrency=1.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
     def _qid(full_id: str) -> str:

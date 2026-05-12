@@ -1,10 +1,10 @@
 ## Current State
 
-agent: developer (sprint 07 E-code fixes: T-07-02 through T-07-06)
-plan: plan/sprint_07_open_ecodes.md (REVIEWED AND APPROVED)
-status: T-07-03, T-07-04, T-07-05, T-07-06 COMPLETE; T-07-02 PARTIAL
-branch: feat/sprint-07-t02-t06 (T-07-01 already shipped in 24b89e9)
-date: 2026-05-12 (session 6)
+agent: developer (sprint 08 performance + perf-skip: T-01 through T-05)
+plan: plan/sprint_08_perf_upsert.md (REVIEWED AND APPROVED)
+status: implementing in order T-03, T-01, T-02, T-05, T-04
+branch: feat/sprint-08-perf-upsert
+date: 2026-05-12 (session 7)
 
 Session 2 summary (2026-05-11, post-sprint):
   - TASK 1: Rewrote scripts/collect_parse_errors.py to measure production parser output
