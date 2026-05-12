@@ -55,7 +55,7 @@ class AnsiParser(SqlParser):
         # Check for pure-DDL files (still parse table definitions but skip lineage)
         is_pure_ddl = self._is_pure_ddl_file(statements)
         if is_pure_ddl:
-            out.errors.append("parse_mode:pure_ddl_skip")
+            out.errors.append("col_lineage_skip:pure_ddl_file")
 
         # Check for scripting fallback
         for stmt in statements:
