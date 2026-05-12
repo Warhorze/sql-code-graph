@@ -1067,3 +1067,74 @@ To be filled in at sprint close by the developer / architect-reviewer. Required 
 ### Decision Outcome
 
 - _Per T-04 Step 4.5: close sprint OR re-open T-01 OR escalate to parallel-parsing sprint?_
+
+---
+
+## Plan Compliance — 2026-05-12
+
+Reviewed branch `feat/sprint-08-perf-upsert` (7 commits ahead of `master`) against the
+sprint plan. Verification performed by grep on the merged diff and a spot read of the
+relevant source files; tests were not re-run (developer reported 524 passed / 4 skipped /
+1 xfail in [`.claude/progress.txt`](../.claude/progress.txt) lines 50–55).
+
+### Ticket-by-Ticket Status
+
+| Ticket | Status | Evidence |
+|--------|--------|----------|
+| T-01 — Bulk upsert API + indexer rewrite | PASS | [`graph_db.py`](../src/sqlcg/core/graph_db.py) declares `upsert_nodes_bulk` / `upsert_edges_bulk`; [`kuzu_backend.py`](../src/sqlcg/core/kuzu_backend.py) implements both with `UNWIND $rows`; [`indexer.py`](../src/sqlcg/indexer/indexer.py) has zero remaining `db.upsert_node(` / `db.upsert_edge(` call sites and 10 bulk call sites (4 node groups + 6 edge groups) at lines 502–520. [`Neo4jBackend`](../src/sqlcg/core/neo4j_backend.py) carries `NotImplementedError` stubs (deviation flagged below). [`tests/integration/test_bulk_upsert.py`](../tests/integration/test_bulk_upsert.py) added with 255 LOC. Commit `3fbeea8`. |
+| T-02 — Pass-2 skip predicate | PASS | [`aggregator.py`](../src/sqlcg/lineage/aggregator.py) defines `_needs_pass2(parsed)` at line 45 and calls it from `resolve_pass2`; identity-return contract preserved. [`indexer.py`](../src/sqlcg/indexer/indexer.py) tracks `pass2_skipped` via `resolved is parsed` identity check and surfaces it in the summary dict. [`tests/unit/test_aggregator_skip.py`](../tests/unit/test_aggregator_skip.py) added (146 LOC, 3 scenarios). Commit `210a06a`. |
+| T-03 — Timeout cancellation fix | PASS | [`indexer.py`](../src/sqlcg/indexer/indexer.py) lines 239 and 273 — `executor.shutdown(wait=False, cancel_futures=True)` in the `finally` block, replacing the `with ThreadPoolExecutor` context manager. [`tests/unit/test_timeout_cancel.py`](../tests/unit/test_timeout_cancel.py) added (108 LOC, 3 scenarios including wall-clock assertion). Commit `020714c`. |
+| T-04 — MEAS-FULLINDEX + anchor re-query | NOT STARTED | `plan/measurements/` directory does not exist. No `sprint_08_changelogs_fullindex.json` artifact. ARCHITECTURE_REVIEW.md § 14 was added by architect-reviewer but the measurement comparison table is not populated. **This is the sole remaining sprint task.** |
+| T-05 — E1 literal-skip guard | PASS | [`base.py`](../src/sqlcg/parsers/base.py) line 621 — `if not list(col_expr.find_all(exp.Column)): continue` guard inserted between the star-skip block and the alias branch. [`tests/unit/test_literal_column_skip.py`](../tests/unit/test_literal_column_skip.py) added (130 LOC, 6 scenarios A–G; Scenario H is the manual T-04 verification). Companion fixups to [`tests/snowflake/E8/test_e8.py`](../tests/snowflake/E8/test_e8.py) and [`tests/benchmarks/bench_indexer.py`](../tests/benchmarks/bench_indexer.py) to reflect the new behaviour. Commits `3c482c5`, `31604c1`, `4197a5d`. |
+
+### Documented Deviations
+
+1. **Neo4j bulk stubs (T-01)**: [`neo4j_backend.py`](../src/sqlcg/core/neo4j_backend.py) gained
+   24 lines of `NotImplementedError` stubs for `upsert_nodes_bulk` / `upsert_edges_bulk`.
+   The plan listed "New backend implementations" as a non-goal but the abstract methods on
+   `GraphBackend` forced this — without the stubs, `Neo4jBackend` cannot instantiate. The
+   stub raises a clear `NotImplementedError("Use upsert_node()")` so any code path that
+   tries to use Neo4j for bulk upserts fails loudly. Acceptable. Tracked as open follow-up
+   in ARCHITECTURE_REVIEW.md § 14.5.
+
+2. **`tests/unit/test_aggregator.py` and `test_base_parser.py` / `test_graph_backend.py`
+   touched**: 39 + 13 + 6 LOC of test deltas not explicitly listed in plan "files affected".
+   These are mechanical updates for the API surface change (bulk methods on the abstract
+   base must be mocked when subclassing `GraphBackend` in tests). Mechanical and expected.
+
+3. **`tests/benchmarks/bench_indexer.py` and `tests/snowflake/E8/test_e8.py` updates**:
+   T-05's literal-skip removed expected error counts that those tests had hard-coded. The
+   updates align them with the new behaviour. Expected per the plan's "no backward
+   compatibility" rule.
+
+### Architectural Concerns Introduced
+
+None blocking. Two carry-forward items already captured by the architect-reviewer in
+ARCHITECTURE_REVIEW.md § 14.5:
+
+- **CTE body coverage in `_needs_pass2`**: bodies harvested into `cross_file_sources` may
+  be referenced by CTE name only (not present in `stmt.sources`), producing a false-negative
+  skip. Scope limit is documented inline in [`aggregator.py`](../src/sqlcg/lineage/aggregator.py).
+  Scenario D of T-02 was meant to cover this but a real-corpus regression cannot be ruled
+  out until T-04 runs.
+
+- **Thread leak on timeout (T-03)**: `cancel_futures=True` cannot kill a running Python
+  thread; the slow-parser thread leaks until sqlglot returns. Acceptable per the plan but
+  flagged for sprint 09 if memory pressure surfaces during T-04.
+
+### Outstanding Work
+
+- **T-04**: full-corpus index run on `/home/ignwrad/Projects/dwh/ddl/changelogs`, anchor
+  re-query, populate [`plan/measurements/sprint_08_changelogs_fullindex.json`](measurements/),
+  fill the ARCHITECTURE_REVIEW.md § 14 comparison table, apply the Step 4.5 decision rule.
+  Owner: developer (measurement task, no code changes).
+
+### Sprint Gate
+
+**Conditional PASS** — 4/5 tickets fully implemented and tested. T-04 is a measurement
+task only; it does not block the code merge but DOES block sprint closure per the plan's
+Step 4.5 decision rule. The sprint cannot be marked "closed" until budget extrapolation
+is recorded and the close / re-open / escalate decision is made.
+
+Code reviewer may proceed on T-01 / T-02 / T-03 / T-05 in parallel with T-04 execution.
+
