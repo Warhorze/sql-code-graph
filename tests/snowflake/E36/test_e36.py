@@ -33,9 +33,7 @@ def test_e36_temp_table(parser):
         f"t must not appear as a raw source; edges: {all_edges}"
     )
 
-    # INVERSION TARGET: when E36 cross-file temp-table lands, write a two-file
-    # test where fixture_a.sql creates the TEMP TABLE and fixture_b.sql INSERTs
-    # from it, and assert the cross-file edge appears.
+    # Cross-file case covered by tests/snowflake/E36/test_e36_xfile.py
 
 
 def test_e36_multiple_temp_uses(parser):

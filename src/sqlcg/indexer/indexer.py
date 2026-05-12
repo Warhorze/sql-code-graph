@@ -33,8 +33,9 @@ class Indexer:
         progress_callback: Callable[[int, int], None] | None = None,
         schema_csv: Path | None = None,
         no_ddl: bool = False,
+        batch_size: int = 50,
     ) -> dict:
-        """Full two-pass index. Returns summary dict.
+        """Full two-pass index with batched writes. Returns summary dict.
 
         Args:
             path: Root directory to index
@@ -49,11 +50,19 @@ class Indexer:
             schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
                 auto-discovers <path>/.sqlcg/schema.csv if present.
             no_ddl: When True, skip DDL-only files from upsert into the graph
+            batch_size: Number of files committed per KuzuDB transaction in the upsert pass.
+                Higher values reduce commit overhead but increase the per-batch recovery cost
+                and the working-set size when a transaction holds locks. Default 50 is a
+                balance between throughput on large corpora (1,000+ files) and memory/lock
+                pressure on small ones. batch_size=1 reproduces the legacy per-file commit
+                behaviour. Must be >= 1.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
-            lineage_edges_created, quality
+            lineage_edges_created, quality, batch_size
         """
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         # Load explicit INFORMATION_SCHEMA CSV if provided
         if schema_csv and schema_csv.exists():
             from sqlcg.cli.commands.load_schema import _load_schema_into_graph
@@ -96,6 +105,9 @@ class Indexer:
 
             load_dbt_manifest(dbt_manifest, schema_resolver)
 
+        # Seed cross-file sources for pass-2 re-parsing
+        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+
         # Pass 2: resolve cross-file references
         pass2_results: list[ParsedFile] = []
         for parsed in pass1_results:
@@ -115,38 +127,57 @@ class Indexer:
         )
         gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
 
-        # Upsert all results and count quality distribution
-
-        tables_found = 0
-        lineage_edges = 0
-        star_sources_found = 0
-        columns_defined = 0
-        quality_counts = {
-            "full": 0,
-            "table_only": 0,
-            "scripting_fallback": 0,
-            "failed": 0,
+        # Upsert all results and count quality distribution using batched transactions
+        nonlocal_counts: dict = {
+            "tables": 0,
+            "edges": 0,
+            "star_sources": 0,
+            "columns_defined": 0,
+            "quality": {"full": 0, "table_only": 0, "scripting_fallback": 0, "failed": 0},
         }
+
+        def _flush_batch(batch: list[ParsedFile]) -> None:
+            """Upsert a batch of ParsedFile objects in a single transaction.
+
+            On any per-file exception, the file is recorded as failed but the
+            transaction continues for the remaining files in the batch. This
+            matches the legacy per-file behaviour where one bad file did not
+            abort the whole index run.
+
+            Note: sqlcg watch's reindex_file uses a separate code path with
+            its own short per-file transaction. PERF-BATCH only affects index_repo.
+            """
+            if not batch:
+                return
+            with db.transaction():
+                for parsed_in_batch in batch:
+                    try:
+                        counts = self._upsert_parsed_file(
+                            parsed_in_batch, db, gold_tables=gold_tables
+                        )
+                        nonlocal_counts["tables"] += counts["tables"]
+                        nonlocal_counts["edges"] += counts["edges"]
+                        nonlocal_counts["star_sources"] += counts.get("star_sources", 0)
+                        nonlocal_counts["columns_defined"] += counts.get("columns_defined", 0)
+                        q_key = parsed_in_batch.parse_quality.value.lower()
+                        nonlocal_counts["quality"][q_key] += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to upsert %s: %s — skipping", parsed_in_batch.path, exc
+                        )
+                        nonlocal_counts["quality"]["failed"] += 1
+
+        batch: list[ParsedFile] = []
         for parsed in pass2_results:
-            # When no_ddl=True, skip table-node upserts for files that are pure-DDL
-            # (marked with parse_mode:pure_ddl_skip error marker)
             skip_upsert = no_ddl and any("pure_ddl_skip" in e for e in parsed.errors)
             if skip_upsert:
-                quality_counts["scripting_fallback"] += 1
+                nonlocal_counts["quality"]["scripting_fallback"] += 1
                 continue
-
-            try:
-                with db.transaction():
-                    counts = self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
-                tables_found += counts["tables"]
-                lineage_edges += counts["edges"]
-                star_sources_found += counts.get("star_sources", 0)
-                columns_defined += counts.get("columns_defined", 0)
-                quality_key = parsed.parse_quality.value.lower()
-                quality_counts[quality_key] += 1
-            except Exception as exc:
-                logger.warning("Failed to upsert %s: %s — skipping", parsed.path, exc)
-                quality_counts["failed"] += 1
+            batch.append(parsed)
+            if len(batch) >= batch_size:
+                _flush_batch(batch)
+                batch = []  # IMPORTANT — free the references so GC can reclaim parsed.statements
+        _flush_batch(batch)  # final partial batch
 
         # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
         star_edges_expanded = self._expand_star_sources(db)
@@ -154,12 +185,13 @@ class Indexer:
         return {
             "files_parsed": len(pass2_results),
             "parse_errors": parse_errors,
-            "tables_found": tables_found,
-            "lineage_edges_created": lineage_edges,
-            "columns_defined": columns_defined,
-            "star_sources": star_sources_found,
+            "tables_found": nonlocal_counts["tables"],
+            "lineage_edges_created": nonlocal_counts["edges"],
+            "columns_defined": nonlocal_counts["columns_defined"],
+            "star_sources": nonlocal_counts["star_sources"],
             "star_edges_expanded": star_edges_expanded,
-            "quality": quality_counts,
+            "quality": nonlocal_counts["quality"],
+            "batch_size": batch_size,
         }
 
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:

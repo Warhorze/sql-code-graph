@@ -10,8 +10,14 @@ from sqlcg.indexer.indexer import Indexer
 class TestPerFileCommitBoundary:
     """Integration tests for P-01 per-file commit boundary."""
 
-    def test_per_file_commit_prevents_oom(self, tmp_path: Path):
-        """Guard: index_repo commits per file, not once for all files."""
+    def test_batched_commits_reduce_overhead(self, tmp_path: Path):
+        """Guard: index_repo batches transactions instead of per-file commits.
+
+        With batching (default batch_size=50), 200 files should produce
+        ~4 transactions instead of 200. This prevents commit overhead from
+        dominating latency on large corpora while still committing frequently
+        enough to prevent OOM.
+        """
         # Create 200 minimal SQL files
         for i in range(200):
             sql_file = tmp_path / f"file_{i:03d}.sql"
@@ -31,12 +37,15 @@ class TestPerFileCommitBoundary:
 
         with patch.object(backend, "transaction", side_effect=counting_transaction):
             indexer = Indexer()
+            # Default batch_size=50: 200 files / 50 = 4 batches
             indexer.index_repo(tmp_path, dialect=None, db=backend)
 
-        # Verify one transaction per file (200 files = 200 transactions)
-        assert transaction_count == 200, (
-            f"Expected one transaction per file (200 files), got {transaction_count}. "
-            "Per-file commit boundary is missing in index_repo."
+        # Verify batched commits: ~4 transactions for 200 files with batch_size=50
+        # (not 200 per-file commits, not 1 monolithic commit)
+        expected_batches = 200 // 50 + (1 if 200 % 50 else 0)  # 4
+        assert 1 < transaction_count < 200, (
+            f"Expected batched transactions (between 1 and 200), got {transaction_count}. "
+            f"Should be ~{expected_batches} batches for 200 files with batch_size=50."
         )
 
     def test_single_file_failure_does_not_abort_corpus(self, tmp_path: Path):

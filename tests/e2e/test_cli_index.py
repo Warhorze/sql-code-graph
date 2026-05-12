@@ -135,3 +135,28 @@ def test_db_reset_repo_isolates(tmp_path, monkeypatch):
     # (The second repo should still have indexed tables)
     find_result = runner.invoke(app, ["find", "table", "orders"])
     assert find_result.exit_code == 0
+
+
+def test_index_with_batch_size_flag(tmp_path, monkeypatch):
+    """Test that --batch-size flag is accepted and works."""
+    monkeypatch.setenv("SQLCG_DB_PATH", str(tmp_path / "test.db"))
+
+    # Init database
+    runner.invoke(app, ["db", "init"])
+
+    fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
+    if not fixtures_path.exists():
+        pytest.skip("Synthetic fixtures not found")
+
+    # Test with default batch size
+    result_default = runner.invoke(app, ["index", str(fixtures_path)])
+    assert result_default.exit_code == 0
+    assert "Indexed" in result_default.output
+
+    # Reset and test with explicit batch size
+    runner.invoke(app, ["db", "reset"])
+    result_custom = runner.invoke(
+        app, ["index", str(fixtures_path), "--batch-size", "7"]
+    )
+    assert result_custom.exit_code == 0
+    assert "Indexed" in result_custom.output

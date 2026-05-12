@@ -191,8 +191,10 @@ class SnowflakeParser(AnsiParser):
         # Compute schema sources once per file
         schema_sources = self._schema.as_sources_dict() if self._schema else {}
 
-        # Initialize sources_map for temp table resolution
-        sources_map: dict[str, Any] = {}
+        # Initialize sources_map for temp table resolution.
+        # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
+        xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
+        sources_map: dict[str, Any] = xfile_sources
 
         # Extract DML statements using regex
         dml_matches = _EMBEDDED_DML.finditer(sql)

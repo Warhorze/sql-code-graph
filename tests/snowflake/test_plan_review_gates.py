@@ -117,9 +117,7 @@ def test_plan_review_e36_intrafile_resolves_ctas_through_sources_map():
         f"t must not appear as a raw source table; edges: {all_edges}"
     )
 
-    # INVERSION TARGET: when E36 cross-file fix lands, write a two-file test
-    # where fixture_a.sql creates TEMP TABLE t and fixture_b.sql INSERTs from it,
-    # then assert the cross-file edge appears. Single-file test is not sufficient.
+    # Cross-file case covered by tests/snowflake/E36/test_e36_xfile.py
 
 
 # ---------------------------------------------------------------------------

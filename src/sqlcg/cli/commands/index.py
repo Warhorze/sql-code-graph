@@ -29,6 +29,17 @@ def index_cmd(  # noqa: B008
         help="KuzuDB buffer pool size in MB (0 = default). "
         "Set to 256-512 on memory-constrained machines.",
     ),
+    batch_size: int = typer.Option(  # noqa: B008
+        50,
+        "--batch-size",
+        help=(
+            "Files per KuzuDB transaction in the upsert pass. "
+            "Default 50 balances commit-overhead reduction (vs. legacy per-file commits) "
+            "against per-batch memory cost. Lower values are safer for memory-constrained "
+            "machines; higher values give marginal speedup at the cost of larger working sets. "
+            "Set to 1 to reproduce legacy per-file commit behaviour."
+        ),
+    ),
     no_ddl: bool = typer.Option(  # noqa: B008
         False, "--no-ddl", help="Skip table-node upserts for DDL-only files"
     ),
@@ -134,6 +145,7 @@ def index_cmd(  # noqa: B008
             progress_callback=_make_progress_callback(total_files),
             schema_csv=None,
             no_ddl=no_ddl,
+            batch_size=batch_size,
         )
         console.print()  # newline after carriage return progress line
 
