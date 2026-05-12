@@ -1,0 +1,1 @@
+SELECT SEQ.NEXTVAL AS id FROM dual;

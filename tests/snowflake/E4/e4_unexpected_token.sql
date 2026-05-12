@@ -1,0 +1,5 @@
+DECLARE x INT DEFAULT 0;
+BEGIN
+    LET x := 1;
+    RETURN x;
+END;

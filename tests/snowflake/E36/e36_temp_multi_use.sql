@@ -1,0 +1,3 @@
+CREATE TEMP TABLE t AS SELECT a, b FROM src;
+INSERT INTO dst_one (a) SELECT a FROM t;
+INSERT INTO dst_two (b) SELECT b FROM t;

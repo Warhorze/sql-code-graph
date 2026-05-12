@@ -39,6 +39,56 @@ body:
     validations:
       required: true
 
+  - type: textarea
+    id: parse-report
+    attributes:
+      label: Parse error report (missing lineage bugs)
+      description: |
+        If you are reporting missing column-lineage edges, run the following
+        command after indexing and paste the output here. This shows which
+        parse-error patterns (E-codes) are affecting your corpus.
+
+        ```bash
+        sqlcg report --stdout
+        ```
+
+        Not sure what E-codes mean? See the
+        [Snowflake lineage failure reference](https://github.com/Warhorze/sql-code-graph/blob/master/tests/snowflake/README.md).
+      placeholder: |
+        Paste output of `sqlcg report --stdout` here.
+
+        If your file fails to parse at all, also include:
+          sqlcg index /path/to/file.sql --dialect snowflake
+        and look for `parse_quality=FAILED` in the output.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ecode
+    attributes:
+      label: Known E-code (if applicable)
+      description: |
+        Does your issue match a known failure pattern?
+        See tests/snowflake/README.md for the full list.
+      options:
+        - "Not sure"
+        - "E2 — unaliased / non-Column expression (star, arithmetic, function)"
+        - "E3 — DDL-only file (ALTER TABLE, CREATE SEQUENCE, etc.)"
+        - "E4 — sqlglot parse failure (dialect gap)"
+        - "E5 — cross-file CTE source not resolvable (lineage exception)"
+        - "E8 — dynamic / runtime source (NEXTVAL, UUID, IDENTIFIER($var))"
+        - "E12 — LATERAL FLATTEN or semi-structured JSON path"
+        - "E16 — MERGE multi-branch (no column lineage extracted)"
+        - "E18 — IFF / DECODE / NVL2 conditional expression"
+        - "E21 — alias forward reference"
+        - "E23 — stored procedure body"
+        - "E25 — cross-database or cross-schema reference"
+        - "E27 — UDF as column source"
+        - "E36 — cross-file temp table"
+        - "Other / unlisted"
+    validations:
+      required: false
+
   - type: input
     id: version
     attributes:
