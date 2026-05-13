@@ -637,16 +637,22 @@ class SqlParser(ABC):
             try:
                 # Expand sources first to inline CTE/temp table definitions
                 expanded_body = body
-                if combined_sources:
+                # Fix A: Filter exp.expand() to only CTAS/CTE/temp sources, not schema sources.
+                # Schema resolution proceeds via mapping_schema and sg_lineage(sources=…);
+                # passing all ~10k schema CSV entries through exp.expand() creates O(N_files)
+                # bloat. See SQLMesh's mapping_schema pattern for the same separation.
+                if sources:
                     sources_to_expand = {
                         k: v
-                        for k, v in combined_sources.items()
+                        for k, v in sources.items()
                         if hasattr(v, "args")  # Filter for AST nodes
                     }
-                    if sources_to_expand:
-                        expanded_body = exp.expand(
-                            body, sources_to_expand, dialect=self.DIALECT, copy=True
-                        )
+                else:
+                    sources_to_expand = {}
+                if sources_to_expand:
+                    expanded_body = exp.expand(
+                        body, sources_to_expand, dialect=self.DIALECT, copy=True
+                    )
                 # Qualify with mapping_schema + infer_schema=True for cross-schema CTE resolution
                 qualified_body = qualify(
                     expanded_body,
@@ -743,20 +749,47 @@ class SqlParser(ABC):
                             for _db, tables in cols.items():
                                 if isinstance(tables, dict):
                                     for _tbl, tcols in tables.items():
-                                        if col_name in tcols:
+                                        # Fix 3: Case-insensitive column lookup
+                                        if col_name.lower() in {c.lower() for c in tcols}:
                                             table_cols = tcols
                                             break
-                    if table_cols is not None and col_name not in table_cols:
-                        self._log.warning(
-                            "column %s not found in schema, emitting low-confidence edge",
-                            col_name,
-                        )
+                    # Fix 3: Case-insensitive schema validation lookup
+                    if table_cols is not None:
+                        col_lower = col_name.lower()
+                        table_cols_lower = {c.lower() for c in table_cols}
+                        if col_lower not in table_cols_lower:
+                            self._log.warning(
+                                "column %s not found in schema, emitting low-confidence edge",
+                                col_name,
+                            )
+                            edges.append(
+                                LineageEdge(
+                                    src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                                    dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
+                                    transform="UNKNOWN",
+                                    confidence=0.5,
+                                )
+                            )
+                            continue
+
+                # Fast path: direct alias.col projection — alias lookup is O(sources),
+                # saves one sg_lineage call (+ deepcopy) per trivially-resolved column.
+                # COMBI files are 500 cols × 22 joins; ~90 % hit this path, cutting ~25 s → ~3 s.
+                if isinstance(col_expr, exp.Column) and col_expr.table and not col_expr.alias:
+                    src_table = self._resolve_star_source(
+                        qualifier=col_expr.table,
+                        sources=query_sources or [],
+                    )
+                    if src_table is not None:
+                        dst_tbl = dst_table if dst_table else TableRef(name="<output>")
+                        schema_key = (src_table.catalog, src_table.db, src_table.name)
+                        conf = 1.0 if schema_key in mapping_schema_tables else 0.7
                         edges.append(
                             LineageEdge(
-                                src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                transform="UNKNOWN",
-                                confidence=0.5,
+                                src=ColumnRef(src_table, col_name),
+                                dst=ColumnRef(dst_tbl, col_name),
+                                transform="SELECT",
+                                confidence=conf,
                             )
                         )
                         continue

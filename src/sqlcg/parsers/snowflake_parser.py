@@ -37,6 +37,7 @@ class SnowflakeParser(AnsiParser):
     - Colon-qualified identifiers (Gap 1)
     - LATERAL FLATTEN operations (Gap 2)
     - Dynamic identifiers (Gap 3)
+    - WITH TAG clause stripping (Gap 4)
     """
 
     DIALECT: str | None = "snowflake"
@@ -49,12 +50,19 @@ class SnowflakeParser(AnsiParser):
         """
         super().__init__(schema_resolver)
 
-    def parse_file(self, path: Path, sql: str) -> ParsedFile:
+    def parse_file(
+        self,
+        path: Path,
+        sql: str,
+        dependency_filter: set[str] | None = None,
+    ) -> ParsedFile:
         """Parse Snowflake SQL file with scripting block detection.
 
         Args:
             path: Path to the source file
             sql: SQL text to parse
+            dependency_filter: optional set of lowercased table names to filter cross-file sources
+                (passed to AnsiParser.parse_file; see that method for full documentation)
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -68,7 +76,7 @@ class SnowflakeParser(AnsiParser):
             return self._parse_scripting_file(path, sql)
 
         # Otherwise use standard ANSI parsing with Snowflake dialect
-        return AnsiParser.parse_file(self, path, sql)  # type: ignore
+        return AnsiParser.parse_file(self, path, sql, dependency_filter=dependency_filter)  # type: ignore
 
     @staticmethod
     def _preprocess_snowflake_sql(sql: str) -> str:
@@ -77,6 +85,7 @@ class SnowflakeParser(AnsiParser):
         Handles:
         1. Gap 1: Normalise CREATE TEMP TABLE t IF NOT EXISTS to CREATE TEMPORARY TABLE t
         2. Gap 3: Strip UNPIVOT clauses (destructive but acceptable for partial lineage extraction)
+        3. Gap 4: Strip WITH TAG (...) clauses from column definitions
 
         Args:
             sql: Raw Snowflake SQL text
@@ -102,6 +111,26 @@ class SnowflakeParser(AnsiParser):
             # This matches UNPIVOT (val FOR col IN (...)) AS alias
             sql = re.sub(
                 r"\s+UNPIVOT\s*\([^)]*\([^)]*\)[^)]*\)\s*(?:AS\s+\w+)?",
+                "",
+                sql,
+                flags=re.IGNORECASE,
+            )
+
+        # Gap 4: Strip "WITH TAG (...)" clauses from column definitions in
+        # CREATE [OR REPLACE] [DYNAMIC] TABLE statements. sqlglot's Snowflake
+        # dialect does not parse this clause and stalls past the 30s timeout
+        # on real DWH dynamic-table DDL. Stripping the clause loses only the
+        # tag metadata (we do not model it) and unblocks parsing of the AS
+        # SELECT body for column lineage.
+        #
+        # WITH TAG may contain up to two levels of nested parens, e.g.
+        #   WITH TAG (SCHEMA."tag_name"='value', other='v2')
+        # A column may carry multiple WITH TAG clauses (chained). Strip each
+        # occurrence independently; do not touch COMMENT or WITH MASKING
+        # POLICY clauses, which sqlglot already handles.
+        if "WITH TAG" in sql.upper():
+            sql = re.sub(
+                r"\s+WITH\s+TAG\s*\((?:[^()]*|\([^()]*\))*\)",
                 "",
                 sql,
                 flags=re.IGNORECASE,
@@ -183,6 +212,10 @@ class SnowflakeParser(AnsiParser):
 
         Returns:
             ParsedFile with extracted DML statements
+
+        Note:
+            dependency_filter is not applied here — DML extraction bypasses sources_map seeding;
+            full xfile_sources used intentionally.
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK

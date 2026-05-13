@@ -32,12 +32,23 @@ class AnsiParser(SqlParser):
         """
         super().__init__(schema_resolver)
 
-    def parse_file(self, path: Path, sql: str) -> ParsedFile:
+    def parse_file(
+        self,
+        path: Path,
+        sql: str,
+        dependency_filter: set[str] | None = None,
+    ) -> ParsedFile:
         """Parse SQL file and extract table/column lineage.
 
         Args:
             path: Path to the source file
             sql: SQL text to parse
+            dependency_filter: optional set of lowercased table names. When provided,
+                the cross-file sources seeded into `sources_map` are filtered to only those
+                whose name is in the set. Pass-1 callers (and direct test callers) pass
+                `None` to disable filtering; pass-2 callers
+                (`CrossFileAggregator.resolve_pass2`) compute this from the pass-1
+                `ParsedFile.referenced_tables`.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -78,7 +89,21 @@ class AnsiParser(SqlParser):
 
         # Initialize sources_map to accumulate temp table definitions.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
-        xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
+        # When `dependency_filter` is provided (pass 2), keep only those CTAS bodies
+        # the current file actually references — keeps exp.expand O(N_refs) instead
+        # of O(N_corpus_ctas).
+        if self._schema:
+            xfile_sources_all = self._schema.cross_file_sources()
+            if dependency_filter is not None:
+                xfile_sources = {
+                    name: body
+                    for name, body in xfile_sources_all.items()
+                    if name in dependency_filter
+                }
+            else:
+                xfile_sources = dict(xfile_sources_all)
+        else:
+            xfile_sources = {}
         sources_map: dict[str, Any] = xfile_sources
 
         # Process each statement

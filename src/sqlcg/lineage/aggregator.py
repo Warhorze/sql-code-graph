@@ -108,4 +108,7 @@ class CrossFileAggregator:
             )
             return parsed
 
-        return parser.parse_file(parsed.path, sql)
+        # Filter cross-file CTAS bodies to what this file actually references —
+        # keeps exp.expand bounded by referenced_tables, not by corpus size.
+        ref_names = {(t.name or "").lower() for t in parsed.referenced_tables if t.name}
+        return parser.parse_file(parsed.path, sql, dependency_filter=ref_names)
