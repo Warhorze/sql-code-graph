@@ -38,6 +38,7 @@ class SnowflakeParser(AnsiParser):
     - LATERAL FLATTEN operations (Gap 2)
     - Dynamic identifiers (Gap 3)
     - WITH TAG clause stripping (Gap 4)
+    - ALTER ... SET TAG statement stripping (Gap 4b)
     """
 
     DIALECT: str | None = "snowflake"
@@ -86,6 +87,7 @@ class SnowflakeParser(AnsiParser):
         1. Gap 1: Normalise CREATE TEMP TABLE t IF NOT EXISTS to CREATE TEMPORARY TABLE t
         2. Gap 3: Strip UNPIVOT clauses (destructive but acceptable for partial lineage extraction)
         3. Gap 4: Strip WITH TAG (...) clauses from column definitions
+        4. Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements
 
         Args:
             sql: Raw Snowflake SQL text
@@ -134,6 +136,17 @@ class SnowflakeParser(AnsiParser):
                 "",
                 sql,
                 flags=re.IGNORECASE,
+            )
+
+        # Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements.
+        # sqlglot emits these as exp.Command (unsupported syntax). They only carry tag
+        # metadata we don't model, so removing them is safe and cleans the error stream.
+        if "SET TAG" in sql.upper():
+            sql = re.sub(
+                r"ALTER\s+(?:TABLE|VIEW)\s+[^;]*?MODIFY\s+COLUMN[^;]*?SET\s+TAG[^;]*?;",
+                "",
+                sql,
+                flags=re.IGNORECASE | re.DOTALL,
             )
 
         return sql
