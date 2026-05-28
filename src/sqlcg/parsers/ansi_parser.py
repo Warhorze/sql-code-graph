@@ -24,13 +24,18 @@ class AnsiParser(SqlParser):
 
     DIALECT: str | None = None
 
-    def __init__(self, schema_resolver: SchemaResolver):
+    def __init__(
+        self,
+        schema_resolver: SchemaResolver,
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize ANSI parser.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional table alias map (bare lowercase name → canonical name)
         """
-        super().__init__(schema_resolver)
+        super().__init__(schema_resolver, schema_aliases=schema_aliases)
 
     def parse_file(
         self,
@@ -207,9 +212,9 @@ class AnsiParser(SqlParser):
         # Extract target table for CREATE/INSERT statements
         target = None
         if isinstance(stmt, exp.Create):
-            target = self._extract_target_table(stmt)
+            target = self._apply_table_alias(self._extract_target_table(stmt))
         elif isinstance(stmt, exp.Insert):
-            target = self._extract_insert_target(stmt)
+            target = self._apply_table_alias(self._extract_insert_target(stmt))
 
         # Extract source tables
         sources = []
@@ -230,13 +235,21 @@ class AnsiParser(SqlParser):
                 sources = self._real_tables(root_scope)
             else:
                 # Fallback to basic table extraction
-                sources = self._fallback_table_scan(stmt)
+                sources = [
+                    r
+                    for s in self._fallback_table_scan(stmt)
+                    if (r := self._apply_table_alias(s)) is not None
+                ]
                 parse_failed = True
         except Exception as exc:
             logger.warning(
                 "Failed to build scope for statement %d in %s: %s", stmt_index, path, exc
             )
-            sources = self._fallback_table_scan(stmt)
+            sources = [
+                r
+                for s in self._fallback_table_scan(stmt)
+                if (r := self._apply_table_alias(s)) is not None
+            ]
             parse_failed = True
 
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)

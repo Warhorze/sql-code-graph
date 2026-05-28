@@ -87,6 +87,39 @@ def get_dialect(path: Path) -> str:
     return "snowflake"
 
 
+def get_schema_aliases(path: Path) -> dict[str, str]:
+    """Get schema alias mappings from .sqlcg.toml.
+
+    Reads [sqlcg.schema_aliases] and returns a lowercased staging-schema →
+    canonical-schema dict.  Use this when a staging area sits under a different
+    schema but the table names are identical, e.g.::
+
+        [sqlcg.schema_aliases]
+        da_tmp = "da"
+        ba_tmp = "ba"
+
+    Any table reference whose schema part matches a key is rewritten to use the
+    canonical schema instead, so ``da_tmp.my_table`` is traced as ``da.my_table``.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        Dict mapping staging schema name (lowercase) to its canonical replacement
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("schema_aliases", {})
+            if isinstance(raw, dict):
+                return {k.lower(): v for k, v in raw.items() if isinstance(v, str)}
+        except Exception:
+            pass
+    return {}
+
+
 def get_backend() -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 

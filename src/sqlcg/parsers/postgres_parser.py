@@ -18,10 +18,15 @@ class PostgresParser(AnsiParser):
 
     DIALECT: str | None = "postgres"
 
-    def __init__(self, schema_resolver: SchemaResolver):
+    def __init__(
+        self,
+        schema_resolver: SchemaResolver,
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize Postgres parser.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional table alias map (bare lowercase name → canonical name)
         """
-        super().__init__(schema_resolver)
+        super().__init__(schema_resolver, schema_aliases=schema_aliases)

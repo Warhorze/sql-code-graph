@@ -43,13 +43,18 @@ class SnowflakeParser(AnsiParser):
 
     DIALECT: str | None = "snowflake"
 
-    def __init__(self, schema_resolver: SchemaResolver):
+    def __init__(
+        self,
+        schema_resolver: SchemaResolver,
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize Snowflake parser.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional table alias map (bare lowercase name → canonical name)
         """
-        super().__init__(schema_resolver)
+        super().__init__(schema_resolver, schema_aliases=schema_aliases)
 
     def parse_file(
         self,
@@ -143,7 +148,7 @@ class SnowflakeParser(AnsiParser):
         # metadata we don't model, so removing them is safe and cleans the error stream.
         if "SET TAG" in sql.upper():
             sql = re.sub(
-                r"ALTER\s+(?:TABLE|VIEW)\s+[^;]*?MODIFY\s+COLUMN[^;]*?SET\s+TAG[^;]*?;",
+                r"ALTER\s+(?:DYNAMIC\s+)?(?:TABLE|VIEW)\s+[^;]*?MODIFY\s+COLUMN[^;]*?SET\s+TAG[^;]*?;",
                 "",
                 sql,
                 flags=re.IGNORECASE | re.DOTALL,

@@ -98,8 +98,9 @@ class Indexer:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        # Load explicit INFORMATION_SCHEMA CSV if provided (into graph DB only;
-        # workers receive the CSV path directly for their own schema resolvers)
+        # INERT (measured 2026-05-28): schema_csv loading (both into the graph and
+        # into worker SchemaResolvers) produces zero delta in edges vs no-schema.
+        # Kept pending network analysis; both code paths below are candidates for removal.
         if schema_csv and schema_csv.exists():
             from sqlcg.cli.commands.load_schema import _load_schema_into_graph
 
@@ -128,10 +129,16 @@ class Indexer:
         p1_timeout = float(timeout_per_file) if timeout_per_file > 0 else float("inf")
         p2_timeout = max(p1_timeout, 15.0) if timeout_per_file > 0 else float("inf")
 
+        from sqlcg.core.config import get_schema_aliases
+
+        schema_aliases = get_schema_aliases(path)
+
         p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
 
         try:
-            with HardKillPool(dialect, schema_csv_str, n_workers) as pool:
+            with HardKillPool(
+                dialect, schema_csv_str, n_workers, schema_aliases=schema_aliases
+            ) as pool:
                 # Pass 1: parse all files in parallel
                 p1_raw = pool.map(p1_tasks, per_task_timeout=p1_timeout)
 
