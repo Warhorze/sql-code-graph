@@ -9,6 +9,7 @@ from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.queries import STALE_VIEWS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.error_classify import _classify_error
+from sqlcg.indexer.pool import HardKillPool
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -57,12 +58,13 @@ class Indexer:
         dialect: str | None,
         db: GraphBackend,
         dbt_manifest: Path | None = None,
-        timeout_per_file: int = 30,
+        timeout_per_file: int = 5,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
         schema_csv: Path | None = None,
         no_ddl: bool = False,
         batch_size: int = 50,
+        n_workers: int | None = None,
     ) -> dict:
         """Full two-pass index with batched writes. Returns summary dict.
 
@@ -85,6 +87,10 @@ class Indexer:
                 balance between throughput on large corpora (1,000+ files) and memory/lock
                 pressure on small ones. batch_size=1 reproduces the legacy per-file commit
                 behaviour. Must be >= 1.
+            n_workers: Number of worker processes in the persistent pool (default: cpu_count()).
+                Workers are spawn-mode so they never inherit the KuzuDB file descriptor.
+                Each worker holds two pre-built parsers (pass-1 empty schema, pass-2 full
+                schema CSV), paying the cold-start cost once per run rather than per file.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
@@ -92,18 +98,14 @@ class Indexer:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        # Load explicit INFORMATION_SCHEMA CSV if provided
+        # Load explicit INFORMATION_SCHEMA CSV if provided (into graph DB only;
+        # workers receive the CSV path directly for their own schema resolvers)
         if schema_csv and schema_csv.exists():
             from sqlcg.cli.commands.load_schema import _load_schema_into_graph
 
             _load_schema_into_graph(schema_csv, include_catalog=False, db=db)
 
         spec = load_ignore_spec(path)
-        schema_resolver = SchemaResolver(dialect=dialect)
-        # T-09-01: Load information schema into schema_resolver for qualify-once pattern
-        if schema_csv and schema_csv.exists():
-            schema_resolver.add_information_schema(schema_csv)
-        parser = get_parser(dialect, schema_resolver)
         aggregator = CrossFileAggregator()
 
         files = list(walk_sql_files(path, spec, use_git=use_git))
@@ -111,47 +113,109 @@ class Indexer:
         parse_errors = 0
         total_files = len(files)
 
-        # Pass 1: parse all files
-        for i, file_path in enumerate(files, 1):
+        # Read all SQL files up-front; unreadable files get an empty string
+        # so the pool still produces a ParsedFile placeholder for them.
+        file_sqls: list[tuple[Path, str]] = []
+        for file_path in files:
             try:
-                sql = file_path.read_text(encoding="utf-8")
-                parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
-                aggregator.register_pass1(parsed)
-                pass1_results.append(parsed)
-                parse_errors += len(parsed.errors)
-            except KeyboardInterrupt:
-                logger.info("SIGINT received — flushing progress")
-                self._upsert_all(pass1_results, db)
-                raise
+                file_sqls.append((file_path, file_path.read_text(encoding="utf-8")))
             except Exception as exc:
-                logger.warning("Failed to parse %s: %s", file_path, exc)
+                logger.warning("Failed to read %s: %s", file_path, exc)
+                file_sqls.append((file_path, ""))
                 parse_errors += 1
 
-            # Invoke progress callback every 100 files
-            if progress_callback is not None and i % 100 == 0:
-                progress_callback(i, total_files)
+        schema_csv_str = str(schema_csv) if schema_csv and schema_csv.exists() else None
+        p1_timeout = float(timeout_per_file) if timeout_per_file > 0 else float("inf")
+        p2_timeout = max(p1_timeout, 15.0) if timeout_per_file > 0 else float("inf")
 
-        # Optional: load dbt manifest
-        if dbt_manifest:
-            from sqlcg.indexer.dbt_adapter import load_dbt_manifest
+        p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
 
-            load_dbt_manifest(dbt_manifest, schema_resolver)
+        try:
+            with HardKillPool(dialect, schema_csv_str, n_workers) as pool:
+                # Pass 1: parse all files in parallel
+                p1_raw = pool.map(p1_tasks, per_task_timeout=p1_timeout)
 
-        # Seed cross-file sources for pass-2 re-parsing
-        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+                # Register pass-1 results with the aggregator
+                for i, (file_path, _sql) in enumerate(file_sqls):
+                    raw = p1_raw[i]
+                    if raw is None:
+                        parsed = ParsedFile(path=file_path, dialect=dialect)
+                        parsed.errors.append("pool_no_result")
+                        parse_errors += 1
+                    else:
+                        parsed = raw
+                        parse_errors += len(parsed.errors)
+                    aggregator.register_pass1(parsed)
+                    pass1_results.append(parsed)
 
-        # Pass 2: resolve cross-file references
-        pass2_results: list[ParsedFile] = []
-        pass2_skipped = 0
-        for parsed in pass1_results:
-            try:
-                resolved = aggregator.resolve_pass2(parser, parsed)
-                if resolved is parsed:  # identity = no re-parse happened
-                    pass2_skipped += 1
-                pass2_results.append(resolved)
-            except Exception as exc:
-                logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
-                pass2_results.append(parsed)
+                    if progress_callback is not None and (i + 1) % 100 == 0:
+                        progress_callback(i + 1, total_files)
+
+                # Optional: load dbt manifest into a transient resolver so that
+                # cross-file sources can reference dbt-managed tables.
+                # Note: dbt schema data is not propagated to pool workers; pass-2
+                # workers run with the information-schema CSV only.
+                if dbt_manifest:
+                    from sqlcg.indexer.dbt_adapter import load_dbt_manifest
+
+                    _dbt_resolver = SchemaResolver(dialect=dialect)
+                    load_dbt_manifest(dbt_manifest, _dbt_resolver)
+
+                # Seed cross-file CTAS bodies into the aggregator (main process only;
+                # workers receive per-task SQL string copies).
+                xfile_sources = aggregator.cross_file_sources
+
+                # Build pass-2 tasks: only files with cross-file dependencies
+                pass2_indices: list[int] = []
+                p2_tasks: list[dict] = []
+                for i, parsed in enumerate(pass1_results):
+                    if not aggregator._needs_pass2(parsed):
+                        continue
+                    dep_names = {(t.name or "").lower() for t in parsed.referenced_tables if t.name}
+                    # Serialize only the CTAS bodies this file needs (keeps payload small)
+                    xfile_sql: dict[str, str] = {}
+                    for name, body in xfile_sources.items():
+                        if name in dep_names:
+                            try:
+                                xfile_sql[name] = body.sql(dialect=dialect)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to serialize cross-file source %s: %s", name, exc
+                                )
+                    pass2_indices.append(i)
+                    p2_tasks.append(
+                        {
+                            "type": "parse_pass2",
+                            "path": str(parsed.path),
+                            "sql": file_sqls[i][1],
+                            "dependency_filter": dep_names,
+                            "xfile_sql": xfile_sql,
+                        }
+                    )
+
+                pass2_skipped = len(pass1_results) - len(pass2_indices)
+
+                # Pass 2: resolve cross-file references in parallel
+                p2_raw = pool.map(p2_tasks, per_task_timeout=p2_timeout)
+
+        except KeyboardInterrupt:
+            logger.info("SIGINT received — flushing pass-1 progress")
+            # pass1_results may be partial; upsert what we have
+            self._upsert_all(pass1_results, db)
+            raise
+
+        # Assemble final pass-2 results: start from pass-1, overlay pass-2 where available
+        pass2_results: list[ParsedFile] = list(pass1_results)
+        for k, orig_idx in enumerate(pass2_indices):
+            r = p2_raw[k]
+            if r is None or isinstance(r, BaseException):
+                logger.warning(
+                    "Pass-2 failed for %s (%s) — keeping pass-1 result",
+                    pass1_results[orig_idx].path,
+                    r,
+                )
+            else:
+                pass2_results[orig_idx] = r
 
         # Load gold tables (information_schema-backed tables) before upserting
         # to suppress DDL columns for tables with production-verified schemas
@@ -314,31 +378,45 @@ class Indexer:
             return parser.parse_file(path, sql)
 
         ctx = mp.get_context("spawn")  # avoid fork-inherit pitfalls (KuzuDB connection FD etc.)
-        q: mp.Queue = ctx.Queue(maxsize=1)
+        # Unbounded queue: the child writes one large ParsedFile (192–552 KB pickled).
+        # Using maxsize=1 with proc.join()-before-q.get() deadlocks when the result
+        # exceeds the OS pipe buffer (~64 KB) — child blocks at exit waiting for the
+        # parent to drain the pipe, while the parent blocks on join() waiting for the
+        # child to exit. Fix: read from the queue FIRST (drives the pipe drain), then join.
+        q: mp.Queue = ctx.Queue()
         proc = ctx.Process(
             target=_subprocess_parse_worker,
             args=(parser.__class__, parser.DIALECT, path, sql, q),
             daemon=True,
         )
         proc.start()
-        proc.join(timeout=timeout)
 
-        if proc.is_alive():
-            # Hard kill — this is the whole point of T-09-04.
-            proc.kill()  # SIGKILL on POSIX; TerminateProcess on Windows
-            proc.join(timeout=5)
-            logger.warning("Timeout parsing %s (>%ds) — subprocess killed", path, timeout)
-            out = ParsedFile(path=path, dialect=parser.DIALECT)
-            out.errors.append(f"timeout:{timeout}s")
-            return out
-
+        # q.get() with the full timeout both bounds wall time and drains the pipe so
+        # the child can exit cleanly. proc.join() after is just cleanup.
         try:
-            result = q.get(timeout=2)  # finished — pull the pickled ParsedFile
+            result = q.get(timeout=timeout)
         except queue.Empty:
-            logger.warning("Subprocess for %s exited but produced no result", path)
             out = ParsedFile(path=path, dialect=parser.DIALECT)
-            out.errors.append("subprocess_empty_result")
+            if proc.is_alive():
+                # Hard kill — this is the whole point of T-09-04.
+                proc.kill()  # SIGKILL on POSIX; TerminateProcess on Windows
+                proc.join(timeout=5)
+                logger.warning("Timeout parsing %s (>%ds) — subprocess killed", path, timeout)
+                out.errors.append(
+                    f"timeout:{timeout}s"
+                    f" file={path.name}"
+                    f" size={len(sql)}B"
+                    f" dialect={parser.DIALECT or 'ansi'}"
+                )
+            else:
+                logger.warning("Subprocess for %s exited but produced no result", path)
+                out.errors.append("subprocess_empty_result")
             return out
+
+        proc.join(timeout=5)  # cleanup; child should have exited by now
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5)
 
         if isinstance(result, BaseException):
             # Worker raised — re-raise into the caller (matches pre-T-09-04 thread behaviour).

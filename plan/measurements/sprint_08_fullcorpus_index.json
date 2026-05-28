@@ -1,0 +1,59 @@
+{
+  "label": "full corpus (ddl + etl)",
+  "run_date": "2026-05-28T12:35:34",
+  "corpus_dir": "/home/ignwrad/Projects/dwh",
+  "dialect": "snowflake",
+  "total_files": 1340,
+  "runtime_seconds_total": 181.02,
+  "rss_delta_kb": 677344,
+  "pass2_skipped": 935,
+  "parse_errors": 3409,
+  "lineage_edges_created": 49189,
+  "tables_found": 2128,
+  "columns_defined": 9698,
+  "star_edges_expanded": 11990,
+  "batch_size": 50,
+  "anchor_omloopsnelheid": {
+    "lineage_edge_count": 8,
+    "sample_edges": [
+      {
+        "s_t": "WTDH_ARTIKEL",
+        "s_c": "\"S1_ARTIKEL\"",
+        "d_t": "tmp_berekening_segment",
+        "d_c": "OMLOOPSNELHEID",
+        "t": "SELECT"
+      },
+      {
+        "s_t": "WTFE_VERKOOPINFO",
+        "s_c": "\"MA_AANTAL\"",
+        "d_t": "tmp_berekening_segment",
+        "d_c": "OMLOOPSNELHEID",
+        "t": "SELECT"
+      },
+      {
+        "s_t": "WTFE_VERKOOPINFO",
+        "s_c": "\"MA_AANTAL\"",
+        "d_t": "tmp_berekening_bestaande_artikelen",
+        "d_c": "OMLOOPSNELHEID",
+        "t": "SELECT"
+      }
+    ]
+  },
+  "anchor_ma_aantal_op_order": {
+    "lineage_edge_count_total": 0,
+    "sample_edges": []
+  },
+  "parse_failed_queries": 3396,
+  "parse_errors_total": 3409,
+  "comparison_with_sprint_07": {
+    "parse_only_baseline_seconds": 119.6,
+    "e1_count_baseline": 1148,
+    "parse_errors_now": 3409,
+    "parse_errors_delta": 2261
+  },
+  "budget_check_1600_files": {
+    "extrapolated_seconds": 216.14,
+    "budget_seconds": 300,
+    "passes_budget": true
+  }
+}
