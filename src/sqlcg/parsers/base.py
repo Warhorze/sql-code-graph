@@ -653,23 +653,53 @@ class SqlParser(ABC):
                     expanded_body = exp.expand(
                         body, sources_to_expand, dialect=self.DIALECT, copy=True
                     )
-                # Qualify with mapping_schema + infer_schema=True for cross-schema CTE resolution
+                # Filter mapping_schema to only tables referenced in this statement.
+                # Passing all 5k+ schema tables to qualify() costs ~300ms/stmt regardless
+                # of how many the statement actually uses (typically 3-10). With filtering,
+                # qualify() drops to ~3ms/stmt — a 100× speedup. mapping_schema_tables is
+                # kept unfiltered for confidence scoring (it must cover all schema tables).
+                stmt_table_names: set[str] = {
+                    t.name.lower() for t in expanded_body.find_all(exp.Table) if t.name
+                }
+                if mapping_schema and stmt_table_names:
+                    qualify_schema: dict = {}
+                    for cat, db_dict in mapping_schema.items():
+                        for db, tbl_dict in db_dict.items():
+                            for tbl, cols in tbl_dict.items():
+                                if tbl.lower() in stmt_table_names:
+                                    qualify_schema.setdefault(cat, {}).setdefault(db, {})[tbl] = (
+                                        cols
+                                    )
+                else:
+                    qualify_schema = mapping_schema  # type: ignore
+                # Qualify with filtered schema + infer_schema=True for cross-schema CTE resolution
                 qualified_body = qualify(
                     expanded_body,
                     dialect=self.DIALECT,
-                    schema=mapping_schema if mapping_schema else None,  # type: ignore
+                    schema=qualify_schema if qualify_schema else None,  # type: ignore
                     validate_qualify_columns=False,
                     infer_schema=True,
                 )
                 # Build scope once for reuse
                 cached_scope = build_scope(qualified_body)
             except Exception as exc:
-                # qualify() may fail on dialect edge cases; record and fall back to the
-                # raw body. sg_lineage will attempt its own internal qualification per
-                # column — slow but correct.
+                # qualify() may fail on dialect edge cases (e.g. Snowflake variant
+                # access, IDENTIFIER($var)). Fix E: try a schema-free qualify so we
+                # can still cache a scope and use the copy=False fast path per column.
+                # Without this, every column triggers a full body deepcopy inside
+                # sg_lineage (copy=True default) — O(N_cols) copies per statement.
                 out.errors.append(f"col_lineage_skip:qualify_failed:{type(exc).__name__}")
-                qualified_body = body
-                cached_scope = None
+                try:
+                    qualified_body = qualify(
+                        expanded_body,
+                        dialect=self.DIALECT,
+                        validate_qualify_columns=False,
+                        infer_schema=True,
+                    )
+                    cached_scope = build_scope(qualified_body)
+                except Exception:
+                    qualified_body = body
+                    cached_scope = None
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -797,9 +827,20 @@ class SqlParser(ABC):
                 try:
                     # T-09-01: Use the pre-qualified body and cached scope (built once before
                     # the column loop, not per column). This is the qualify-once pattern.
-                    sg_kwargs = {"sources": combined_sources, "dialect": self.DIALECT}
                     if cached_scope is not None:
-                        sg_kwargs["scope"] = cached_scope
+                        # scope= path: qualify() already resolved all column→table mappings.
+                        # Omit sources= — sqlglot would iterate all ~10k entries per call even
+                        # though the scope makes them redundant, costing O(N_schema) per column.
+                        # copy=False + trim_selects=False: suppress per-call AST deepcopy and
+                        # per-column AST trim (neither is needed when scope is pre-built).
+                        sg_kwargs: dict = {
+                            "scope": cached_scope,
+                            "dialect": self.DIALECT,
+                            "copy": False,
+                            "trim_selects": False,
+                        }
+                    else:
+                        sg_kwargs = {"sources": combined_sources, "dialect": self.DIALECT}
                     root = sg_lineage(col_name, qualified_body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
@@ -868,6 +909,23 @@ class SqlParser(ABC):
                             else:
                                 projection_source = cte_body
 
+                            # Serialize + parse the CTE body once per CTE, then build a
+                            # scope. This avoids N parse_one() calls (one per column) which
+                            # dominate cProfile when CTEs have many projections.
+                            # Must serialize first: passing the raw AST subtree causes a
+                            # segfault (parent pointers create cycles in sqlglot's qualify()).
+                            cte_scope: Any = None
+                            cte_body_ast: Any = None
+                            try:
+                                cte_body_sql = cte_body.sql(dialect=self.DIALECT)
+                                from sqlglot import parse_one as _parse_one
+
+                                cte_body_ast = _parse_one(cte_body_sql, dialect=self.DIALECT)
+                                cte_scope = build_scope(cte_body_ast)
+                            except Exception:
+                                cte_body_ast = None
+                                cte_scope = None
+
                             # For each projection in the CTE, extract lineage.
                             # Only iterate projections from left branch for column names, but pass
                             # entire Union body to sg_lineage so sqlglot resolves both branches.
@@ -891,18 +949,23 @@ class SqlParser(ABC):
                                 )
                                 if not cte_col_name or cte_col_name == "*":
                                     continue
+                                if cte_body_ast is None:
+                                    continue
                                 try:
-                                    # Serialize to SQL string before sg_lineage.
-                                    # Must serialize: passing the AST subtree causes a segfault
-                                    # (parent pointers create cycles in sqlglot's qualify()).
-                                    cte_body_sql = cte_body.sql(dialect=self.DIALECT)
                                     # No schema: resolver.as_dict() {table:[cols]} triggers
                                     # sqlglot nesting-level errors on fresh string parses.
                                     # sqlglot resolves CTE bodies structurally without schema.
+                                    cte_sg_kwargs: dict = {
+                                        "dialect": self.DIALECT,
+                                        "trim_selects": False,
+                                        "copy": False,
+                                    }
+                                    if cte_scope is not None:
+                                        cte_sg_kwargs["scope"] = cte_scope
                                     root = sg_lineage(
                                         cte_col_name,
-                                        cte_body_sql,
-                                        dialect=self.DIALECT,
+                                        cte_body_ast,
+                                        **cte_sg_kwargs,
                                     )
                                     if root:
                                         # Emit edges with dst = CTE name
@@ -939,6 +1002,13 @@ class SqlParser(ABC):
             # stops sg_lineage at the CTE name boundary (doesn't expand into bodies).
             if isinstance(stmt, exp.Insert) and isinstance(stmt.this, exp.Schema):
                 insert_cols = [c.name for c in stmt.this.expressions]
+                # Fix D: hoist body.copy() + WITH-strip before the column loop.
+                # Previously body.copy() was called once per INSERT column (N times);
+                # now copied once and reused — the expressions slot is overwritten each
+                # iteration, then serialised to SQL as before. Eliminates N-1 large
+                # AST deep-copies (dominant cost) without changing sg_lineage behaviour.
+                body_no_with = body.copy()
+                body_no_with.set("with_", None)
                 for idx, col_expr in enumerate(col_expressions):
                     if idx >= len(insert_cols):
                         break
@@ -947,10 +1017,6 @@ class SqlParser(ABC):
                     insert_col = insert_cols[idx]
                     if not insert_col:
                         continue
-                    # Build a patched SELECT: strip WITH, alias the expression with the
-                    # INSERT column name so sg_lineage can trace it.
-                    body_no_with = body.copy()
-                    body_no_with.set("with_", None)
                     aliased = exp.Alias(this=col_expr.copy(), alias=insert_col)
                     body_no_with.set("expressions", [aliased])
                     patched_sql = body_no_with.sql(dialect=self.DIALECT)

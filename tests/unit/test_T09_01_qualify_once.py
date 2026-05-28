@@ -38,10 +38,11 @@ def test_T09_01_mapping_schema_returns_depth3_dict():
     result = resolver.mapping_schema()
 
     assert isinstance(result, dict), "mapping_schema() must return a dict"
-    assert "DWH_PRD" in result, "catalog key missing"
-    assert "BA" in result["DWH_PRD"], "db key missing"
-    assert "X" in result["DWH_PRD"]["BA"], "table key missing"
-    cols = result["DWH_PRD"]["BA"]["X"]
+    # add_information_schema lowercases all identifiers at load time to match sqlglot normalisation
+    assert "dwh_prd" in result, "catalog key missing"
+    assert "ba" in result["dwh_prd"], "db key missing"
+    assert "x" in result["dwh_prd"]["ba"], "table key missing"
+    cols = result["dwh_prd"]["ba"]["x"]
     assert isinstance(cols, dict), "column level must be a dict {col_name: type}"
     assert "a" in cols, "column 'a' missing"
     assert "b" in cols, "column 'b' missing"

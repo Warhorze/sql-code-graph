@@ -84,8 +84,9 @@ class AnsiParser(SqlParser):
             except Exception:
                 file_scopes.append(None)
 
-        # Compute schema sources once per file
+        # Compute schema sources and as_dict once per file (not per statement)
         schema_sources = self._schema.as_sources_dict() if self._schema else {}
+        schema_dict = self._schema.as_dict() if self._schema else {}
 
         # Initialize sources_map to accumulate temp table definitions.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
@@ -122,6 +123,7 @@ class AnsiParser(SqlParser):
                     scope=scope,
                     schema_sources=schema_sources,
                     skip_column_lineage=is_pure_ddl,
+                    schema_dict=schema_dict,
                 )
                 out.statements.append(query_node)
 
@@ -182,6 +184,7 @@ class AnsiParser(SqlParser):
         scope: Any = None,
         schema_sources: dict[str, Any] | None = None,
         skip_column_lineage: bool = False,
+        schema_dict: dict | None = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -246,7 +249,11 @@ class AnsiParser(SqlParser):
 
             extraction = LineageExtraction(edges=[], star_sources=[])
         else:
-            schema = self._schema.as_dict() if self._schema else {}
+            schema = (
+                schema_dict
+                if schema_dict is not None
+                else (self._schema.as_dict() if self._schema else {})
+            )
             extraction = self._extract_column_lineage(
                 stmt,
                 path,

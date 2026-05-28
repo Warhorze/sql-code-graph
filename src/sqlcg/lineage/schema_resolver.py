@@ -41,6 +41,7 @@ class SchemaResolver:
         self._lock = threading.Lock()
         self._cache: dict | None = None
         self._sources_cache: dict | None = None
+        self._mapping_cache: dict | None = None
 
     def add_create_table(self, ast: Any) -> None:
         """Parse a CREATE TABLE AST node and register the table schema.
@@ -80,6 +81,7 @@ class SchemaResolver:
             self._tables[(catalog, db, table_name)] = col_names
             self._cache = None
             self._sources_cache = None
+            self._mapping_cache = None
 
     def add_view_sources(self, sources: dict[str, Any]) -> None:
         """Register view-to-source-table mapping.
@@ -91,6 +93,7 @@ class SchemaResolver:
             self._view_bodies.update(sources)
             self._cache = None
             self._sources_cache = None
+            self._mapping_cache = None
 
     def register_cross_file_sources(self, sources: dict[str, Any]) -> None:
         """Register CTAS bodies harvested across pass-1 files for cross-file resolution.
@@ -105,6 +108,7 @@ class SchemaResolver:
             self._cross_file_sources = dict(sources)
             self._cache = None
             self._sources_cache = None
+            self._mapping_cache = None
 
     def cross_file_sources(self) -> dict[str, Any]:
         """Return a copy of cross-file CTAS bodies for seeding sources_map in pass 2.
@@ -157,6 +161,7 @@ class SchemaResolver:
 
                 self._cache = None
                 self._sources_cache = None
+                self._mapping_cache = None
 
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
             logger.warning("Failed to load dbt manifest %s: %s", manifest_path, exc)
@@ -242,6 +247,7 @@ class SchemaResolver:
                 self._table_catalogs[(db_name, table_name)] = catalogs[(db_name, table_name)]
             self._cache = None
             self._sources_cache = None
+            self._mapping_cache = None
 
         return len(catalogs)
 
@@ -348,6 +354,8 @@ class SchemaResolver:
             Column types are all "UNKNOWN" (type is not validated by qualify).
         """
         with self._lock:
+            if self._mapping_cache is not None:
+                return self._mapping_cache
             out: dict = {}
             for (cat, db, name), cols in self._tables.items():
                 # Skip entries without a schema
@@ -373,6 +381,7 @@ class SchemaResolver:
                 col_dict = {col: "UNKNOWN" for col in cols}
                 out[catalog][db][name] = col_dict
 
+            self._mapping_cache = out
             return out
 
     def _build_dict(self) -> dict:

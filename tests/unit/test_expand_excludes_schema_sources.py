@@ -76,12 +76,15 @@ def test_expand_excludes_schema_sources_from_expand_call():
             f"exp.expand should receive only CTAS/CTE sources {{'cte_a'}}, but got {expand_keys}"
         )
 
-        # Assert sg_lineage still receives combined_sources (both keys)
+        # When scope= is provided (qualify succeeded), sg_lineage receives no sources= —
+        # the scope already contains all column→table resolution. schema_sources must
+        # never reach exp.expand(); they may reach sg_lineage only on the qualify-failed
+        # fallback path (no scope). Assert "big_table" is absent from both paths.
         assert mock_sg_lineage.called, "sg_lineage should have been called"
         sg_call_args = mock_sg_lineage.call_args
         sg_sources_arg = sg_call_args.kwargs.get("sources", {})
         sg_keys = set(sg_sources_arg.keys())
 
-        assert sg_keys == {"cte_a", "big_table"}, (
-            f"sg_lineage should receive combined_sources with both keys, but got {sg_keys}"
+        assert "big_table" not in sg_keys, (
+            f"schema_sources key 'big_table' must not reach sg_lineage, got sources={sg_keys}"
         )

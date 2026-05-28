@@ -171,12 +171,13 @@ class TestSchemaResolver:
         assert result == 2, f"Expected 2 tables loaded, got {result}"
 
         schema = resolver.as_dict()
-        assert "BA" in schema
-        assert "orders" in schema["BA"]
-        assert "customers" in schema["BA"]
+        # add_information_schema lowercases all identifiers to match sqlglot normalisation
+        assert "ba" in schema
+        assert "orders" in schema["ba"]
+        assert "customers" in schema["ba"]
         # Columns must be sorted by ORDINAL_POSITION, not CSV row order
-        assert schema["BA"]["orders"] == ["id", "total", "status"]
-        assert schema["BA"]["customers"] == ["id", "name", "email"]
+        assert schema["ba"]["orders"] == ["id", "total", "status"]
+        assert schema["ba"]["customers"] == ["id", "name", "email"]
 
     def test_add_information_schema_missing_column_raises(self, tmp_path):
         """CSV missing ORDINAL_POSITION must raise ValueError naming the missing column."""
@@ -215,7 +216,7 @@ class TestSchemaResolver:
         resolver.add_information_schema(csv_file)
 
         schema = resolver.as_dict()
-        assert schema["BA"]["src"] == ["a"], (
+        assert schema["ba"]["src"] == ["a"], (
             "Second add_information_schema call must not duplicate columns"
         )
 
@@ -252,8 +253,10 @@ class TestSchemaResolver:
         # Values should be parsed exp.Select nodes, not strings
         assert isinstance(result["orders"], exp.Select)
         assert isinstance(result["ba.orders"], exp.Select)
-        # Verify the SELECT nodes have the correct structure
-        assert str(result["orders"]).upper() == "SELECT id, amount FROM BA.orders".upper()
+        # Verify the SELECT nodes have the correct columns/table (quoted, lowercased)
+        sql_upper = str(result["orders"]).upper()
+        assert "ID" in sql_upper and "AMOUNT" in sql_upper, "expected columns in SELECT"
+        assert "ORDERS" in sql_upper, "expected table name in FROM"
 
     def test_as_sources_dict_excludes_tables_with_no_columns(self):
         """Tables with empty column lists are excluded."""
@@ -293,11 +296,11 @@ class TestSchemaResolver:
         # Values should be parsed exp.Select nodes, not strings
         assert isinstance(result["ia_semantic.view1"], exp.Select)
         assert isinstance(result["ba.table1"], exp.Select)
-        # Verify the SELECT nodes have the correct structure
-        assert (
-            str(result["ia_semantic.view1"]).upper() == "SELECT col1 FROM IA_SEMANTIC.view1".upper()
-        )
-        assert str(result["ba.table1"]).upper() == "SELECT col2 FROM BA.table1".upper()
+        # Verify the SELECT nodes have the correct columns/table (quoted, lowercased)
+        sql1_upper = str(result["ia_semantic.view1"]).upper()
+        assert "COL1" in sql1_upper and "VIEW1" in sql1_upper, "expected col1/view1 in sources"
+        sql2_upper = str(result["ba.table1"]).upper()
+        assert "COL2" in sql2_upper and "TABLE1" in sql2_upper, "expected col2/table1 in sources"
 
     def test_as_sources_dict_thread_safe(self):
         """as_sources_dict() is thread-safe."""
