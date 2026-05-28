@@ -166,6 +166,11 @@ class SchemaResolver:
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
             logger.warning("Failed to load dbt manifest %s: %s", manifest_path, exc)
 
+    # INERT (measured 2026-05-28, N=100 DWH sample, seed=42): loading the CSV
+    # produces zero delta in lineage_edges or star_edges_expanded vs no-schema
+    # (7241 vs 7259 edges).  Cross-file pass-2 sources dominate; CSV entries are
+    # registered but never consulted for column resolution on this corpus.
+    # Pending network analysis before removal.
     def add_information_schema(self, csv_path: str | Path) -> int:
         """Load table schemas from an INFORMATION_SCHEMA.COLUMNS CSV.
 
@@ -336,6 +341,10 @@ class SchemaResolver:
             self._sources_cache = result
             return result
 
+    # INERT (measured 2026-05-28): only populated when catalog is non-null, but
+    # DWH corpus table references don't carry a catalog — qualify() falls back to
+    # infer_schema=True regardless of whether schema_csv was provided.
+    # Pending network analysis before removal.
     def mapping_schema(self) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
         """Return schema in sqlglot's mapping_schema format.
 

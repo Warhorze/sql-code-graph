@@ -135,12 +135,24 @@ class Indexer:
 
         p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
 
+        p1_done = 0
+
+        def _p1_on_result() -> None:
+            nonlocal p1_done
+            p1_done += 1
+            if progress_callback is not None:
+                progress_callback(p1_done, total_files)
+
         try:
             with HardKillPool(
                 dialect, schema_csv_str, n_workers, schema_aliases=schema_aliases
             ) as pool:
                 # Pass 1: parse all files in parallel
-                p1_raw = pool.map(p1_tasks, per_task_timeout=p1_timeout)
+                p1_raw = pool.map(
+                    p1_tasks,
+                    per_task_timeout=p1_timeout,
+                    on_result=_p1_on_result,
+                )
 
                 # Register pass-1 results with the aggregator
                 for i, (file_path, _sql) in enumerate(file_sqls):
@@ -154,9 +166,6 @@ class Indexer:
                         parse_errors += len(parsed.errors)
                     aggregator.register_pass1(parsed)
                     pass1_results.append(parsed)
-
-                    if progress_callback is not None:
-                        progress_callback(i + 1, total_files)
 
                 # Optional: load dbt manifest into a transient resolver so that
                 # cross-file sources can reference dbt-managed tables.
@@ -233,6 +242,13 @@ class Indexer:
         )
         gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
 
+        # Build duplicate-DDL registry from in-memory results so _upsert_parsed_file
+        # can detect conflicts with a dict lookup instead of a per-table graph read.
+        defined_table_registry: dict[str, str] = {}
+        for pf in pass2_results:
+            for table in pf.defined_tables:
+                defined_table_registry.setdefault(table.full_id, pf.path_str)
+
         # Upsert all results and count quality distribution using batched transactions
         nonlocal_counts: dict = {
             "tables": 0,
@@ -259,7 +275,10 @@ class Indexer:
                 for parsed_in_batch in batch:
                     try:
                         counts = self._upsert_parsed_file(
-                            parsed_in_batch, db, gold_tables=gold_tables
+                            parsed_in_batch,
+                            db,
+                            gold_tables=gold_tables,
+                            defined_table_registry=defined_table_registry,
                         )
                         nonlocal_counts["tables"] += counts["tables"]
                         nonlocal_counts["edges"] += counts["edges"]
@@ -440,6 +459,7 @@ class Indexer:
         parsed: ParsedFile,
         db: GraphBackend,
         gold_tables: frozenset[str] = frozenset(),
+        defined_table_registry: dict[str, str] | None = None,
     ) -> dict:
         """Map ParsedFile → graph nodes/edges using bulk upsert.
 
@@ -474,22 +494,20 @@ class Indexer:
         # Defined tables
         for table in parsed.defined_tables:
             # Guard: detect duplicate DDL for the same table across files
-            existing = db.run_read(
-                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
-                {"qid": table.full_id},
-            )
-            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
+            if defined_table_registry is not None:
+                first_file = defined_table_registry.get(table.full_id)
+            else:
+                first_file = None
+            if first_file and first_file != parsed.path_str:
                 logger.warning(
                     "Table %s already defined in %s — %s will add columns to the union; "
                     "star expansion may include columns from the earlier DDL file",
                     table.full_id,
-                    existing[0]["f"],
+                    first_file,
                     parsed.path_str,
                 )
                 if hasattr(parsed, "errors"):
-                    parsed.errors.append(
-                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
-                    )
+                    parsed.errors.append(f"duplicate_ddl:{table.full_id}:already_in:{first_file}")
 
             table_rows.append(
                 {

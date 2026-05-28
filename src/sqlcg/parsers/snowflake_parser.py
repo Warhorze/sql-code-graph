@@ -78,7 +78,7 @@ class SnowflakeParser(AnsiParser):
 
         # Check for scripting blocks
         if self._has_scripting_block(sql):
-            logger.info("Snowflake scripting block detected in %s, using DML extraction", path)
+            logger.debug("Snowflake scripting block detected in %s, using DML extraction", path)
             return self._parse_scripting_file(path, sql)
 
         # Otherwise use standard ANSI parsing with Snowflake dialect
@@ -299,7 +299,7 @@ class SnowflakeParser(AnsiParser):
                         out.referenced_tables.extend(query_node.sources)
 
                     except Exception as exc:
-                        logger.warning(
+                        logger.debug(
                             "Failed to process extracted DML statement %d in %s: %s",
                             stmt_index,
                             path,
@@ -309,7 +309,7 @@ class SnowflakeParser(AnsiParser):
                         stmt_index += 1
 
             except Exception as exc:
-                logger.warning("Failed to parse extracted DML from %s: %s", path, exc)
+                logger.debug("Failed to parse extracted DML from %s: %s", path, exc)
                 out.errors.append(f"dml_extraction_error:{exc}")
 
         return out

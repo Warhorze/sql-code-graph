@@ -14,6 +14,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.connection import wait as _mp_wait
@@ -53,9 +54,15 @@ def _worker_main(
     ParsedFile results back.  Never raises — exceptions are caught and
     forwarded as exception objects so the coordinator can handle them.
     """
+    import logging
     import signal
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # Workers inherit the parent's stderr but are not connected to the Rich
+    # live display — suppress all output by default.
+    logging.getLogger("sqlcg").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlglot").setLevel(logging.CRITICAL)
 
     from sqlcg.lineage.schema_resolver import SchemaResolver
     from sqlcg.parsers.registry import get_parser
@@ -250,6 +257,7 @@ class HardKillPool:
         tasks: list[dict],
         per_task_timeout: float,
         poison_retries: int = 2,
+        on_result: Callable[[], None] | None = None,
     ) -> list[ParsedFile | None]:
         """Dispatch all tasks; return results in the same order as *tasks*.
 
@@ -278,6 +286,8 @@ class HardKillPool:
                 if kill_counts.get(path, 0) >= poison_retries:
                     results[tidx] = _timeout_file(path, self._dialect, poison=True)
                     logger.warning("Skipping %s — poisoned after %d kills", path, poison_retries)
+                    if on_result is not None:
+                        on_result()
                     continue
                 return tidx
             return None
@@ -343,6 +353,8 @@ class HardKillPool:
                     kill_counts[path],
                 )
                 results[tidx] = _timeout_file(path, self._dialect)
+                if on_result is not None:
+                    on_result()
                 self._respawn(w)
                 busy.discard(slot)
                 _assign(slot)
@@ -387,6 +399,8 @@ class HardKillPool:
                     results[tidx] = result
                     kill_counts.pop(path, None)  # success resets consecutive kills
 
+                if on_result is not None:
+                    on_result()
                 w.busy = False
                 busy.discard(slot)
                 _assign(slot)

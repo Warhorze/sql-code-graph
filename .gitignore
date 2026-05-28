@@ -61,6 +61,7 @@ build/
 
 # Local-only e2e tests that reference private corpora — never commit
 tests/e2e/test_dwh_e2e.py
+tests/e2e/test_dwh_schema_e2e.py
 .claude/progress.txt
 columns.csv
 results_*.json

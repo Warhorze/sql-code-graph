@@ -18,9 +18,9 @@ class TestTraceColumnLineageHint:
 
     def test_empty_result_has_hint(self):
         """Test that empty lineage result has a hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock empty lineage results
             mock_db.run_read.side_effect = [
@@ -36,9 +36,9 @@ class TestTraceColumnLineageHint:
 
     def test_non_empty_result_no_hint(self):
         """Test that non-empty lineage result has no hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock non-empty results
             mock_db.run_read.side_effect = [
@@ -58,9 +58,9 @@ class TestFindTableUsagesHint:
 
     def test_empty_result_has_hint(self):
         """Test that empty usages result has a hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock empty usages results
             mock_db.run_read.side_effect = [
@@ -76,9 +76,9 @@ class TestFindTableUsagesHint:
 
     def test_non_empty_result_no_hint(self):
         """Test that non-empty usages result has no hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock non-empty usages
             mock_db.run_read.side_effect = [
@@ -97,9 +97,9 @@ class TestGetDownstreamDependenciesHint:
 
     def test_empty_result_has_hint(self):
         """Test that empty downstream dependencies result has a hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock empty downstream results
             mock_db.run_read.side_effect = [
@@ -119,9 +119,9 @@ class TestGetUpstreamDependenciesHint:
 
     def test_empty_result_has_hint(self):
         """Test that empty upstream dependencies result has a hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock empty upstream results
             mock_db.run_read.side_effect = [
@@ -141,9 +141,9 @@ class TestSearchSqlPatternHint:
 
     def test_empty_result_has_hint(self):
         """Test that empty pattern search result has a hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock empty pattern search results
             mock_db.run_read.side_effect = [
@@ -159,9 +159,9 @@ class TestSearchSqlPatternHint:
 
     def test_non_empty_result_no_hint(self):
         """Test that non-empty pattern search result has no hint."""
-        with patch("sqlcg.server.tools._get_backend") as mock_get_backend:
+        with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
-            mock_get_backend.return_value = mock_db
+            mock_get_backend.return_value.__enter__.return_value = mock_db
 
             # Mock non-empty pattern search
             mock_db.run_read.side_effect = [

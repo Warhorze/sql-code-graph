@@ -52,19 +52,20 @@ def _find_lock_holder(db_path: str) -> str:
 class KuzuBackend(GraphBackend):
     """KùzuDB implementation of the graph database backend."""
 
-    def __init__(self, db_path: str, buffer_pool_size_mb: int = 0):
+    def __init__(self, db_path: str, buffer_pool_size_mb: int = 0, read_only: bool = False):
         """Initialize KùzuDB backend.
 
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
             buffer_pool_size_mb: Buffer pool size in MB (0 = use KuzuDB default)
+            read_only: Open in read-only mode (allows concurrent indexing)
 
         Raises:
             RuntimeError: If the database is locked or cannot be opened.
         """
         self._db_path = db_path
         try:
-            kwargs = {}
+            kwargs: dict = {"read_only": read_only}
             if buffer_pool_size_mb > 0:
                 kwargs["buffer_pool_size"] = buffer_pool_size_mb * 1024 * 1024
             self._db = kuzu.database.Database(db_path, **kwargs)
@@ -394,11 +395,16 @@ class KuzuBackend(GraphBackend):
             yield self
             self._conn.execute("COMMIT")
             self._in_transaction = False
-        except Exception:
+        except Exception as exc:
+            self._in_transaction = False
+            if "No active transaction" in str(exc):
+                # KuzuDB killed the transaction internally (e.g. KU_UNREACHABLE assertion
+                # during a bulk write). Individual failures were already logged; the batch
+                # is lost but the indexer can continue.
+                logger.warning("Transaction invalidated by KuzuDB — batch not committed")
+                return
             try:
                 self._conn.execute("ROLLBACK")
-                self._in_transaction = False
             except Exception as rollback_err:
-                logger.error(f"Rollback failed: {rollback_err}")
-                self._in_transaction = False  # defensive reset
+                logger.debug("Rollback skipped: %s", rollback_err)
             raise

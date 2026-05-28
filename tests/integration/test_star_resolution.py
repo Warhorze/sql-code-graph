@@ -375,8 +375,14 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     captured_errors: list[list[str]] = []
     original_upsert = Indexer._upsert_parsed_file
 
-    def recording_upsert(self, parsed, db, gold_tables=frozenset()):
-        result = original_upsert(self, parsed, db, gold_tables=gold_tables)
+    def recording_upsert(self, parsed, db, gold_tables=frozenset(), defined_table_registry=None):
+        result = original_upsert(
+            self,
+            parsed,
+            db,
+            gold_tables=gold_tables,
+            defined_table_registry=defined_table_registry,
+        )
         captured_errors.append(list(parsed.errors))
         return result
 

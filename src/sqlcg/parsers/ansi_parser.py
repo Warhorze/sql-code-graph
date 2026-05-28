@@ -64,7 +64,7 @@ class AnsiParser(SqlParser):
         statements, parse_errors = self._do_parse(sql)
         out.errors.extend(parse_errors)
         if not statements:
-            logger.warning("Failed to parse file %s", path)
+            logger.debug("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
             return out
 
@@ -242,9 +242,7 @@ class AnsiParser(SqlParser):
                 ]
                 parse_failed = True
         except Exception as exc:
-            logger.warning(
-                "Failed to build scope for statement %d in %s: %s", stmt_index, path, exc
-            )
+            logger.debug("Failed to build scope for statement %d in %s: %s", stmt_index, path, exc)
             sources = [
                 r
                 for s in self._fallback_table_scan(stmt)

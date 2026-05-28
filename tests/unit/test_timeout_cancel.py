@@ -59,7 +59,9 @@ def test_T03_slow_parser_returns_within_timeout(tmp_path):
         "expected hard kill within 2s (1s timeout + 5s join + overhead). "
         "Expected < 2.0s."
     )
-    assert result.errors == ["timeout:1s"], f"Expected errors=['timeout:1s'], got {result.errors}"
+    assert len(result.errors) == 1 and result.errors[0].startswith("timeout:1s"), (
+        f"Expected errors starting with 'timeout:1s', got {result.errors}"
+    )
 
 
 # ---------------------------------------------------------------------------

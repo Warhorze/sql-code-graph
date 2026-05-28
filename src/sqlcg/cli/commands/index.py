@@ -59,8 +59,21 @@ def index_cmd(  # noqa: B008
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary console output"
     ),
+    debug: bool = typer.Option(  # noqa: B008
+        False, "--debug", help="Show detailed log output during indexing"
+    ),
 ) -> None:
-    """Index SQL files in a directory."""
+    """Index SQL files in a directory.
+
+    Schema aliases (staging schema → canonical schema) can be configured in
+    .sqlcg.toml under sqlcg.schema_aliases, e.g. da_tmp = "da".
+    """
+
+    import logging
+
+    level = logging.DEBUG if debug else logging.CRITICAL
+    logging.getLogger("sqlcg").setLevel(level)
+    logging.getLogger("sqlglot").setLevel(level)
 
     # Set buffer pool size via env var if specified
     if buffer_pool_size > 0:
@@ -123,12 +136,6 @@ def index_cmd(  # noqa: B008
         # Index the repository
         indexer = Indexer()
 
-        from sqlcg.indexer.walker import walk_sql_files
-        from sqlcg.utils.ignore import load_ignore_spec
-
-        spec = load_ignore_spec(path)
-        total_files = len(list(walk_sql_files(path, spec, use_git=True)))
-
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -136,11 +143,12 @@ def index_cmd(  # noqa: B008
             MofNCompleteColumn(),
             TimeRemainingColumn(),
             console=console,
+            redirect_stderr=True,
         ) as progress:
-            task = progress.add_task("Parsing", total=total_files)
+            task = progress.add_task("Parsing", total=None)
 
             def _progress_callback(n: int, total_n: int) -> None:
-                progress.update(task, completed=n)
+                progress.update(task, completed=n, total=total_n)
 
             summary = indexer.index_repo(
                 path,
@@ -153,7 +161,6 @@ def index_cmd(  # noqa: B008
                 no_ddl=no_ddl,
                 batch_size=batch_size,
             )
-            progress.update(task, completed=total_files)
 
         # Connect files to repo
         from sqlcg.core.schema import RelType
@@ -172,11 +179,32 @@ def index_cmd(  # noqa: B008
 
         # Print summary unless --quiet is specified
         if not quiet:
+            quality = summary.get("quality", {})
+            err = summary.get("error_summary", {})
+            n_full = quality.get("full", 0)
+            n_partial = quality.get("table_only", 0)
+            n_ddl = quality.get("scripting_fallback", 0)
+            n_failed = quality.get("failed", 0)
+            n_timeout = err.get("timeout", 0)
+
+            quality_parts = []
+            if n_full:
+                quality_parts.append(f"[green]{n_full} with column lineage[/green]")
+            if n_partial:
+                quality_parts.append(f"[yellow]{n_partial} table-only[/yellow]")
+            if n_ddl:
+                quality_parts.append(f"{n_ddl} DDL-only")
+            if n_timeout:
+                quality_parts.append(f"[red]{n_timeout} timed out[/red]")
+            if n_failed:
+                quality_parts.append(f"[red]{n_failed} failed[/red]")
+
             console.print(
                 f"[green]Indexed[/green] {summary['files_parsed']} files — "
-                f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
-                f"{summary['parse_errors']} errors"
+                f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges"
             )
+            if quality_parts:
+                console.print("  " + " · ".join(quality_parts))
             if summary.get("lineage_edges_created", 0) == 0:
                 console.print(
                     "[yellow]Warning: 0 lineage edges extracted — column lineage "
