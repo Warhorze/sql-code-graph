@@ -5,6 +5,14 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from sqlcg.core.config import get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
@@ -21,7 +29,7 @@ def index_cmd(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        30, "--timeout-per-file", help="Timeout per file in seconds"
+        5, "--timeout-per-file", help="Timeout per file in seconds"
     ),
     buffer_pool_size: int = typer.Option(  # noqa: B008
         0,
@@ -115,39 +123,37 @@ def index_cmd(  # noqa: B008
         # Index the repository
         indexer = Indexer()
 
-        # Determine total files for progress callback
         from sqlcg.indexer.walker import walk_sql_files
         from sqlcg.utils.ignore import load_ignore_spec
 
         spec = load_ignore_spec(path)
-        files = list(walk_sql_files(path, spec, use_git=True))
-        total_files = len(files)
+        total_files = len(list(walk_sql_files(path, spec, use_git=True)))
 
-        # Define progress callback
-        def _make_progress_callback(total: int):
-            """Create a progress callback that prints progress every 100 files.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Parsing", total=total_files)
 
-            The callback is only invoked every 100 files, so with fewer than 100 files
-            in the repository, no progress line is printed.
-            """
+            def _progress_callback(n: int, total_n: int) -> None:
+                progress.update(task, completed=n)
 
-            def callback(n: int, total_n: int) -> None:
-                console.print(f"\r  Indexed {n}/{total_n} files...", end="", highlight=False)
-
-            return callback
-
-        summary = indexer.index_repo(
-            path,
-            dialect,
-            backend,
-            dbt_manifest,
-            timeout_per_file,
-            progress_callback=_make_progress_callback(total_files),
-            schema_csv=None,
-            no_ddl=no_ddl,
-            batch_size=batch_size,
-        )
-        console.print()  # newline after carriage return progress line
+            summary = indexer.index_repo(
+                path,
+                dialect,
+                backend,
+                dbt_manifest,
+                timeout_per_file,
+                progress_callback=_progress_callback,
+                schema_csv=None,
+                no_ddl=no_ddl,
+                batch_size=batch_size,
+            )
+            progress.update(task, completed=total_files)
 
         # Connect files to repo
         from sqlcg.core.schema import RelType

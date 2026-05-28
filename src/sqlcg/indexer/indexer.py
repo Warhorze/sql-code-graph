@@ -155,7 +155,7 @@ class Indexer:
                     aggregator.register_pass1(parsed)
                     pass1_results.append(parsed)
 
-                    if progress_callback is not None and (i + 1) % 100 == 0:
+                    if progress_callback is not None:
                         progress_callback(i + 1, total_files)
 
                 # Optional: load dbt manifest into a transient resolver so that

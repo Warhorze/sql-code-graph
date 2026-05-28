@@ -15,22 +15,17 @@ runner = CliRunner()
 class TestProgressCallbackUnit:
     """Unit tests for progress callback invocation."""
 
-    def test_callback_invoked_at_100_file_boundary(self, tmp_path: Path):
-        """Guard: progress callback is invoked every 100 files during indexing."""
-        # Create 105 minimal SQL files
-        sql_files = []
-        for i in range(105):
-            sql_file = tmp_path / f"file_{i:03d}.sql"
-            sql_file.write_text("SELECT 1;")
-            sql_files.append(sql_file)
+    def test_callback_invoked_for_every_file(self, tmp_path: Path):
+        """Guard: progress callback is invoked once per file during indexing."""
+        n_files = 15
+        for i in range(n_files):
+            (tmp_path / f"file_{i:02d}.sql").write_text("SELECT 1;")
 
-        # Track callback invocations
         calls = []
 
         def track_callback(n: int, total: int) -> None:
             calls.append((n, total))
 
-        # Index the files
         backend = KuzuBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
@@ -41,28 +36,26 @@ class TestProgressCallbackUnit:
             progress_callback=track_callback,
         )
 
-        # Verify callback was called at 100-file boundary
-        assert any(n == 100 for n, t in calls), (
-            f"Progress callback must be invoked at 100-file boundary. Calls: {calls}"
+        assert len(calls) == n_files, (
+            f"Expected {n_files} callback calls (one per file), got {len(calls)}: {calls}"
         )
-        assert all(t == 105 for n, t in calls), (
-            f"Total argument must be 105 in all calls. Calls: {calls}"
+        assert calls[-1] == (n_files, n_files), (
+            f"Last call must be ({n_files}, {n_files}), got {calls[-1]}"
+        )
+        assert all(t == n_files for _, t in calls), (
+            f"Total argument must be {n_files} in all calls. Calls: {calls}"
         )
 
-    def test_no_callback_invocation_below_100_files(self, tmp_path: Path):
-        """Guard: progress callback is not invoked when less than 100 files exist."""
-        # Create 50 minimal SQL files
-        for i in range(50):
-            sql_file = tmp_path / f"file_{i:02d}.sql"
-            sql_file.write_text("SELECT 1;")
+    def test_callback_invoked_for_small_repos(self, tmp_path: Path):
+        """Guard: progress callback fires even with fewer than 100 files."""
+        for i in range(5):
+            (tmp_path / f"file_{i}.sql").write_text("SELECT 1;")
 
-        # Track callback invocations
         calls = []
 
         def track_callback(n: int, total: int) -> None:
             calls.append((n, total))
 
-        # Index the files
         backend = KuzuBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
@@ -73,9 +66,8 @@ class TestProgressCallbackUnit:
             progress_callback=track_callback,
         )
 
-        # Verify callback was never called (below 100 files)
-        assert len(calls) == 0, (
-            f"Progress callback must not be invoked for < 100 files. Got {len(calls)} calls."
+        assert len(calls) == 5, (
+            f"Expected 5 callback calls for a 5-file repo, got {len(calls)}: {calls}"
         )
 
 
