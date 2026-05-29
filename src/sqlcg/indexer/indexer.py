@@ -343,6 +343,24 @@ class Indexer:
         if profile:
             _t_star_end = time.perf_counter()
 
+        # Persist the HEAD SHA so `sqlcg reindex` (no SHAs) can compute the delta.
+        # Silent on failure — non-git repos still index cleanly.
+        try:
+            import subprocess as _sp
+
+            _sha_result = _sp.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(path),
+                capture_output=True,
+                text=True,
+            )
+            if _sha_result.returncode == 0:
+                _head_sha = _sha_result.stdout.strip()
+                if _head_sha:
+                    db.set_indexed_sha(_head_sha)
+        except Exception as _sha_exc:
+            logger.debug("Could not write indexed_sha: %s", _sha_exc)
+
         # Classify all errors into buckets for measurement and reporting
         error_summary: dict[str, int] = {
             "E1": 0,

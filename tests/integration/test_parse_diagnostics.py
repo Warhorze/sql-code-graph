@@ -107,11 +107,11 @@ def test_parse_cause_column_queryable_after_init(fresh_db):
     assert isinstance(rows, list)
 
 
-def test_schema_version_is_three():
-    """SCHEMA_VERSION constant must equal '3' after this PR."""
+def test_schema_version_is_four():
+    """SCHEMA_VERSION constant must equal '4' after the living-codebase-resync PR."""
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "3", f"Expected SCHEMA_VERSION='3', got {SCHEMA_VERSION!r}"
+    assert SCHEMA_VERSION == "4", f"Expected SCHEMA_VERSION='4', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------

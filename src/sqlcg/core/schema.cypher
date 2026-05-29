@@ -111,5 +111,6 @@ CREATE REL TABLE STAR_SOURCE (
 
 -- Schema version tracking
 CREATE NODE TABLE SchemaVersion (
-    version STRING PRIMARY KEY
+    version STRING PRIMARY KEY,
+    indexed_sha STRING
 );

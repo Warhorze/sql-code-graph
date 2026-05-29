@@ -365,6 +365,38 @@ class KuzuBackend(GraphBackend):
             logger.warning(f"Failed to read schema version: {e}")
             return None
 
+    def set_indexed_sha(self, sha: str) -> None:
+        """Persist the git SHA of the last successful index.
+
+        Uses MERGE so the call is safe whether the SchemaVersion node already
+        exists or not.  Mirrors the init_schema MERGE pattern.
+
+        Args:
+            sha: Git commit SHA string.
+        """
+        try:
+            self._conn.execute(
+                "MERGE (v:SchemaVersion {version: $version}) SET v.indexed_sha = $sha",
+                {"version": SCHEMA_VERSION, "sha": sha},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write indexed_sha: {e}")
+
+    def get_indexed_sha(self) -> str | None:
+        """Retrieve the git SHA of the last successful index.
+
+        Returns:
+            The stored SHA string, or None if never set.
+        """
+        try:
+            result = self.run_read(
+                "MATCH (v:SchemaVersion) RETURN v.indexed_sha AS sha LIMIT 1", {}
+            )
+            return result[0]["sha"] if result else None
+        except Exception as e:
+            logger.warning(f"Failed to read indexed_sha: {e}")
+            return None
+
     def close(self) -> None:
         """Close the database connection."""
         try:

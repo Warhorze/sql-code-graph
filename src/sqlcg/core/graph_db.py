@@ -159,6 +159,25 @@ class GraphBackend(ABC):
         """
 
     @abstractmethod
+    def set_indexed_sha(self, sha: str) -> None:
+        """Persist the git SHA of the last successful index.
+
+        Written by index_repo on success and by resync_changed on success.
+
+        Args:
+            sha: Git commit SHA string (e.g. from git rev-parse HEAD).
+        """
+
+    @abstractmethod
+    def get_indexed_sha(self) -> str | None:
+        """Retrieve the git SHA of the last successful index.
+
+        Returns:
+            The stored SHA string, or None if never set (repo pre-dates this
+            feature, or the DB was freshly initialised).
+        """
+
+    @abstractmethod
     def close(self) -> None:
         """Close the database connection."""
 
