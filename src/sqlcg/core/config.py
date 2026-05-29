@@ -156,6 +156,40 @@ def get_noise_filter_patterns(path: Path) -> list[str]:
     return default_patterns
 
 
+def get_ignored_tables(path: Path) -> list[str]:
+    """Get explicitly-ignored qualified table names from .sqlcg.toml.
+
+    Complements ``get_noise_filter_patterns`` (glob patterns) with an exact
+    qualified-name list, for specific tables that do not follow a backup naming
+    convention but should still be dropped from tool answers — e.g. a
+    load-control / delta-bookkeeping table::
+
+        [sqlcg.noise_filter]
+        ignored_tables = ["ma.rtetl_delta", "ctl.load_log"]
+
+    Names are matched exactly (case-insensitive) against ``schema.table``. The
+    lineage engine still records these as real edges; this only lets a user
+    declare them noise in config rather than baking the judgment into code.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of qualified table names (all lowercased). Defaults to an empty list.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("noise_filter", {}).get("ignored_tables")
+            if isinstance(raw, list):
+                return [t.lower() for t in raw if isinstance(t, str)]
+        except Exception:
+            pass
+    return []
+
+
 def get_backend() -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 

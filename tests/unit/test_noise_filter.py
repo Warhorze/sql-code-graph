@@ -149,6 +149,81 @@ staging_schema = "prod_schema"
         assert "*_backup" in filter.patterns
 
 
+class TestNoiseFilterIgnoredTables:
+    """Scenario E — explicit ignored_tables exact-name match (control/delta tables)."""
+
+    def test_ignored_table_exact_match(self) -> None:
+        """A qualified name in ignored_tables is noise even without a glob match."""
+        filter = NoiseFilter(
+            patterns=["*_bck"],
+            schema_aliases={},
+            ignored_tables=["ma.rtetl_delta"],
+        )
+        assert filter.is_noise("ma.rtetl_delta") is True
+        # A non-listed table that matches no glob stays clean.
+        assert filter.is_noise("ba.wtfe_verkoopinfo") is False
+
+    def test_ignored_table_case_insensitive(self) -> None:
+        """ignored_tables matching is case-insensitive."""
+        filter = NoiseFilter(
+            patterns=[],
+            schema_aliases={},
+            ignored_tables=["ma.rtetl_delta"],
+        )
+        assert filter.is_noise("MA.RTETL_DELTA") is True
+
+    def test_ignored_table_partial_name_not_matched(self) -> None:
+        """ignored_tables is exact-match, not substring/prefix."""
+        filter = NoiseFilter(
+            patterns=[],
+            schema_aliases={},
+            ignored_tables=["ma.rtetl_delta"],
+        )
+        assert filter.is_noise("ma.rtetl_delta_history") is False
+
+    def test_filter_nodes_drops_ignored_table(self) -> None:
+        """filter_nodes routes an ignored table into excluded."""
+        filter = NoiseFilter(
+            patterns=["*_bck"],
+            schema_aliases={},
+            ignored_tables=["ma.rtetl_delta"],
+        )
+        kept, excluded = filter.filter_nodes(["ba.mart", "ma.rtetl_delta", "ba.mart_bck"])
+        assert kept == ["ba.mart"]
+        assert "ma.rtetl_delta" in excluded
+        assert "ba.mart_bck" in excluded
+
+    def test_get_ignored_tables_default_empty(self) -> None:
+        """get_ignored_tables defaults to [] when config is absent."""
+        from sqlcg.core.config import get_ignored_tables
+
+        assert get_ignored_tables(Path("/nonexistent")) == []
+
+    def test_get_ignored_tables_from_toml(self, tmp_path: Path) -> None:
+        """get_ignored_tables reads and lowercases the configured list."""
+        from sqlcg.core.config import get_ignored_tables
+
+        (tmp_path / ".sqlcg.toml").write_text(
+            """
+[sqlcg.noise_filter]
+ignored_tables = ["MA.RTETL_DELTA", "ctl.Load_Log"]
+"""
+        )
+        result = get_ignored_tables(tmp_path)
+        assert result == ["ma.rtetl_delta", "ctl.load_log"]
+
+    def test_from_config_loads_ignored_tables(self, tmp_path: Path) -> None:
+        """from_config wires ignored_tables into the NoiseFilter."""
+        (tmp_path / ".sqlcg.toml").write_text(
+            """
+[sqlcg.noise_filter]
+ignored_tables = ["ma.rtetl_delta"]
+"""
+        )
+        filter = NoiseFilter.from_config(repo_root=tmp_path)
+        assert filter.is_noise("ma.rtetl_delta") is True
+
+
 class TestNoiseFilterIntegration:
     """Integration tests combining multiple features."""
 
