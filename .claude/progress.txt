@@ -1,11 +1,134 @@
 ## Current State
 
-agent: plan-reviewer
-plan: plan/fix_dynamic_table_parsing.md
-feature: fix-dynamic-table-parsing
-date: 2026-05-12
-status: REVIEWED — READY FOR IMPLEMENTATION (corrections applied, failing tests committed)
+CURRENT FEATURE: F1 — living-codebase resync (architect-planner: plan written, now IDLE for plan-reviewer + dev Q&A)
+  plan: plan/living_codebase_resync.md
+  source draft: plan/v1_living_codebase_and_skill.md (F1 section)
+  user decisions: PR #21 (trust-layer) = HOLD, do not merge yet; F1 chosen over F2 to go first.
+last completed: trust-layer
+plan: plan/trust_layer.md
+feature: trust-layer (facts-vs-heuristics MCP payloads + analysis answer-anchors)
+date: 2026-05-29
+status: COMPLETE — full pipeline green (planner→plan-reviewer→developer→compliance).
+  COMPLIANT-WITH-NOTES (PASS), ready to MERGE. PR #21: https://github.com/Warhorze/sql-code-graph/pull/21
+  commits: 943a1da (feat) + 95670ab (test) + 5c77f20 (plan: deviation D1 + compliance).
+  678 passed / 0 failed; pyright clean; ruff clean; 4 perf invariants intact.
+  NOT YET MERGED — merge is the user's call.
 
+## v1 Backlog (NOT started — do NOT begin until trust-layer ships; one feature at a time)
+
+draft plan: plan/v1_living_codebase_and_skill.md  (DRAFT — has NOT passed architect-planner)
+  F1: living-codebase resync — make branch-change resync INCREMENTAL (today it full-reindexes
+      via post-checkout hook + BranchMonitor → the "files flooding in" problem). Per-file watch
+      path already incremental (2s debounce) — keep it. Add post-merge/(post-commit) hooks.
+      Central risk: cross-file pass-2 affected-closure recompute.
+  F2: bundle a Claude skill in install — teach LLM how to use the MCP tools (encode the
+      trust-layer fact/heuristic boundary). Install LOCATION = user choice (locked).
+  next action: run architect-planner on the draft (likely 1 file per feature) before any code.
+
+Handoff — architect-planner (2026-05-29) — F1 living-codebase resync:
+  plan: plan/living_codebase_resync.md (NEW, committed)
+  summary: Replace the TWO full-reindex branch triggers (post-checkout hook +
+    BranchMonitor) with ONE git-diff incremental entry point Indexer.resync_changed(
+    root, old, new, db, dialect). Per-file watch path (2s debounce) stays UNCHANGED.
+  central correctness (make-or-break): cross-file pass-2 is non-local — editing an
+    upstream CTAS changes dependents' lineage. resync re-resolves the AFFECTED
+    CLOSURE = files that SELECTS_FROM tables defined in changed/deleted files, walked
+    transitively to max_closure_depth=3 via new DEPENDENT_FILES_OF_TABLES query; if
+    frontier still growing at cap → fall back to full index_repo (never silently wrong).
+    Deletes: capture deleted file's tables BEFORE delete_nodes_for_file, then re-resolve
+    its dependents. CTAS bodies re-harvested from definer files (pass-1) because stored
+    q.sql is truncated to 500 chars (lossy).
+  four scope decisions RESOLVED:
+    (a) closure = transitive dependents to depth 3 + full-index fallback; deletes
+        captured pre-delete. (b) standalone `sqlcg reindex` needs metadata: add
+        indexed_sha to SchemaVersion node, BUMP SCHEMA_VERSION 3->4 (re-index migration,
+        no backcompat); no per-file content hashes (git diff is the delta). (c) post-commit
+        OUT (only post-checkout + post-merge). (d) staleness FACT = fast-follow, this PR
+        only persists the prerequisite indexed_sha.
+  grounding-verified: File.sha exists in DDL but UNUSED; SchemaVersion is a singleton
+    written in init_schema (kuzu_backend.py:130); reindex_file only re-resolves VIEW
+    dependents (STALE_VIEWS, DECLARES->VIEW), NOT CTAS dependents — the gap this fixes;
+    cross_file_sources harvested from ALL files' CTAS bodies in register_pass1
+    (aggregator.py); dependents edge = (t)<-[:SELECTS_FROM]-(q)-[:QUERY_DEFINED_IN]->(f);
+    SCHEMA_VERSION="3" (schema.py:6); watch already gates on version mismatch (watch.py:35).
+  two open decisions for user/reviewer: (1) max_closure_depth default 3 — confirm vs real
+    DWH chain depth. (2) post-merge uses stored-SHA delta (no SHAs passed) vs ORIG_HEAD —
+    chose stored-SHA (strictly-safe superset, reuses standalone path).
+  next: plan-reviewer gate, then developer (single PR, sized for one feature).
+
+Handoff — architect-planner (2026-05-29):
+  plan: plan/trust_layer.md (commit c528542)
+  summary: Trust-layer foundation slice planned. One PR combining the two ideas:
+    (A) Judgement discriminator (assertion_type fact|heuristic; confidence+reason
+        REQUIRED for heuristics, FORBIDDEN for facts, enforced by model_validator)
+        applied to the risk label in get_change_scope/scope_change and to the new
+        analyze_unused tool. Pure-fact tools stay plain (boundary, not every field).
+    (B) Three answer-anchors EXTENDING the golden harness (not a new fixture):
+        expected_downstream_count, expected_dead_code, expected_top_hub_rank.
+  scope decisions locked: (a) assertion_type discriminator, not `kind`; risk_label/
+    risk_weight REPLACED (no-backward-compat) by risk:Judgement + downstream_count.
+    (b) 3 anchors above; per-column count + KPI anchors deferred/out. (c) hub/
+    centrality IN — single count(DISTINCT q.target_table) aggregation, fact tool,
+    no Judgement. (d) extend golden_lineage.yaml, reuse _score()/table_status gate.
+  KPI discovery: explicit Non-Goal (no fact-shaped output ever).
+  grounding-verified: risk_label/risk_weight are bare strings/ints today (no
+    confidence/reason); `kind` already used for node type at models.py 10/50/69/102/161;
+    analyze unused predicate NOT (t)<-[:SELECTS_FROM]-() at analyze.py:102; SELECTS_FROM
+    is SqlQuery->SqlTable so hub count uses q.target_table; PR-01..PR-07 all committed.
+  open decisions for user: (1) heuristic confidence constants (0.5 dead-code, 0.6 risk)
+    are reasoned placeholders, not calibrated. (2) hub count = distinct consuming tables
+    vs raw query count — chose distinct-tables; confirm before curating hub anchor.
+  next: plan-reviewer gate, then developer implements (single PR).
+
+Handoff — developer (2026-05-29):
+  agent: developer
+  plan: plan/parse_diagnostics.md
+  status: IMPLEMENTATION COMPLETE (no commit — user will commit)
+  test results: 663 passed, 5 skipped, 3 xfailed — 0 failures
+  pyright: 0 errors; ruff: all checks passed
+  files changed:
+    - src/sqlcg/indexer/error_classify.py: dominant_cause(), _CAUSE_PRIORITY, _DEGRADING
+    - src/sqlcg/core/schema.cypher: File node + parse_failed BOOLEAN, parse_cause STRING
+    - src/sqlcg/core/schema.py: SCHEMA_VERSION "2" -> "3"
+    - src/sqlcg/indexer/indexer.py: import dominant_cause, wire file row, profile param
+    - src/sqlcg/cli/commands/analyze.py: failures subcommand
+    - src/sqlcg/cli/commands/index.py: --profile flag + timing table
+    - tests/unit/test_index_cmd.py: mock version "2" -> "3"
+    - tests/unit/test_index_flags.py: mock version "2" -> "3"
+    - tests/unit/test_star_schema_unit.py: test_schema_version_is_two -> _three
+    - scratch_profile_{10,100,combi,index,slow}.py: deleted
+    - tests/unit/test_dominant_cause.py: NEW (14 tests)
+    - tests/integration/test_parse_diagnostics.py: NEW (9 tests)
+    - tests/e2e/test_parse_diagnostics_cli.py: NEW (5 tests)
+  deviation: integration test uses func_fallback fixture instead of E5 (E5 fixture
+    resolves cleanly in ANSI parser; func_fallback is equally degrading). Documented
+    in plan/parse_diagnostics.md Deviations section.
+
+Handoff — architect-planner (2026-05-29):
+  plan: plan/parse_diagnostics.md (commit 6287582)
+  summary: Parse-diagnostics feature plan committed. Two capabilities in one PR:
+    (1) `sqlcg index --profile` flag emitting per-stage + per-file timing,
+        superseding the five scratch_profile_*.py scripts (deleted in Phase 4).
+    (2) Persist per-file parse-failure cause onto the File graph node
+        (parse_failed BOOLEAN + parse_cause STRING), read via new
+        `sqlcg analyze failures` subcommand.
+  grounding-verified against source:
+    - File node (schema.cypher:8-13) had NEITHER column; parse_failed at line 43
+      is on SqlQuery, not File. Both columns are NEW (plan corrects the brief).
+    - cause folds into the single file_rows dict (indexer.py:454) flowing through
+      the existing upsert_nodes_bulk(FILE) at line 632 — no new upsert calls,
+      bulk-upsert invariant preserved. parsers/base.py untouched.
+    - dominant_cause() reuses _classify_error's 10 buckets (no new vocabulary).
+    - analyze failures reuses unused-command pattern (get_backend/run_read/
+      _print_table); analyze.app mounted in main.py:35.
+    - SCHEMA_VERSION 2 -> 3.
+  scope decisions resolved: (a) flag not subcommand; (b) delete 5 scratch scripts,
+    leave scratch_bootstrap_golden.py; (c) parse_cause STRING reusing E-buckets;
+    (d) MCP get_parse_failures DEFERRED to follow-up (property is prerequisite).
+  open decisions: none blocking.
+  next steps: plan-reviewer gate, then developer (Phase 1 schema/persistence first).
+  note: code-review-graph MCP tools not reachable from this session; used
+    Read/Grep fallback per workflow health-check rule.
 
 Handoff — plan-reviewer (2026-05-12):
   agent: plan-reviewer
