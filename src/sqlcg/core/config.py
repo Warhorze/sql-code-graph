@@ -120,6 +120,42 @@ def get_schema_aliases(path: Path) -> dict[str, str]:
     return {}
 
 
+def get_noise_filter_patterns(path: Path) -> list[str]:
+    """Get backup table ignore patterns from .sqlcg.toml.
+
+    Reads [sqlcg.noise_filter] -> ignore_table_patterns (a list of glob strings)
+    from .sqlcg.toml. Returns the list lowercased. When the key is absent,
+    returns a built-in default list::
+
+        [sqlcg.noise_filter]
+        ignore_table_patterns = ["*_bck", "*_bck_us", "*_bck_[0-9]*"]
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of glob patterns (all lowercased). Defaults to built-in backup patterns.
+    """
+    default_patterns = [
+        "*_bck",
+        "*_bck_us",
+        "*_bck_[0-9]*",
+        "*_backup",
+        "*_backup_[0-9]*",
+    ]
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("noise_filter", {}).get("ignore_table_patterns")
+            if isinstance(raw, list):
+                return [p.lower() if isinstance(p, str) else p for p in raw]
+        except Exception:
+            pass
+    return default_patterns
+
+
 def get_backend() -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 
