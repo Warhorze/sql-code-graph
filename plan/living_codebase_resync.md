@@ -187,6 +187,18 @@ the closure files depend on. Two options, decided here:
 This seeding step is the reason the closure is computed against **defining files**, and it is bounded
 by the same `max_closure_depth` walk.
 
+**Re-harvest dedup + delete invariant (W-2).** Two cases the developer must handle explicitly:
+- **Definer already in `reparse_set`** (the common case — the modified file *is* the definer): its
+  new CTAS body is already in the aggregator from pass-1. **Skip the `GET_TABLE_DEFINING_FILES`
+  lookup for those tables** — re-parsing would be wasted work (and a benign same-key overwrite of
+  `cross_file_sources`). Only look up definers for referenced tables **not** already satisfied
+  in-memory.
+- **Definer was deleted** (`GET_TABLE_DEFINING_FILES` returns no row because `delete_nodes_for_file`
+  removed it): the reference is genuinely unresolvable — **register nothing**. The closure file's
+  pass-2 then correctly produces zero edges for that dangling reference. Do NOT add a defensive
+  fallback that re-reads the now-absent definer from disk (it would resurrect a stale body). This is
+  the intended post-delete lineage.
+
 ### Persisted index metadata (Scope Decision (b))
 
 `sqlcg reindex` with no SHAs needs a baseline. Design:
@@ -312,7 +324,20 @@ seeding, capture-deleted-tables-before-delete, batched upsert, single `_expand_s
 `set_indexed_sha(new_sha)` on success, full-`index_repo` fallback (delta `None`, or frontier still
 growing at depth cap) with a `fell_back_to_full` flag in the summary.
 - Files: [`indexer.py`](../src/sqlcg/indexer/indexer.py) (NEW method; existing methods untouched)
-- Acceptance: see Test Strategy — closure correctness + delta-only scenarios.
+
+**Parallelism model (resolved — B-1).** `resync_changed` must NOT spin up `index_repo`'s
+`HardKillPool` for the delta: pool startup is fixed-cost (~0.2–0.5 s × `cpu_count`) and for a 1–3
+file branch delta that overhead exceeds the parse itself. Instead **pass-1 of `reparse_set` and the
+harvested definer files runs through the existing `_index_single_file` path** — it already provides
+the spawn/kill **subprocess isolation + per-file timeout** so a single slow/adversarial file cannot
+hang the `BranchMonitor` thread (which would be strictly worse than today's full `index_repo`).
+**Pass-2 re-resolve of `closure_set` needs NO subprocess** — it is an in-process aggregator
+re-resolve, not a fresh parse. The bulk-upsert invariant holds because writes still flow through
+`_upsert_parsed_file` inside the batched transaction (Step 3.2), not through the per-file pool
+coordinator. (If a future large-delta case justifies pooling, gate it behind a delta-size threshold —
+but that is explicitly out of scope here.)
+- Acceptance: see Test Strategy — closure correctness + delta-only scenarios; plus a test that a delta
+  containing a deliberately-slow file is killed by the per-file timeout and does not hang the resync.
 
 **Step 3.2** — Verify `resync_changed` never calls `upsert_node`/`upsert_edge` per row — it composes
 `_upsert_parsed_file` (already bulk Phase A→B→C) inside a batched transaction, identical to
@@ -337,13 +362,26 @@ and `--quiet` summary output.
 **Step 5.1** — `BranchMonitor`: capture old SHA (`git rev-parse HEAD` *before* updating
 `_current_branch`) and new SHA (after), and call `indexer.resync_changed(root, old, new, db, dialect)`
 in `_on_branch_change` instead of `index_repo`. Keep the pause/cancel/drain coordination exactly as
-today. `BranchMonitor.__init__` already has `indexer`, `db`, `watched_path`; it needs the `dialect`
-threaded through (currently `WatchJobManager` holds it — pass it into `SqlFileEventHandler` →
-`BranchMonitor`).
+today.
+
+**Dialect wiring (explicit — B-2).** Today `BranchMonitor._on_branch_change` hardcodes `dialect=None`
+(watcher.py line 173) — a pre-existing latent bug this step also fixes. Thread the real dialect through:
+1. `BranchMonitor.__init__` gains a **keyword-only** `dialect: str | None = None` parameter (keyword-only
+   with a default so the existing positional call sites in `test_branch_monitor.py` —
+   `BranchMonitor(temp_path, mock_job_manager, mock_indexer, mock_db, _poll_interval=0.1)` — do not break).
+2. `SqlFileEventHandler.__init__` gains `dialect` and passes it through:
+   `BranchMonitor(root, job_manager, indexer, db, dialect=dialect)`.
+3. The `watch.py` call site `SqlFileEventHandler(job_manager, backend, spec, path, indexer=indexer)`
+   is updated to pass `dialect=dialect` (it already resolves the dialect for `WatchJobManager`).
+   Do NOT reach into `job_manager._dialect` across the module boundary.
 - Files: [`watcher.py`](../src/sqlcg/indexer/watcher.py), [`watch.py`](../src/sqlcg/cli/commands/watch.py)
-  (thread `dialect` into the handler).
-- Acceptance: simulated branch change in `test_branch_monitor` calls `resync_changed` (not
-  `index_repo`) with the captured old/new SHAs; the existing pause/drain assertions still hold.
+- Acceptance (W-1): the existing `test_branch_monitor.py` assertion on `mock_indexer.index_repo.called`
+  is **flipped** to assert `mock_indexer.resync_changed.called is True` **and**
+  `mock_indexer.index_repo.called is False` (do not treat the now-failing old assertion as pre-existing —
+  it must be deliberately updated). Add a mock for `git rev-parse HEAD` returning predictable SHAs for the
+  old and new calls (in addition to the existing `git rev-parse --abbrev-ref HEAD` branch-detection mock).
+  The existing pause/cancel/drain assertions must still hold; `resync_changed` is called with the captured
+  old/new SHAs and the threaded dialect.
 
 **Step 5.2** — Generalize `install-hooks` to write both `post-checkout` (updated to call
 `sqlcg reindex --from "$1" --to "$2"`) and `post-merge`, each idempotent with its own sentinel,
