@@ -98,4 +98,5 @@ markers = [
     "integration: integration tests",
     "e2e: end-to-end tests",
     "benchmark: benchmark tests",
+    "perf: wall-clock performance backstops (opt-in via -m perf)",
 ]

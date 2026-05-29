@@ -132,9 +132,7 @@ def test_branch_monitor_pauses_and_resumes_job_manager(
 
     # Verify the sequence of calls
     # set_paused(True) should be called before cancel_all
-    set_paused_calls = [
-        call for call in mock_job_manager.method_calls if call[0] == "set_paused"
-    ]
+    set_paused_calls = [call for call in mock_job_manager.method_calls if call[0] == "set_paused"]
     assert any(call[1][0] is True for call in set_paused_calls), "set_paused(True) not called"
 
     # drain_queued should be called (as part of resuming)
@@ -204,9 +202,9 @@ def test_branch_monitor_queues_file_events_during_resync(
 
     # Verify the overall sequence: pause -> index_repo -> resume -> drain
     # This guarantees that any file events arriving during resync won't be lost
-    assert (
-        mock_job_manager.cancel_all.called
-    ), "cancel_all should be called to stop pending timers during resync"
+    assert mock_job_manager.cancel_all.called, (
+        "cancel_all should be called to stop pending timers during resync"
+    )
 
 
 def test_branch_monitor_stops_cleanly(temp_path, mock_job_manager, mock_indexer, mock_db):

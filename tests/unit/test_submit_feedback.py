@@ -14,7 +14,7 @@ def test_fn_label_accepted():
                 tool_name="trace_column_lineage",
                 query="orders.amount",
                 label="FN",
-                note="Expected lineage but got empty"
+                note="Expected lineage but got empty",
             )
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
@@ -26,22 +26,14 @@ def test_tp_and_fp_still_valid():
     with patch("sqlcg.server.tools._metrics"):
         # Test TP
         try:
-            result = submit_feedback(
-                tool_name="find_table_usages",
-                query="orders",
-                label="TP"
-            )
+            result = submit_feedback(tool_name="find_table_usages", query="orders", label="TP")
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
             raise AssertionError("TP label should be accepted") from None
 
         # Test FP
         try:
-            result = submit_feedback(
-                tool_name="find_table_usages",
-                query="orders",
-                label="FP"
-            )
+            result = submit_feedback(tool_name="find_table_usages", query="orders", label="FP")
             assert result["status"] in ("recorded", "skipped")
         except ValueError:
             raise AssertionError("FP label should be accepted") from None
@@ -51,11 +43,7 @@ def test_invalid_label_raises_error_mentioning_fn():
     """Test that invalid label raises ValueError mentioning FN."""
     with patch("sqlcg.server.tools._metrics"):
         try:
-            submit_feedback(
-                tool_name="trace_column_lineage",
-                query="orders.amount",
-                label="XX"
-            )
+            submit_feedback(tool_name="trace_column_lineage", query="orders.amount", label="XX")
             raise AssertionError("Should raise ValueError for invalid label")
         except ValueError as e:
             error_msg = str(e)

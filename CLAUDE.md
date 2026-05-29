@@ -84,7 +84,36 @@ in the relevant sprint plan.
 
 **Perf budget**: indexing 1,600 files with schema CSV provided should complete in
 under 5 minutes on a laptop. Measure and record actual timings in sprint postmortems.
-<!-- TODO: replace with real benchmark numbers after large-repo testing -->
+
+## Performance invariants — DO NOT REMOVE OR SIMPLIFY
+
+These patterns exist because measured profiling showed catastrophic regressions without them.
+Any refactor that touches [`base.py`](src/sqlcg/parsers/base.py) or [`indexer.py`](src/sqlcg/indexer/indexer.py) must keep all of these intact.
+
+| Invariant | Location | Why it exists |
+|-----------|----------|---------------|
+| `qualify` and `build_scope` imported at **module level** | `base.py` top | Tests patch `sqlcg.parsers.base.qualify`; inline imports make the patch miss |
+| `exp.expand()` called with **`sources` only**, never `schema_sources` | `_extract_column_lineage` | Schema CSV has ~5–10k entries; passing them to `expand()` is O(N_files × N_schema) — measured at 400 s/file |
+| **`body_scope` built once per statement**, reused across all columns | `_extract_column_lineage` | Wide SELECTs (176 cols × 11 joins) took 7 min with per-column qualify; once-per-statement is the fix |
+| **Pure-literal skip** (`if not list(col_expr.find_all(exp.Column)): continue`) | column loop in `_extract_column_lineage` | Literals have no source column; without the skip sg_lineage raises noise E1 errors and wastes time |
+| **`mapping_schema_tables` built once per statement**, passed to `_lineage_node_to_edges` | `_extract_column_lineage` | Confidence scoring (1.0 schema-backed / 0.7 inferred) must not call `mapping_schema()` per edge |
+| When `body_scope` is available, **`sources=` is NOT passed to `sg_lineage`** | `sg_kwargs` construction | Scope embeds full resolution; passing `combined_sources` (including schema_sources) would re-introduce the O(N_schema) bloat through sg_lineage's internal expand |
+| **`_upsert_parsed_file` uses `upsert_nodes_bulk`/`upsert_edges_bulk`** (Phase A→B→C), never `upsert_node`/`upsert_edge` per row | `indexer.py` `_upsert_parsed_file` | Measured: bulk=181s vs per-node=1020s+ on 1,340-file DWH (~10 execute() calls per file vs ~14,500 total). Commit `4234e5d` accidentally regressed this by rewriting the method during C2 normalization. |
+
+Tests covering these invariants live in [`test_T09_01_qualify_once.py`](tests/unit/test_T09_01_qualify_once.py),
+[`test_expand_excludes_schema_sources.py`](tests/unit/test_expand_excludes_schema_sources.py),
+and [`test_bulk_upsert_invariant.py`](tests/unit/test_bulk_upsert_invariant.py) (each pins
+one *named* regression). If any fail after a refactor, the invariant was broken — do not mark
+the test as pre-existing and move on.
+
+**The general guard is [`test_perf_scaling_guard.py`](tests/unit/test_perf_scaling_guard.py).**
+Every perf blow-up here has been the same class of bug: an op that must run once per statement
+(build_scope/qualify/exp.expand/mapping_schema) or carry only file-level sources started scaling
+with column count / edge count / schema size — O(N) flipping to O(N²). The scaling guard parses
+a fixture at size N and 2N and asserts these stay flat. It catches *future* regressions of this
+class, not just the named ones, and uses deterministic op-counts (never wall-clock) so it cannot
+flake by machine speed. A red here means something started scaling — find what, do not raise the
+slack. When adding a new hot-path op that must be once-per-statement, add a counter for it there.
 
 - When referring to files in docs or plans, use markdown hyperlinks (e.g. [`schema.py`](src/sqlcg/core/schema.py)) so stale references are immediately visible when file names change.
 - No backward compatibility. Re-index is the migration path.

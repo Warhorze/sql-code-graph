@@ -24,9 +24,7 @@ def _git_sql_files(root: Path) -> list[Path] | None:
         return None
 
 
-def walk_sql_files(
-    root: Path, spec: pathspec.PathSpec, use_git: bool = True
-) -> Iterator[Path]:
+def walk_sql_files(root: Path, spec: pathspec.PathSpec, use_git: bool = True) -> Iterator[Path]:
     """Walk directory tree and yield SQL files not matching ignore patterns.
 
     When use_git=True (default) and git is available, only tracked files are

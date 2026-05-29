@@ -12,12 +12,25 @@ class LineageNode(BaseModel):
     confidence: float | None = Field(None, description="Confidence score 0.0-1.0")
 
 
+class LineageEdge(BaseModel):
+    """Edge in a lineage graph."""
+
+    src: str = Field(..., description="Source column id (table_qualified.col_name)")
+    dst: str = Field(..., description="Destination column id (table_qualified.col_name)")
+    transform: str | None = Field(None, description="Transform applied (e.g. SELECT, CAST)")
+
+
 class LineageResult(BaseModel):
     """Result of trace_column_lineage query."""
 
     column: str = Field(..., description="Column reference (table.column)")
     lineage: list[LineageNode] = Field(
         default_factory=list, description="List of nodes in the lineage"
+    )
+    mermaid: str | None = Field(
+        None,
+        description="Mermaid flowchart diagram of the lineage graph. "
+        "Render with ```mermaid ... ``` in any Markdown viewer.",
     )
     hint: str | None = Field(
         None,
@@ -111,9 +124,7 @@ class DbInfoResult(BaseModel):
         default_factory=dict,
         description="Node counts per label (Repo, SqlTable, SqlQuery, SqlColumn, SqlFile)",
     )
-    column_lineage_edges: int = Field(
-        0, description="Number of COLUMN_LINEAGE edges in the graph"
-    )
+    column_lineage_edges: int = Field(0, description="Number of COLUMN_LINEAGE edges in the graph")
     parse_quality: dict[str, int] = Field(
         default_factory=dict,
         description=(

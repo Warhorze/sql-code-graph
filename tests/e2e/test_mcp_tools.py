@@ -94,6 +94,39 @@ class TestTraceColumnLineage:
         assert result.column == "orders.id"
         assert isinstance(result.lineage, list)
 
+    def test_mermaid_starts_with_flowchart_lr_when_lineage_exists(self, indexed_graph):
+        result = trace_column_lineage("customer_orders.customer_id", max_depth=3)
+        assert result.lineage, "expected lineage for customer_orders.customer_id"
+        assert result.mermaid is not None
+        assert result.mermaid.startswith("flowchart LR")
+
+    def test_mermaid_contains_edge_arrow(self, indexed_graph):
+        result = trace_column_lineage("customer_orders.customer_id", max_depth=3)
+        assert result.mermaid is not None
+        assert "-->" in result.mermaid
+
+    def test_mermaid_is_none_when_lineage_empty(self, indexed_graph):
+        result = trace_column_lineage("orders.nonexistent_col_xyz", max_depth=3)
+        assert result.lineage == []
+        assert result.mermaid is None
+
+    def test_mermaid_no_duplicate_edges(self, indexed_graph):
+        result = trace_column_lineage("customer_orders.customer_id", max_depth=3)
+        assert result.mermaid is not None
+        arrow_lines = [line.strip() for line in result.mermaid.splitlines() if "-->" in line]
+        assert len(arrow_lines) == len(set(arrow_lines))
+
+    def test_mermaid_node_ids_have_no_dots_or_spaces(self, indexed_graph):
+
+        result = trace_column_lineage("customer_orders.customer_id", max_depth=3)
+        assert result.mermaid is not None
+        for line in result.mermaid.splitlines():
+            # Extract bare node id tokens (first word on lines that define nodes or edges)
+            token = line.strip().split("[")[0].split(" ")[0]
+            if token and token not in ("flowchart", "LR", ""):
+                assert "." not in token, f"dot in node id: {token!r}"
+                assert " " not in token, f"space in node id: {token!r}"
+
 
 class TestFindTableUsages:
     """Tests for find_table_usages tool."""

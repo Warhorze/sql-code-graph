@@ -155,8 +155,6 @@ def test_index_with_batch_size_flag(tmp_path, monkeypatch):
 
     # Reset and test with explicit batch size
     runner.invoke(app, ["db", "reset"])
-    result_custom = runner.invoke(
-        app, ["index", str(fixtures_path), "--batch-size", "7"]
-    )
+    result_custom = runner.invoke(app, ["index", str(fixtures_path), "--batch-size", "7"])
     assert result_custom.exit_code == 0
     assert "Indexed" in result_custom.output

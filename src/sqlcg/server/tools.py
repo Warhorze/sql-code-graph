@@ -36,8 +36,39 @@ from sqlcg.server.models import (
     TableUsage,
     TableUsageResult,
 )
-from sqlcg.server.server import mcp  # noqa: F401
-from sqlcg.utils.logging import getLogger
+
+
+def _build_mermaid(root_id: str, edges: list[tuple[str, str, str]]) -> str:
+    """Build a Mermaid LR flowchart from a list of (src_id, dst_id, transform) edges."""
+
+    def _nid(col_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "_", col_id)
+
+    def _label(col_id: str) -> str:
+        parts = col_id.rsplit(".", 1)
+        if len(parts) == 2:
+            return f"{parts[0]}\n{parts[1]}"
+        return col_id
+
+    lines = ["flowchart LR"]
+    seen_nodes: set[str] = set()
+    seen_edges: set[tuple[str, str]] = set()
+    for src, dst, transform in edges:
+        for col_id in (src, dst):
+            nid = _nid(col_id)
+            if nid not in seen_nodes:
+                seen_nodes.add(nid)
+                lines.append(f'    {nid}["{_label(col_id)}"]')
+        edge_key = (_nid(src), _nid(dst))
+        if edge_key not in seen_edges:
+            seen_edges.add(edge_key)
+            label = f"|{transform}|" if transform else ""
+            lines.append(f"    {_nid(src)} -->{label} {_nid(dst)}")
+    return "\n".join(lines)
+
+
+from sqlcg.server.server import mcp  # noqa: E402, F401
+from sqlcg.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger(__name__)
 
@@ -324,6 +355,7 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
         col_id = f"{table_id}.{col_name}"
 
         lineage: list[LineageNode] = []
+        edges: list[tuple[str, str, str]] = []
         visited: set[str] = set()
         emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
         queue: deque[tuple[str, int]] = deque([(col_id, 0)])
@@ -344,6 +376,7 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
 
             for row in rows:
                 node_id = row["id"]
+                edges.append((node_id, current_id, row.get("transform") or "SELECT"))
                 if node_id not in visited:
                     # Step 3.1: only emit each node_id once
                     if node_id not in emitted:
@@ -353,10 +386,12 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
                                 name=row.get("col_name", ""),
                                 kind="column",
                                 file=None,
-                                confidence=None,
+                                confidence=row.get("confidence"),
                             )
                         )
                     queue.append((node_id, depth + 1))
+
+        mermaid = _build_mermaid(col_id, edges) if edges else None
 
         # Populate hint if result is empty (Step 4.1)
         hint = None
@@ -369,7 +404,7 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
                 "was a false negative."
             )
 
-        return LineageResult(column=table_col, lineage=lineage, hint=hint)
+        return LineageResult(column=table_col, lineage=lineage, mermaid=mermaid, hint=hint)
 
 
 @mcp.tool()

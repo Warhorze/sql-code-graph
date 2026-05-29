@@ -97,9 +97,7 @@ class BranchMonitor(threading.Thread):
     drains queued file events.
     """
 
-    def __init__(
-        self, watched_path: Path, job_manager, indexer, db, _poll_interval: float = 2.0
-    ):
+    def __init__(self, watched_path: Path, job_manager, indexer, db, _poll_interval: float = 2.0):
         """Initialize the branch monitor.
 
         Args:
@@ -127,9 +125,7 @@ class BranchMonitor(threading.Thread):
             try:
                 branch = self._get_current_branch()
                 if branch is not None and branch != self._current_branch:
-                    logger.debug(
-                        "Branch change detected: %s -> %s", self._current_branch, branch
-                    )
+                    logger.debug("Branch change detected: %s -> %s", self._current_branch, branch)
                     self._current_branch = branch
                     self._on_branch_change()
             except subprocess.CalledProcessError:

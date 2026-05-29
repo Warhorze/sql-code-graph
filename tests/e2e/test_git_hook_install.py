@@ -89,8 +89,8 @@ def test_hook_runs_sqlcg_on_branch_checkout(temp_git_repo):
 
     # Verify the hook would call sqlcg index
     assert "sqlcg index" in hook_content
-    assert '--dialect auto' in hook_content
-    assert '--quiet' in hook_content
+    assert "--dialect auto" in hook_content
+    assert "--quiet" in hook_content
 
     # Verify the condition check for branch checkout
     assert '[ "$3" = "1" ]' in hook_content

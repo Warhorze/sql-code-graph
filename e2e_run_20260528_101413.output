@@ -1,0 +1,41 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /home/ignwrad/Projects/sql-code-graph/.venv/bin/python3
+cachedir: .pytest_cache
+benchmark: 5.2.3 (defaults: timer=time.perf_counter disable_gc=False min_rounds=5 min_time=0.000005 max_time=1.0 calibration_precision=10 warmup=False warmup_iterations=100000)
+rootdir: /home/ignwrad/Projects/sql-code-graph
+configfile: pyproject.toml
+plugins: benchmark-5.2.3, cov-7.1.0, asyncio-1.3.0, anyio-4.13.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 11 items
+
+tests/e2e/test_dwh_e2e.py::TestDdlCorpus::test_files_processed PASSED    [  9%]
+tests/e2e/test_dwh_e2e.py::TestDdlCorpus::test_parse_errors_recorded PASSED [ 18%]
+tests/e2e/test_dwh_e2e.py::TestDdlCorpus::test_pass2_skip_nonzero PASSED [ 27%]
+tests/e2e/test_dwh_e2e.py::TestDdlCorpus::test_budget_extrapolation_recorded PASSED [ 36%]
+tests/e2e/test_dwh_e2e.py::TestDdlCorpus::test_measurement_json_written PASSED [ 45%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_files_processed PASSED   [ 54%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_lineage_edges_present PASSED [ 63%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_anchor_omloopsnelheid PASSED [ 72%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_anchor_ma_aantal_op_order XFAIL) [ 81%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_budget_passes FAILED     [ 90%]
+tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_measurement_json_written PASSED [100%]
+
+=================================== FAILURES ===================================
+______________________ TestFullCorpus.test_budget_passes _______________________
+
+self = <tests.e2e.test_dwh_e2e.TestFullCorpus object at 0x72e2b01f79e0>
+full_measurement = {'anchor_ma_aantal_op_order': {'lineage_edge_count_total': 0, 'sample_edges': []}, 'anchor_omloopsnelheid': {'lineage_...: 50, 'budget_check_1600_files': {'budget_seconds': 300, 'extrapolated_seconds': 1211.59, 'passes_budget': False}, ...}
+
+    def test_budget_passes(self, full_measurement):
+        b = full_measurement["budget_check_1600_files"]
+        if not b["passes_budget"]:
+>           pytest.fail(
+                f"Budget FAILED: {b['extrapolated_seconds']}s extrapolated "
+                f"> {BUDGET_SECONDS}s limit. Re-open T-01 or escalate to parallel-parsing sprint."
+            )
+E           Failed: Budget FAILED: 1211.59s extrapolated > 300s limit. Re-open T-01 or escalate to parallel-parsing sprint.
+
+tests/e2e/test_dwh_e2e.py:259: Failed
+=========================== short test summary info ============================
+FAILED tests/e2e/test_dwh_e2e.py::TestFullCorpus::test_budget_passes - Failed: Budget FAILED: 1211.59s extrapolated > 300s limit. Re-open T-01 or escalate to parallel-parsing sprint.
+============= 1 failed, 9 passed, 1 xfailed in 1363.84s (0:22:43) ==============

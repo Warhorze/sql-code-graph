@@ -21,7 +21,7 @@ def test_parse_quality_full_when_column_lineage_extracted():
     sql = "SELECT col1 FROM table1"
 
     # Mock the _parse_statement to return a QueryNode with column lineage
-    with patch.object(parser, '_parse_statement') as mock_parse:
+    with patch.object(parser, "_parse_statement") as mock_parse:
         from sqlcg.parsers.base import ColumnRef, LineageEdge, QueryNode, TableRef
 
         # Create a QueryNode with column lineage
@@ -51,8 +51,9 @@ def test_parse_quality_full_when_column_lineage_extracted():
         parsed = parser.parse_file(Path("test.sql"), sql)
 
         # Verify parse_quality is FULL
-        assert parsed.parse_quality == ParseQuality.FULL, \
+        assert parsed.parse_quality == ParseQuality.FULL, (
             f"Expected FULL, got {parsed.parse_quality}"
+        )
 
 
 def test_parse_quality_table_only_without_column_lineage():
@@ -65,5 +66,6 @@ def test_parse_quality_table_only_without_column_lineage():
     parsed = parser.parse_file(Path("test.sql"), sql)
 
     # Verify parse_quality is TABLE_ONLY (default)
-    assert parsed.parse_quality == ParseQuality.TABLE_ONLY, \
+    assert parsed.parse_quality == ParseQuality.TABLE_ONLY, (
         f"Expected TABLE_ONLY, got {parsed.parse_quality}"
+    )

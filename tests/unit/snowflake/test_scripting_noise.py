@@ -30,9 +30,11 @@ def test_scripting_block_extracts_dml_with_merge():
 
     # Should extract at least 2 statements (the exact count depends on regex matching)
     # The important thing is that MERGE is attempted to be extracted
-    assert len(result.statements) >= 2, \
+    assert len(result.statements) >= 2, (
         f"Expected at least 2 extracted statements, got {len(result.statements)}"
+    )
 
     # Verify that the file was recognized as scripting mode
-    assert any("scripting_block" in error for error in result.errors), \
+    assert any("scripting_block" in error for error in result.errors), (
         "Expected scripting_block to be noted in errors"
+    )

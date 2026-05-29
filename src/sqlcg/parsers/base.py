@@ -6,6 +6,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# Module-level imports so tests can patch sqlcg.parsers.base.qualify / build_scope
+from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
+from sqlglot.optimizer.scope import build_scope as sqlglot_build_scope
+
+qualify = sqlglot_qualify
+build_scope = sqlglot_build_scope
+
 if TYPE_CHECKING:
     from sqlcg.lineage.schema_resolver import SchemaResolver
 
@@ -92,13 +99,18 @@ class ColumnRef:
     name: str = ""
 
     def __post_init__(self) -> None:
-        """Normalize the column name to lowercase.
+        """Normalize the column name to lowercase and strip surrounding quotes.
 
         C2 design: lowercase the name so that full_id and graph keys
-        are lowercase, matching the schema side.
+        are lowercase, matching the schema side. sqlglot's lineage API
+        preserves surrounding double-quotes on quoted identifiers; strip them
+        so `"ma_aantal"` and `ma_aantal` map to the same graph node.
         """
         if self.name:
-            object.__setattr__(self, "name", self.name.lower())
+            name = self.name
+            if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+                name = name[1:-1]
+            object.__setattr__(self, "name", name.lower())
 
     @property
     def full_id(self) -> str:
@@ -435,6 +447,7 @@ class SqlParser(ABC):
         dst_table: "TableRef | None",
         path: Path,
         out: ParsedFile,
+        mapping_schema_tables: "set[tuple[str | None, str | None, str]] | None" = None,
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -451,6 +464,9 @@ class SqlParser(ABC):
             dst_col_name: The output column name (destination)
             path: Source file path (for error recording)
             out: ParsedFile for error recording
+            mapping_schema_tables: Set of (catalog, db, table) tuples present in
+                mapping_schema. Source tables found here get confidence=1.0;
+                inferred-only tables get confidence=0.7. Pass None for 0.7 everywhere.
 
         Returns:
             List of LineageEdge objects (may be empty if tree is malformed)
@@ -480,12 +496,18 @@ class SqlParser(ABC):
                         else dst_col_name
                     )
                     dst_tbl = dst_table if dst_table else TableRef(name="<output>")
+                    schema_key = (src_table_ref.catalog, src_table_ref.db, src_table_ref.name)
+                    confidence = (
+                        1.0
+                        if mapping_schema_tables and schema_key in mapping_schema_tables
+                        else 0.7
+                    )
                     edges.append(
                         LineageEdge(
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=0.9,
+                            confidence=confidence,
                         )
                     )
                 except Exception as exc:
@@ -616,6 +638,17 @@ class SqlParser(ABC):
             body_scope = None
             combined_sources = {**(sources or {}), **(schema_sources or {})}
 
+            # T-09-01: Build mapping_schema_tables once per statement for confidence scoring.
+            # Source tables found in mapping_schema get confidence=1.0; inferred-only get 0.7.
+            mapping_schema_tables: set[tuple[str | None, str | None, str]] = set()
+            if hasattr(self, "_schema") and self._schema is not None:
+                for catalog, db_dict in (self._schema.mapping_schema() or {}).items():
+                    if isinstance(db_dict, dict):
+                        for db, table_dict in db_dict.items():
+                            if isinstance(table_dict, dict):
+                                for table_name in table_dict.keys():
+                                    mapping_schema_tables.add((catalog, db, table_name))
+
             # NEW (T-07-02): Add CTE bodies to combined_sources so that outer columns
             # can resolve through CTE names. This makes CTE-to-CTE chains resolvable.
             # Example: WITH x AS (SELECT a FROM src), y AS (SELECT a FROM x)
@@ -655,6 +688,13 @@ class SqlParser(ABC):
                         )
                     continue
 
+                # Skip pure-literal expressions (NULL, numeric/string constants,
+                # zero-arg functions like CURRENT_TIMESTAMP()). sg_lineage would raise
+                # "Cannot find column '<literal>'" and emit a noise E1 error. An
+                # expression with at least one real exp.Column descendant is NOT skipped.
+                if not list(col_expr.find_all(exp.Column)):
+                    continue
+
                 if col_expr.alias:
                     col_name = col_expr.alias
                 elif isinstance(col_expr, exp.Column):
@@ -663,19 +703,15 @@ class SqlParser(ABC):
                         out.errors.append("col_lineage_skip:star:<empty_name>")
                         continue
                 else:
-                    # Best-effort: try .alias, then .name, then str representation.
-                    # sg_lineage may still fail; the existing exception handler records it.
-                    col_name = (
-                        col_expr.alias
-                        or (col_expr.name if hasattr(col_expr, "name") else None)
-                        or str(col_expr)[:40]
-                    )
-                    if not col_name or col_name == "*":
-                        out.errors.append("col_lineage_skip:expr_no_name:<empty>")
-                        continue
-                    out.errors.append(
-                        f"col_lineage_attempt:expr_fallback:{type(col_expr).__name__}"
-                    )
+                    # Unaliased expression (function call, arithmetic, CASE WHEN, …).
+                    # The historical fallback str(col_expr)[:40] passed garbage like
+                    # "YEAR(BOEKDATUM_FIS)" into sg_lineage and produced E2 noise.
+                    # Record a structured skip and continue — the target column is unnamed,
+                    # so the downstream graph cannot model the lineage anyway.
+                    # (T-09-03: FIX-E2-FUNC-FALLBACK)
+                    expr_type = type(col_expr).__name__
+                    out.errors.append(f"col_lineage_skip:func_fallback:{expr_type}")
+                    continue
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
                 # Skip when the expression has an explicit alias — the alias is the
@@ -720,25 +756,18 @@ class SqlParser(ABC):
                     # complex and not yet implemented (see sprint_06 T-05 deviation for details).
                     if body_scope is None and scope is None:
                         try:
-                            from sqlglot.optimizer.qualify import qualify
-                            from sqlglot.optimizer.scope import build_scope
-
-                            # Expand sources first (same as sg_lineage does)
+                            # Expand only file-level sources (CTEs, temp tables, CTAS bodies),
+                            # NOT schema_sources. Passing all ~5-10k schema CSV entries through
+                            # exp.expand() creates O(N_files * N_schema) bloat — schema resolution
+                            # goes through sg_lineage(sources=combined_sources) instead.
                             expanded_body = body
-                            if combined_sources:
-                                # Cast sources to Query type for expansion
-                                sources_to_expand = {}
-                                for k, v in combined_sources.items():
-                                    if isinstance(v, exp.Query):
-                                        sources_to_expand[k] = v
-                                    else:
-                                        # For non-Query objects, try to use as-is
-                                        # (sg_lineage's expand will handle type checking)
-                                        sources_to_expand[k] = v  # type: ignore
-
+                            expand_sources = {
+                                k: v for k, v in (sources or {}).items() if isinstance(v, exp.Query)
+                            }
+                            if expand_sources:
                                 expanded_body = exp.expand(
                                     body,
-                                    sources_to_expand,  # type: ignore
+                                    expand_sources,  # type: ignore
                                     dialect=self.DIALECT,
                                     copy=True,
                                 )
@@ -752,22 +781,25 @@ class SqlParser(ABC):
                                 identify=False,
                             )
                             body_scope = build_scope(qualified_body)
-                        except Exception:
-                            # If scope building fails, sg_lineage will fall back
+                        except Exception as _qualify_exc:
+                            # qualify() failure is non-fatal: sg_lineage falls back to
+                            # its own qualification. Record for observability.
+                            out.errors.append(
+                                f"col_lineage_skip:qualify_failed:{type(_qualify_exc).__name__}:{_qualify_exc}"
+                            )
                             body_scope = None
 
-                    # Only pass body_scope if it's non-None (optimization for reuse).
-                    # schema is NOT passed: resolver.as_dict() returns {table:[cols]}
-                    # which has nesting depth 1, causing sqlglot nesting-level errors.
-                    # sqlglot resolves column lineage structurally without schema.
-                    sg_kwargs = {
-                        "sources": combined_sources,
-                        "dialect": self.DIALECT,
-                    }
-                    if scope is not None:
-                        sg_kwargs["scope"] = scope
-                    elif body_scope is not None:
-                        sg_kwargs["scope"] = body_scope
+                    # When a scope is available it embeds full column→table resolution,
+                    # so schema_sources must NOT be passed via sources= (that would leak
+                    # O(N_schema) entries through sg_lineage's internal expand pass).
+                    # On the qualify-failed fallback path (no scope), pass only the small
+                    # set of file-level sources so sg_lineage can resolve CTEs/CTAS bodies.
+                    active_scope = scope if scope is not None else body_scope
+                    sg_kwargs: dict = {"dialect": self.DIALECT}
+                    if active_scope is not None:
+                        sg_kwargs["scope"] = active_scope
+                    else:
+                        sg_kwargs["sources"] = sources or {}
                     root = sg_lineage(col_name, body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
@@ -777,6 +809,7 @@ class SqlParser(ABC):
                             dst_table=dst_table,
                             path=path,
                             out=out,
+                            mapping_schema_tables=mapping_schema_tables,
                         )
                         edges.extend(new_edges)
                         if not new_edges:
@@ -787,7 +820,7 @@ class SqlParser(ABC):
                                 col_name,
                             )
                 except Exception as exc:
-                    self._log.warning(
+                    self._log.debug(
                         "column lineage extraction failed: file=%s col=%s error=%s",
                         path,
                         col_name,
@@ -835,6 +868,13 @@ class SqlParser(ABC):
                             else:
                                 projection_source = cte_body
 
+                            # Serialize CTE body once before the per-column loop.
+                            # Must serialize: passing the AST subtree causes a segfault
+                            # (parent pointers create cycles in sqlglot's qualify()).
+                            # Hoisted here so sg_lineage receives the same pre-serialized
+                            # string for every column rather than re-serializing O(N_cols) times.
+                            cte_body_sql = cte_body.sql(dialect=self.DIALECT)
+
                             # For each projection in the CTE, extract lineage.
                             # Only iterate projections from left branch for column names, but pass
                             # entire Union body to sg_lineage so sqlglot resolves both branches.
@@ -859,10 +899,6 @@ class SqlParser(ABC):
                                 if not cte_col_name or cte_col_name == "*":
                                     continue
                                 try:
-                                    # Serialize to SQL string before sg_lineage.
-                                    # Must serialize: passing the AST subtree causes a segfault
-                                    # (parent pointers create cycles in sqlglot's qualify()).
-                                    cte_body_sql = cte_body.sql(dialect=self.DIALECT)
                                     # No schema: resolver.as_dict() {table:[cols]} triggers
                                     # sqlglot nesting-level errors on fresh string parses.
                                     # sqlglot resolves CTE bodies structurally without schema.
@@ -879,6 +915,7 @@ class SqlParser(ABC):
                                             dst_table=cte_dst_table,
                                             path=path,
                                             out=out,
+                                            mapping_schema_tables=mapping_schema_tables,
                                         )
                                         # Tag edges as CTE projections
                                         # (transform is read-only, so create new edges)
@@ -929,13 +966,14 @@ class SqlParser(ABC):
                                 dst_table=dst_table,
                                 path=path,
                                 out=out,
+                                mapping_schema_tables=mapping_schema_tables,
                             )
                             edges.extend(new_edges)
                     except Exception:
                         pass
 
         except Exception as exc:
-            self._log.warning(
+            self._log.debug(
                 "column lineage extraction failed for entire statement: file=%s error=%s",
                 path,
                 exc,

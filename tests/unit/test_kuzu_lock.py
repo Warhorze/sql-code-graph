@@ -27,8 +27,7 @@ class TestKuzuLockError:
                     KuzuBackend("/tmp/test.db")
 
                 assert "Database is locked" in str(exc_info.value), (
-                    f"Error message must mention 'Database is locked'. "
-                    f"Got: {exc_info.value}"
+                    f"Error message must mention 'Database is locked'. Got: {exc_info.value}"
                 )
                 assert "12345" in str(exc_info.value), (
                     f"Error message must include PID. Got: {exc_info.value}"
@@ -49,8 +48,7 @@ class TestKuzuLockError:
                 KuzuBackend("/tmp/test.db")
 
             assert str(exc_info.value) == "Some other error", (
-                f"Non-lock errors must propagate unchanged. "
-                f"Got: {exc_info.value}"
+                f"Non-lock errors must propagate unchanged. Got: {exc_info.value}"
             )
 
     def test_find_lock_holder_when_lsof_unavailable(self):
@@ -60,8 +58,7 @@ class TestKuzuLockError:
             result = _find_lock_holder("/tmp/test.db")
 
             assert "unknown" in result.lower(), (
-                f"Fallback message should indicate lsof unavailable. "
-                f"Got: {result}"
+                f"Fallback message should indicate lsof unavailable. Got: {result}"
             )
 
 

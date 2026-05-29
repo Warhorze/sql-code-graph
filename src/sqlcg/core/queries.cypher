@@ -22,8 +22,8 @@ RETURN DISTINCT v.qualified AS view_name
 MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path
 
 -- TRACE_COLUMN_LINEAGE
-MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
-RETURN src.id AS id, src.col_name AS col_name
+MATCH (dst:SqlColumn {id: $id})<-[r:COLUMN_LINEAGE]-(src:SqlColumn)
+RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified, r.transform AS transform, r.confidence AS confidence
 
 -- FIND_TABLE_USAGES
 MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)

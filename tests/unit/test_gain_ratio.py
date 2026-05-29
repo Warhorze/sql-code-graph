@@ -20,8 +20,7 @@ class TestGainRatio:
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[15]]
                 elif (
-                    "COUNT(*) as count FROM tool_calls" in query
-                    and "WHERE timestamp" not in query
+                    "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query
                 ):
                     return [[20]]
                 elif "index_runs" in query:
@@ -55,8 +54,7 @@ class TestGainRatio:
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[2]]
                 elif (
-                    "COUNT(*) as count FROM tool_calls" in query
-                    and "WHERE timestamp" not in query
+                    "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query
                 ):
                     return [[20]]
                 elif "index_runs" in query:
@@ -89,8 +87,7 @@ class TestGainRatio:
                 if "execute_cypher" in query and "WHERE" in query:
                     return [[0]]
                 elif (
-                    "COUNT(*) as count FROM tool_calls" in query
-                    and "WHERE timestamp" not in query
+                    "COUNT(*) as count FROM tool_calls" in query and "WHERE timestamp" not in query
                 ):
                     return [[0]]
                 elif "index_runs" in query:

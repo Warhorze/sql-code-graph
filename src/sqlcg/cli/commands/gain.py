@@ -113,19 +113,12 @@ def gain_cmd(
         )
 
         # Section E: execute_cypher ratio
-        cypher_query = (
-            "SELECT COUNT(*) as count FROM tool_calls "
-            "WHERE tool_name = 'execute_cypher'"
-        )
+        cypher_query = "SELECT COUNT(*) as count FROM tool_calls WHERE tool_name = 'execute_cypher'"
         execute_cypher_count_result = metrics.execute_query(cypher_query)
         execute_cypher_count = (
-            execute_cypher_count_result[0][0]
-            if execute_cypher_count_result
-            else 0
+            execute_cypher_count_result[0][0] if execute_cypher_count_result else 0
         )
-        execute_cypher_ratio = (
-            execute_cypher_count / total_calls if total_calls > 0 else 0
-        )
+        execute_cypher_ratio = execute_cypher_count / total_calls if total_calls > 0 else 0
 
         # Section F: parse quality from graph
         parse_quality: dict[str, int] | None = None
@@ -137,9 +130,7 @@ def gain_cmd(
                     {},
                 )
                 if mode_rows and "mode" in mode_rows[0]:
-                    parse_quality = {
-                        str(r["mode"]): int(r["cnt"]) for r in mode_rows
-                    }
+                    parse_quality = {str(r["mode"]): int(r["cnt"]) for r in mode_rows}
         except Exception:
             pass  # graph not available — skip quality section
 
@@ -202,10 +193,7 @@ def gain_cmd(
             console.print("[bold cyan]E. Raw Cypher Usage[/bold cyan]")
             ratio_pct = execute_cypher_ratio * 100
             if execute_cypher_ratio > 0.3:
-                msg = (
-                    f"  [yellow]execute_cypher: {ratio_pct:.1f}% "
-                    "(high raw-Cypher usage)[/yellow]"
-                )
+                msg = f"  [yellow]execute_cypher: {ratio_pct:.1f}% (high raw-Cypher usage)[/yellow]"
                 console.print(msg)
             else:
                 console.print(f"  execute_cypher: {ratio_pct:.1f}%")
