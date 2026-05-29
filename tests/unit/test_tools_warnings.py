@@ -7,10 +7,10 @@ from sqlcg.server.tools import db_info
 
 def test_db_info_warns_on_zero_sql_columns():
     """Test that db_info warns when SqlColumn count is 0 (T-02)."""
-    with patch("sqlcg.server.tools._open_backend") as mock_get_backend_func:
+    with patch("sqlcg.server.tools._get_backend") as mock_get_backend_func:
         mock_backend = MagicMock()
         mock_backend.get_schema_version.return_value = "1"
-        mock_get_backend_func.return_value.__enter__.return_value = mock_backend
+        mock_get_backend_func.return_value = mock_backend
 
         def run_read_side_effect(query, params):
             if "COLUMN_LINEAGE" in query:

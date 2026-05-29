@@ -252,15 +252,22 @@ class SqlParser(ABC):
 
     DIALECT: str | None = None
 
-    def __init__(self, schema_resolver: "SchemaResolver"):
+    def __init__(
+        self,
+        schema_resolver: "SchemaResolver",
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize parser with schema resolver.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional staging-schema → canonical-schema map
+                (e.g. {"ba_tmp": "ba"}) applied at TableRef construction time
         """
         from sqlcg.utils.logging import getLogger
 
         self._schema = schema_resolver
+        self._schema_aliases: dict[str, str] = schema_aliases or {}
         self._log = getLogger(f"{__name__}.{self.__class__.__name__}")
 
     @abstractmethod
@@ -373,7 +380,7 @@ class SqlParser(ABC):
 
                     if table_name not in cte_sources:
                         # Convert table expression to TableRef
-                        ref = self._convert_table_expr_to_ref(table_expr)
+                        ref = self._apply_table_alias(self._convert_table_expr_to_ref(table_expr))
                         if ref:
                             tables.append(ref)
 
@@ -409,6 +416,17 @@ class SqlParser(ABC):
                 if name:
                     return TableRef(name=name)
                 return None
+
+    def _apply_table_alias(self, ref: "TableRef | None") -> "TableRef | None":
+        """Remap ref.db if it matches a schema alias (e.g. ba_tmp → ba)."""
+        if ref is None or not self._schema_aliases or not ref.db:
+            return ref
+        aliased = self._schema_aliases.get(ref.db.lower())
+        if aliased is None:
+            return ref
+        import dataclasses
+
+        return dataclasses.replace(ref, db=aliased)
 
     def _lineage_node_to_edges(
         self,
@@ -497,10 +515,12 @@ class SqlParser(ABC):
         if source is None:
             return None
         if isinstance(source, exp.Table):
-            return TableRef(
-                catalog=source.catalog if hasattr(source, "catalog") else None,
-                db=source.db if hasattr(source, "db") else None,
-                name=source.name if hasattr(source, "name") else str(source),
+            return self._apply_table_alias(
+                TableRef(
+                    catalog=source.catalog if hasattr(source, "catalog") else None,
+                    db=source.db if hasattr(source, "db") else None,
+                    name=source.name if hasattr(source, "name") else str(source),
+                )
             )
         # Subquery or CTE — return None (cannot resolve to a concrete table)
         return None
