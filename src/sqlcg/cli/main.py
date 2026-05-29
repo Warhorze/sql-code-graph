@@ -12,6 +12,7 @@ from sqlcg.cli.commands import (
     index,
     install,
     mcp,
+    reindex,
     report,
     uninstall,
     watch,
@@ -38,6 +39,7 @@ app.add_typer(git.app, name="git")
 
 # Register single commands
 app.command("index")(index.index_cmd)
+app.command("reindex")(reindex.reindex_cmd)
 app.command("watch")(watch.watch_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)
