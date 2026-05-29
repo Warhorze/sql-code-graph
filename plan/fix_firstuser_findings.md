@@ -22,8 +22,17 @@ run against the 1,340-file DWH repo.
 
 ### Blocking Questions
 
-None. The case-folding direction (lowercase) is already fixed by the schema side,
-so the normalization target is unambiguous.
+**BQ-1 (resolved by plan-reviewer): `_parse_column_ref` does not lowercase tool input.**
+
+`_parse_column_ref` (`tools.py` lines 106-127) splits the caller-supplied `table_col`
+string and constructs `col_id = f"{table_id}.{col_name}"` without lowercasing. After C2
+normalizes all stored `SqlColumn.id` values to lowercase, a user calling
+`trace_column_lineage("BA.WTFE_KPI.MA_ROTATIE")` will look up `"BA.WTFE_KPI.MA_ROTATIE"`
+against a graph that only stores `"ba.wtfe_kpi.ma_rotatie"` -- returning empty results.
+This would make C2 **actively worse** for users who pass uppercase column references.
+
+Resolution: Step 1.4b (added below) lowercases `col_ref` at the top of `_parse_column_ref`
+before splitting. Must be implemented together with Step 1.4.
 
 ## Scope
 
@@ -53,6 +62,9 @@ so the normalization target is unambiguous.
 - MERGE-branch lineage, star-expansion accuracy, or schema-CSV ingestion changes.
 - Changing the on-disk schema shape (column property set is unchanged; we only read
   an existing property in the Cypher RETURN clauses).
+- Cleaning up `RelType.INSERTS_INTO` (`schema.py` line 24, `schema.cypher` line 75) -- this
+  enum value is defined but never written by the indexer. It is dead schema but harmless;
+  removal is housekeeping outside this plan's scope.
 - Case-insensitive *matching* of user input in `find_table_usages` beyond what C2
   requires. (See §Cross-cutting note — C2 lowercases `name`, so the tool input must be
   lowercased to match; this is included, but no fuzzy matching is added.)
@@ -160,6 +172,13 @@ None new.
   `{"name": table_name.lower()}`.
 - Acceptance: `find_table_usages("WTFE_KPI_ROTATIE_WEBSHOP")` returns the same usages as
   `find_table_usages("wtfe_kpi_rotatie_webshop")`.
+
+**Step 1.4b**: Lowercase the `table_col` input in the three traversal tools via `_parse_column_ref`.
+- Files: [`tools.py`](../src/sqlcg/server/tools.py) `_parse_column_ref` (lines 106-127) --
+  add `col_ref = col_ref.lower()` as the first line of the function body (before the split).
+  Single chokepoint; all three traversal tools call it.
+- Acceptance: unit test with mocked backend confirms the Cypher `id` param sent by
+  `trace_column_lineage("BA.WTFE_KPI.MA_ROTATIE")` equals `"ba.wtfe_kpi.ma_rotatie"`.
 
 **Step 1.5 (C2b investigation)**: Confirm scripting-mode source refs pass through
 `_apply_table_alias`.
@@ -281,6 +300,8 @@ from a re-index without reset or from the same statement counted in multiple bat
       lowercase), and upstream lineage from `ba.wtfe_kpi_rotatie_webshop.ma_rotatie`
       returns a non-empty list.
 - [ ] C2: `TableRef`/`ColumnRef.full_id` is lowercase for any input case (unit).
+- [ ] C2: `trace_column_lineage("BA.T.COL")` resolves to the same graph node as
+      `trace_column_lineage("ba.t.col")` -- `_parse_column_ref` lowercases input (Step 1.4b).
 - [ ] C2b: scripting-mode `BA_TMP.X` source produces a single lowercase ref; with
       `schema_aliases={"ba_tmp":"ba"}` it produces `ba.x` (unit).
 - [ ] F1: empty-lineage hint and the three traversal docstrings contain the literal
@@ -300,8 +321,10 @@ from a re-index without reset or from the same statement counted in multiple bat
 - **R1 — Lowercasing breaks a case-sensitive consumer.** Snowflake is case-insensitive
   for unquoted identifiers, and the schema side is already lowercase (§2.6), so this
   aligns rather than diverges. Mitigation: the C2 integration regression guard plus the
-  `find_table_usages` input-lowercasing step (1.4) cover the one place that matched on raw
-  `name`. Grep for other `{name:` / `{qualified:` Cypher matches before opening the PR.
+  `find_table_usages` input-lowercasing step (1.4) and the `_parse_column_ref` lowercasing
+  step (1.4b) together cover all MCP lookup points that match raw user input (`SqlTable.name`
+  for FIND_TABLE_USAGES, `SqlColumn.id` for the three traversal queries). Grep for other
+  `{name:` / `{qualified:` Cypher matches before opening the PR.
 - **R2 — Quoted/case-sensitive Snowflake identifiers** (rare, `"MixedCase"`). Out of scope
   for this corpus; the report shows the real collisions are unquoted case variants of the
   same name. Document as a known limitation; do not special-case quoted identifiers now.
