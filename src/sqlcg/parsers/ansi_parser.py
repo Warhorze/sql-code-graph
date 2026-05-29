@@ -89,8 +89,7 @@ class AnsiParser(SqlParser):
             except Exception:
                 file_scopes.append(None)
 
-        # Compute schema sources and as_dict once per file (not per statement)
-        schema_sources = self._schema.as_sources_dict() if self._schema else {}
+        # Compute as_dict once per file (not per statement)
         schema_dict = self._schema.as_dict() if self._schema else {}
 
         # Initialize sources_map to accumulate temp table definitions.
@@ -126,7 +125,6 @@ class AnsiParser(SqlParser):
                     out,
                     sources_map,
                     scope=scope,
-                    schema_sources=schema_sources,
                     skip_column_lineage=is_pure_ddl,
                     schema_dict=schema_dict,
                 )
@@ -187,7 +185,6 @@ class AnsiParser(SqlParser):
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
-        schema_sources: dict[str, Any] | None = None,
         skip_column_lineage: bool = False,
         schema_dict: dict | None = None,
     ) -> QueryNode:
@@ -200,7 +197,6 @@ class AnsiParser(SqlParser):
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
-            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
 
         Returns:
@@ -273,7 +269,6 @@ class AnsiParser(SqlParser):
                 dst_table=target,
                 sources=sources_map,
                 query_sources=sources,
-                schema_sources=schema_sources,
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources

@@ -447,7 +447,6 @@ class SqlParser(ABC):
         dst_table: "TableRef | None",
         path: Path,
         out: ParsedFile,
-        mapping_schema_tables: "set[tuple[str | None, str | None, str]] | None" = None,
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -464,9 +463,6 @@ class SqlParser(ABC):
             dst_col_name: The output column name (destination)
             path: Source file path (for error recording)
             out: ParsedFile for error recording
-            mapping_schema_tables: Set of (catalog, db, table) tuples present in
-                mapping_schema. Source tables found here get confidence=1.0;
-                inferred-only tables get confidence=0.7. Pass None for 0.7 everywhere.
 
         Returns:
             List of LineageEdge objects (may be empty if tree is malformed)
@@ -496,18 +492,12 @@ class SqlParser(ABC):
                         else dst_col_name
                     )
                     dst_tbl = dst_table if dst_table else TableRef(name="<output>")
-                    schema_key = (src_table_ref.catalog, src_table_ref.db, src_table_ref.name)
-                    confidence = (
-                        1.0
-                        if mapping_schema_tables and schema_key in mapping_schema_tables
-                        else 0.7
-                    )
                     edges.append(
                         LineageEdge(
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=confidence,
+                            confidence=0.7,
                         )
                     )
                 except Exception as exc:
@@ -556,7 +546,6 @@ class SqlParser(ABC):
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
-        schema_sources: dict[str, Any] | None = None,
         scope: Any | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
@@ -575,7 +564,6 @@ class SqlParser(ABC):
             dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
-            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             scope: Pre-built sqlglot Scope for the query body (optional optimization).
                 When provided, sg_lineage() will reuse this scope instead of re-qualifying.
                 If not provided, a scope will be built from the extracted body before each
@@ -636,18 +624,7 @@ class SqlParser(ABC):
             # are expanded first (avoid rebuilding for each column, but only build
             # after sources are known)
             body_scope = None
-            combined_sources = {**(sources or {}), **(schema_sources or {})}
-
-            # T-09-01: Build mapping_schema_tables once per statement for confidence scoring.
-            # Source tables found in mapping_schema get confidence=1.0; inferred-only get 0.7.
-            mapping_schema_tables: set[tuple[str | None, str | None, str]] = set()
-            if hasattr(self, "_schema") and self._schema is not None:
-                for catalog, db_dict in (self._schema.mapping_schema() or {}).items():
-                    if isinstance(db_dict, dict):
-                        for db, table_dict in db_dict.items():
-                            if isinstance(table_dict, dict):
-                                for table_name in table_dict.keys():
-                                    mapping_schema_tables.add((catalog, db, table_name))
+            combined_sources = {**(sources or {})}
 
             # NEW (T-07-02): Add CTE bodies to combined_sources so that outer columns
             # can resolve through CTE names. This makes CTE-to-CTE chains resolvable.
@@ -756,10 +733,7 @@ class SqlParser(ABC):
                     # complex and not yet implemented (see sprint_06 T-05 deviation for details).
                     if body_scope is None and scope is None:
                         try:
-                            # Expand only file-level sources (CTEs, temp tables, CTAS bodies),
-                            # NOT schema_sources. Passing all ~5-10k schema CSV entries through
-                            # exp.expand() creates O(N_files * N_schema) bloat — schema resolution
-                            # goes through sg_lineage(sources=combined_sources) instead.
+                            # Expand only file-level sources (CTEs, temp tables, CTAS bodies).
                             expanded_body = body
                             expand_sources = {
                                 k: v for k, v in (sources or {}).items() if isinstance(v, exp.Query)
@@ -789,9 +763,7 @@ class SqlParser(ABC):
                             )
                             body_scope = None
 
-                    # When a scope is available it embeds full column→table resolution,
-                    # so schema_sources must NOT be passed via sources= (that would leak
-                    # O(N_schema) entries through sg_lineage's internal expand pass).
+                    # When a scope is available it embeds full column→table resolution.
                     # On the qualify-failed fallback path (no scope), pass only the small
                     # set of file-level sources so sg_lineage can resolve CTEs/CTAS bodies.
                     active_scope = scope if scope is not None else body_scope
@@ -809,7 +781,6 @@ class SqlParser(ABC):
                             dst_table=dst_table,
                             path=path,
                             out=out,
-                            mapping_schema_tables=mapping_schema_tables,
                         )
                         edges.extend(new_edges)
                         if not new_edges:
@@ -915,7 +886,6 @@ class SqlParser(ABC):
                                             dst_table=cte_dst_table,
                                             path=path,
                                             out=out,
-                                            mapping_schema_tables=mapping_schema_tables,
                                         )
                                         # Tag edges as CTE projections
                                         # (transform is read-only, so create new edges)
@@ -966,7 +936,6 @@ class SqlParser(ABC):
                                 dst_table=dst_table,
                                 path=path,
                                 out=out,
-                                mapping_schema_tables=mapping_schema_tables,
                             )
                             edges.extend(new_edges)
                     except Exception:

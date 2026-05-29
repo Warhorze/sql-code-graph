@@ -36,12 +36,8 @@ class SchemaResolver:
         self._tables: dict[tuple[str | None, str | None, str], list[str]] = {}
         self._view_bodies: dict[str, Any] = {}  # str -> ParsedFile
         self._cross_file_sources: dict[str, Any] = {}  # str -> exp.Select for CTAS
-        # T-09-01: Track catalog per (db, table) for mapping_schema() reconstruction
-        self._table_catalogs: dict[tuple[str | None, str | None], str | None] = {}
         self._lock = threading.Lock()
         self._cache: dict | None = None
-        self._sources_cache: dict | None = None
-        self._mapping_cache: dict | None = None
 
     def add_create_table(self, ast: Any) -> None:
         """Parse a CREATE TABLE AST node and register the table schema.
@@ -80,8 +76,6 @@ class SchemaResolver:
         with self._lock:
             self._tables[(catalog, db, table_name)] = col_names
             self._cache = None
-            self._sources_cache = None
-            self._mapping_cache = None
 
     def add_view_sources(self, sources: dict[str, Any]) -> None:
         """Register view-to-source-table mapping.
@@ -92,8 +86,6 @@ class SchemaResolver:
         with self._lock:
             self._view_bodies.update(sources)
             self._cache = None
-            self._sources_cache = None
-            self._mapping_cache = None
 
     def register_cross_file_sources(self, sources: dict[str, Any]) -> None:
         """Register CTAS bodies harvested across pass-1 files for cross-file resolution.
@@ -107,8 +99,6 @@ class SchemaResolver:
         with self._lock:
             self._cross_file_sources = dict(sources)
             self._cache = None
-            self._sources_cache = None
-            self._mapping_cache = None
 
     def cross_file_sources(self) -> dict[str, Any]:
         """Return a copy of cross-file CTAS bodies for seeding sources_map in pass 2.
@@ -160,101 +150,9 @@ class SchemaResolver:
                     self._tables[key] = col_names
 
                 self._cache = None
-                self._sources_cache = None
-                self._mapping_cache = None
 
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as exc:
             logger.warning("Failed to load dbt manifest %s: %s", manifest_path, exc)
-
-    # INERT (measured 2026-05-28, N=100 DWH sample, seed=42): loading the CSV
-    # produces zero delta in lineage_edges or star_edges_expanded vs no-schema
-    # (7241 vs 7259 edges).  Cross-file pass-2 sources dominate; CSV entries are
-    # registered but never consulted for column resolution on this corpus.
-    # Pending network analysis before removal.
-    def add_information_schema(self, csv_path: str | Path) -> int:
-        """Load table schemas from an INFORMATION_SCHEMA.COLUMNS CSV.
-
-        Expected columns: TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME,
-        COLUMN_NAME, ORDINAL_POSITION. Returns the number of tables loaded.
-
-        Args:
-            csv_path: Path to CSV file or file-like object (io.StringIO, etc.)
-
-        Returns:
-            Number of tables loaded
-
-        Raises:
-            ValueError: If CSV is missing required columns
-        """
-        import csv as _csv
-
-        required = {
-            "TABLE_CATALOG",
-            "TABLE_SCHEMA",
-            "TABLE_NAME",
-            "COLUMN_NAME",
-            "ORDINAL_POSITION",
-        }
-        tables: dict[tuple[str | None, str | None, str], list[tuple[int, str]]] = {}
-
-        # Handle both file paths and file-like objects
-        if isinstance(csv_path, (str, Path)):
-            f = open(Path(csv_path), newline="", encoding="utf-8")
-            should_close = True
-        else:
-            # Assume it's a file-like object
-            f = csv_path
-            should_close = False
-
-        catalogs: dict[tuple[str | None, str | None], str | None] = {}
-        try:
-            reader = _csv.DictReader(f)
-            if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-                missing = required - set(reader.fieldnames or [])
-                raise ValueError(f"CSV missing required columns: {missing}")
-            for row in reader:
-                # Fix 1: Lowercase all identifiers at load time to match sqlglot's normalisation
-                catalog_val = (row["TABLE_CATALOG"] or "").lower() or None
-                db_name = (row["TABLE_SCHEMA"] or "").lower() or None
-                table_name = row["TABLE_NAME"].lower()
-                col_name_lc = row["COLUMN_NAME"].lower()
-
-                # Try to parse ORDINAL_POSITION, skip row on error
-                try:
-                    ordinal = int(row["ORDINAL_POSITION"])
-                except ValueError:
-                    logger.warning(
-                        "Skipping CSV row with invalid ORDINAL_POSITION '%s' for column %s.%s.%s",
-                        row.get("ORDINAL_POSITION", ""),
-                        catalog_val,
-                        db_name,
-                        col_name_lc,
-                    )
-                    continue
-
-                # Store 2-part keys (db, table) in _tables for backward compat
-                # T-09-01: Also track catalog separately for mapping_schema()
-                key_2part = (db_name, table_name)
-                key_3part = (None, db_name, table_name)
-                tables.setdefault(key_3part, []).append((ordinal, col_name_lc))
-                # Track catalog for later reconstruction in mapping_schema()
-                catalogs[key_2part] = catalog_val
-        finally:
-            if should_close:
-                f.close()
-
-        with self._lock:
-            for key, cols in tables.items():
-                self._tables[key] = [c for _, c in sorted(cols)]
-                # Track catalog using (db, table) tuple
-                db_name = key[1]
-                table_name = key[2]
-                self._table_catalogs[(db_name, table_name)] = catalogs[(db_name, table_name)]
-            self._cache = None
-            self._sources_cache = None
-            self._mapping_cache = None
-
-        return len(catalogs)
 
     def as_dict(self) -> dict:
         """Return the schema as a nested dict: {catalog: {db: {table: [cols]}}}.
@@ -267,131 +165,6 @@ class SchemaResolver:
             if self._cache is None:
                 self._cache = self._build_dict()
             return copy.deepcopy(self._cache)
-
-    @staticmethod
-    def _q(name: str) -> str:
-        """Quote an identifier for ANSI SQL, escaping embedded double-quotes.
-
-        Per ANSI SQL, a double-quote inside a double-quoted identifier is escaped
-        by doubling: "col""name" represents col"name.
-
-        Args:
-            name: The identifier to quote
-
-        Returns:
-            The identifier wrapped in double-quotes with internal quotes escaped
-        """
-        return '"' + name.replace('"', '""') + '"'
-
-    def as_sources_dict(self) -> dict[str, Any]:
-        """Return a sources= dict for sg_lineage(): {table_name: parsed_SELECT_node}.
-
-        For each table known to the resolver, creates a parsed exp.Select AST node:
-            SELECT col1, col2, ... FROM table_name
-        This lets qualify() inside sg_lineage() expand CTE references to cross-file
-        views whose columns are known from INFORMATION_SCHEMA but whose SQL body is
-        not available in the current file.
-
-        Returns:
-            Dict mapping table_name (last component) to a parsed exp.Select AST node.
-            Keys are lowercased to match sqlglot's qualify() normalisation.
-            Returned dict is cached and reused; the caller must not mutate it.
-
-        Note: Parsing once at construction time is preferable to parsing on-demand
-        per-call. With ~5k tables and ~144k columns, the memory footprint of ~5k
-        parsed exp.Select nodes is acceptable (<50 MB). The result is cached to avoid
-        re-parsing on subsequent calls; the cache is invalidated when the resolver
-        is mutated via add_create_table, add_view_sources, register_cross_file_sources,
-        add_dbt_manifest, or add_information_schema.
-        """
-        import sqlglot
-        import sqlglot.expressions as exp
-
-        with self._lock:
-            # Check cache first
-            if self._sources_cache is not None:
-                return self._sources_cache
-
-            result: dict[str, Any] = {}
-            for (_, db, name), cols in self._tables.items():
-                if not cols:
-                    continue
-                # Fix 2: Quote identifiers to handle spaces and special characters
-                col_list = ", ".join(self._q(c) for c in cols)
-                quoted_table = f"{self._q(db)}.{self._q(name)}" if db else self._q(name)
-                sql = f"SELECT {col_list} FROM {quoted_table}"
-
-                try:
-                    parsed = sqlglot.parse_one(sql, dialect=self.dialect, into=exp.Select)
-                    # Key is the bare table name (lowercased) — sqlglot expand() uses
-                    # the scope name which comes from the CTE or alias, not the full path.
-                    result[name.lower()] = parsed
-                    # Also register under schema.table key for fully-qualified CTE sources
-                    if db:
-                        result[f"{db}.{name}".lower()] = parsed
-                except Exception as e:
-                    # Parsing failure shouldn't block the resolver; log and skip
-                    logger.warning(
-                        "Failed to parse synthetic SELECT for %s: %s (%s)",
-                        quoted_table,
-                        sql,
-                        e,
-                    )
-
-            self._sources_cache = result
-            return result
-
-    # INERT (measured 2026-05-28): only populated when catalog is non-null, but
-    # DWH corpus table references don't carry a catalog — qualify() falls back to
-    # infer_schema=True regardless of whether schema_csv was provided.
-    # Pending network analysis before removal.
-    def mapping_schema(self) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
-        """Return schema in sqlglot's mapping_schema format.
-
-        Shape: ``{catalog: {db: {table: {col: type}}}}``. Used by qualify() to
-        resolve cross-schema column references during pass-2 lineage extraction.
-
-        Distinct from as_dict(), which returns the depth-1 ``{table: [cols]}``
-        shape used by parser-internal source maps (see base.py).
-
-        Empty dict when no schema has been loaded — qualify() then operates in
-        infer-only mode (validate_qualify_columns=False + infer_schema=True),
-        which is the small-repo default.
-
-        Returns:
-            Nested dictionary {catalog: {db: {table: {col: type}}}}.
-            Column types are all "UNKNOWN" (type is not validated by qualify).
-        """
-        with self._lock:
-            if self._mapping_cache is not None:
-                return self._mapping_cache
-            out: dict = {}
-            for (cat, db, name), cols in self._tables.items():
-                # Skip entries without a schema
-                if not db:
-                    continue
-
-                # T-09-01: Use tracked catalog from add_information_schema if available,
-                # otherwise use the (cat, db) key's catalog (which should be None for
-                # backward compat entries). For entries loaded from CSV, we look up
-                # the catalog from _table_catalogs using (db, name) key.
-                catalog = self._table_catalogs.get((db, name), cat)
-                if not catalog:
-                    # Entries without a catalog cannot be represented in mapping_schema
-                    continue
-
-                # Build nested structure
-                if catalog not in out:
-                    out[catalog] = {}
-                if db not in out[catalog]:
-                    out[catalog][db] = {}
-
-                # Add table with column->type mapping
-                col_dict = {col: "UNKNOWN" for col in cols}
-                out[catalog][db][name] = col_dict
-
-            self._mapping_cache = out
-            return out
 
     def _build_dict(self) -> dict:
         """Build the nested schema dictionary (called only under self._lock).

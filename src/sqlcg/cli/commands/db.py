@@ -51,11 +51,23 @@ def db_reset(  # noqa: B008
             )
         console.print(f"[yellow]Reset repo[/yellow] {repo}")
     else:
-        # Full reset — delete the DB file (close backend first to release file handle)
+        # Full reset — delete the DB. Kuzu may store it as a single file (current,
+        # e.g. 0.11.x) or a directory (older versions); also drop the .wal sidecar.
+        # shutil.rmtree silently no-ops on a regular file (NotADirectoryError +
+        # ignore_errors), so dispatch on the actual filesystem type.
         db_path = get_db_path()
-        if db_path.exists():
-            shutil.rmtree(str(db_path), ignore_errors=True)
-        console.print("[red]Database wiped[/red]")
+        removed = False
+        for target in (db_path, db_path.with_name(db_path.name + ".wal")):
+            if target.is_dir():
+                shutil.rmtree(str(target), ignore_errors=True)
+                removed = True
+            elif target.exists():
+                target.unlink()
+                removed = True
+        if removed:
+            console.print("[red]Database wiped[/red]")
+        else:
+            console.print("[yellow]Nothing to wipe — database does not exist[/yellow]")
 
 
 @app.command("info")

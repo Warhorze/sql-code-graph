@@ -1,7 +1,7 @@
-"""E_aggregates: Aggregate function expressions with and without schema.
+"""E_aggregates: Aggregate function expressions produce inferred edges.
 
-T-09-01 fix: Aggregate functions with mapping_schema should produce edges.
-Aggregates without schema (inferred-only) should emit confidence=0.7 instead of E5.
+Aggregate functions (SUM, AVG, etc.) over a source column should emit an
+inferred column-lineage edge rather than an E5 'Cannot find column' error.
 """
 
 from pathlib import Path
@@ -10,11 +10,10 @@ from tests.snowflake.conftest import edges, parse
 
 
 def test_sum_present_source_produces_high_confidence_edge(parser):
-    """SUM aggregate with source present in schema produces confidence=1.0 edge."""
+    """SUM aggregate over a source column produces an inferred edge."""
     sql = Path(__file__).with_name("fixture_sum_present_source.sql").read_text()
     result = parse(parser, sql, "fixture_sum_present_source.sql")
 
-    # With default empty mapping_schema, SUM(amount) will be inferred
     all_edges = edges(result)
     assert len(all_edges) >= 1, f"Expected at least 1 edge for SUM(amount), got {all_edges}"
 

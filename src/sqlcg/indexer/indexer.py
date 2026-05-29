@@ -2,13 +2,14 @@
 
 import multiprocessing as mp
 import queue
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.queries import STALE_VIEWS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
-from sqlcg.indexer.error_classify import _classify_error
+from sqlcg.indexer.error_classify import _classify_error, dominant_cause
 from sqlcg.indexer.pool import HardKillPool
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
@@ -28,13 +29,9 @@ def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
     instantiates the parser inside the child process so that any thread-local
     state from the parent does not leak.
 
-    T-09-04: Parser constructors require a SchemaResolver.
-    The subprocess has no schema loaded (no CSV in the child), so pass a
-    fresh empty resolver. The qualify-once path in the child still calls
-    self._schema.mapping_schema() which returns {} on an empty resolver,
-    giving the same infer-only behaviour as small-repo mode. This is correct
-    because schema context is passed via mapping_schema at the parse_file call
-    site, not via the resolver state when subprocess isolation is active.
+    T-09-04: Parser constructors require a SchemaResolver. The subprocess gets a
+    fresh empty resolver; column resolution runs in infer-only mode, the same as
+    small-repo mode.
     """
     try:
         parser = parser_cls(SchemaResolver(dialect=str(dialect) if dialect else None))
@@ -61,10 +58,10 @@ class Indexer:
         timeout_per_file: int = 5,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
-        schema_csv: Path | None = None,
         no_ddl: bool = False,
         batch_size: int = 50,
         n_workers: int | None = None,
+        profile: bool = False,
     ) -> dict:
         """Full two-pass index with batched writes. Returns summary dict.
 
@@ -78,8 +75,6 @@ class Indexer:
                 indexing to tracked files; falls back to rglob when git
                 is unavailable or the directory is not a git repository.
             progress_callback: Optional callback(n, total) invoked every 100 files
-            schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
-                auto-discovers <path>/.sqlcg/schema.csv if present.
             no_ddl: When True, skip DDL-only files from upsert into the graph
             batch_size: Number of files committed per KuzuDB transaction in the upsert pass.
                 Higher values reduce commit overhead but increase the per-batch recovery cost
@@ -89,8 +84,13 @@ class Indexer:
                 behaviour. Must be >= 1.
             n_workers: Number of worker processes in the persistent pool (default: cpu_count()).
                 Workers are spawn-mode so they never inherit the KuzuDB file descriptor.
-                Each worker holds two pre-built parsers (pass-1 empty schema, pass-2 full
-                schema CSV), paying the cold-start cost once per run rather than per file.
+                Each worker holds two pre-built parsers (one per pass), paying the
+                cold-start cost once per run rather than per file.
+            profile: When True, attach a "profile" dict to the returned summary with
+                per-stage wall-time (pass1_parse_s, pass2_resolve_s, upsert_s,
+                star_expand_s, total_s), per-file ms, and the top-10 slowest files by
+                parse time. When False (default), no timing calls are made in the hot
+                loop — zero overhead.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
@@ -98,13 +98,17 @@ class Indexer:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        # INERT (measured 2026-05-28): schema_csv loading (both into the graph and
-        # into worker SchemaResolvers) produces zero delta in edges vs no-schema.
-        # Kept pending network analysis; both code paths below are candidates for removal.
-        if schema_csv and schema_csv.exists():
-            from sqlcg.cli.commands.load_schema import _load_schema_into_graph
 
-            _load_schema_into_graph(schema_csv, include_catalog=False, db=db)
+        # Timing accumulators — only assigned when profile=True; zero-initialised
+        # here so pyright can infer their types as float throughout the method.
+        _t_pass1_start: float = 0.0
+        _t_pass1_end: float = 0.0
+        _t_pass2_start: float = 0.0
+        _t_pass2_end: float = 0.0
+        _t_upsert_start: float = 0.0
+        _t_upsert_end: float = 0.0
+        _t_star_start: float = 0.0
+        _t_star_end: float = 0.0
 
         spec = load_ignore_spec(path)
         aggregator = CrossFileAggregator()
@@ -125,7 +129,6 @@ class Indexer:
                 file_sqls.append((file_path, ""))
                 parse_errors += 1
 
-        schema_csv_str = str(schema_csv) if schema_csv and schema_csv.exists() else None
         p1_timeout = float(timeout_per_file) if timeout_per_file > 0 else float("inf")
         p2_timeout = max(p1_timeout, 15.0) if timeout_per_file > 0 else float("inf")
 
@@ -136,23 +139,50 @@ class Indexer:
         p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
 
         p1_done = 0
+        # Per-file parse times collected when profile=True.
+        # Each entry is (path_str, elapsed_ms) recorded at result-delivery time.
+        # CAVEAT (W1): this measures the wall time between consecutive worker-result
+        # deliveries to the coordinator, NOT the true in-worker parse duration. It
+        # reflects coordinator receive-order and scheduling overhead, so `slowest_files`
+        # is a proxy for "files whose results arrived after the longest gap", not an
+        # absolute per-file parse-latency ranking. Per-stage totals below ARE accurate.
+        # A true per-file timing would require worker-side start/end timestamps returned
+        # with each ParsedFile (follow-up; would touch pool.py).
+        _file_parse_times: list[tuple[str, float]] = []
+        _last_result_t: list[float] = []  # single-element list used as a nonlocal cell
+
+        if profile:
+            _last_result_t.append(time.perf_counter())
 
         def _p1_on_result() -> None:
             nonlocal p1_done
             p1_done += 1
+            if profile:
+                now = time.perf_counter()
+                elapsed_ms = (now - _last_result_t[0]) * 1000.0
+                # Associate elapsed time with the file that just completed.
+                # p1_done-1 is the 0-based index of the just-completed file.
+                file_idx = p1_done - 1
+                if file_idx < len(file_sqls):
+                    _file_parse_times.append((str(file_sqls[file_idx][0]), elapsed_ms))
+                _last_result_t[0] = now
             if progress_callback is not None:
                 progress_callback(p1_done, total_files)
 
+        if profile:
+            _t_pass1_start = time.perf_counter()
+
         try:
-            with HardKillPool(
-                dialect, schema_csv_str, n_workers, schema_aliases=schema_aliases
-            ) as pool:
+            with HardKillPool(dialect, n_workers, schema_aliases=schema_aliases) as pool:
                 # Pass 1: parse all files in parallel
                 p1_raw = pool.map(
                     p1_tasks,
                     per_task_timeout=p1_timeout,
                     on_result=_p1_on_result,
                 )
+
+                if profile:
+                    _t_pass1_end = time.perf_counter()
 
                 # Register pass-1 results with the aggregator
                 for i, (file_path, _sql) in enumerate(file_sqls):
@@ -211,8 +241,14 @@ class Indexer:
 
                 pass2_skipped = len(pass1_results) - len(pass2_indices)
 
+                if profile:
+                    _t_pass2_start = time.perf_counter()
+
                 # Pass 2: resolve cross-file references in parallel
                 p2_raw = pool.map(p2_tasks, per_task_timeout=p2_timeout)
+
+                if profile:
+                    _t_pass2_end = time.perf_counter()
 
         except KeyboardInterrupt:
             logger.info("SIGINT received — flushing pass-1 progress")
@@ -232,15 +268,6 @@ class Indexer:
                 )
             else:
                 pass2_results[orig_idx] = r
-
-        # Load gold tables (information_schema-backed tables) before upserting
-        # to suppress DDL columns for tables with production-verified schemas
-        gold_rows = db.run_read(
-            "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
-            "RETURN DISTINCT t.qualified AS q",
-            {},
-        )
-        gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
 
         # Build duplicate-DDL registry from in-memory results so _upsert_parsed_file
         # can detect conflicts with a dict lookup instead of a per-table graph read.
@@ -277,7 +304,6 @@ class Indexer:
                         counts = self._upsert_parsed_file(
                             parsed_in_batch,
                             db,
-                            gold_tables=gold_tables,
                             defined_table_registry=defined_table_registry,
                         )
                         nonlocal_counts["tables"] += counts["tables"]
@@ -292,6 +318,9 @@ class Indexer:
                         )
                         nonlocal_counts["quality"]["failed"] += 1
 
+        if profile:
+            _t_upsert_start = time.perf_counter()
+
         batch: list[ParsedFile] = []
         for parsed in pass2_results:
             skip_upsert = no_ddl and any("pure_ddl_skip" in e for e in parsed.errors)
@@ -304,8 +333,15 @@ class Indexer:
                 batch = []  # IMPORTANT — free the references so GC can reclaim parsed.statements
         _flush_batch(batch)  # final partial batch
 
+        if profile:
+            _t_upsert_end = time.perf_counter()
+            _t_star_start = time.perf_counter()
+
         # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
         star_edges_expanded = self._expand_star_sources(db)
+
+        if profile:
+            _t_star_end = time.perf_counter()
 
         # Classify all errors into buckets for measurement and reporting
         error_summary: dict[str, int] = {
@@ -334,7 +370,7 @@ class Indexer:
             ", ".join(summary_parts) if summary_parts else "(no errors)",
         )
 
-        return {
+        result: dict = {
             "files_parsed": len(pass2_results),
             "pass2_skipped": pass2_skipped,
             "parse_errors": parse_errors,
@@ -347,6 +383,27 @@ class Indexer:
             "error_summary": error_summary,
             "batch_size": batch_size,
         }
+
+        if profile:
+            pass1_s = _t_pass1_end - _t_pass1_start
+            pass2_s = _t_pass2_end - _t_pass2_start
+            upsert_s = _t_upsert_end - _t_upsert_start
+            star_s = _t_star_end - _t_star_start
+            total_s = pass1_s + pass2_s + upsert_s + star_s
+            n_files = max(len(pass2_results), 1)
+            slowest = sorted(_file_parse_times, key=lambda x: x[1], reverse=True)[:10]
+            result["profile"] = {
+                "pass1_parse_s": pass1_s,
+                "pass2_resolve_s": pass2_s,
+                "upsert_s": upsert_s,
+                "star_expand_s": star_s,
+                "total_s": total_s,
+                "files": len(pass2_results),
+                "ms_per_file": total_s / n_files * 1000.0,
+                "slowest_files": slowest,
+            }
+
+        return result
 
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
         """Re-index a single file and its dependent views.
@@ -365,15 +422,7 @@ class Indexer:
             sql = Path(file_path).read_text(encoding="utf-8")
             parsed = parser.parse_file(Path(file_path), sql)
 
-            # Load gold tables for this re-index call
-            gold_rows = db.run_read(
-                "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
-                "RETURN DISTINCT t.qualified AS q",
-                {},
-            )
-            gold_tables = frozenset(row["q"] for row in gold_rows)
-
-            self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
+            self._upsert_parsed_file(parsed, db)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
@@ -458,7 +507,6 @@ class Indexer:
         self,
         parsed: ParsedFile,
         db: GraphBackend,
-        gold_tables: frozenset[str] = frozenset(),
         defined_table_registry: dict[str, str] | None = None,
     ) -> dict:
         """Map ParsedFile → graph nodes/edges using bulk upsert.
@@ -466,8 +514,6 @@ class Indexer:
         Args:
             parsed: ParsedFile to upsert
             db: GraphBackend instance
-            gold_tables: Set of table full_ids with information_schema-backed columns
-                        (skip DDL column writes for these tables)
 
         Returns:
             Dict with keys: tables, edges, columns_defined, star_sources
@@ -489,7 +535,15 @@ class Indexer:
         star_source_edges: list[dict] = []  # QUERY -> TABLE
 
         # File node
-        file_rows.append({"path": parsed.path_str, "dialect": parsed.dialect or ""})
+        cause, failed = dominant_cause(parsed.errors)
+        file_rows.append(
+            {
+                "path": parsed.path_str,
+                "dialect": parsed.dialect or "",
+                "parse_failed": failed,
+                "parse_cause": cause,
+            }
+        )
 
         # Defined tables
         for table in parsed.defined_tables:
@@ -534,14 +588,6 @@ class Indexer:
 
         # DDL columns and HAS_COLUMN edges
         for table in parsed.defined_tables:
-            # Check if this table is covered by information_schema (gold table)
-            if table.full_id in gold_tables:
-                logger.debug(
-                    "Skipping DDL columns for %s — information_schema takes precedence",
-                    table.full_id,
-                )
-                continue
-
             qnode = defined_by_query.get(table.full_id)
             if not qnode:
                 continue

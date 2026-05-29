@@ -1,52 +1,16 @@
-"""Failing acceptance tests for T-09-01 (qualify-once + schema-aware parsing).
+"""Acceptance tests for T-09-01 qualify-once parsing.
 
-Tests must FAIL before T-09-01 is implemented and PASS after.
+Pins the qualify-once invariant: build_scope() runs at most once per statement
+and a qualify() failure is caught as a structured error rather than crashing.
 Named so ``pytest -k T09_01`` works.
 """
 
-import io
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
-
-# ---------------------------------------------------------------------------
-# Scenario A — mapping_schema() returns depth-3 nested dict
-# ---------------------------------------------------------------------------
-
-
-def test_T09_01_mapping_schema_returns_depth3_dict():
-    """SchemaResolver.mapping_schema() must return {catalog: {db: {table: {col: type}}}}.
-
-    This method does not exist pre-T-09-01; the test will AttributeError-skip
-    until the symbol lands.
-    """
-    try:
-        resolver = SchemaResolver(dialect="snowflake")
-        _ = resolver.mapping_schema  # introduced by T-09-01
-    except AttributeError:
-        pytest.skip("T-09-01 not yet implemented: mapping_schema missing")
-
-    csv_content = (
-        "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,DATA_TYPE\n"
-        "DWH_PRD,BA,X,a,1,TEXT\n"
-        "DWH_PRD,BA,X,b,2,TEXT\n"
-    )
-    resolver.add_information_schema(io.StringIO(csv_content))
-    result = resolver.mapping_schema()
-
-    assert isinstance(result, dict), "mapping_schema() must return a dict"
-    # add_information_schema lowercases all identifiers at load time to match sqlglot normalisation
-    assert "dwh_prd" in result, "catalog key missing"
-    assert "ba" in result["dwh_prd"], "db key missing"
-    assert "x" in result["dwh_prd"]["ba"], "table key missing"
-    cols = result["dwh_prd"]["ba"]["x"]
-    assert isinstance(cols, dict), "column level must be a dict {col_name: type}"
-    assert "a" in cols, "column 'a' missing"
-    assert "b" in cols, "column 'b' missing"
-
 
 # ---------------------------------------------------------------------------
 # Scenario B — build_scope is called exactly once per _extract_column_lineage
@@ -97,70 +61,6 @@ def test_T09_01_build_scope_called_once_per_statement():
         "T-09-01 qualify-once pattern should call it at most once."
     )
     assert len(call_count) >= 1, "build_scope was never called — qualify-once path not reached"
-
-
-# ---------------------------------------------------------------------------
-# Scenario D — confidence scoring: schema-backed=1.0, inferred-only=0.7
-# ---------------------------------------------------------------------------
-
-
-def test_T09_01_confidence_scoring_schema_backed():
-    """Edges from schema-backed sources get confidence=1.0, inferred-only get 0.7.
-
-    Pre-T-09-01 there is no confidence distinction based on mapping_schema presence.
-    """
-    try:
-        resolver = SchemaResolver(dialect="snowflake")
-        _ = resolver.mapping_schema  # introduced by T-09-01
-    except AttributeError:
-        pytest.skip("T-09-01 not yet implemented: mapping_schema missing")
-
-    try:
-        from sqlcg.parsers.ansi_parser import AnsiParser
-    except ImportError:
-        pytest.skip("AnsiParser not importable")
-
-    # Load schema so 'src' table is known
-    csv_content = (
-        "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,DATA_TYPE\n"
-        "db,s,src,a,1,NUMBER\n"
-    )
-    resolver.add_information_schema(io.StringIO(csv_content))
-    parser = AnsiParser(resolver)
-
-    sql = "INSERT INTO db.s.t (a) SELECT src.a FROM db.s.src;"
-    result = parser.parse_file(Path("test.sql"), sql)
-
-    edges = [e for stmt in result.statements for e in stmt.column_lineage]
-    assert len(edges) >= 1, "Expected at least one lineage edge for schema-backed source"
-    schema_edges = [e for e in edges if e.confidence == 1.0]
-    assert len(schema_edges) >= 1, (
-        f"Expected confidence=1.0 for schema-backed edge. Got confidences: "
-        f"{[e.confidence for e in edges]}"
-    )
-
-
-def test_T09_01_confidence_scoring_inferred_only():
-    """With empty mapping_schema, edges are inferred (confidence=0.7 not 1.0)."""
-    try:
-        from sqlcg.parsers.ansi_parser import AnsiParser
-
-        resolver = SchemaResolver(dialect="snowflake")
-        _ = resolver.mapping_schema  # introduced by T-09-01
-    except AttributeError:
-        pytest.skip("T-09-01 not yet implemented: mapping_schema missing")
-
-    parser = AnsiParser(resolver)  # no schema loaded → empty mapping_schema
-    sql = "INSERT INTO db.s.t (a) SELECT src.a FROM db.s.src;"
-    result = parser.parse_file(Path("test.sql"), sql)
-
-    edges = [e for stmt in result.statements for e in stmt.column_lineage]
-    assert len(edges) >= 1, "Expected at least one lineage edge for inferred source"
-    high_conf = [e for e in edges if e.confidence == 1.0]
-    assert len(high_conf) == 0, (
-        "With empty mapping_schema all edges should be inferred (confidence < 1.0). "
-        f"Got confidence=1.0 on {len(high_conf)} edges."
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ def test_index_quiet_flag_suppresses_summary():
                 patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
             ):
                 mock_backend = MagicMock()
-                mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
+                mock_backend.get_schema_version.return_value = "3"  # Match SCHEMA_VERSION
                 mock_get_backend.return_value.__enter__.return_value = mock_backend
 
                 mock_indexer = MagicMock()
@@ -65,7 +65,6 @@ def test_index_quiet_flag_suppresses_summary():
                     timeout_per_file=30,
                     buffer_pool_size=0,
                     no_ddl=False,
-                    schema_from_info_schema=None,
                     quiet=True,
                 )
 
@@ -82,7 +81,6 @@ def test_index_quiet_flag_suppresses_summary():
                     timeout_per_file=30,
                     buffer_pool_size=0,
                     no_ddl=False,
-                    schema_from_info_schema=None,
                     quiet=False,
                 )
 
@@ -101,7 +99,7 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
         patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
     ):
         mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "2"
+        mock_backend.get_schema_version.return_value = "3"
         mock_get_backend.return_value.__enter__.return_value = mock_backend
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer
@@ -118,7 +116,6 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
             timeout_per_file=30,
             buffer_pool_size=0,
             no_ddl=False,
-            schema_from_info_schema=None,
             quiet=True,
         )
         defaults.update(kwargs)

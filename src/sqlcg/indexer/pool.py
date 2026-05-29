@@ -45,7 +45,6 @@ _SHUTDOWN = "__sqlcg_pool_shutdown__"  # string sentinel: survives pickle across
 def _worker_main(
     conn: Connection,
     dialect: str | None,
-    schema_csv_path: str | None,
     schema_aliases: dict[str, str] | None = None,
 ) -> None:
     """Entry point for each pool worker.  Runs in a spawned child process.
@@ -71,9 +70,6 @@ def _worker_main(
     parser_p1 = get_parser(dialect, schema_p1, schema_aliases=schema_aliases)
 
     schema_p2 = SchemaResolver(dialect=dialect)
-    if schema_csv_path:
-        # INERT (measured 2026-05-28): see SchemaResolver.add_information_schema.
-        schema_p2.add_information_schema(schema_csv_path)
     parser_p2 = get_parser(dialect, schema_p2, schema_aliases=schema_aliases)
 
     try:
@@ -182,7 +178,7 @@ class HardKillPool:
 
     Usage::
 
-        with HardKillPool(dialect, schema_csv_path, n_workers=8) as pool:
+        with HardKillPool(dialect, n_workers=8) as pool:
             results_p1 = pool.map(p1_tasks, per_task_timeout=5.0)
             results_p2 = pool.map(p2_tasks, per_task_timeout=15.0)
 
@@ -193,12 +189,10 @@ class HardKillPool:
     def __init__(
         self,
         dialect: str | None,
-        schema_csv_path: str | None = None,
         n_workers: int | None = None,
         schema_aliases: dict[str, str] | None = None,
     ) -> None:
         self._dialect = dialect
-        self._schema_csv_path = schema_csv_path
         self._schema_aliases: dict[str, str] = schema_aliases or {}
         self._n = n_workers or os.cpu_count() or 4
         self._ctx = mp.get_context("spawn")
@@ -223,7 +217,7 @@ class HardKillPool:
         coord_conn, child_conn = self._ctx.Pipe(duplex=True)
         proc = self._ctx.Process(
             target=_worker_main,
-            args=(child_conn, self._dialect, self._schema_csv_path, self._schema_aliases),
+            args=(child_conn, self._dialect, self._schema_aliases),
             daemon=True,
         )
         proc.start()

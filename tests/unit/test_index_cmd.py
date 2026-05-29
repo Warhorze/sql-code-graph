@@ -38,7 +38,7 @@ def test_zero_edges_warning_appears_in_output():
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = "3"  # Match SCHEMA_VERSION
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with zero edges
@@ -64,7 +64,6 @@ def test_zero_edges_warning_appears_in_output():
                 timeout_per_file=30,
                 buffer_pool_size=0,
                 no_ddl=False,
-                schema_from_info_schema=None,
                 quiet=False,
             )
 
@@ -102,7 +101,7 @@ def test_no_warning_when_edges_exist():
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = "3"  # Match SCHEMA_VERSION
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with edges present
@@ -128,7 +127,6 @@ def test_no_warning_when_edges_exist():
                 timeout_per_file=30,
                 buffer_pool_size=0,
                 no_ddl=False,
-                schema_from_info_schema=None,
                 quiet=False,
             )
 

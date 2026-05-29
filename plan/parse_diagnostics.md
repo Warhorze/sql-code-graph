@@ -425,3 +425,20 @@ None blocking. All four called-out scope decisions are resolved above. The singl
 correction (File node did not have `parse_failed`; both columns are new) is documented and
 folded into Phase 1. The MCP tool is a deliberate, documented deferral, not an unresolved
 question.
+
+### Deviations
+
+#### Deviation 1: Integration test uses func_fallback instead of E5 as the degrading-bucket fixture
+- **Reason**: The plan specified `parse_cause="E5"` for the integration test fixture
+  (`WITH x AS (SELECT a FROM table_not_in_schema) SELECT a FROM x`). In practice, the
+  current ANSI parser resolves this CTE successfully (confidence 0.7) without emitting
+  any `col_lineage:...:Cannot find column` error marker — sqlglot traces lineage back to
+  `table_not_in_schema` instead of raising. The fixture produces zero errors.
+- **Change**: `test_failing_file_has_correct_cause` uses `SELECT SUM(amount) FROM orders;`
+  which reliably triggers `col_lineage_skip:func_fallback:Sum` via the unaliased-aggregate
+  guard (T-09-03). The acceptance criterion (a degrading file has `parse_failed=true` and a
+  populated `parse_cause`) is fully satisfied. `dominant_cause()` unit tests cover E5 directly
+  via `_classify_error` input strings.
+- **Impact**: No scope change. `func_fallback` is a first-class degrading bucket and a real
+  production trigger path. The e2e `analyze failures` tests also use `func_fallback`.
+- **Date**: 2026-05-29

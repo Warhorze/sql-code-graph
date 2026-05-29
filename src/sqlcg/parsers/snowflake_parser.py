@@ -239,9 +239,6 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
-        # Compute schema sources once per file
-        schema_sources = self._schema.as_sources_dict() if self._schema else {}
-
         # Initialize sources_map for temp table resolution.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
         xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
@@ -272,7 +269,6 @@ class SnowflakeParser(AnsiParser):
                             stmt_index,
                             out,
                             sources_map,
-                            schema_sources=schema_sources,
                         )
                         # Mark as parse_failed since we're in scripting mode
                         query_node.parse_failed = True

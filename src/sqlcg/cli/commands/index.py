@@ -51,16 +51,14 @@ def index_cmd(  # noqa: B008
     no_ddl: bool = typer.Option(  # noqa: B008
         False, "--no-ddl", help="Skip table-node upserts for DDL-only files"
     ),
-    schema_from_info_schema: str | None = typer.Option(  # noqa: B008
-        None,
-        "--schema-from-info-schema",
-        help="Path to INFORMATION_SCHEMA.COLUMNS CSV (overrides .sqlcg/schema.csv convention).",
-    ),
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary console output"
     ),
     debug: bool = typer.Option(  # noqa: B008
         False, "--debug", help="Show detailed log output during indexing"
+    ),
+    profile: bool = typer.Option(  # noqa: B008
+        False, "--profile/--no-profile", help="Emit per-stage timing after indexing"
     ),
 ) -> None:
     """Index SQL files in a directory.
@@ -100,29 +98,6 @@ def index_cmd(  # noqa: B008
             )
             raise typer.Exit(1)
 
-        # Auto-discover or explicitly load INFORMATION_SCHEMA CSV
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
-
-        _convention = path / ".sqlcg" / "schema.csv"
-        schema_csv: Path | None = (
-            Path(schema_from_info_schema)
-            if schema_from_info_schema
-            else (_convention if _convention.exists() else None)
-        )
-        if schema_csv:
-            try:
-                tables_loaded, cols_loaded = _load_schema_into_graph(
-                    schema_csv, include_catalog=False, db=backend
-                )
-                if not quiet:
-                    console.print(
-                        f"[blue]Schema[/blue] loaded {tables_loaded} tables, "
-                        f"{cols_loaded} columns from {schema_csv}"
-                    )
-            except ValueError as exc:
-                console.print(f"[red]Schema CSV error: {exc}[/red]")
-                raise typer.Exit(1) from exc
-
         abs_path = str(path.resolve())
         backend.upsert_node(
             NodeLabel.REPO,
@@ -157,9 +132,9 @@ def index_cmd(  # noqa: B008
                 dbt_manifest,
                 timeout_per_file,
                 progress_callback=_progress_callback,
-                schema_csv=None,
                 no_ddl=no_ddl,
                 batch_size=batch_size,
+                profile=profile,
             )
 
         # Connect files to repo
@@ -210,3 +185,18 @@ def index_cmd(  # noqa: B008
                     "[yellow]Warning: 0 lineage edges extracted — column lineage "
                     "unavailable.[/yellow]"
                 )
+
+        if prof := summary.get("profile"):
+            console.print("\n[bold]Profile[/bold]")
+            console.print(
+                f"  pass1 parse:    {prof['pass1_parse_s']:.2f}s\n"
+                f"  pass2 resolve:  {prof['pass2_resolve_s']:.2f}s\n"
+                f"  upsert:         {prof['upsert_s']:.2f}s\n"
+                f"  star expand:    {prof['star_expand_s']:.2f}s\n"
+                f"  total:          {prof['total_s']:.2f}s\n"
+                f"  ms/file:        {prof['ms_per_file']:.1f}ms  ({prof['files']} files)"
+            )
+            if prof["slowest_files"]:
+                console.print("  [bold]Slowest files[/bold]")
+                for file_path, ms in prof["slowest_files"]:
+                    console.print(f"    {ms:8.1f}ms  {file_path}")

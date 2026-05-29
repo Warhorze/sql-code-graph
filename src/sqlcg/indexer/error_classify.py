@@ -4,6 +4,70 @@ Maps structured error messages recorded during parsing into E-code buckets
 for measurement and summary reporting.
 """
 
+# Priority order when one file emits multiple distinct buckets.
+# Highest blast-radius / most severe failures first; pure_ddl_skip last
+# (non-degrading: a deliberate skip, not a failure).
+_CAUSE_PRIORITY: list[str] = [
+    "timeout",
+    "E8",
+    "E3",
+    "E2",
+    "E5",
+    "E1",
+    "qualify_failed",
+    "func_fallback",
+    "pure_ddl_skip",
+]
+
+# Buckets that represent a genuine parse degradation (as opposed to a
+# deliberate skip or fully unclassifiable noise).
+_DEGRADING: frozenset[str] = frozenset(
+    ["E1", "E2", "E3", "E5", "E8", "timeout", "func_fallback", "qualify_failed"]
+)
+
+
+def dominant_cause(errors: list[str]) -> tuple[str, bool]:
+    """Return (parse_cause, parse_failed) for one file's error list.
+
+    Reuses _classify_error per message, counts buckets, and returns the most
+    frequent non-"other" bucket. Ties are broken by _CAUSE_PRIORITY (highest
+    severity wins). Returns ("", False) when the list is empty or every message
+    classifies as "other".
+
+    Args:
+        errors: List of structured error/skip strings from ParsedFile.errors.
+
+    Returns:
+        (parse_cause, parse_failed) where parse_cause is the dominant E-code
+        bucket string (or "" when clean) and parse_failed is True when the
+        dominant cause is in _DEGRADING.
+    """
+    if not errors:
+        return ("", False)
+
+    counts: dict[str, int] = {}
+    for msg in errors:
+        bucket = _classify_error(msg)
+        if bucket != "other":
+            counts[bucket] = counts.get(bucket, 0) + 1
+
+    if not counts:
+        return ("", False)
+
+    # Find the maximum count
+    max_count = max(counts.values())
+    # Candidates are all buckets tied at the maximum count
+    candidates = [b for b, c in counts.items() if c == max_count]
+
+    # Break ties using _CAUSE_PRIORITY (lowest index = highest priority)
+    priority_index: dict[str, int] = {b: i for i, b in enumerate(_CAUSE_PRIORITY)}
+    # Buckets not in _CAUSE_PRIORITY get a sentinel high index
+    sentinel = len(_CAUSE_PRIORITY)
+    candidates.sort(key=lambda b: priority_index.get(b, sentinel))
+
+    cause = candidates[0]
+    return (cause, cause in _DEGRADING)
+
 
 def _classify_error(msg: str) -> str:
     """Map a structured error message to its E-code or skip-reason bucket.

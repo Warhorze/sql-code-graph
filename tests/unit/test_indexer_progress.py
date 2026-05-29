@@ -37,8 +37,6 @@ def test_progress_callback_invoked_at_100_file_boundary():
         mock_backend.transaction.return_value.__exit__ = MagicMock(return_value=None)
 
         def run_read_side_effect(query, _params):
-            if "HAS_COLUMN" in query:  # gold_tables query
-                return []
             return []
 
         mock_backend.run_read = MagicMock(side_effect=run_read_side_effect)

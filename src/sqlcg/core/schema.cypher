@@ -9,7 +9,9 @@ CREATE NODE TABLE File (
     path STRING PRIMARY KEY,
     repo_path STRING,
     sha STRING,
-    dialect STRING
+    dialect STRING,
+    parse_failed BOOLEAN,
+    parse_cause STRING
 );
 
 -- Table node: one per unique table reference

@@ -39,7 +39,13 @@ class TestGainRatio:
                 mock_path.exists.return_value = True
                 MockPath.return_value = mock_path
 
-                with patch("sqlcg.cli.commands.gain.console"):
+                with (
+                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.console"),
+                ):
+                    # Section F opens a graph backend; mock it so the unit test
+                    # never touches a real KuzuDB.
+                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -73,7 +79,13 @@ class TestGainRatio:
                 mock_path.exists.return_value = True
                 MockPath.return_value = mock_path
 
-                with patch("sqlcg.cli.commands.gain.console"):
+                with (
+                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.console"),
+                ):
+                    # Section F opens a graph backend; mock it so the unit test
+                    # never touches a real KuzuDB.
+                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -106,9 +118,16 @@ class TestGainRatio:
                 mock_path.exists.return_value = True
                 MockPath.return_value = mock_path
 
-                try:
-                    gain_cmd(_metrics_path=mock_path)
-                except ZeroDivisionError:
-                    raise AssertionError(
-                        "Should not raise ZeroDivisionError with zero calls"
-                    ) from None
+                with (
+                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.console"),
+                ):
+                    # Section F opens a graph backend; mock it so the unit test
+                    # never touches a real KuzuDB.
+                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
+                    try:
+                        gain_cmd(_metrics_path=mock_path)
+                    except ZeroDivisionError:
+                        raise AssertionError(
+                            "Should not raise ZeroDivisionError with zero calls"
+                        ) from None
