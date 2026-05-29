@@ -97,13 +97,18 @@ class Judgement(BaseModel):
     )
     confidence: float | None = Field(
         None,
-        description="0.0-1.0 confidence. REQUIRED when assertion_type='heuristic'; "
-        "MUST be None when assertion_type='fact'.",
+        description="0.0-1.0 UNCALIBRATED heuristic estimate — a coarse self-assessment, "
+        "NOT a measured probability or frequency. Do not treat as calibrated until the "
+        "golden anchor set is large enough to measure false-positive rates. REQUIRED when "
+        "assertion_type='heuristic'; MUST be None when assertion_type='fact'.",
     )
     reason: str | None = Field(
         None,
-        description="Short human-readable basis for a heuristic (e.g. '34 downstream "
-        "dependents > 20 threshold'). REQUIRED when assertion_type='heuristic'.",
+        description="Short human-readable basis for a heuristic. MUST cite the concrete "
+        "fact(s) it is derived from (e.g. '34 downstream dependents >= threshold 20', "
+        "'zero within-corpus SELECTS_FROM references') so the caller can reason from the "
+        "grounded fact even if it ignores the confidence number. REQUIRED when "
+        "assertion_type='heuristic'.",
     )
 
     @model_validator(mode="after")
@@ -134,10 +139,13 @@ Keep `risk_label: str` and `risk_weight: int` for backward field-compatibility *
 PR's own surface* — NO, see decision (a): the project has a no-backward-compat rule
 (re-index is the migration path; same spirit applies to the MCP surface which is consumed
 by an LLM per-call, not persisted). **Replace** `risk_label`/`risk_weight` with `risk:
-Judgement`. `risk.label` carries the old `risk_label` value; `risk.reason` carries the
-weight-derived basis; `risk.confidence` is a fixed heuristic confidence (see below). The
-downstream count, a fact, moves to a sibling fact field `downstream_count: int` (it is a
-cold count, not part of the heuristic).
+Judgement`. `risk.label` carries the old `risk_label` value; `risk.reason` **must cite the
+grounding fact** — the concrete downstream count and the threshold it crosses (e.g. `"57
+downstream dependents >= threshold 20"`), not a vague phrase — so the caller can reason from
+the count even if it discards the confidence number; `risk.confidence` is a fixed,
+*uncalibrated* heuristic confidence (see below). The downstream count, a fact, moves to a
+sibling fact field `downstream_count: int` (it is a cold count, not part of the heuristic) —
+so the same number appears once as a bare fact and once, named, inside the heuristic's reason.
 
 Net field change on `ChangeScopeResult`:
 - remove `risk_label: str`, `risk_weight: int`
@@ -259,11 +267,13 @@ risk = Judgement(
     reason=f"{n} downstream dependent table(s); thresholds safe=0/low<=5/medium<=20/high>20",
 )
 ```
-`downstream_count = n` (fact). `confidence=0.6` is a fixed heuristic confidence: the count is
-exact but the *risk interpretation* of that count is a coarse heuristic (a 25-dependent
-control table may be low-actual-risk).
+`downstream_count = n` (fact). `confidence=0.6` is a fixed, *uncalibrated* heuristic
+confidence: the count is exact but the *risk interpretation* of that count is a coarse
+heuristic (a 25-dependent control table may be low-actual-risk). The `reason` embeds the
+exact count `n` and the thresholds so the caller can reason from the fact, not the number.
 - Acceptance: `get_change_scope` returns `result.risk.assertion_type == "heuristic"`,
-  `result.risk.label in {"safe","low","medium","high"}`, `result.risk.reason` non-empty,
+  `result.risk.label in {"safe","low","medium","high"}`, `str(n)` appears in
+  `result.risk.reason` (reason is fact-grounded, not vague), and
   `result.downstream_count == len(result.affected_tables)`.
 
 **Step 2.3** — Mirror onto `ScopeChangeResult` + `scope_change`: replace `risk_label`/
@@ -369,7 +379,9 @@ In [`tests/integration/test_anchor_tools.py`](../tests/integration/test_anchor_t
 - **get_hub_ranking — k caps results and backup excluded**: assert `len(top) <= k` and a
   `_bck` table never appears.
 - **risk retrofit** (Step 2.4 updates): `get_change_scope` / `scope_change` assert
-  `risk.assertion_type == "heuristic"` and `downstream_count` equals the affected count.
+  `risk.assertion_type == "heuristic"`, `downstream_count` equals the affected count, and
+  `str(downstream_count)` appears in `risk.reason` (the heuristic's basis is fact-grounded,
+  not a vague label).
 
 ### E2E / golden harness
 The Step 5.4 unit scenarios run with no external data. The full answer-anchor enforcement
@@ -462,12 +474,21 @@ PR-07 without disturbing column-level entries.
 These do not block implementation (sensible defaults are in the plan) but the user owns the
 final call:
 
-1. **Heuristic confidence values are placeholders.** `dead_code` confidence = 0.5,
-   `risk` confidence = 0.6 are reasoned defaults, not measured. There is no calibration data
-   yet (the full gold standard is still being built — see sprint-10 §"will we create the gold
-   standard before or after"). Once dead-code false-positive rate and risk-label accuracy are
-   measured against the curated anchor set, these constants should be revisited. Documented
-   here so they are not mistaken for tuned values.
+1. **Heuristic confidence values are placeholders — only the numeric calibration is deferred.**
+   `dead_code` confidence = 0.5, `risk` confidence = 0.6 are reasoned defaults, not measured.
+   There is no calibration data yet (the full gold standard is still being built — see
+   sprint-10 §"will we create the gold standard before or after"). Once dead-code
+   false-positive rate and risk-label accuracy are measured against the curated anchor set,
+   these constants should be revisited.
+   **Mitigations applied this PR** (so the uncalibrated number cannot mislead): (i) the
+   `confidence` field description explicitly states it is uncalibrated and not a measured
+   probability; (ii) every heuristic `reason` MUST cite the concrete grounding fact (the
+   downstream count + threshold, the zero-reference observation) so a caller can reason from
+   the fact even if it ignores the number — enforced by acceptance checks asserting the count
+   appears in `risk.reason`; (iii) **no answer-anchor is ever curated on a confidence value** —
+   anchors freeze facts and boolean/ranking outcomes only. The integration test pinning
+   `dead_code.confidence == 0.5` exists to force any future change to be deliberate, not to
+   validate the value as truth.
 
 2. **Hub dependent-count definition: table-level distinct consumers vs raw query count.**
    The plan uses `count(DISTINCT q.target_table)` (distinct *consuming tables*), which matches
