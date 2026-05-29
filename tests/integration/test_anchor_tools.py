@@ -105,3 +105,78 @@ def test_find_definition_not_indexed(tmp_path, monkeypatch):
 
     assert result.definitions == []
     assert result.hint is not None and len(result.hint) > 0
+
+
+# --------------------------------------------------------------------------
+# PR-04 — get_change_scope
+# --------------------------------------------------------------------------
+
+
+def test_change_scope_terminal_is_safe(tmp_path, monkeypatch):
+    """Scenario A — a terminal view with no consumers is 'safe'."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source_table (id INT);",
+            "terminal.sql": "CREATE VIEW ba.terminal_view AS SELECT id FROM ba.source_table;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_change_scope("ba.terminal_view")
+
+    assert result.risk_label == "safe", f"expected safe, got {result.risk_label}"
+    assert len(result.defining_files) == 1
+    assert len(result.upstream_tables) >= 1
+    assert "ba.source_table" in result.upstream_tables
+
+
+def test_change_scope_source_with_downstream(tmp_path, monkeypatch):
+    """Scenario B — a source table with a downstream chain has a non-safe risk."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "etl.sql": "CREATE TABLE ba.etl AS SELECT id FROM ba.source;",
+            "mart.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.etl;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_change_scope("ba.source")
+
+    assert result.risk_label in ("low", "medium", "high")
+    assert len(result.affected_tables) >= 1
+    assert any("etl" in t for t in result.affected_tables), (
+        f"expected an etl table in affected_tables, got {result.affected_tables}"
+    )
+
+
+def test_change_scope_backup_excluded(tmp_path, monkeypatch):
+    """Scenario C — backup tables are excluded from affected and reported."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "bck.sql": "CREATE TABLE ba.source_bck AS SELECT id FROM ba.source;",
+            "mart.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.source_bck;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_change_scope("ba.source")
+
+    assert all("_bck" not in t for t in result.affected_tables), (
+        f"backup tables must not appear in affected_tables: {result.affected_tables}"
+    )
+    assert any("source_bck" in t for t in result.noise_excluded), (
+        f"source_bck must be reported in noise_excluded: {result.noise_excluded}"
+    )
+
+
+def test_risk_label_thresholds():
+    """Scenario D — risk label thresholds (pure function, no graph)."""
+    assert tools._risk_label(0) == "safe"
+    assert tools._risk_label(3) == "low"
+    assert tools._risk_label(15) == "medium"
+    assert tools._risk_label(25) == "high"

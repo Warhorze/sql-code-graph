@@ -74,3 +74,17 @@ MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS
 -- FIND_DEFINITION
 MATCH (t:SqlTable {qualified: $table_qualified})-[:DEFINED_IN]->(f:File)
 RETURN t.qualified AS table_qualified, t.kind AS kind, t.defined_in_file AS defined_in_file, f.path AS file_path
+
+-- GET_TABLE_DEFINING_FILES
+MATCH (t:SqlTable {qualified: $table_qualified})-[:DEFINED_IN]->(f:File)
+RETURN f.path AS file_path, t.kind AS kind
+
+-- GET_TABLE_DIRECT_UPSTREAMS
+MATCH (q:SqlQuery {target_table: $table_qualified})-[:SELECTS_FROM]->(src:SqlTable)
+WHERE src.qualified <> $table_qualified
+OPTIONAL MATCH (q)-[:QUERY_DEFINED_IN]->(f:File)
+RETURN DISTINCT src.qualified AS upstream_table, f.path AS in_file
+
+-- GET_COLUMNS_FOR_TABLE
+MATCH (t:SqlTable {qualified: $table_qualified})-[:HAS_COLUMN]->(c:SqlColumn)
+RETURN c.id AS col_id, c.col_name AS col_name

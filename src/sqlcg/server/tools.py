@@ -13,7 +13,10 @@ from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
     FIND_DEFINITION_QUERY,
     FIND_TABLE_USAGES_QUERY,
+    GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_TABLE_DEFINING_FILES_QUERY,
+    GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     INDEX_REPO_FILES_QUERY,
     LIST_DIALECTS_AND_REPOS_QUERY,
@@ -25,6 +28,7 @@ from sqlcg.indexer.indexer import Indexer
 from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
+    ChangeScopeResult,
     DbInfoResult,
     DefinitionFile,
     DefinitionResult,
@@ -193,6 +197,93 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     column_name = parts[-1]
     table_id = ".".join(parts[:-1])
     return table_id, column_name
+
+
+# Shared safety cap for all BFS closures (matches the per-tool guard in PR-01).
+_MAX_CLOSURE_NODES = 50000
+
+
+def _affected_columns_closure(
+    db: GraphBackend, start_col_ids: list[str], max_depth: int | None = None
+) -> tuple[list[str], int, bool]:
+    """BFS downstream over COLUMN_LINEAGE from a set of starting columns.
+
+    Returns (affected_col_ids, depth_reached, truncated). The starting columns
+    themselves are NOT included in affected_col_ids — only their transitive
+    downstream consumers. Honours the same 50k-node safety cap as the per-column
+    dependency tools (PR-01).
+    """
+    visited: set[str] = set()
+    emitted: set[str] = set()
+    affected: list[str] = []
+    queue: deque[tuple[str, int]] = deque((cid, 0) for cid in start_col_ids)
+    depth_reached = 0
+    truncated = False
+
+    while queue:
+        current_id, depth = queue.popleft()
+
+        if current_id in visited or (max_depth is not None and depth > max_depth):
+            continue
+
+        if len(visited) >= _MAX_CLOSURE_NODES:
+            truncated = True
+            break
+
+        visited.add(current_id)
+        depth_reached = max(depth_reached, depth)
+
+        rows = db.run_read(GET_DOWNSTREAM_DEPENDENCIES_QUERY, {"id": current_id})
+        for row in rows:
+            node_id = row["id"]
+            next_depth = depth + 1
+            if node_id not in visited and (max_depth is None or next_depth <= max_depth):
+                if node_id not in emitted:
+                    emitted.add(node_id)
+                    affected.append(node_id)
+                queue.append((node_id, next_depth))
+            elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                truncated = True
+
+    return affected, depth_reached, truncated
+
+
+def _rollup_to_tables(col_ids: list[str]) -> list[str]:
+    """Roll up a list of column ids (table_qualified.col_name) to a deduplicated,
+    order-preserving list of table_qualified strings."""
+    tables: list[str] = []
+    seen: set[str] = set()
+    for cid in col_ids:
+        table_qualified = cid.rsplit(".", 1)[0]
+        if table_qualified not in seen:
+            seen.add(table_qualified)
+            tables.append(table_qualified)
+    return tables
+
+
+def _dedup_preserve_order(items: list[str]) -> list[str]:
+    """Deduplicate a list while preserving first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _risk_label(affected_table_count: int) -> str:
+    """Map a downstream affected-table count to a coarse risk label.
+
+    0 -> "safe", 1-5 -> "low", 6-20 -> "medium", >20 -> "high".
+    """
+    if affected_table_count == 0:
+        return "safe"
+    if affected_table_count <= 5:
+        return "low"
+    if affected_table_count <= 20:
+        return "medium"
+    return "high"
 
 
 def _record_tool_call(tool_name: str, duration_ms: float, success: bool = True) -> None:
@@ -521,6 +612,72 @@ def find_definition(table_qualified: str) -> DefinitionResult:
             definitions=definitions,
             duplicate_ddl=duplicate_ddl,
             noise_excluded=noise_excluded,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("get_change_scope")
+def get_change_scope(table_qualified: str) -> ChangeScopeResult:
+    """Return the minimal reading set and risk for changing a table.
+
+    Bundles, in one call: the defining file(s), direct upstream input tables,
+    the full-depth downstream blast radius (column-precise, rolled up to tables),
+    and a coarse risk label. Backup/noise tables are excluded from the blast
+    radius and reported in ``noise_excluded``.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        ChangeScopeResult with defining files, upstreams, affected columns/tables,
+        and risk label.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    target = table_qualified.lower()
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
+        defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
+
+        up_rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": target})
+        upstream_raw = _dedup_preserve_order(
+            [r["upstream_table"] for r in up_rows if r["upstream_table"]]
+        )
+        upstream_tables, _ = noise_filter.filter_nodes(upstream_raw)
+
+        col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": target})
+        start_cols = [r["col_id"] for r in col_rows]
+        affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
+
+        affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        kept_tables = set(affected_tables)
+        affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
+
+        risk_label = _risk_label(len(affected_tables))
+
+        hint = None
+        if not defining_files and not affected_tables and not upstream_tables:
+            hint = (
+                "No scope found for this table. Confirm the qualified name (schema.table) "
+                "and that the defining/consuming SQL files were indexed."
+            )
+
+        return ChangeScopeResult(
+            target=table_qualified,
+            defining_files=defining_files,
+            upstream_tables=upstream_tables,
+            affected_columns=affected_columns,
+            affected_tables=affected_tables,
+            risk_label=risk_label,
+            risk_weight=len(affected_tables),
+            noise_excluded=noise_excluded,
+            truncated=truncated,
             hint=hint,
         )
 

@@ -183,3 +183,36 @@ class DefinitionResult(BaseModel):
         None,
         description="Diagnostic hint when no definition is found.",
     )
+
+
+class ChangeScopeResult(BaseModel):
+    """Result of get_change_scope — the minimal reading set + risk for a change."""
+
+    target: str = Field(..., description="Qualified table name that was scoped")
+    defining_files: list[str] = Field(
+        default_factory=list, description="Files that define the target table"
+    )
+    upstream_tables: list[str] = Field(
+        default_factory=list,
+        description="Direct upstream input tables (one hop, not full closure).",
+    )
+    affected_columns: list[str] = Field(
+        default_factory=list,
+        description="Downstream column ids (full closure) consuming the target's columns.",
+    )
+    affected_tables: list[str] = Field(
+        default_factory=list,
+        description="Table rollup of affected_columns (noise-filtered).",
+    )
+    risk_label: str = Field(
+        ...,
+        description="Change risk: 'safe' (0), 'low' (1-5), 'medium' (6-20), 'high' (>20) "
+        "by affected table count.",
+    )
+    risk_weight: int = Field(0, description="Count of affected downstream tables.")
+    noise_excluded: list[str] = Field(
+        default_factory=list,
+        description="Affected tables excluded as backup/noise.",
+    )
+    truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
+    hint: str | None = Field(None, description="Diagnostic hint when scope is empty.")
