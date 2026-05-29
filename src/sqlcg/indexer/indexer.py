@@ -423,6 +423,347 @@ class Indexer:
 
         return result
 
+    def resync_changed(
+        self,
+        root: Path,
+        old_sha: str,
+        new_sha: str,
+        db: GraphBackend,
+        dialect: str | None,
+        *,
+        batch_size: int = 50,
+        timeout_per_file: int = 5,
+        max_closure_depth: int = 3,
+    ) -> dict:
+        """Incrementally resync the graph after a git branch change or pull.
+
+        Only re-parses files in the git delta plus the cross-file pass-2
+        affected closure (files that SELECT_FROM tables defined in changed/deleted
+        files). Avoids a full corpus reindex for small branch deltas.
+
+        Algorithm (see plan/living_codebase_resync.md):
+          1. Compute git delta (added/modified/deleted .sql files).
+          2. Capture deleted files' table names BEFORE deletion.
+          3. Delete nodes for deleted files.
+          4. Pass-1 parse reparse_set (added+modified) via _index_single_file.
+          5. Re-harvest CTAS bodies for frontier definer files not already parsed.
+          6. Compute bounded closure (DEPENDENT_FILES_OF_TABLES, max_closure_depth).
+          7. Pass-2 re-resolve closure files + reparse_set, then bulk upsert.
+          8. Run _expand_star_sources once.
+          9. Write new_sha to metadata on success.
+
+        Falls back to full index_repo when:
+          - git_name_status_delta returns None (git unavailable / bad SHA).
+          - The closure frontier is still growing when max_closure_depth is reached.
+        In both fallback cases, fell_back_to_full=True is set in the summary.
+
+        Args:
+            root:              Repository root directory.
+            old_sha:           Previously-indexed git commit SHA.
+            new_sha:           Current git commit SHA.
+            db:                GraphBackend instance.
+            dialect:           SQL dialect (None for ANSI).
+            batch_size:        Files per KuzuDB transaction (same default as index_repo).
+            timeout_per_file:  Per-file parse timeout in seconds for _index_single_file.
+            max_closure_depth: Maximum BFS depth for closure walk; exceeding triggers
+                               full-index fallback.
+
+        Returns:
+            Dict with keys: added, modified, deleted, closure_resolved,
+            fell_back_to_full, batch_size.
+        """
+        from sqlcg.core.queries import (
+            DEPENDENT_FILES_OF_TABLES_QUERY,
+            GET_TABLES_DEFINED_IN_FILE_QUERY,
+        )
+        from sqlcg.indexer.git_delta import git_name_status_delta
+
+        summary: dict = {
+            "added": 0,
+            "modified": 0,
+            "deleted": 0,
+            "closure_resolved": 0,
+            "fell_back_to_full": False,
+            "batch_size": batch_size,
+        }
+
+        # ---- Step 1: Compute delta -----------------------------------------------
+        delta = git_name_status_delta(root, old_sha, new_sha)
+        if delta is None:
+            logger.warning(
+                "resync_changed: git_name_status_delta returned None for %s..%s — "
+                "falling back to full index_repo",
+                old_sha[:8],
+                new_sha[:8],
+            )
+            summary["fell_back_to_full"] = True
+            self.index_repo(
+                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+            )
+            return summary
+
+        reparse_set: set[Path] = delta.added | delta.modified
+        delete_set: set[Path] = delta.deleted
+
+        summary["added"] = len(delta.added)
+        summary["modified"] = len(delta.modified)
+        summary["deleted"] = len(delta.deleted)
+
+        # Nothing to do — delta is empty but we still update the SHA.
+        if not reparse_set and not delete_set:
+            logger.debug(
+                "resync_changed: empty delta %s..%s — no files to resync", old_sha[:8], new_sha[:8]
+            )
+            db.set_indexed_sha(new_sha)
+            return summary
+
+        # ---- Step 2: Capture deleted tables BEFORE deletion ---------------------
+        deleted_tables: list[str] = []
+        for del_path in delete_set:
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(del_path)})
+            deleted_tables.extend(row["table_qualified"] for row in rows)
+
+        # ---- Step 3: Delete nodes for deleted files --------------------------------
+        with db.transaction():
+            for del_path in delete_set:
+                db.delete_nodes_for_file(str(del_path))
+
+        # ---- Step 4: Pass-1 parse reparse_set via _index_single_file --------------
+        # B-1 mandate: use _index_single_file (subprocess isolation + per-file timeout),
+        # NOT HardKillPool (pool startup cost exceeds parsing cost for small deltas).
+        aggregator = CrossFileAggregator()
+        schema_resolver = SchemaResolver(dialect=dialect)
+        parser = get_parser(dialect, schema_resolver)
+
+        pass1_results: list[ParsedFile] = []
+        for file_path in reparse_set:
+            try:
+                sql = file_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning("resync_changed: cannot read %s: %s — skipping", file_path, exc)
+                placeholder = ParsedFile(path=file_path, dialect=dialect)
+                placeholder.errors.append(f"read_error:{exc}")
+                aggregator.register_pass1(placeholder)
+                pass1_results.append(placeholder)
+                continue
+            try:
+                parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
+            except Exception as exc:
+                logger.warning("resync_changed: parse failed %s: %s", file_path, exc)
+                parsed = ParsedFile(path=file_path, dialect=dialect)
+                parsed.errors.append(f"parse_error:{exc}")
+            aggregator.register_pass1(parsed)
+            pass1_results.append(parsed)
+
+        # ---- Step 5: Compute closure via BFS over DEPENDENT_FILES_OF_TABLES ------
+        # Seed frontier with tables defined in reparse_set + deleted_tables.
+        frontier_tables: list[str] = list(deleted_tables)
+        for pf in pass1_results:
+            frontier_tables.extend(t.full_id for t in pf.defined_tables)
+
+        # Remove duplicates while preserving order
+        seen_tables: set[str] = set(frontier_tables)
+        frontier_tables = list({t: None for t in frontier_tables}.keys())
+
+        # Already-visited files (don't re-resolve the same file twice)
+        visited_files: set[str] = {str(p) for p in reparse_set} | {str(p) for p in delete_set}
+        closure_files: set[str] = set()
+
+        fell_back = False
+        for depth in range(max_closure_depth):
+            if not frontier_tables:
+                break
+            rows = db.run_read(DEPENDENT_FILES_OF_TABLES_QUERY, {"tables": frontier_tables})
+            new_files: list[str] = [row["path"] for row in rows if row["path"] not in visited_files]
+            if not new_files:
+                break
+
+            # Check if frontier is still growing at the depth cap
+            if depth == max_closure_depth - 1:
+                # Frontier still producing new files at the last allowed depth —
+                # fall back to full reindex (correctness guarantee).
+                logger.warning(
+                    "resync_changed: closure frontier still growing at depth %d — "
+                    "falling back to full index_repo",
+                    max_closure_depth,
+                )
+                fell_back = True
+                break
+
+            for fp in new_files:
+                if fp not in visited_files:
+                    closure_files.add(fp)
+                    visited_files.add(fp)
+
+            # Advance frontier: tables defined in these newly-found files
+            next_tables: list[str] = []
+            for fp in new_files:
+                t_rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": fp})
+                next_tables.extend(row["table_qualified"] for row in t_rows)
+            new_frontier = [t for t in next_tables if t not in seen_tables]
+            seen_tables.update(new_frontier)
+            frontier_tables = new_frontier
+
+        if fell_back:
+            summary["fell_back_to_full"] = True
+            self.index_repo(
+                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+            )
+            return summary
+
+        summary["closure_resolved"] = len(closure_files)
+
+        # ---- Step 5b: Re-harvest CTAS bodies for definer files the closure needs ---
+        # W-2: only look up definers for referenced tables NOT already satisfied in-memory
+        # (from reparse_set pass-1). Deleted definers return no row — register nothing.
+        in_memory_bare_names: set[str] = set()
+        for _pf in pass1_results:
+            for _stmt in _pf.statements:
+                if _stmt.target and _stmt.target.name:
+                    in_memory_bare_names.add(_stmt.target.name.lower())
+        # Collect all bare table names referenced by closure files (need their CTAS bodies)
+        closure_ref_tables: set[str] = set()
+        for cl_path in closure_files:
+            try:
+                cl_rows = db.run_read(
+                    "MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery) "
+                    "MATCH (q)-[:SELECTS_FROM]->(t:SqlTable) "
+                    "RETURN DISTINCT t.name AS name",
+                    {"path": cl_path},
+                )
+                for row in cl_rows:
+                    bare = (row["name"] or "").lower()
+                    if bare and bare not in in_memory_bare_names:
+                        closure_ref_tables.add(bare)
+            except Exception as exc:
+                logger.debug("resync_changed: could not query refs for %s: %s", cl_path, exc)
+
+        # For each unsatisfied referenced table, look up its defining file and parse it
+        # (pass-1 only — to harvest CTAS body; do NOT upsert unless in reparse_set).
+        harvested_definer_paths: set[str] = set()
+        for bare_name in closure_ref_tables:
+            # Try to find a defining table by bare name (approximate match on qualified)
+            # We look up via GET_TABLE_DEFINING_FILES using the bare name as the qualified key
+            # first, but we do a broader search since the table might be qualified differently.
+            try:
+                def_rows = db.run_read(
+                    "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
+                    "WHERE t.name = $name "
+                    "RETURN DISTINCT f.path AS file_path",
+                    {"name": bare_name.upper()},
+                )
+                if not def_rows:
+                    # Try lowercase match
+                    def_rows = db.run_read(
+                        "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
+                        "WHERE t.name = $name "
+                        "RETURN DISTINCT f.path AS file_path",
+                        {"name": bare_name},
+                    )
+                for row in def_rows:
+                    definer_fp = row["file_path"]
+                    if definer_fp in visited_files or definer_fp in harvested_definer_paths:
+                        continue
+                    harvested_definer_paths.add(definer_fp)
+                    try:
+                        def_path = Path(definer_fp)
+                        def_sql = def_path.read_text(encoding="utf-8")
+                        def_parsed = self._index_single_file(
+                            parser, def_path, def_sql, timeout_per_file
+                        )
+                        # Harvest only — register for cross_file_sources but do NOT upsert
+                        aggregator.register_pass1(def_parsed)
+                    except Exception as exc:
+                        logger.debug(
+                            "resync_changed: could not harvest definer %s: %s", definer_fp, exc
+                        )
+            except Exception as exc:
+                logger.debug("resync_changed: definer lookup for %r failed: %s", bare_name, exc)
+
+        # Seed cross-file CTAS bodies into the schema resolver
+        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+        schema_resolver.add_view_sources(aggregator.sources)
+
+        # ---- Step 6: Pass-2 re-resolve closure files (in-process, no subprocess) --
+        # Closure files: re-parse with cross_file_sources seeded; then upsert.
+        closure_results: list[ParsedFile] = []
+        for cl_path_str in closure_files:
+            cl_path = Path(cl_path_str)
+            try:
+                cl_sql = cl_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "resync_changed: cannot read closure file %s: %s — skipping", cl_path, exc
+                )
+                continue
+            try:
+                cl_parsed = parser.parse_file(cl_path, cl_sql)
+            except Exception as exc:
+                logger.warning("resync_changed: parse failed for closure file %s: %s", cl_path, exc)
+                cl_parsed = ParsedFile(path=cl_path, dialect=dialect)
+                cl_parsed.errors.append(f"parse_error:{exc}")
+            closure_results.append(cl_parsed)
+
+        # ---- Step 7: Batched bulk upsert (same _flush_batch path as index_repo) ----
+        all_results = pass1_results + closure_results
+
+        # Build a registry for duplicate DDL detection
+        defined_table_registry: dict[str, str] = {}
+        for pf in all_results:
+            for table in pf.defined_tables:
+                defined_table_registry.setdefault(table.full_id, pf.path_str)
+
+        # Delete old nodes for reparsed files before upserting fresh data
+        with db.transaction():
+            for pf in pass1_results:
+                db.delete_nodes_for_file(pf.path_str)
+            for pf in closure_results:
+                db.delete_nodes_for_file(pf.path_str)
+
+        # Flush in batches using the same pattern as index_repo._flush_batch
+        batch: list[ParsedFile] = []
+        for pf in all_results:
+            batch.append(pf)
+            if len(batch) >= batch_size:
+                with db.transaction():
+                    for pf_in_batch in batch:
+                        try:
+                            self._upsert_parsed_file(
+                                pf_in_batch,
+                                db,
+                                defined_table_registry=defined_table_registry,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "resync_changed: upsert failed for %s: %s — skipping",
+                                pf_in_batch.path,
+                                exc,
+                            )
+                batch = []
+        if batch:
+            with db.transaction():
+                for pf_in_batch in batch:
+                    try:
+                        self._upsert_parsed_file(
+                            pf_in_batch,
+                            db,
+                            defined_table_registry=defined_table_registry,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "resync_changed: upsert failed for %s: %s — skipping",
+                            pf_in_batch.path,
+                            exc,
+                        )
+
+        # ---- Step 8: Single star expansion (same as index_repo) ------------------
+        self._expand_star_sources(db)
+
+        # ---- Step 9: Persist new SHA on success ----------------------------------
+        db.set_indexed_sha(new_sha)
+
+        return summary
+
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
         """Re-index a single file and its dependent views.
 
