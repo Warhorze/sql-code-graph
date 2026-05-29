@@ -323,10 +323,11 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
 
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
-def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
+def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
     """Trace upstream lineage of a column.
 
-    Traverses COLUMN_LINEAGE edges backward up to max_depth levels.
+    Traverses COLUMN_LINEAGE edges backward. When max_depth is None, computes
+    the full transitive closure. When max_depth is an integer, stops at that depth.
 
     Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
     lineage lookups. Column references must include both the table and column names.
@@ -334,7 +335,9 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
     Args:
         table_col: Column reference in format "table.column"
                    or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
-        max_depth: Maximum number of hops to traverse
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         LineageResult with list of upstream column nodes
@@ -359,12 +362,17 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
         visited: set[str] = set()
         emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
         queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
 
         while queue:
             current_id, depth = queue.popleft()
 
-            if current_id in visited or depth > max_depth:
+            if current_id in visited or (max_depth is not None and depth > max_depth):
                 continue
+
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                break
 
             visited.add(current_id)
 
@@ -456,15 +464,19 @@ def find_table_usages(table_name: str) -> TableUsageResult:
 
 @mcp.tool()
 @_timed_tool("get_downstream_dependencies")
-def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+def get_downstream_dependencies(table_col: str, max_depth: int | None = None) -> DependencyResult:
     """Find all downstream dependencies of a column.
 
     Traverses COLUMN_LINEAGE edges forward to find columns that depend on this one.
+    When max_depth is None, computes the full transitive closure. When max_depth is
+    an integer, stops at that depth.
 
     Args:
         table_col: Column reference in format "table.column"
                    or "catalog.db.table.column" (e.g., "ba.table.column")
-        max_depth: Maximum number of hops to traverse
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         DependencyResult with list of downstream column nodes
@@ -488,14 +500,23 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
         visited: set[str] = set()
         emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
         queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
+        depth_reached = 0
+        truncated = False
 
         while queue:
             current_id, depth = queue.popleft()
 
-            if current_id in visited or depth > max_depth:
+            if current_id in visited or (max_depth is not None and depth > max_depth):
                 continue
 
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                truncated = True
+                break
+
             visited.add(current_id)
+            depth_reached = max(depth_reached, depth)
 
             # Query for downstream columns (forward direction)
             rows = db.run_read(
@@ -505,7 +526,8 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
 
             for row in rows:
                 node_id = row["id"]
-                if node_id not in visited:
+                next_depth = depth + 1
+                if node_id not in visited and (max_depth is None or next_depth <= max_depth):
                     # Step 3.1: only emit each node_id once
                     if node_id not in emitted:
                         emitted.add(node_id)
@@ -515,7 +537,9 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
                                 kind="column",
                             )
                         )
-                    queue.append((node_id, depth + 1))
+                    queue.append((node_id, next_depth))
+                elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                    truncated = True
 
         # Populate hint if result is empty (Step 4.2)
         hint = None
@@ -527,15 +551,26 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
                 "(e.g., ba.table_name.column_name)."
             )
 
-        return DependencyResult(root=table_col, nodes=nodes, hint=hint)
+        if truncated and max_depth is None:
+            hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
+
+        return DependencyResult(
+            root=table_col,
+            nodes=nodes,
+            truncated=truncated,
+            depth_reached=depth_reached,
+            hint=hint,
+        )
 
 
 @mcp.tool()
 @_timed_tool("get_upstream_dependencies")
-def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+def get_upstream_dependencies(table_col: str, max_depth: int | None = None) -> DependencyResult:
     """Find all upstream dependencies of a column.
 
     Traverses COLUMN_LINEAGE edges backward to find columns this one depends on.
+    When max_depth is None, computes the full transitive closure. When max_depth is
+    an integer, stops at that depth.
 
     Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
     lookups.
@@ -543,7 +578,9 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
     Args:
         table_col: Column reference in format "table.column"
                    or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
-        max_depth: Maximum number of hops to traverse
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         DependencyResult with list of upstream column nodes
@@ -567,14 +604,23 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
         visited: set[str] = set()
         emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
         queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
+        depth_reached = 0
+        truncated = False
 
         while queue:
             current_id, depth = queue.popleft()
 
-            if current_id in visited or depth > max_depth:
+            if current_id in visited or (max_depth is not None and depth > max_depth):
                 continue
 
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                truncated = True
+                break
+
             visited.add(current_id)
+            depth_reached = max(depth_reached, depth)
 
             # Query for upstream columns (reverse direction)
             rows = db.run_read(
@@ -584,7 +630,8 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
 
             for row in rows:
                 node_id = row["id"]
-                if node_id not in visited:
+                next_depth = depth + 1
+                if node_id not in visited and (max_depth is None or next_depth <= max_depth):
                     # Step 3.1: only emit each node_id once
                     if node_id not in emitted:
                         emitted.add(node_id)
@@ -594,7 +641,9 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
                                 kind="column",
                             )
                         )
-                    queue.append((node_id, depth + 1))
+                    queue.append((node_id, next_depth))
+                elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                    truncated = True
 
         # Populate hint if result is empty (Step 4.1)
         hint = None
@@ -607,7 +656,16 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
                 "submit_feedback tool if this was a false negative."
             )
 
-        return DependencyResult(root=table_col, nodes=nodes, hint=hint)
+        if truncated and max_depth is None:
+            hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
+
+        return DependencyResult(
+            root=table_col,
+            nodes=nodes,
+            truncated=truncated,
+            depth_reached=depth_reached,
+            hint=hint,
+        )
 
 
 @mcp.tool()

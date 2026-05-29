@@ -71,6 +71,16 @@ class DependencyResult(BaseModel):
 
     root: str = Field(..., description="Root column or table")
     nodes: list[DependencyNode] = Field(default_factory=list, description="List of dependent nodes")
+    truncated: bool = Field(
+        False,
+        description="True if traversal was stopped by max_depth limit or 50k-node safety cap. "
+        "False for full-closure runs.",
+    )
+    depth_reached: int = Field(
+        0,
+        description="Maximum depth reached before truncation (0 if no nodes, "
+        "or if full closure completed).",
+    )
     hint: str | None = Field(
         None,
         description="Diagnostic hint when result list is empty. Explains the likely cause "
