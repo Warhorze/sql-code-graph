@@ -146,3 +146,40 @@ class DbInfoResult(BaseModel):
         default_factory=list,
         description="Health warnings. Empty means the graph is in a healthy state.",
     )
+
+
+class DefinitionFile(BaseModel):
+    """A file in which a table is defined."""
+
+    file_path: str = Field(..., description="Path to the SQL file containing the DDL")
+    kind: str | None = Field(None, description="Table kind (TABLE, VIEW, etc.)")
+    is_authoritative: bool = Field(
+        ...,
+        description="True when this is the single, non-backup definition. "
+        "False when the table is a backup snapshot or defined in multiple files.",
+    )
+    is_backup: bool = Field(
+        ...,
+        description="True when the table name matches a configured backup pattern (e.g. *_bck).",
+    )
+
+
+class DefinitionResult(BaseModel):
+    """Result of find_definition — where a table is authoritatively defined."""
+
+    table_qualified: str = Field(..., description="Qualified table name that was looked up")
+    definitions: list[DefinitionFile] = Field(
+        default_factory=list,
+        description="All definition files found, including backups (flagged via is_backup).",
+    )
+    duplicate_ddl: bool = Field(
+        False, description="True when the same table is defined in more than one file."
+    )
+    noise_excluded: list[str] = Field(
+        default_factory=list,
+        description="Definition file paths that were flagged as backup/noise.",
+    )
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint when no definition is found.",
+    )

@@ -11,6 +11,7 @@ from sqlcg.core.config import get_db_path
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
+    FIND_DEFINITION_QUERY,
     FIND_TABLE_USAGES_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
@@ -25,6 +26,8 @@ from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
     DbInfoResult,
+    DefinitionFile,
+    DefinitionResult,
     DependencyNode,
     DependencyResult,
     DialectRepo,
@@ -36,6 +39,7 @@ from sqlcg.server.models import (
     TableUsage,
     TableUsageResult,
 )
+from sqlcg.server.noise_filter import NoiseFilter
 
 
 def _build_mermaid(root_id: str, edges: list[tuple[str, str, str]]) -> str:
@@ -460,6 +464,65 @@ def find_table_usages(table_name: str) -> TableUsageResult:
             )
 
         return TableUsageResult(table=table_name, usages=usages, hint=hint)
+
+
+@mcp.tool()
+@_timed_tool("find_definition")
+def find_definition(table_qualified: str) -> DefinitionResult:
+    """Find where a table is authoritatively defined.
+
+    Returns every file that defines the table via a DEFINED_IN edge. Backup
+    snapshots (e.g. ``*_bck``) are still returned but flagged ``is_backup=True``
+    and listed in ``noise_excluded`` so the LLM can see them without being misled
+    into treating a backup as the source of truth.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        DefinitionResult listing definition files, duplicate-DDL flag, and noise.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+
+        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": table_qualified.lower()})
+        noise_filter = NoiseFilter.from_config()
+
+        duplicate_ddl = len(rows) > 1
+        definitions: list[DefinitionFile] = []
+        noise_excluded: list[str] = []
+        for row in rows:
+            is_backup = noise_filter.is_noise(row["table_qualified"])
+            definitions.append(
+                DefinitionFile(
+                    file_path=row["file_path"],
+                    kind=row.get("kind"),
+                    is_backup=is_backup,
+                    is_authoritative=(not is_backup and not duplicate_ddl),
+                )
+            )
+            if is_backup:
+                noise_excluded.append(row["file_path"])
+
+        hint = None
+        if not definitions:
+            hint = (
+                "No definition found. The table may not be indexed, or it is created "
+                "dynamically (e.g. CREATE TABLE AS in a scripting block that did not parse). "
+                "Confirm the qualified name (schema.table) and that the defining DDL file "
+                "was indexed."
+            )
+
+        return DefinitionResult(
+            table_qualified=table_qualified,
+            definitions=definitions,
+            duplicate_ddl=duplicate_ddl,
+            noise_excluded=noise_excluded,
+            hint=hint,
+        )
 
 
 @mcp.tool()

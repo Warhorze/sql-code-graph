@@ -70,3 +70,7 @@ MATCH ()-[r:STAR_SOURCE]->() RETURN count(r) AS n
 
 -- COUNT_STAR_EXPANSIONS
 MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n
+
+-- FIND_DEFINITION
+MATCH (t:SqlTable {qualified: $table_qualified})-[:DEFINED_IN]->(f:File)
+RETURN t.qualified AS table_qualified, t.kind AS kind, t.defined_in_file AS defined_in_file, f.path AS file_path
