@@ -88,3 +88,7 @@ RETURN DISTINCT src.qualified AS upstream_table, f.path AS in_file
 -- GET_COLUMNS_FOR_TABLE
 MATCH (t:SqlTable {qualified: $table_qualified})-[:HAS_COLUMN]->(c:SqlColumn)
 RETURN c.id AS col_id, c.col_name AS col_name
+
+-- GET_TABLES_DEFINED_IN_FILE
+MATCH (f:File {path: $file_path})<-[:DEFINED_IN]-(t:SqlTable)
+RETURN t.qualified AS table_qualified

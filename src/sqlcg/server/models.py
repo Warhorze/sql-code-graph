@@ -216,3 +216,57 @@ class ChangeScopeResult(BaseModel):
     )
     truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
     hint: str | None = Field(None, description="Diagnostic hint when scope is empty.")
+
+
+class BackfillOrderResult(BaseModel):
+    """Result of get_backfill_order — topological rebuild order for a change."""
+
+    target: str = Field(..., description="Qualified table name that was scoped")
+    backfill_order: list[str] = Field(
+        default_factory=list,
+        description="Affected tables in topological rebuild order (producers before consumers).",
+    )
+    affected_columns: list[str] = Field(
+        default_factory=list,
+        description="Downstream column ids (full closure), for column-precise understanding.",
+    )
+    noise_excluded: list[str] = Field(
+        default_factory=list, description="Affected tables excluded as backup/noise."
+    )
+    truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint — set when a dependency cycle was detected "
+        "(order is approximate) or there is nothing to backfill.",
+    )
+
+
+class DiffImpactResult(BaseModel):
+    """Result of diff_impact — union blast radius across changed files."""
+
+    changed_files: list[str] = Field(
+        default_factory=list, description="Input file paths that were analysed"
+    )
+    changed_tables: list[str] = Field(
+        default_factory=list, description="Tables defined in the changed files"
+    )
+    affected_tables: list[str] = Field(
+        default_factory=list,
+        description="Union downstream blast radius across all changed tables (noise-filtered).",
+    )
+    presentation_facing: list[str] = Field(
+        default_factory=list,
+        description="Subset of affected_tables whose schema matches a configured "
+        "presentation prefix ([sqlcg.presentation] schema_prefixes). Empty when unconfigured.",
+    )
+    backfill_order: list[str] = Field(
+        default_factory=list,
+        description="Affected tables in topological rebuild order across the union blast radius.",
+    )
+    noise_excluded: list[str] = Field(
+        default_factory=list, description="Affected tables excluded as backup/noise."
+    )
+    truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
+    hint: str | None = Field(
+        None, description="Diagnostic hint when result is empty or approximate."
+    )

@@ -190,6 +190,37 @@ def get_ignored_tables(path: Path) -> list[str]:
     return []
 
 
+def get_presentation_prefixes(path: Path) -> list[str]:
+    """Get presentation-facing schema prefixes from .sqlcg.toml.
+
+    Reads [sqlcg.presentation] -> schema_prefixes (a list of strings) from
+    .sqlcg.toml. Returns the list lowercased. **Defaults to an empty list** when
+    the key is absent — when unset, presentation-facing detection is simply off
+    (correct generic behaviour for any user). No schema prefix is hardcoded in
+    shipped code; a DWH that wants ``ia_`` flagged must declare it::
+
+        [sqlcg.presentation]
+        schema_prefixes = ["ia_"]
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of schema prefixes (all lowercased). Defaults to an empty list.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("presentation", {}).get("schema_prefixes")
+            if isinstance(raw, list):
+                return [p.lower() for p in raw if isinstance(p, str)]
+        except Exception:
+            pass
+    return []
+
+
 def get_backend() -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 

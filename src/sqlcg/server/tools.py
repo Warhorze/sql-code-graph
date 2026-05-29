@@ -7,7 +7,7 @@ from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlcg.core.config import get_db_path
+from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
@@ -17,6 +17,7 @@ from sqlcg.core.queries import (
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+    GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     INDEX_REPO_FILES_QUERY,
     LIST_DIALECTS_AND_REPOS_QUERY,
@@ -28,6 +29,7 @@ from sqlcg.indexer.indexer import Indexer
 from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
+    BackfillOrderResult,
     ChangeScopeResult,
     DbInfoResult,
     DefinitionFile,
@@ -36,6 +38,7 @@ from sqlcg.server.models import (
     DependencyResult,
     DialectRepo,
     DialectRepoResult,
+    DiffImpactResult,
     LineageNode,
     LineageResult,
     SqlPatternMatch,
@@ -284,6 +287,52 @@ def _risk_label(affected_table_count: int) -> str:
     if affected_table_count <= 20:
         return "medium"
     return "high"
+
+
+def _kahn_topological_sort(affected_tables: list[str], db: GraphBackend) -> tuple[list[str], bool]:
+    """Order affected tables so producers come before consumers (rebuild order).
+
+    Builds an adjacency list from SELECTS_FROM edges *within* the affected set
+    (a table's producing query selecting from another affected table is an edge
+    producer -> consumer) and runs Kahn's algorithm. Returns
+    (ordered_tables, had_cycle). On a cycle the acyclic prefix is emitted in
+    topological order and the remaining cyclic tables are appended in input
+    order — no exception is raised.
+    """
+    table_set = set(affected_tables)
+    successors: dict[str, set[str]] = {t: set() for t in affected_tables}
+    indegree: dict[str, int] = {t: 0 for t in affected_tables}
+
+    for table in affected_tables:
+        rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": table})
+        for row in rows:
+            src = row["upstream_table"]
+            if src in table_set and src != table and table not in successors[src]:
+                successors[src].add(table)
+                indegree[table] += 1
+
+    # Sort the zero-indegree frontier for deterministic output.
+    ready: deque[str] = deque(sorted(t for t in affected_tables if indegree[t] == 0))
+    order: list[str] = []
+    while ready:
+        node = ready.popleft()
+        order.append(node)
+        for consumer in sorted(successors[node]):
+            indegree[consumer] -= 1
+            if indegree[consumer] == 0:
+                ready.append(consumer)
+
+    if len(order) != len(affected_tables):
+        remaining = [t for t in affected_tables if t not in set(order)]
+        logger.warning(
+            "Cycle detected among %d affected tables; appending in input order: %s",
+            len(remaining),
+            remaining,
+        )
+        order.extend(remaining)
+        return order, True
+
+    return order, False
 
 
 def _record_tool_call(tool_name: str, duration_ms: float, success: bool = True) -> None:
@@ -676,6 +725,139 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
             affected_tables=affected_tables,
             risk_label=risk_label,
             risk_weight=len(affected_tables),
+            noise_excluded=noise_excluded,
+            truncated=truncated,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("get_backfill_order")
+def get_backfill_order(table_qualified: str) -> BackfillOrderResult:
+    """Return the topological rebuild order for a table's downstream blast radius.
+
+    Computes the full-depth downstream affected table set (noise-filtered) and
+    orders it so that producers are rebuilt before consumers. If a dependency
+    cycle is present the order degrades gracefully (acyclic prefix first, cyclic
+    remainder appended) and ``hint`` reports the cycle.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        BackfillOrderResult with the rebuild order and column-precise blast radius.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    target = table_qualified.lower()
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": target})
+        start_cols = [r["col_id"] for r in col_rows]
+        affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
+
+        affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        kept_tables = set(affected_tables)
+        affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
+
+        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+
+        hint = None
+        if had_cycle:
+            hint = (
+                "Dependency cycle detected among affected tables; backfill order is "
+                "approximate (cyclic tables appended in input order)."
+            )
+        elif not order:
+            hint = "No downstream consumers — nothing to backfill."
+
+        return BackfillOrderResult(
+            target=table_qualified,
+            backfill_order=order,
+            affected_columns=affected_columns,
+            noise_excluded=noise_excluded,
+            truncated=truncated,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("diff_impact")
+def diff_impact(changed_files: list[str]) -> DiffImpactResult:
+    """Return the union downstream blast radius for a set of changed files.
+
+    The CI / agent integration point: given the file paths that changed, resolve
+    the tables defined in them, compute each table's full-depth downstream blast
+    radius, union and noise-filter the result, flag presentation-facing tables
+    (config-driven prefixes), and return a topological rebuild order.
+
+    Args:
+        changed_files: SQL file paths that changed (must match indexed File.path)
+
+    Returns:
+        DiffImpactResult with changed tables, union blast radius, presentation
+        subset, and rebuild order.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+        prefixes = get_presentation_prefixes(Path.cwd())
+
+        changed_tables: list[str] = []
+        seen_changed: set[str] = set()
+        for file_path in changed_files:
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": file_path})
+            for row in rows:
+                tq = row["table_qualified"]
+                if tq not in seen_changed:
+                    seen_changed.add(tq)
+                    changed_tables.append(tq)
+
+        all_affected_cols: list[str] = []
+        affected_seen: set[str] = set()
+        truncated = False
+        for tq in changed_tables:
+            col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": tq})
+            start_cols = [r["col_id"] for r in col_rows]
+            cols, _depth, tr = _affected_columns_closure(db, start_cols, max_depth=None)
+            truncated = truncated or tr
+            for col in cols:
+                if col not in affected_seen:
+                    affected_seen.add(col)
+                    all_affected_cols.append(col)
+
+        affected_tables_all = [
+            t for t in _rollup_to_tables(all_affected_cols) if t not in seen_changed
+        ]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]
+        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+
+        hint = None
+        if not changed_tables:
+            hint = (
+                "No tables are defined in the given files. Confirm the paths match indexed "
+                "File.path values (absolute paths as stored by the indexer)."
+            )
+        elif had_cycle:
+            hint = (
+                "Dependency cycle detected among affected tables; backfill order is "
+                "approximate (cyclic tables appended in input order)."
+            )
+
+        return DiffImpactResult(
+            changed_files=changed_files,
+            changed_tables=changed_tables,
+            affected_tables=affected_tables,
+            presentation_facing=presentation_facing,
+            backfill_order=order,
             noise_excluded=noise_excluded,
             truncated=truncated,
             hint=hint,

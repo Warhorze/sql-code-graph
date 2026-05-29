@@ -180,3 +180,125 @@ def test_risk_label_thresholds():
     assert tools._risk_label(3) == "low"
     assert tools._risk_label(15) == "medium"
     assert tools._risk_label(25) == "high"
+
+
+# --------------------------------------------------------------------------
+# PR-05 — get_backfill_order + diff_impact
+# --------------------------------------------------------------------------
+
+
+def test_backfill_order_topological(tmp_path, monkeypatch):
+    """Scenario A — staged is rebuilt before mart."""
+    _index_fixture(
+        tmp_path,
+        {
+            "raw.sql": "CREATE TABLE ba.raw (id INT);",
+            "staged.sql": "CREATE TABLE ba.staged AS SELECT id FROM ba.raw;",
+            "mart.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.staged;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_backfill_order("ba.raw")
+
+    assert "ba.staged" in result.backfill_order
+    assert "ba.mart" in result.backfill_order
+    assert result.backfill_order.index("ba.staged") < result.backfill_order.index("ba.mart"), (
+        f"staged must precede mart in rebuild order: {result.backfill_order}"
+    )
+
+
+def test_backfill_order_cycle_degrades(tmp_path, monkeypatch):
+    """Scenario B — a dependency cycle degrades gracefully with a 'cycle' hint."""
+    # b derives its column from a (unambiguous lineage a.id -> b.id), but selects
+    # from both a and c at the table level, while c selects from b — so b and c
+    # form a SELECTS_FROM cycle that the topological sort must handle gracefully.
+    _index_fixture(
+        tmp_path,
+        {
+            "a.sql": "CREATE TABLE ba.a (id INT);",
+            "b.sql": (
+                "CREATE VIEW ba.b AS "
+                "SELECT a.id AS id FROM ba.a AS a JOIN ba.c AS c ON a.id = c.id;"
+            ),
+            "c.sql": "CREATE VIEW ba.c AS SELECT id FROM ba.b;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_backfill_order("ba.a")
+
+    assert len(result.backfill_order) >= 1, "order must be non-empty even with a cycle"
+    assert result.hint is not None and "cycle" in result.hint.lower()
+
+
+def test_diff_impact_file_to_blast_radius(tmp_path, monkeypatch):
+    """Scenario C — changed file path resolves to a downstream blast radius."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source_table (id INT);",
+            "etl.sql": "CREATE TABLE ba.etl_table AS SELECT id FROM ba.source_table;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.diff_impact([str(tmp_path / "source.sql")])
+
+    assert "ba.source_table" in result.changed_tables
+    assert "ba.etl_table" in result.affected_tables
+
+
+def test_diff_impact_presentation_configured(tmp_path, monkeypatch):
+    """Scenario D (configured) — presentation_facing reflects configured prefixes."""
+    _index_fixture(
+        tmp_path,
+        {
+            ".sqlcg.toml": '[sqlcg.presentation]\nschema_prefixes = ["ia_"]\n',
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "view.sql": "CREATE VIEW ia_analytics.ba_view AS SELECT id FROM ba.source;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.diff_impact([str(tmp_path / "source.sql")])
+
+    assert "ia_analytics.ba_view" in result.presentation_facing, (
+        f"configured ia_ prefix must flag the view: {result.presentation_facing}"
+    )
+
+
+def test_diff_impact_presentation_off_by_default(tmp_path, monkeypatch):
+    """Scenario D (unconfigured) — presentation_facing is empty with no config."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "view.sql": "CREATE VIEW ia_analytics.ba_view AS SELECT id FROM ba.source;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.diff_impact([str(tmp_path / "source.sql")])
+
+    assert result.presentation_facing == [], (
+        "presentation_facing must be empty when no prefix is configured (no hardcoded ia_)"
+    )
+
+
+def test_backfill_order_excludes_noise(tmp_path, monkeypatch):
+    """Scenario E — backup tables excluded from backfill order, reported as noise."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "bck.sql": "CREATE TABLE ba.source_bck AS SELECT id FROM ba.source;",
+            "mart.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.source_bck;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_backfill_order("ba.source")
+
+    assert "ba.source_bck" not in result.backfill_order
+    assert any("source_bck" in t for t in result.noise_excluded)
