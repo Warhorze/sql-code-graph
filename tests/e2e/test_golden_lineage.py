@@ -118,6 +118,85 @@ def _direct_sources(db, col_id: str) -> set[str]:
     return {r["sid"] for r in rows if "." in _table_of(r["sid"])}
 
 
+# Default backup-table patterns — mirror the PR-02 NoiseFilter defaults so the
+# harness applies the same hygiene as the shipped tools without needing config.
+_DEFAULT_BACKUP_PATTERNS = ["*_bck", "*_bck_us", "*_bck_[0-9]*", "*_backup", "*_backup_[0-9]*"]
+
+
+def _table_is_noise(table_qualified: str, patterns: list[str]) -> bool:
+    """True when the table-name part matches a backup glob (same rule as NoiseFilter)."""
+    name = table_qualified.rsplit(".", 1)[-1] if "." in table_qualified else table_qualified
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
+
+def _columns_of(db, table_qualified: str) -> list[str]:
+    """All column ids belonging to a table via HAS_COLUMN."""
+    rows = db.run_read(
+        "MATCH (t:SqlTable {qualified: $tq})-[:HAS_COLUMN]->(c:SqlColumn) RETURN c.id AS cid",
+        {"tq": table_qualified},
+    )
+    return [r["cid"] for r in rows]
+
+
+def _table_blast_radius(
+    db, table_qualified: str, patterns: list[str] | None = None, max_nodes: int = 50000
+) -> set[str]:
+    """BFS downstream over COLUMN_LINEAGE from all columns of `table_qualified`,
+    roll up to table_qualified, drop the table itself and any backup-pattern
+    noise. Returns the set of affected downstream tables."""
+    patterns = patterns if patterns is not None else _DEFAULT_BACKUP_PATTERNS
+    seen: set[str] = set()
+    frontier: deque[str] = deque(_columns_of(db, table_qualified))
+    affected: set[str] = set()
+    while frontier and len(seen) < max_nodes:
+        cid = frontier.popleft()
+        if cid in seen:
+            continue
+        seen.add(cid)
+        rows = db.run_read(
+            "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
+            "WHERE s.id = $cid RETURN DISTINCT d.id AS did",
+            {"cid": cid},
+        )
+        for r in rows:
+            did = r["did"]
+            if did not in seen:
+                frontier.append(did)
+            tq = _table_of(did)
+            if tq != table_qualified and not _table_is_noise(tq, patterns):
+                affected.add(tq)
+    return affected
+
+
+def _upstream_tables(
+    db, table_qualified: str, patterns: list[str] | None = None, max_nodes: int = 50000
+) -> set[str]:
+    """BFS upstream over COLUMN_LINEAGE from all columns of `table_qualified`,
+    roll up to table_qualified, drop the table itself and backup noise."""
+    patterns = patterns if patterns is not None else _DEFAULT_BACKUP_PATTERNS
+    seen: set[str] = set()
+    frontier: deque[str] = deque(_columns_of(db, table_qualified))
+    upstreams: set[str] = set()
+    while frontier and len(seen) < max_nodes:
+        cid = frontier.popleft()
+        if cid in seen:
+            continue
+        seen.add(cid)
+        rows = db.run_read(
+            "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
+            "WHERE d.id = $cid RETURN DISTINCT s.id AS sid",
+            {"cid": cid},
+        )
+        for r in rows:
+            sid = r["sid"]
+            if sid not in seen:
+                frontier.append(sid)
+            tq = _table_of(sid)
+            if tq != table_qualified and not _table_is_noise(tq, patterns):
+                upstreams.add(tq)
+    return upstreams
+
+
 def _score(expected: set[str], actual: set[str]) -> dict:
     tp = len(expected & actual)
     fp = len(actual - expected)
@@ -161,28 +240,78 @@ def evaluate() -> list[dict]:
                 target=target,
                 bucket=entry.get("bucket", ""),
                 status=entry.get("status", "draft"),
+                scope="column",
                 backup_noise=backup_noise,
                 n_expected=len(expected),
             )
             results.append(r)
+
+            # Table-level blast-radius scoring (V-GOLDEN). Gated on its own
+            # table_status key so a seed anchor can carry hand-verified table
+            # truth while its column-level sources are still draft.
+            target_table = entry.get("target_table")
+            table_status = entry.get("table_status", "draft")
+            if target_table and entry.get("expected_downstream_tables") is not None:
+                exp_dn = {
+                    t for t in entry["expected_downstream_tables"] if not _table_is_noise(t, [])
+                }
+                act_dn = _table_blast_radius(db, target_table)
+                rr = _score(exp_dn, act_dn)
+                rr.update(
+                    target=target_table,
+                    bucket=entry.get("bucket", ""),
+                    status=table_status,
+                    scope="downstream_tables",
+                    backup_noise=0,
+                    n_expected=len(exp_dn),
+                )
+                results.append(rr)
+            if target_table and entry.get("expected_upstream_tables") is not None:
+                exp_up = {
+                    t for t in entry["expected_upstream_tables"] if not _table_is_noise(t, [])
+                }
+                act_up = _upstream_tables(db, target_table)
+                rr = _score(exp_up, act_up)
+                rr.update(
+                    target=target_table,
+                    bucket=entry.get("bucket", ""),
+                    status=table_status,
+                    scope="upstream_tables",
+                    backup_noise=0,
+                    n_expected=len(exp_up),
+                )
+                results.append(rr)
     finally:
         db.close()
     return results
 
 
 def _format_report(results: list[dict]) -> str:
+    column_results = [r for r in results if r.get("scope", "column") == "column"]
+    table_results = [r for r in results if r.get("scope", "column") != "column"]
+
     lines = [
         f"\n{'=' * 100}",
-        f"GOLDEN LINEAGE REPORT  ({len(results)} columns)",
+        f"GOLDEN LINEAGE REPORT  ({len(column_results)} cols, {len(table_results)} blast-radius)",
         f"{'=' * 100}",
         f"{'st':<4}{'P':>5}{'R':>6}{'F1':>6}{'exp':>5}{'noise':>7}  target",
     ]
-    for r in sorted(results, key=lambda x: (x["status"] != "curated", x["f1"])):
+    for r in sorted(column_results, key=lambda x: (x["status"] != "curated", x["f1"])):
         st = "CUR" if r["status"] == "curated" else "drf"
         lines.append(
             f"{st:<4}{r['precision']:>5.2f}{r['recall']:>6.2f}{r['f1']:>6.2f}"
             f"{r['n_expected']:>5}{r['backup_noise']:>7}  {r['target']}"
         )
+
+    if table_results:
+        lines += [f"{'-' * 100}", "BLAST RADIUS (table-level)"]
+        for r in sorted(table_results, key=lambda x: (x["status"] != "curated", x["f1"])):
+            st = "CUR" if r["status"] == "curated" else "drf"
+            lines.append(
+                f"{st:<4}{r['precision']:>5.2f}{r['recall']:>6.2f}{r['f1']:>6.2f}"
+                f"{r['n_expected']:>5}{'':>7}  [{r['scope']}] {r['target']}"
+            )
+
     cur = [r for r in results if r["status"] == "curated"]
     if cur:
         mp = sum(r["precision"] for r in cur) / len(cur)
@@ -194,7 +323,7 @@ def _format_report(results: list[dict]) -> str:
             f"(floors: P>={PRECISION_FLOOR} R>={RECALL_FLOOR})",
         ]
     else:
-        lines.append("(no curated columns yet — report only, nothing enforced)")
+        lines.append("(no curated entries yet — report only, nothing enforced)")
     return "\n".join(lines)
 
 
@@ -211,13 +340,120 @@ def test_golden_lineage_quality(capsys):
             continue
         if r["recall"] < RECALL_FLOOR or r["precision"] < PRECISION_FLOOR:
             failures.append(
-                f"  {r['target']}: P={r['precision']:.2f} R={r['recall']:.2f} "
+                f"  [{r.get('scope', 'column')}] {r['target']}: "
+                f"P={r['precision']:.2f} R={r['recall']:.2f} "
                 f"missing={r['missing']} spurious={r['spurious']}"
             )
     assert not failures, (
-        f"{len(failures)} curated column(s) below quality floor "
+        f"{len(failures)} curated entr(y/ies) below quality floor "
         f"(P>={PRECISION_FLOOR}, R>={RECALL_FLOOR}):\n" + "\n".join(failures)
     )
+
+
+# --------------------------------------------------------------------------
+# PR-07 unit scenarios — exercise the table-level helpers on a built graph.
+# These do NOT need the gitignored golden file or SQLCG_DB_PATH.
+# --------------------------------------------------------------------------
+
+
+def _mk_chain(backend, tables: list[str]) -> None:
+    """Build a single-column COLUMN_LINEAGE chain across the given tables."""
+    backend.init_schema()
+    for t in tables:
+        name = t.rsplit(".", 1)[-1]
+        backend.upsert_node(
+            "SqlTable",
+            t,
+            {
+                "qualified": t,
+                "catalog": "",
+                "db": "",
+                "name": name,
+                "kind": "TABLE",
+                "defined_in_file": "",
+            },
+        )
+        cid = f"{t}.col"
+        backend.upsert_node(
+            "SqlColumn",
+            cid,
+            {
+                "id": cid,
+                "catalog": "",
+                "db": "",
+                "table_name": name,
+                "col_name": "col",
+                "table_qualified": t,
+            },
+        )
+        backend.upsert_edge("SqlTable", t, "SqlColumn", cid, "HAS_COLUMN", {"source": ""})
+    for a, b in zip(tables, tables[1:], strict=False):
+        backend.upsert_edge(
+            "SqlColumn",
+            f"{a}.col",
+            "SqlColumn",
+            f"{b}.col",
+            "COLUMN_LINEAGE",
+            {"transform": "SELECT", "confidence": 1.0, "query_id": "q"},
+        )
+
+
+def test_table_blast_radius_nonempty():
+    """Scenario A — blast radius reaches the downstream tables."""
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    backend = KuzuBackend(":memory:")
+    _mk_chain(backend, ["ba.source", "ba.etl", "ba.mart"])
+
+    result = _table_blast_radius(backend, "ba.source")
+
+    assert len(result) >= 1
+    assert "ba.etl" in result
+    assert "ba.mart" in result
+
+
+def test_table_blast_radius_excludes_noise():
+    """Scenario B — backup tables are excluded from the blast radius."""
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    backend = KuzuBackend(":memory:")
+    _mk_chain(backend, ["ba.source", "ba.source_bck", "ba.mart"])
+
+    result = _table_blast_radius(backend, "ba.source")
+
+    assert "ba.source_bck" not in result, f"backup must be filtered: {result}"
+    assert "ba.mart" in result
+
+
+def test_evaluate_handles_missing_downstream_key(tmp_path, monkeypatch):
+    """Scenario C — evaluate() returns cleanly when an entry has no
+    expected_downstream_tables key (the new code path must not error)."""
+    import sys
+
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    db_path = str(tmp_path / "graph.db")
+    backend = KuzuBackend(db_path)
+    _mk_chain(backend, ["ba.source", "ba.etl"])
+    backend.close()
+
+    golden = tmp_path / "golden_lineage.yaml"
+    golden.write_text(
+        "mode: reachable_leaves\n"
+        "columns:\n"
+        "  - target: ba.etl.col\n"
+        "    expected_sources: [ba.source.col]\n"
+        "    status: draft\n"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "GOLDEN_FILE", golden)
+    monkeypatch.setenv("SQLCG_DB_PATH", db_path)
+
+    results = evaluate()
+
+    assert isinstance(results, list)
+    assert len(results) >= 1
+    # No table-level result was produced (no expected_downstream_tables key).
+    assert all(r.get("scope", "column") == "column" for r in results)
 
 
 if __name__ == "__main__":
