@@ -1,9 +1,11 @@
 """Noise filter for backup tables and schema-alias mirrors."""
 
 import fnmatch
+import re
 from pathlib import Path
 
 from sqlcg.core.config import (
+    get_ignore_table_regexes,
     get_ignored_tables,
     get_noise_filter_patterns,
     get_schema_aliases,
@@ -22,32 +24,47 @@ class NoiseFilter:
         patterns: list[str],
         schema_aliases: dict[str, str],
         ignored_tables: list[str] | None = None,
+        ignore_regexes: list[str] | None = None,
     ) -> None:
         """Initialize the noise filter.
 
         Args:
-            patterns: List of glob patterns for backup table names.
+            patterns: List of glob patterns for backup table names (matched on the
+                table-name part, anchored as fnmatch globs — e.g. ``*_bck``).
             schema_aliases: Dict mapping staging schema names to canonical schema names.
             ignored_tables: Exact qualified table names (schema.table) to drop,
                 matched case-insensitively. Complements ``patterns`` for tables
                 that do not follow a backup naming convention.
+            ignore_regexes: Regular expressions matched (``re.search``,
+                case-insensitive) against the full qualified name. Complements the
+                anchored globs for conventions they cannot express — e.g. a
+                ``_bck`` marker appearing anywhere in the name. Invalid patterns
+                are skipped (they never match) rather than raising.
         """
         self.patterns = patterns
         self.schema_aliases = schema_aliases
         self.ignored_tables = {t.lower() for t in (ignored_tables or [])}
+        self.ignore_regexes: list[re.Pattern[str]] = []
+        for pattern in ignore_regexes or []:
+            try:
+                self.ignore_regexes.append(re.compile(pattern, re.IGNORECASE))
+            except re.error:
+                # A malformed user regex must not break filtering for every table.
+                continue
 
     def is_noise(self, table_qualified: str) -> bool:
-        """Return True if table_qualified is noise (backup glob or explicit ignore).
+        """Return True if table_qualified is noise.
 
-        A node is noise when its table name matches a backup glob pattern
-        (fnmatch) OR its qualified name appears in the ``ignored_tables`` exact
-        list (case-insensitive).
+        A node is noise when any of the three layers matches:
+        1. its qualified name is in the ``ignored_tables`` exact list (case-insensitive);
+        2. its table-name part matches a backup glob pattern (fnmatch);
+        3. its full qualified name matches an ``ignore_regexes`` pattern (re.search).
 
         Args:
             table_qualified: A qualified table name (schema.table).
 
         Returns:
-            True if the table matches any backup pattern or ignored-table entry.
+            True if the table matches any ignore layer.
         """
         # Exact qualified-name match against the explicit ignore list.
         if table_qualified.lower() in self.ignored_tables:
@@ -62,6 +79,12 @@ class NoiseFilter:
         for pattern in self.patterns:
             if fnmatch.fnmatch(table_name, pattern):
                 return True
+
+        # Regex layer: match against the full qualified name (unanchored).
+        for regex in self.ignore_regexes:
+            if regex.search(table_qualified):
+                return True
+
         return False
 
     def canonical(self, table_qualified: str) -> str:
@@ -115,8 +138,9 @@ class NoiseFilter:
     def from_config(cls, repo_root: Path | None = None) -> "NoiseFilter":
         """Construct a NoiseFilter from config files.
 
-        Calls get_noise_filter_patterns(), get_schema_aliases(), and
-        get_ignored_tables() from config.py and constructs a NoiseFilter.
+        Calls get_noise_filter_patterns(), get_schema_aliases(),
+        get_ignored_tables(), and get_ignore_table_regexes() from config.py and
+        constructs a NoiseFilter.
 
         Args:
             repo_root: Root directory to search for .sqlcg.toml. Falls back to
@@ -133,9 +157,11 @@ class NoiseFilter:
         patterns = get_noise_filter_patterns(repo_root)
         schema_aliases = get_schema_aliases(repo_root)
         ignored_tables = get_ignored_tables(repo_root)
+        ignore_regexes = get_ignore_table_regexes(repo_root)
 
         return cls(
             patterns=patterns,
             schema_aliases=schema_aliases,
             ignored_tables=ignored_tables,
+            ignore_regexes=ignore_regexes,
         )

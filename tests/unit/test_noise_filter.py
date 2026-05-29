@@ -274,3 +274,64 @@ class TestNoiseFilterIntegration:
         assert "ia_analytics.mart" in kept
         assert "ba.source_table_bck" in excluded
         assert "ba.etl_table_bck_20240115" in excluded
+
+
+class TestNoiseFilterRegex:
+    """Regex ignore layer — catch _bck markers anywhere in the name."""
+
+    def test_regex_matches_bck_anywhere(self) -> None:
+        """An unanchored `_bck` regex excludes names a `*_bck` glob would miss."""
+        filter = NoiseFilter(patterns=["*_bck"], schema_aliases={}, ignore_regexes=["_bck"])
+
+        # The anchored glob only catches suffix _bck...
+        assert filter.is_noise("ba.table_bck") is True
+        # ...but the regex also catches _bck when it is not the final token,
+        # which the `*_bck` glob would miss.
+        assert filter.is_noise("ba.table_bck_archive") is True
+        assert filter.is_noise("ba.table_bck_20240101_old") is True
+
+    def test_regex_does_not_overmatch(self) -> None:
+        """A `_bck` regex must not flag an unrelated table."""
+        filter = NoiseFilter(patterns=[], schema_aliases={}, ignore_regexes=["_bck"])
+        assert filter.is_noise("ba.verkoopinfo") is False
+
+    def test_regex_is_case_insensitive(self) -> None:
+        """Regex layer matches case-insensitively like the other layers."""
+        filter = NoiseFilter(patterns=[], schema_aliases={}, ignore_regexes=["_bck"])
+        assert filter.is_noise("BA.TABLE_BCK_OLD") is True
+
+    def test_invalid_regex_is_skipped_not_raised(self) -> None:
+        """A malformed regex is dropped silently and never matches."""
+        filter = NoiseFilter(patterns=[], schema_aliases={}, ignore_regexes=["[unclosed"])
+        # Construction did not raise; the bad pattern simply matches nothing.
+        assert filter.is_noise("ba.anything") is False
+
+    def test_default_regexes_empty(self) -> None:
+        """get_ignore_table_regexes defaults to [] when config is absent."""
+        from sqlcg.core.config import get_ignore_table_regexes
+
+        assert get_ignore_table_regexes(Path("/nonexistent")) == []
+
+    def test_get_regexes_from_toml(self, tmp_path: Path) -> None:
+        """get_ignore_table_regexes reads the configured list verbatim."""
+        from sqlcg.core.config import get_ignore_table_regexes
+
+        (tmp_path / ".sqlcg.toml").write_text(
+            """
+[sqlcg.noise_filter]
+ignore_table_regexes = ["_bck", "_tmp_[0-9]{8}"]
+"""
+        )
+        assert get_ignore_table_regexes(tmp_path) == ["_bck", "_tmp_[0-9]{8}"]
+
+    def test_from_config_wires_regexes(self, tmp_path: Path) -> None:
+        """from_config wires ignore_table_regexes into the NoiseFilter."""
+        (tmp_path / ".sqlcg.toml").write_text(
+            """
+[sqlcg.noise_filter]
+ignore_table_regexes = ["_bck"]
+"""
+        )
+        filter = NoiseFilter.from_config(repo_root=tmp_path)
+        assert filter.is_noise("ba.foo_bck_archive") is True
+        assert filter.is_noise("ba.foo") is False

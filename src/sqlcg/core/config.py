@@ -190,6 +190,44 @@ def get_ignored_tables(path: Path) -> list[str]:
     return []
 
 
+def get_ignore_table_regexes(path: Path) -> list[str]:
+    """Get table-exclusion regexes from .sqlcg.toml.
+
+    Complements ``get_noise_filter_patterns`` (anchored fnmatch globs) and
+    ``get_ignored_tables`` (exact names) with full regular expressions, for
+    backup conventions the globs cannot express — e.g. a ``_bck`` marker that
+    can appear anywhere in the name, not just as a suffix::
+
+        [sqlcg.noise_filter]
+        ignore_table_regexes = ["_bck", "_tmp_[0-9]{8}"]
+
+    Each pattern is matched (``re.search``, case-insensitive) against the full
+    qualified ``schema.table`` name, so an unanchored ``_bck`` excludes
+    ``ba.foo_bck`` and ``da.bar_bck_archive`` alike (the latter is missed by the
+    suffix-anchored ``*_bck`` glob). The
+    lineage engine still records these as real edges; this only lets a user
+    declare them noise in config rather than baking the judgment into code.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of regex strings (kept verbatim — not lowercased, so character
+        classes survive). Defaults to an empty list.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("noise_filter", {}).get("ignore_table_regexes")
+            if isinstance(raw, list):
+                return [r for r in raw if isinstance(r, str)]
+        except Exception:
+            pass
+    return []
+
+
 def get_presentation_prefixes(path: Path) -> list[str]:
     """Get presentation-facing schema prefixes from .sqlcg.toml.
 
