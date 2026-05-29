@@ -318,14 +318,23 @@ new optional, independently-gated per-entry fields:
   (reuse the PR-07 helper; do not re-traverse).
 - `_is_dead_code(db, table_qualified)` → no consuming `SELECTS_FROM` (one Cypher read).
 - `_hub_rank(db, table_qualified, k)` → run the same `HUB_RANKING` Cypher, return 1-based
-  index or `None`.
+  index or `None`. The harness helper must run the query with a large `k` (e.g. `k=1000`),
+  NOT the user-facing default of 10 — otherwise a table with genuine dependents that ranks
+  below top-10 returns `None` and produces a false-negative anchor failure.
 
 **Step 5.3** — In `evaluate()`, for each entry carrying one of the new keys AND
 `table_status: curated`, produce a scored result row with `scope` set to `"downstream_count"`
-/ `"dead_code"` / `"hub_rank"`. Reuse `_score()` for the count (treat as exact-match:
-score is 1.0 iff actual == expected, else 0.0 — a count anchor is pass/fail, document this).
-For dead-code and hub-rank, a boolean pass/fail mapped to recall 1.0/0.0 so the existing
-`RECALL_FLOOR` enforcement in `test_golden_lineage_quality` covers them with no new gate.
+/ `"dead_code"` / `"hub_rank"`. For `expected_downstream_count`, do **NOT** call `_score()`
+(it operates on `set[str]` and computes set intersection — an integer count cannot be passed
+to it; Pyright would flag the type and Kuzu sets hold strings, not ints). Emit a result row
+directly with `recall = 1.0 if actual_count == expected_count else 0.0`, `precision = recall`,
+`f1 = recall`, `missing = [] if recall == 1.0 else [str(expected_count)]`, `spurious = []`,
+`status = table_status`. The existing `RECALL_FLOOR` enforcement in
+`test_golden_lineage_quality` covers this row because `status == "curated"`.
+For dead-code and hub-rank, likewise a boolean pass/fail mapped to recall 1.0/0.0 (`status =
+table_status`) so the existing `RECALL_FLOOR` enforcement covers them with no new gate.
+Gate strictly on key presence: when none of the three keys is on an entry, `evaluate()` must
+add **no** non-`column` scope row for it (preserves `test_evaluate_handles_missing_downstream_key`).
 
 **Step 5.4** — PR unit scenarios (no golden file / no SQLCG_DB_PATH needed), mirroring the
 existing PR-07 unit tests at the bottom of
@@ -392,6 +401,10 @@ otherwise — existing harness invariant, must remain).
 - [ ] Golden harness accepts `expected_downstream_count` / `expected_dead_code` /
       `expected_top_hub_rank`, scores them under `table_status: curated`, and the new code
       path does not error when those keys are absent (unit scenario).
+- [ ] `grep -n "model_validator\|from typing import Literal" src/sqlcg/server/models.py`
+      returns results for both (validator + `Literal` imports added).
+- [ ] `test_evaluate_handles_missing_downstream_key` still passes after Phase 5 — `evaluate()`
+      adds no non-`column` scope rows when the three new anchor keys are absent from an entry.
 - [ ] No `# TODO` in the happy path of any new tool or harness helper.
 - [ ] Every new tool/method has a grep-confirmed call site (`@mcp.tool()` registration for
       tools; harness helpers called from `evaluate()`).
