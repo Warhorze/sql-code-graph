@@ -147,8 +147,8 @@ def test_anchor_ma_chain_link_6_target_to_view(chain_edges):
         for e in chain_edges
         if e[0].lower() == "wtfs_openstaande_orders"
         and e[1].lower() == "ma_aantal_op_order"
-        and e[2] == "Openstaande orders"
-        and e[3] == "Aantal op order"
+        and e[2].lower() == "openstaande orders"
+        and e[3].lower() == "aantal op order"
     ]
     assert len(link_6) >= 1, (
         "Expected wtfs_openstaande_orders.ma_aantal_op_order -> "

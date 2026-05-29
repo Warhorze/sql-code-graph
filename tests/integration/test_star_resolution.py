@@ -45,7 +45,7 @@ def test_ddl_columns_persisted(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
+        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
         "RETURN c.col_name AS n ORDER BY n",
         {},
     )
@@ -60,14 +60,14 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (c:SqlColumn {id: 'BA.src.amount'}) "
+        "MATCH (c:SqlColumn {id: 'ba.src.amount'}) "
         "RETURN c.id AS id, c.col_name AS n, c.table_qualified AS tq",
         {},
     )
     assert len(rows) == 1
-    assert rows[0]["id"] == "BA.src.amount"
+    assert rows[0]["id"] == "ba.src.amount"
     assert rows[0]["n"] == "amount"
-    assert rows[0]["tq"] == "BA.src"
+    assert rows[0]["tq"] == "ba.src"
 
 
 def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
@@ -97,9 +97,9 @@ def test_star_source_edge_persisted(temp_db, star_repo):
         {},
     )
     assert len(rows) == 1, f"Expected 1 STAR_SOURCE edge, got {len(rows)}: {rows}"
-    assert rows[0]["src"] == "BA.src"
+    assert rows[0]["src"] == "ba.src"
     assert rows[0]["q"] == "<unqualified>"
-    assert rows[0]["tgt"] == "BA.tgt"
+    assert rows[0]["tgt"] == "ba.tgt"
     assert abs(rows[0]["conf"] - 0.8) < 1e-6
 
 
@@ -154,8 +154,8 @@ def test_star_expansion_creates_edges(temp_db, tmp_path):
         {},
     )
     assert rows == [
-        {"src": "BA.src.col1", "dst": "BA.tgt.col1", "c": pytest.approx(0.8)},
-        {"src": "BA.src.col2", "dst": "BA.tgt.col2", "c": pytest.approx(0.8)},
+        {"src": "ba.src.col1", "dst": "ba.tgt.col1", "c": pytest.approx(0.8)},
+        {"src": "ba.src.col2", "dst": "ba.tgt.col2", "c": pytest.approx(0.8)},
     ], f"Unexpected expansion edges: {rows}"
 
 
@@ -348,15 +348,17 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     (tmp_path / "ddl_v1.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
     (tmp_path / "ddl_v2.sql").write_text("CREATE TABLE BA.src (col1 INT, col2 STRING);\n")
 
-    with caplog.at_level(logging.WARNING, logger="sqlcg.indexer.indexer"):
+    with caplog.at_level(logging.DEBUG, logger="sqlcg.indexer.indexer"):
         Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
-    # A WARNING containing both file references must have been emitted
+    # F6: duplicate DDL is now logged at DEBUG (not WARNING) — still must be emitted
     dup_warnings = [
-        r.message for r in caplog.records if r.levelno == logging.WARNING and "BA.src" in r.message
+        r.message
+        for r in caplog.records
+        if "ba.src" in r.message and "duplicate" in r.message.lower()
     ]
     assert len(dup_warnings) >= 1, (
-        "Expected a logger.warning about duplicate DDL for BA.src. "
+        "Expected a logger.debug about duplicate DDL for ba.src. "
         "Add the duplicate-DDL guard to _upsert_parsed_file."
     )
     # The warning must mention both files so the user can locate the conflict
@@ -397,7 +399,7 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     assert len(dup_errors) >= 1, (
         f"Expected at least one duplicate_ddl: error entry. All errors: {all_errors}"
     )
-    assert "BA.t" in dup_errors[0], (
+    assert "ba.t" in dup_errors[0], (
         f"duplicate_ddl error must name the conflicting table. Got: {dup_errors[0]}"
     )
 
@@ -410,12 +412,12 @@ def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     # Exactly one SqlTable node for BA.src
-    tables = temp_db.run_read("MATCH (t:SqlTable {qualified: 'BA.src'}) RETURN count(t) AS n", {})
+    tables = temp_db.run_read("MATCH (t:SqlTable {qualified: 'ba.src'}) RETURN count(t) AS n", {})
     assert tables[0]["n"] == 1, "Duplicate DDL must not create duplicate SqlTable nodes"
 
     # Both columns must be present (union of both DDL files)
     cols = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
+        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
         "RETURN c.col_name AS n ORDER BY n",
         {},
     )
@@ -501,7 +503,7 @@ def test_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
+        "MATCH (:SqlTable {qualified: 'ba.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
     )
     assert len(rows) == 1
     assert rows[0]["src"] == "ddl"
