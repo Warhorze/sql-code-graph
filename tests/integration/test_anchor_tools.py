@@ -302,3 +302,64 @@ def test_backfill_order_excludes_noise(tmp_path, monkeypatch):
 
     assert "ba.source_bck" not in result.backfill_order
     assert any("source_bck" in t for t in result.noise_excluded)
+
+
+# --------------------------------------------------------------------------
+# PR-06 — scope_change (synthesis)
+# --------------------------------------------------------------------------
+
+
+def test_scope_change_full_synthesis(tmp_path, monkeypatch):
+    """Scenario A — one call assembles definition, scope, and backfill order."""
+    _index_fixture(
+        tmp_path,
+        {
+            "raw.sql": "CREATE TABLE ba.raw (id INT);",
+            "staged.sql": "CREATE TABLE ba.staged AS SELECT id FROM ba.raw;",
+            "mart.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.staged;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.scope_change("ba.raw")
+
+    assert len(result.authoritative_files) >= 1
+    assert result.authoritative_files[0].endswith("raw.sql")
+    assert "ba.staged" in result.downstream_blast_radius
+    assert result.risk_label in ("low", "medium", "high")
+    assert len(result.backfill_order) >= 1
+    assert result.truncated is False
+
+
+def test_scope_change_noise_excluded(tmp_path, monkeypatch):
+    """Scenario B — backups are excluded from the blast radius and reported."""
+    _index_fixture(
+        tmp_path,
+        {
+            "raw.sql": "CREATE TABLE ba.raw (id INT);",
+            "staged.sql": "CREATE TABLE ba.staged AS SELECT id FROM ba.raw;",
+            "bck.sql": "CREATE TABLE ba.staged_bck AS SELECT id FROM ba.raw;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.scope_change("ba.raw")
+
+    assert all("_bck" not in t for t in result.downstream_blast_radius)
+    assert len(result.noise_excluded) >= 1
+
+
+def test_scope_change_undefined_table(tmp_path, monkeypatch):
+    """Scenario C — an undefined target returns empty sets, safe risk, a hint."""
+    _index_fixture(
+        tmp_path,
+        {"raw.sql": "CREATE TABLE ba.raw (id INT);"},
+        monkeypatch,
+    )
+
+    result = tools.scope_change("ba.does_not_exist")
+
+    assert result.authoritative_files == []
+    assert result.downstream_blast_radius == []
+    assert result.risk_label == "safe"
+    assert result.hint is not None and len(result.hint) > 0

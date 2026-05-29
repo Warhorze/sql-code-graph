@@ -41,6 +41,7 @@ from sqlcg.server.models import (
     DiffImpactResult,
     LineageNode,
     LineageResult,
+    ScopeChangeResult,
     SqlPatternMatch,
     SqlPatternResult,
     TableUsage,
@@ -862,6 +863,92 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             truncated=truncated,
             hint=hint,
         )
+
+
+@mcp.tool()
+@_timed_tool("scope_change")
+def scope_change(target: str) -> ScopeChangeResult:
+    """One-call synthesis of everything an LLM needs before changing a table.
+
+    Delegates to the already-implemented anchor tools — find_definition,
+    get_change_scope, get_backfill_order — and assembles their results into a
+    single response. No query logic is reimplemented here. Each delegate call is
+    isolated: a failure in one is logged and surfaced in ``hint`` without
+    blanking the rest of the response.
+
+    Args:
+        target: Qualified table name being changed (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        ScopeChangeResult bundling authoritative files, upstream inputs,
+        downstream blast radius (table + column precise), rebuild order, and risk.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    authoritative_files: list[str] = []
+    upstream_inputs: list[str] = []
+    downstream_blast_radius: list[str] = []
+    affected_columns: list[str] = []
+    backfill_order: list[str] = []
+    risk_label = "safe"
+    risk_weight = 0
+    noise_excluded: list[str] = []
+    truncated = False
+    hints: list[str] = []
+
+    try:
+        definition = find_definition(target)
+        authoritative_files = [d.file_path for d in definition.definitions if d.is_authoritative]
+        noise_excluded.extend(definition.noise_excluded)
+        if definition.hint:
+            hints.append(definition.hint)
+    except Exception as exc:
+        logger.warning("scope_change: find_definition(%s) failed: %s", target, exc)
+        hints.append(f"find_definition failed: {exc}")
+
+    try:
+        scope = get_change_scope(target)
+        upstream_inputs = scope.upstream_tables
+        downstream_blast_radius = scope.affected_tables
+        affected_columns = scope.affected_columns
+        risk_label = scope.risk_label
+        risk_weight = scope.risk_weight
+        noise_excluded.extend(scope.noise_excluded)
+        truncated = truncated or scope.truncated
+        if scope.hint:
+            hints.append(scope.hint)
+    except Exception as exc:
+        logger.warning("scope_change: get_change_scope(%s) failed: %s", target, exc)
+        hints.append(f"get_change_scope failed: {exc}")
+
+    try:
+        backfill = get_backfill_order(target)
+        backfill_order = backfill.backfill_order
+        noise_excluded.extend(backfill.noise_excluded)
+        truncated = truncated or backfill.truncated
+        if backfill.hint:
+            hints.append(backfill.hint)
+    except Exception as exc:
+        logger.warning("scope_change: get_backfill_order(%s) failed: %s", target, exc)
+        hints.append(f"get_backfill_order failed: {exc}")
+
+    noise_excluded = _dedup_preserve_order(noise_excluded)
+    hint = " | ".join(hints) if hints else None
+
+    return ScopeChangeResult(
+        target=target,
+        authoritative_files=authoritative_files,
+        upstream_inputs=upstream_inputs,
+        downstream_blast_radius=downstream_blast_radius,
+        affected_columns=affected_columns,
+        backfill_order=backfill_order,
+        risk_label=risk_label,
+        risk_weight=risk_weight,
+        noise_excluded=noise_excluded,
+        truncated=truncated,
+        hint=hint,
+    )
 
 
 @mcp.tool()

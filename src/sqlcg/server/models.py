@@ -270,3 +270,36 @@ class DiffImpactResult(BaseModel):
     hint: str | None = Field(
         None, description="Diagnostic hint when result is empty or approximate."
     )
+
+
+class ScopeChangeResult(BaseModel):
+    """Result of scope_change — single-call synthesis of everything an LLM needs
+    before changing a table."""
+
+    target: str = Field(..., description="Qualified table name being changed")
+    authoritative_files: list[str] = Field(
+        default_factory=list, description="Authoritative (non-backup) defining files."
+    )
+    upstream_inputs: list[str] = Field(
+        default_factory=list, description="Direct upstream input tables."
+    )
+    downstream_blast_radius: list[str] = Field(
+        default_factory=list, description="Full-depth affected tables (noise-filtered)."
+    )
+    affected_columns: list[str] = Field(
+        default_factory=list, description="Column-precise downstream blast radius."
+    )
+    backfill_order: list[str] = Field(
+        default_factory=list, description="Topological rebuild order for the blast radius."
+    )
+    risk_label: str = Field(..., description="Change risk: 'safe' | 'low' | 'medium' | 'high'.")
+    risk_weight: int = Field(0, description="Count of affected downstream tables.")
+    noise_excluded: list[str] = Field(
+        default_factory=list, description="Backup/noise tables and files excluded from the answer."
+    )
+    truncated: bool = Field(
+        False, description="True if any underlying closure hit the 50k-node safety cap."
+    )
+    hint: str | None = Field(
+        None, description="Combined hints from the underlying tools (joined with ' | ')."
+    )
