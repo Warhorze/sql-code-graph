@@ -103,7 +103,7 @@ def test_select_star_records_star_source():
 
     insert = parsed.statements[0]
     assert len(insert.star_sources) == 1
-    assert insert.star_sources[0].source.full_id == "BA.src"
+    assert insert.star_sources[0].source.full_id == "ba.src"
     assert insert.star_sources[0].qualifier is None
     # Parser must not produce concrete column lineage edges for star projections
     assert insert.column_lineage == []
@@ -117,7 +117,7 @@ def test_select_alias_star_records_qualifier():
 
     insert = parsed.statements[0]
     assert len(insert.star_sources) == 1
-    assert insert.star_sources[0].source.full_id == "BA.src"
+    assert insert.star_sources[0].source.full_id == "ba.src"
     assert insert.star_sources[0].qualifier == "base"
 
 
@@ -166,7 +166,7 @@ def test_multi_source_star_uses_first_source_as_fallback():
     # At least one StarSource must be emitted
     assert len(stmt.star_sources) >= 1
     # The first StarSource must point to one of the two sources (whichever comes first)
-    assert stmt.star_sources[0].source.full_id in ("BA.src_a", "BA.src_b")
+    assert stmt.star_sources[0].source.full_id in ("ba.src_a", "ba.src_b")
     assert stmt.star_sources[0].qualifier is None
 
 
@@ -182,7 +182,7 @@ def test_resolve_star_source_method_exists_on_parser():
         sources=[TableRef(db="BA", name="src")],
     )
     assert result is not None
-    assert result.full_id == "BA.src"
+    assert result.full_id == "ba.src"
 
 
 def test_resolve_star_source_alias_match():

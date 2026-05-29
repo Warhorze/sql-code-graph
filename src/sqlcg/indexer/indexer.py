@@ -263,6 +263,7 @@ class Indexer:
         parsed: ParsedFile,
         db: GraphBackend,
         gold_tables: frozenset[str] = frozenset(),
+        defined_table_registry: dict[str, str] | None = None,
     ) -> dict:
         """Map ParsedFile → graph nodes/edges.
 
@@ -290,22 +291,29 @@ class Indexer:
         # Upsert defined tables (with duplicate DDL detection)
         for table in parsed.defined_tables:
             # Guard: detect duplicate DDL for the same table across files
-            existing = db.run_read(
-                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
-                {"qid": table.full_id},
-            )
-            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
-                logger.warning(
+            # Step 5.1: Check using provided registry or database query
+            first_file = None
+            if defined_table_registry is not None:
+                first_file = defined_table_registry.get(table.full_id)
+            else:
+                query = (
+                    f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f"
+                )
+                existing = db.run_read(query, {"qid": table.full_id})
+                first_file = existing[0]["f"] if existing and existing[0].get("f") else None
+
+            if first_file and first_file != parsed.path_str:
+                # Step 5.1: Log at DEBUG level instead of WARNING (benign cross-file DDL)
+                logger.debug(
                     "Table %s already defined in %s — %s will add columns to the union; "
                     "star expansion may include columns from the earlier DDL file",
                     table.full_id,
-                    existing[0]["f"],
+                    first_file,
                     parsed.path_str,
                 )
+                # Keep the structured error for queryability (Step 5.1)
                 if hasattr(parsed, "errors"):
-                    parsed.errors.append(
-                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
-                    )
+                    parsed.errors.append(f"duplicate_ddl:{table.full_id}:already_in:{first_file}")
 
             db.upsert_node(
                 NodeLabel.TABLE,

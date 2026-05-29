@@ -1,8 +1,10 @@
 """MCP tools for SQL code graph queries and indexing."""
 
+import functools
 import re
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
 from sqlcg.core.config import get_db_path
@@ -102,6 +104,19 @@ def _get_backend() -> GraphBackend:
     return _backend
 
 
+@contextmanager
+def _open_backend():
+    """Context manager to get the initialized backend.
+
+    Used for testing and context-manager-style access patterns.
+    """
+    backend = _get_backend()
+    try:
+        yield backend
+    finally:
+        pass
+
+
 def _assert_indexed(db: GraphBackend) -> None:
     """Check that the graph has indexed repos.
 
@@ -122,7 +137,7 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     """Parse column reference "table.column" or "catalog.db.table.column".
 
     Args:
-        col_ref: Column reference string
+        col_ref: Column reference string (e.g., "ba.table.column")
 
     Returns:
         Tuple of (table_id, column_name)
@@ -130,6 +145,9 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     Raises:
         InvalidColumnRefError: If format is invalid
     """
+    # Step 1.4b: Lowercase the input to match lowercased graph keys (C2)
+    col_ref = col_ref.lower()
+
     parts = col_ref.split(".")
     if len(parts) < 2:
         raise InvalidColumnRefError(
@@ -166,6 +184,7 @@ def _timed_tool(tool_name: str):
     """
 
     def decorator(func):
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             start_time = time.time()
             try:
@@ -278,9 +297,12 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
 
     Traverses COLUMN_LINEAGE edges backward up to max_depth levels.
 
+    Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
+    lineage lookups. Column references must include both the table and column names.
+
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
+                   or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
         max_depth: Maximum number of hops to traverse
 
     Returns:
@@ -290,58 +312,64 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    lineage: list[LineageNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        lineage: list[LineageNode] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or depth > max_depth:
+                continue
 
-        visited.add(current_id)
+            visited.add(current_id)
 
-        # Query for upstream columns (reverse direction)
-        rows = db.run_read(
-            TRACE_COLUMN_LINEAGE_QUERY,
-            {"id": current_id},
-        )
+            # Query for upstream columns (reverse direction)
+            rows = db.run_read(
+                TRACE_COLUMN_LINEAGE_QUERY,
+                {"id": current_id},
+            )
 
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                lineage.append(
-                    LineageNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                        file=None,
-                        confidence=None,
-                    )
-                )
-                queue.append((node_id, depth + 1))
+            for row in rows:
+                node_id = row["id"]
+                if node_id not in visited:
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        lineage.append(
+                            LineageNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                                file=None,
+                                confidence=None,
+                            )
+                        )
+                    queue.append((node_id, depth + 1))
 
-    # Populate hint if result is empty
-    hint = None
-    if not lineage:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
+        # Populate hint if result is empty (Step 4.1)
+        hint = None
+        if not lineage:
+            hint = (
+                "No lineage found. Ensure the column reference includes the schema prefix "
+                "(e.g., ba.table_name.column_name). Check that 'sqlcg db info' shows "
+                "SqlColumn > 0. If SqlColumn is 0, column lineage was not extracted — "
+                "check parse errors. Submit feedback with submit_feedback tool if this "
+                "was a false negative."
+            )
 
-    return LineageResult(column=table_col, lineage=lineage, hint=hint)
+        return LineageResult(column=table_col, lineage=lineage, hint=hint)
 
 
 @mcp.tool()
@@ -352,7 +380,7 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     Searches for SELECTS_FROM relationships pointing to the table.
 
     Args:
-        table_name: Table name to search for
+        table_name: Table name to search for (e.g. "ba.table_name")
 
     Returns:
         TableUsageResult with list of queries using this table
@@ -360,34 +388,35 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     Raises:
         NotIndexedError: If no repos have been indexed
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    rows = db.run_read(
-        FIND_TABLE_USAGES_QUERY,
-        {"name": table_name},
-    )
+        # Step 1.4: Lowercase the input to match lowercased SqlTable.name (C2)
+        rows = db.run_read(
+            FIND_TABLE_USAGES_QUERY,
+            {"name": table_name.lower()},
+        )
 
-    usages: list[TableUsage] = []
-    for row in rows:
-        usages.append(
-            TableUsage(
-                query_file=row["file"],
-                sql=row.get("sql"),
-                kind=row.get("kind"),
+        usages: list[TableUsage] = []
+        for row in rows:
+            usages.append(
+                TableUsage(
+                    query_file=row["file"],
+                    sql=row.get("sql"),
+                    kind=row.get("kind"),
+                )
             )
-        )
 
-    # Populate hint if result is empty
-    hint = None
-    if not usages:
-        hint = (
-            "No usages found for this table. The table may not be referenced by any "
-            "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
-            "Run 'analyze impact <table>' from the CLI to cross-check."
-        )
+        # Populate hint if result is empty
+        hint = None
+        if not usages:
+            hint = (
+                "No usages found for this table. The table may not be referenced by any "
+                "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
+                "Run 'analyze impact <table>' from the CLI to cross-check."
+            )
 
-    return TableUsageResult(table=table_name, usages=usages, hint=hint)
+        return TableUsageResult(table=table_name, usages=usages, hint=hint)
 
 
 @mcp.tool()
@@ -399,7 +428,7 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
 
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
+                   or "catalog.db.table.column" (e.g., "ba.table.column")
         max_depth: Maximum number of hops to traverse
 
     Returns:
@@ -409,56 +438,61 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    nodes: list[DependencyNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        nodes: list[DependencyNode] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or depth > max_depth:
+                continue
 
-        visited.add(current_id)
+            visited.add(current_id)
 
-        # Query for downstream columns (forward direction)
-        rows = db.run_read(
-            GET_DOWNSTREAM_DEPENDENCIES_QUERY,
-            {"id": current_id},
-        )
+            # Query for downstream columns (forward direction)
+            rows = db.run_read(
+                GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+                {"id": current_id},
+            )
 
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                nodes.append(
-                    DependencyNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                    )
-                )
-                queue.append((node_id, depth + 1))
+            for row in rows:
+                node_id = row["id"]
+                if node_id not in visited:
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        nodes.append(
+                            DependencyNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                            )
+                        )
+                    queue.append((node_id, depth + 1))
 
-    # Populate hint if result is empty
-    hint = None
-    if not nodes:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
+        # Populate hint if result is empty (Step 4.2)
+        hint = None
+        if not nodes:
+            hint = (
+                "No downstream consumers found — this column may be a terminal output. "
+                "If you expected consumers, confirm the consuming files were indexed "
+                "and that the column reference includes the schema prefix "
+                "(e.g., ba.table_name.column_name)."
+            )
 
-    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
+        return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
@@ -468,9 +502,12 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
 
     Traverses COLUMN_LINEAGE edges backward to find columns this one depends on.
 
+    Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
+    lookups.
+
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
+                   or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
         max_depth: Maximum number of hops to traverse
 
     Returns:
@@ -480,56 +517,62 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    nodes: list[DependencyNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        nodes: list[DependencyNode] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or depth > max_depth:
+                continue
 
-        visited.add(current_id)
+            visited.add(current_id)
 
-        # Query for upstream columns (reverse direction)
-        rows = db.run_read(
-            GET_UPSTREAM_DEPENDENCIES_QUERY,
-            {"id": current_id},
-        )
+            # Query for upstream columns (reverse direction)
+            rows = db.run_read(
+                GET_UPSTREAM_DEPENDENCIES_QUERY,
+                {"id": current_id},
+            )
 
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                nodes.append(
-                    DependencyNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                    )
-                )
-                queue.append((node_id, depth + 1))
+            for row in rows:
+                node_id = row["id"]
+                if node_id not in visited:
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        nodes.append(
+                            DependencyNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                            )
+                        )
+                    queue.append((node_id, depth + 1))
 
-    # Populate hint if result is empty
-    hint = None
-    if not nodes:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
+        # Populate hint if result is empty (Step 4.1)
+        hint = None
+        if not nodes:
+            hint = (
+                "No lineage found. Ensure the column reference includes the schema "
+                "prefix (e.g., ba.table_name.column_name). Check that 'sqlcg db info' "
+                "shows SqlColumn > 0. If SqlColumn is 0, column lineage was not "
+                "extracted — check parse errors. Submit feedback with "
+                "submit_feedback tool if this was a false negative."
+            )
 
-    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
+        return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
@@ -642,14 +685,11 @@ def db_info() -> DbInfoResult:
         result = db.run_read(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
         node_counts[str(label)] = result[0]["count"] if result else 0
 
-    edges_result = db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {}
-    )
+    edges_result = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {})
     column_lineage_edges = edges_result[0]["count"] if edges_result else 0
 
     mode_rows = db.run_read(
-        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
-        " COUNT(q) AS cnt ORDER BY cnt DESC",
+        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC",
         {},
     )
     parse_quality: dict[str, int] = {}
@@ -658,13 +698,9 @@ def db_info() -> DbInfoResult:
 
     warnings: list[str] = []
     if node_counts.get("Repo", 0) == 0:
-        warnings.append(
-            "Database is empty. Run 'sqlcg db init' then 'sqlcg index <path>'."
-        )
+        warnings.append("Database is empty. Run 'sqlcg db init' then 'sqlcg index <path>'.")
     elif node_counts.get("SqlQuery", 0) == 0:
-        warnings.append(
-            "No queries indexed. Run 'sqlcg index <path>' to populate the graph."
-        )
+        warnings.append("No queries indexed. Run 'sqlcg index <path>' to populate the graph.")
     elif node_counts.get("SqlColumn", 0) == 0:
         warnings.append(
             "SqlColumn count is 0 — column lineage was not extracted. "

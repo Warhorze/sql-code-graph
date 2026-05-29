@@ -167,13 +167,13 @@ def test_plan_review_case_sensitivity_bare_identifiers_are_uppercase():
     src_cols = {e[1] for e in all_edges}
     dst_cols = {e[3] for e in all_edges}
 
-    # Bare table 'src' -> 'SRC' in lineage walker output
-    assert "SRC" in src_tables, (
-        f"Bare table 'src' must appear as 'SRC' (uppercase) in edges; got {src_tables}"
+    # Bare table 'src' -> normalized to lowercase after C2 case normalization
+    assert "src" in src_tables, (
+        f"Bare table 'src' must appear as 'src' (lowercase) in edges; got {src_tables}"
     )
-    # Bare column 'x' -> 'X'
-    assert "X" in src_cols, (
-        f"Bare column 'x' must appear as 'X' (uppercase) in edges; got {src_cols}"
+    # Bare column 'x' -> normalized to lowercase after C2 case normalization
+    assert "x" in src_cols, (
+        f"Bare column 'x' must appear as 'x' (lowercase) in edges; got {src_cols}"
     )
     # Aliased output 'my_col' retains its declared case
     assert "my_col" in dst_cols, (

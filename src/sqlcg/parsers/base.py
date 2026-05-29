@@ -49,6 +49,20 @@ class TableRef:
     name: str = ""
     alias: str | None = None
 
+    def __post_init__(self) -> None:
+        """Normalize identity components to lowercase.
+
+        C2 design: lowercase catalog, db, and name so that full_id and graph keys
+        are lowercase, matching the schema side (ARCHITECTURE_REVIEW §2.6).
+        alias is NOT lowercased — it is not an identity field.
+        """
+        if self.catalog is not None:
+            object.__setattr__(self, "catalog", self.catalog.lower())
+        if self.db is not None:
+            object.__setattr__(self, "db", self.db.lower())
+        if self.name:
+            object.__setattr__(self, "name", self.name.lower())
+
     @property
     def full_id(self) -> str:
         """Return the fully qualified table identifier.
@@ -76,6 +90,15 @@ class ColumnRef:
 
     table: TableRef
     name: str = ""
+
+    def __post_init__(self) -> None:
+        """Normalize the column name to lowercase.
+
+        C2 design: lowercase the name so that full_id and graph keys
+        are lowercase, matching the schema side.
+        """
+        if self.name:
+            object.__setattr__(self, "name", self.name.lower())
 
     @property
     def full_id(self) -> str:
