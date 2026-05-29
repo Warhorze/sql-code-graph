@@ -469,6 +469,49 @@ PR-07 without disturbing column-level entries.
 
 ---
 
+## Deviations (recorded during implementation)
+
+**D1 — `HUB_RANKING` Cypher self-reference filter rewritten via `WITH` (platform constraint, semantically identical).**
+The plan specified the self-exclusion inline in the initial `WHERE`:
+
+```cypher
+MATCH (t:SqlTable)<-[:SELECTS_FROM]-(q:SqlQuery)
+WHERE q.target_table <> '' AND q.target_table <> t.qualified
+RETURN t.qualified AS table_qualified,
+       count(DISTINCT q.target_table) AS downstream_dependents
+ORDER BY downstream_dependents DESC, t.qualified
+LIMIT $k
+```
+
+KuzuDB raised `Variable t is not in scope` for the `t.qualified` reference once the
+clause entered the aggregation context. The implemented query
+([`queries.cypher`](../src/sqlcg/core/queries.cypher) lines 102–109) projects both
+qualifiers into aliases with a `WITH` and applies the self-exclusion afterward:
+
+```cypher
+MATCH (t:SqlTable)<-[:SELECTS_FROM]-(q:SqlQuery)
+WHERE q.target_table <> ''
+WITH t.qualified AS table_qualified, q.target_table AS consumer_table
+WHERE consumer_table <> table_qualified
+RETURN table_qualified, count(DISTINCT consumer_table) AS downstream_dependents
+ORDER BY downstream_dependents DESC, table_qualified
+LIMIT $k
+```
+
+Assessment: **semantically identical to the plan's intent.** It is still a single
+aggregation (no Python per-row traversal, no O(N²)); the metric is still
+`count(DISTINCT consumer_table)` (distinct consuming tables — no query-level
+double-count, per Open Decision 2); the `<> ''` empty-target guard and the
+self-reference exclusion are both preserved (now in two clauses instead of one). The
+`WITH` is a pure projection/rename, not a re-aggregation or a re-scope, so it cannot
+silently reorder the ranking. Verified by `test_hub_ranking_exact_fact`
+([`tests/integration/test_anchor_tools.py`](../tests/integration/test_anchor_tools.py)
+line 462), which asserts the known fan-in hub ranks at `rank == 1` with the exact
+`downstream_dependents == 3` (3 distinct consumers, self excluded). Legitimate platform
+constraint; ranking semantics unchanged.
+
+---
+
 ## Open Decisions (genuinely unresolved — flagged for the user / reviewer)
 
 These do not block implementation (sensible defaults are in the plan) but the user owns the
@@ -497,3 +540,53 @@ final call:
    which double-counts a table consumed by three queries. I chose distinct-tables as the
    honest centrality measure; confirm this is the intended semantics for the hub anchor before
    curating `expected_top_hub_rank`, because the two definitions can reorder the ranking.
+
+---
+
+## Plan Compliance — 2026-05-29
+
+**Verdict: PASS (COMPLIANT-WITH-NOTES).** All implementation steps were addressed as
+planned; the single deviation (D1) is sound and is recorded above. Reviewed against the
+two trust-layer commits `943a1da` (feat) + `95670ab` (test). Trust-layer test suites:
+35 passed, 1 skipped (golden-file-absent, expected).
+
+Itemized:
+
+- **Step 1.1 (Judgement)** — PASS. `model_validator(mode="after")` requires
+  confidence+reason for `heuristic` and forbids both on `fact`; `Literal` and
+  `model_validator` imported (`models.py` lines 3, 5, 38). Field descriptions mark
+  `confidence` UNCALIBRATED and require `reason` to cite the grounding fact (honesty
+  pass `e2245c6` folded in). Three validator scenarios pass in `test_judgement.py`.
+- **Step 2.1–2.4 (risk retrofit)** — PASS. `risk_label`/`risk_weight` removed from
+  both result models; `grep` for `.risk_label`/`.risk_weight` across `src/` + `tests/`
+  returns zero. `risk: Judgement` + `downstream_count: int` added to both
+  `ChangeScopeResult` and `ScopeChangeResult`. `get_change_scope` builds a heuristic
+  Judgement whose `reason` embeds `str(n)` (`tools.py` lines 720–728);
+  `downstream_count == len(affected_tables)`. `scope_change` threads `risk` through the
+  delegate (`tools.py` line 937). The breaking tests (`test_risk_label_thresholds`,
+  `test_change_scope_*`, `test_scope_change_*`) were updated in place, not deleted-around.
+- **Step 3 (analyze_unused)** — PASS. `@mcp.tool()` + `@_timed_tool` (lines 1440–1442);
+  `within_corpus_references` is a plain fact int (0); `dead_code` is a heuristic
+  Judgement, confidence 0.5, reason cites zero within-corpus references; calls
+  `NoiseFilter.from_config()` (line 1461). `total_tables_scanned` reuses
+  `MATCH (t:SqlTable) RETURN count(t)`.
+- **Step 4 (get_hub_ranking)** — PASS with deviation D1. `@mcp.tool()` + `@_timed_tool`
+  (lines 1503–1505); all-fact `HubEntry` with NO Judgement attribute (`not hasattr`
+  asserted in test); calls `NoiseFilter.from_config()`; single aggregation over existing
+  `SELECTS_FROM` edges. The `WITH`-clause rewrite (KuzuDB scope constraint) is
+  semantically identical — recorded in Deviations §D1.
+- **Step 5 (answer-anchors)** — PASS. All three keys consumed in `evaluate()` (lines
+  339–403), each gated on key presence + `target_table` (so
+  `test_evaluate_handles_missing_downstream_key` still passes);
+  `expected_downstream_count` uses DIRECT equality, not `_score()` (W2);
+  `_hub_rank` defaults to `k=1000` (Note-3). No anchor is curated on a confidence value
+  (all anchors freeze counts / booleans / ranks only).
+- **Invariants** — PASS. The two trust-layer commits touch only the seven planned files
+  (`queries.cypher`, `queries.py`, `models.py`, `tools.py`, `test_golden_lineage.py`,
+  `test_anchor_tools.py`, `test_judgement.py`); `base.py`/`indexer.py` are NOT in the
+  trust-layer diff (their master…HEAD changes belong to earlier sprint-10 commits). No
+  schema DDL / re-index path added; no O(N²); no `# TODO` in any new tool/harness happy
+  path; every new tool has a grep-confirmed `@mcp.tool()` registration and every harness
+  helper is called from `evaluate()`.
+
+Feature is ready to merge.
