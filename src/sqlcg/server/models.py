@@ -1,6 +1,49 @@
 """Pydantic models for MCP tool return types."""
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class Judgement(BaseModel):
+    """A labelled analysis result distinguishing a deterministic graph fact from a
+    heuristic interpretation. Heuristics carry confidence and a human-readable reason;
+    facts do not (a fact does not need to justify itself)."""
+
+    assertion_type: Literal["fact", "heuristic"] = Field(
+        ...,
+        description="'fact' = deterministic graph read (counts, references, edges). "
+        "'heuristic' = an interpretation that may be wrong; see confidence and reason.",
+    )
+    label: str = Field(
+        ...,
+        description="The interpretation or fact statement (e.g. 'high', 'dead_code_candidate').",
+    )
+    confidence: float | None = Field(
+        None,
+        description="0.0-1.0 UNCALIBRATED heuristic estimate — a coarse self-assessment, "
+        "NOT a measured probability or frequency. Do not treat as calibrated until the "
+        "golden anchor set is large enough to measure false-positive rates. REQUIRED when "
+        "assertion_type='heuristic'; MUST be None when assertion_type='fact'.",
+    )
+    reason: str | None = Field(
+        None,
+        description="Short human-readable basis for a heuristic. MUST cite the concrete "
+        "fact(s) it is derived from (e.g. '34 downstream dependents >= threshold 20', "
+        "'zero within-corpus SELECTS_FROM references') so the caller can reason from the "
+        "grounded fact even if it ignores the confidence number. REQUIRED when "
+        "assertion_type='heuristic'.",
+    )
+
+    @model_validator(mode="after")
+    def _check_invariants(self) -> "Judgement":
+        if self.assertion_type == "heuristic":
+            if self.confidence is None or self.reason is None:
+                raise ValueError("heuristic Judgement requires confidence and reason")
+        else:  # fact
+            if self.confidence is not None or self.reason is not None:
+                raise ValueError("fact Judgement must not carry confidence or reason")
+        return self
 
 
 class LineageNode(BaseModel):
@@ -210,12 +253,12 @@ class ChangeScopeResult(BaseModel):
         default_factory=list,
         description="Table rollup of affected_columns (noise-filtered).",
     )
-    risk_label: str = Field(
-        ...,
-        description="Change risk: 'safe' (0), 'low' (1-5), 'medium' (6-20), 'high' (>20) "
-        "by affected table count.",
+    downstream_count: int = Field(
+        0, description="Count of affected downstream tables (fact — equals len(affected_tables))."
     )
-    risk_weight: int = Field(0, description="Count of affected downstream tables.")
+    risk: Judgement = Field(
+        ..., description="Heuristic risk interpretation (assertion_type='heuristic')."
+    )
     noise_excluded: list[str] = Field(
         default_factory=list,
         description="Affected tables excluded as backup/noise.",
@@ -298,8 +341,15 @@ class ScopeChangeResult(BaseModel):
     backfill_order: list[str] = Field(
         default_factory=list, description="Topological rebuild order for the blast radius."
     )
-    risk_label: str = Field(..., description="Change risk: 'safe' | 'low' | 'medium' | 'high'.")
-    risk_weight: int = Field(0, description="Count of affected downstream tables.")
+    downstream_count: int = Field(
+        0,
+        description=(
+            "Count of affected downstream tables (fact — equals len(downstream_blast_radius))."
+        ),
+    )
+    risk: Judgement = Field(
+        ..., description="Heuristic risk interpretation (assertion_type='heuristic')."
+    )
     noise_excluded: list[str] = Field(
         default_factory=list, description="Backup/noise tables and files excluded from the answer."
     )
@@ -308,4 +358,63 @@ class ScopeChangeResult(BaseModel):
     )
     hint: str | None = Field(
         None, description="Combined hints from the underlying tools (joined with ' | ')."
+    )
+
+
+class UnusedCandidate(BaseModel):
+    """A table that has no within-corpus consumers — a dead-code candidate."""
+
+    table_qualified: str = Field(..., description="Qualified table name (schema.table).")
+    within_corpus_references: int = Field(
+        ...,
+        description="FACT: count of SELECTS_FROM consumers in the indexed corpus (always 0 here).",
+    )
+    dead_code: Judgement = Field(
+        ...,
+        description="HEURISTIC: dead-code interpretation (assertion_type='heuristic'). "
+        "confidence=0.5 because the table may be consumed externally (BI, API, COPY INTO).",
+    )
+
+
+class UnusedTablesResult(BaseModel):
+    """Result of analyze_unused — tables with no within-corpus consumers."""
+
+    candidates: list[UnusedCandidate] = Field(
+        default_factory=list,
+        description="Tables with zero SELECTS_FROM consumers (noise-filtered).",
+    )
+    total_tables_scanned: int = Field(
+        0, description="FACT: total SqlTable nodes in the graph at time of scan."
+    )
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint (e.g. when no candidates are found or graph is empty).",
+    )
+
+
+class HubEntry(BaseModel):
+    """One table in the hub ranking — all fields are deterministic graph facts."""
+
+    table_qualified: str = Field(..., description="Qualified table name (schema.table).")
+    downstream_dependents: int = Field(
+        ...,
+        description="FACT: number of distinct consuming tables that SELECT_FROM this table.",
+    )
+    rank: int = Field(..., description="FACT: 1-based rank by downstream_dependents (descending).")
+
+
+class HubRankingResult(BaseModel):
+    """Result of get_hub_ranking — top-k tables by downstream dependent count.
+
+    All fields are deterministic graph facts; no Judgement field is present.
+    """
+
+    top: list[HubEntry] = Field(
+        default_factory=list,
+        description="Top-k tables ordered by downstream_dependents descending.",
+    )
+    k: int = Field(..., description="The k limit applied to the query.")
+    hint: str | None = Field(
+        None,
+        description="Diagnostic hint (e.g. when no tables have downstream dependents).",
     )

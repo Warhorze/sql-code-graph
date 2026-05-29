@@ -11,6 +11,7 @@ from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
+    ANALYZE_UNUSED_TABLES_QUERY,
     FIND_DEFINITION_QUERY,
     FIND_TABLE_USAGES_QUERY,
     GET_COLUMNS_FOR_TABLE_QUERY,
@@ -19,6 +20,7 @@ from sqlcg.core.queries import (
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
+    HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
     LIST_DIALECTS_AND_REPOS_QUERY,
     SEARCH_SQL_PATTERN_QUERY,
@@ -39,6 +41,9 @@ from sqlcg.server.models import (
     DialectRepo,
     DialectRepoResult,
     DiffImpactResult,
+    HubEntry,
+    HubRankingResult,
+    Judgement,
     LineageNode,
     LineageResult,
     ScopeChangeResult,
@@ -46,6 +51,8 @@ from sqlcg.server.models import (
     SqlPatternResult,
     TableUsage,
     TableUsageResult,
+    UnusedCandidate,
+    UnusedTablesResult,
 )
 from sqlcg.server.noise_filter import NoiseFilter
 
@@ -710,7 +717,15 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         kept_tables = set(affected_tables)
         affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
 
-        risk_label = _risk_label(len(affected_tables))
+        n = len(affected_tables)
+        risk = Judgement(
+            assertion_type="heuristic",
+            label=_risk_label(n),
+            confidence=0.6,
+            reason=(
+                f"{n} downstream dependent table(s); thresholds safe=0/low<=5/medium<=20/high>20"
+            ),
+        )
 
         hint = None
         if not defining_files and not affected_tables and not upstream_tables:
@@ -725,8 +740,8 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
             upstream_tables=upstream_tables,
             affected_columns=affected_columns,
             affected_tables=affected_tables,
-            risk_label=risk_label,
-            risk_weight=len(affected_tables),
+            downstream_count=n,
+            risk=risk,
             noise_excluded=noise_excluded,
             truncated=truncated,
             hint=hint,
@@ -892,8 +907,13 @@ def scope_change(target: str) -> ScopeChangeResult:
     downstream_blast_radius: list[str] = []
     affected_columns: list[str] = []
     backfill_order: list[str] = []
-    risk_label = "safe"
-    risk_weight = 0
+    downstream_count = 0
+    risk: Judgement = Judgement(
+        assertion_type="heuristic",
+        label="safe",
+        confidence=0.6,
+        reason="0 downstream dependent table(s); thresholds safe=0/low<=5/medium<=20/high>20",
+    )
     noise_excluded: list[str] = []
     truncated = False
     hints: list[str] = []
@@ -913,8 +933,8 @@ def scope_change(target: str) -> ScopeChangeResult:
         upstream_inputs = scope.upstream_tables
         downstream_blast_radius = scope.affected_tables
         affected_columns = scope.affected_columns
-        risk_label = scope.risk_label
-        risk_weight = scope.risk_weight
+        downstream_count = scope.downstream_count
+        risk = scope.risk
         noise_excluded.extend(scope.noise_excluded)
         truncated = truncated or scope.truncated
         if scope.hint:
@@ -944,8 +964,8 @@ def scope_change(target: str) -> ScopeChangeResult:
         downstream_blast_radius=downstream_blast_radius,
         affected_columns=affected_columns,
         backfill_order=backfill_order,
-        risk_label=risk_label,
-        risk_weight=risk_weight,
+        downstream_count=downstream_count,
+        risk=risk,
         noise_excluded=noise_excluded,
         truncated=truncated,
         hint=hint,
@@ -1415,3 +1435,118 @@ def submit_feedback(
             return {"status": "skipped"}
     else:
         return {"status": "skipped"}
+
+
+@mcp.tool()
+@_timed_tool("analyze_unused")
+def analyze_unused() -> UnusedTablesResult:
+    """Find tables with no within-corpus consumers (dead-code candidates).
+
+    Identifies SqlTable nodes that no SqlQuery selects from (zero SELECTS_FROM
+    incoming edges). Each candidate carries a heuristic dead_code Judgement
+    (confidence=0.5) because the table may be consumed externally — by BI tools,
+    an API layer, or COPY INTO statements — which are invisible to the corpus.
+
+    Backup/noise tables are excluded via NoiseFilter so snapshot tables do not
+    pollute the results.
+
+    Returns:
+        UnusedTablesResult with the dead-code candidate list and total table count.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        # Single aggregation — no Python per-row graph traversal.
+        unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
+        total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+        total_tables_scanned = total_rows[0]["n"] if total_rows else 0
+
+        candidates: list[UnusedCandidate] = []
+        for row in unused_rows:
+            tq = row["table_qualified"]
+            if noise_filter.is_noise(tq):
+                continue
+            candidates.append(
+                UnusedCandidate(
+                    table_qualified=tq,
+                    within_corpus_references=0,
+                    dead_code=Judgement(
+                        assertion_type="heuristic",
+                        label="dead_code_candidate",
+                        confidence=0.5,
+                        reason=(
+                            "zero within-corpus SELECTS_FROM references; "
+                            "may be consumed externally (BI, API, COPY INTO)"
+                        ),
+                    ),
+                )
+            )
+
+        hint = None
+        if not candidates:
+            hint = (
+                "No unused-table candidates found. All indexed tables have at least one "
+                "within-corpus consumer, or the graph is empty."
+            )
+
+        return UnusedTablesResult(
+            candidates=candidates,
+            total_tables_scanned=total_tables_scanned,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("get_hub_ranking")
+def get_hub_ranking(k: int = 10) -> HubRankingResult:
+    """Return the top-k tables by downstream dependent count (hub/centrality ranking).
+
+    Counts, for each table, the number of DISTINCT consuming tables whose SqlQuery
+    selects from it. All fields are deterministic graph facts — no heuristic
+    Judgement is attached. Re-ranks after noise filtering so rank is contiguous.
+
+    Backup/noise tables are excluded via NoiseFilter.
+
+    Args:
+        k: Maximum number of results to return (default 10).
+
+    Returns:
+        HubRankingResult with the top-k ranked entries.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        # Single aggregation — no Python per-row graph calls.
+        rows = db.run_read(HUB_RANKING_QUERY, {"k": k})
+
+        top: list[HubEntry] = []
+        rank = 1
+        for row in rows:
+            tq = row["table_qualified"]
+            if noise_filter.is_noise(tq):
+                continue
+            top.append(
+                HubEntry(
+                    table_qualified=tq,
+                    downstream_dependents=int(row["downstream_dependents"]),
+                    rank=rank,
+                )
+            )
+            rank += 1
+
+        hint = None
+        if not top:
+            hint = (
+                "No hub candidates found. Either no tables have downstream consumers, "
+                "or all candidates were excluded by the noise filter."
+            )
+
+        return HubRankingResult(top=top, k=k, hint=hint)

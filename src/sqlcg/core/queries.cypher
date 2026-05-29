@@ -92,3 +92,18 @@ RETURN c.id AS col_id, c.col_name AS col_name
 -- GET_TABLES_DEFINED_IN_FILE
 MATCH (f:File {path: $file_path})<-[:DEFINED_IN]-(t:SqlTable)
 RETURN t.qualified AS table_qualified
+
+-- ANALYZE_UNUSED_TABLES
+MATCH (t:SqlTable)
+WHERE NOT (t)<-[:SELECTS_FROM]-()
+RETURN t.qualified AS table_qualified
+ORDER BY t.qualified
+
+-- HUB_RANKING
+MATCH (t:SqlTable)<-[:SELECTS_FROM]-(q:SqlQuery)
+WHERE q.target_table <> ''
+WITH t.qualified AS table_qualified, q.target_table AS consumer_table
+WHERE consumer_table <> table_qualified
+RETURN table_qualified, count(DISTINCT consumer_table) AS downstream_dependents
+ORDER BY downstream_dependents DESC, table_qualified
+LIMIT $k
