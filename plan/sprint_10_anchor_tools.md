@@ -25,6 +25,29 @@ would be 10× too large. Column-precise avoids that noise and maps directly onto
 
 ---
 
+## Design Principle — Open-Source Generality (sprint-wide)
+
+`sqlcg` is an open-source package. No DWH-specific rule may live in shipped code. Three
+layers, kept strictly separate:
+
+| Layer | Lives in | Example | Rule |
+|-------|----------|---------|------|
+| **Mechanism** | shipped code | graph traversal, BFS closure, Kahn sort, set rollup | Generic. Knows nothing about table semantics. |
+| **Policy** | `.sqlcg.toml` config (sensible, overridable defaults) | noise patterns, presentation-facing prefixes, risk thresholds | Opinionated defaults OK only if fully overridable; a user who sets nothing still gets correct generic behavior. |
+| **Ground truth** | gitignored local fixtures (`golden_lineage.yaml`) | "ma_rotatie_totaal upstream = {…}" | Never ships. Calibrates one deployment's recall. |
+
+**Consequences for this sprint:**
+- The lineage engine reports **all real edges** (every `SELECTS_FROM` is upstream). It must
+  never guess that a table is "just bookkeeping" — that semantic distinction is the user's
+  to express via a noise pattern. So control/delta tables (e.g. load-bookkeeping) appear in
+  blast radius by default; users who don't want them add an `ignore_table_patterns` entry.
+- `presentation_facing` (PR-05) must NOT hardcode any schema prefix. It reads configured
+  prefixes; empty config → feature simply off. See PR-05 amendment below.
+- The seed golden set reflects what is genuinely in the SQL (all read inputs), not a
+  semantic subset — honesty over convenience, since it is the acceptance target.
+
+---
+
 ## Summary
 
 Sprint 09 shipped qualify-once, DDL-skip, subprocess isolation, and log-verbosity fixes.
@@ -553,7 +576,7 @@ class DiffImpactResult(BaseModel):
     changed_files: list[str]
     changed_tables: list[str]          # tables defined in those files
     affected_tables: list[str]         # union blast radius, deduplicated
-    presentation_facing: list[str]     # subset of affected_tables matching ia_* prefix
+    presentation_facing: list[str]     # subset of affected_tables whose schema matches a configured presentation prefix (empty when unconfigured)
     backfill_order: list[str]          # topological order across union blast radius
     noise_excluded: list[str]
     truncated: bool
@@ -578,9 +601,24 @@ class DiffImpactResult(BaseModel):
    - For each file path: query `GET_TABLES_DEFINED_IN_FILE_QUERY` → `changed_tables`.
    - For each changed table: expand to its columns via `GET_COLUMNS_FOR_TABLE_QUERY`; BFS downstream (full closure).
    - Union all affected column sets; roll up to `affected_tables`.
-   - Filter `presentation_facing = [t for t in affected_tables if t.startswith("ia_")]`.
+   - Filter `presentation_facing` by configured schema prefixes (see config note below).
    - Apply noise filter.
    - Call `_kahn_topological_sort(affected_tables, db)`.
+
+**Config-driven presentation prefixes (open-source generality, per the sprint Design Principle)**:
+`ia_` is the DWH's analytics schema — it must not be hardcoded in shipped code. Add
+`get_presentation_prefixes(path: Path) -> list[str]` to [`config.py`](../src/sqlcg/core/config.py),
+following the `get_schema_aliases`/`get_noise_filter_patterns` convention: read
+`[sqlcg.presentation]` → `schema_prefixes` (list of strings, lowercased). **Default: `[]`** —
+when unset, `presentation_facing` is always empty and the feature is simply off (correct
+generic behavior for any user). `diff_impact` computes
+`presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]`.
+
+```toml
+# .sqlcg.toml — this repo sets:
+[sqlcg.presentation]
+schema_prefixes = ["ia_"]
+```
 
 **Wiring verification**:
 
@@ -590,6 +628,7 @@ Before opening the PR:
 - `grep -n "_kahn_topological_sort" src/sqlcg/server/tools.py` must show both the definition and two call sites (in `get_backfill_order` and `diff_impact`)
 - `grep -n "NoiseFilter" src/sqlcg/server/tools.py` must show usage in both new tools
 - `grep -n "max_depth=None" src/sqlcg/server/tools.py` must show full-closure calls in both new tools
+- `grep -n "get_presentation_prefixes" src/sqlcg/core/config.py` must show the function; `grep -n "ia_" src/sqlcg/server/tools.py` must return zero hardcoded results (prefix comes from config only)
 - Confirm no TODO in `_kahn_topological_sort`, `get_backfill_order`, `diff_impact`
 
 **Files affected**:
@@ -607,7 +646,7 @@ Before opening the PR:
 
 - **Scenario C — diff_impact from file path to blast radius**: index a fixture where `source.sql` defines `ba.source_table` and `etl.sql` defines `ba.etl_table` which selects from `ba.source_table`. Call `diff_impact(["<path>/source.sql"])`. Assert `"ba.source_table" in result.changed_tables`; `"ba.etl_table" in result.affected_tables`. Assertion: specific table names.
 
-- **Scenario D — presentation_facing tables identified**: index a fixture with `ba.source_table → ia_analytics.ba_view`. Call `diff_impact(["<path>/source.sql"])`. Assert `"ia_analytics.ba_view" in result.presentation_facing`. Assertion: specific table name in the list.
+- **Scenario D — presentation_facing is config-driven**: index a fixture with `ba.source_table → ia_analytics.ba_view`. With `[sqlcg.presentation] schema_prefixes = ["ia_"]` configured (write a temp `.sqlcg.toml` or pass the prefix list), call `diff_impact(["<path>/source.sql"])` and assert `"ia_analytics.ba_view" in result.presentation_facing`. **Then with no presentation config**, assert `result.presentation_facing == []` (feature off by default — no hardcoded `ia_`). Assertion: specific table name present when configured, empty list when not.
 
 - **Scenario E — noise excluded from backfill order**: index `ba.source → ba.source_bck → ba.mart`. Call `get_backfill_order("ba.source")`. Assert `"ba.source_bck" not in result.backfill_order` and `"ba.source_bck" in result.noise_excluded`.
 
@@ -615,7 +654,8 @@ Before opening the PR:
 - `[ ]` `grep -n "get_backfill_order\|diff_impact" src/sqlcg/server/tools.py` shows both `@mcp.tool()` decorations
 - `[ ]` `grep -n "_kahn_topological_sort" src/sqlcg/server/tools.py` returns >= 3 lines (definition + 2 call sites)
 - `[ ]` Topological order is correct (Scenario A verified)
-- `[ ]` `presentation_facing` contains `ia_*` tables only (Scenario D verified)
+- `[ ]` `presentation_facing` is config-driven via `[sqlcg.presentation] schema_prefixes`; empty (feature off) when unconfigured, no hardcoded `ia_` in shipped code (Scenario D verified)
+- `[ ]` `get_presentation_prefixes` added to `config.py` with default `[]` (grep-confirmed)
 - `[ ]` No TODO in any of the three new functions
 
 ---
@@ -714,7 +754,7 @@ Before opening the PR:
 
 4. In `evaluate()`, for each entry that has `expected_downstream_tables`, compute `actual_downstream` via `_table_blast_radius(db, entry["target_table"])` and score with the existing `_score()` function. For entries with `expected_upstream_tables`, score similarly.
 
-5. In `test_golden_lineage_quality`, add enforcement for table-level blast-radius recall: entries with `status: curated` and `expected_downstream_tables` must meet `RECALL_FLOOR` on the downstream score.
+5. In `test_golden_lineage_quality`, add enforcement for table-level blast-radius recall. **Gate table-level enforcement on a separate `table_status: curated` key, NOT the existing `status` key.** Rationale: `status` gates column-level `expected_sources` enforcement; a seed anchor can have hand-verified *table-level* upstream truth (`table_status: curated`) while its column-level sources are still `status: draft` (foundation PRs move column identities). Entries with `table_status: curated` and `expected_downstream_tables` (or `expected_upstream_tables`) must meet `RECALL_FLOOR` on the corresponding table-level score; entries without `table_status: curated` are reported but not enforced. The `ma_rotatie_totaal` seed anchor in `golden_lineage.yaml` already carries `expected_upstream_tables` and the `table_status` marker comment — flip it to `table_status: curated` when this harness change lands.
 
 6. Update the `_format_report` output to show a separate "BLAST RADIUS" section.
 
@@ -851,3 +891,227 @@ This test:
 | KuzuDB `MATCH … STARTS WITH` is O(N) on large graphs without index | Low | All anchor queries filter on `PRIMARY KEY` properties (`qualified`, `id`, `path`). KuzuDB indexes primary keys. No unindexed table scans introduced. |
 | `noise_filter.py` `from_config()` called once per tool call is redundant | Low | Cost is one `Path.cwd()` + one `tomllib.load()` per call — microseconds. If profiling shows it matters, cache with `functools.lru_cache` keyed on `str(repo_root)`. Do not pre-optimize. |
 | golden harness new modes fail silently when golden YAML has no `expected_downstream_tables` key | Low | Guard: `entry.get("expected_downstream_tables")` returns `None`; skip scoring for that entry. This is the same pattern as `entry.get("expected_sources")`. Scenario C in PR-07 confirms this. |
+
+
+❯ and will we create the gold standard dataset before or after?
+
+● Both — but split deliberately, because there's a trap in doing the full gold standard before the
+  foundation lands.
+
+  The trap: the bootstrap draft is currently circular (all 1.00) — it's "what the engine says," which
+  includes the very bugs we're fixing (depth-5 truncation, _bck noise, ba.x vs ia_analytics.ba_x split
+  identity). And F-HYGIENE will rewrite node identities (alias unification) and F-CLOSURE will change
+  what's reachable. So if you hand-curate 15–20 anchors now, you're curating against identities and a
+  closure depth that the foundation PRs will move out from under you → rework.
+
+  But doing it entirely after is the "trust me it works" failure you've been burned by — the foundation
+  PRs (does closure really recover the depth-6/7 tables? does hygiene really drop the backups?) would
+  have no objective acceptance target.
+
+  So:
+
+  Before the features — a small hand-verified SEED (3–5 anchors). Curated from the SQL / your domain
+  knowledge, not from current output. This is the acceptance target the foundation PRs must hit, e.g.:
+  - "ba.wtfe_verkoopinfo blast radius must include the depth-6/7 tables" → proves F-CLOSURE.
+  - "blast radius must not include any _bck table" → proves F-HYGIENE.
+  - "ma_rotatie_totaal upstream = {ma_aantal, sn_artikel_s1}" → the anchor we already reasoned out.
+
+  We can knock the seed out fast: I draft the proposed truth by reading each anchor's SQL, you
+  confirm/correct.
+
+  After the foundation stabilizes (post F-CLOSURE + F-HYGIENE) — finalize the full 15–20 anchor set.
+  Now node identity and closure semantics are fixed, so curation sticks, and the A-* anchor PRs get
+  validated against it with recall floors.
+
+  Re: the merge — this is independent and doesn't block it. The harness is committable and already in
+  the set going to master; the gold data (golden_lineage.yaml) is gitignored and lives locally
+  regardless of timing. So: merge first (once the planner lands), build the seed alongside the
+  foundation PRs, full curation after.
+
+  Net sequencing: merge → seed (with foundation as its first customer) → foundation PRs → full gold
+  standard → anchor PRs. Want me to fold "build the seed" in as an explicit early step when I spawn the
+  developers?
+
+✻ Waiting for 1 background agent to finish
+
+❯ y
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      echo "=== latest commits (did plan land?) ==="; git log --oneline -4…)
+  ⎿  === latest commits (did plan land?) ===
+     4e703e0 chore(checkpoint): perf scaling guard + branch WIP, fix lint/tests
+     d8bbf35 fix: restore schema_aliases and _apply_table_alias accidentally removed by developer
+     … +11 lines (ctrl+o to expand)
+
+● Done — the seed is now an explicit Step 0 in the spawn sequence: right after the merge, before any
+  foundation work, and it doubles as F-CLOSURE's and F-HYGIENE's acceptance target. So the order is:
+
+  Step 0 — Seed gold standard (3–5 hand-verified anchors; I draft proposed truth from the SQL, you
+  confirm) →
+  Foundation PRs (F-CLOSURE, F-HYGIENE — must satisfy the seed) →
+  Full gold standard (15–20 anchors, once identity/closure are stable) →
+  Anchor PRs (A-*, validated against it with recall floors).
+
+  The sprint-planner is still running (HEAD is still 4e703e0, no plan commit yet), so I'm holding the
+  merge to avoid the index.lock race and to make sure the plan lands on master too.
+
+  When it finishes, I'll: commit the golden-set files → fast-forward master (clean, local-only unless
+  you tell me to push) → then spawn the developers per the plan's schedule, leading with the Step 0
+  seed.
+
+  I'll get pinged automatically when the planner completes — no need to poll. Want me to get a head
+  start on the seed draft now (read the ma_rotatie_totaal / wtfe_verkoopinfo defining SQL and propose
+  their expected blast-radius + upstream truth for your confirmation) while the planner finishes? It's
+  non-conflicting work.
+
+✻ Waiting for 1 background agent to finish
+
+❯ y
+
+● On it. The seed must be ground truth from the SQL, not from the (buggy) graph — so let me use the
+  graph to locate the defining files, then read the actual SQL to verify what each column really
+  derives from.
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      SQLCG_DB_PATH=/tmp/sqlcg_timing/graph.db uv run python -c "…)
+  ⎿      result = self._conn.execute(query, params)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         query_result_internal = self._connection.execute(prepared_statement._prepared_statement,
+     … +5 lines (ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+● Node labels differ — let me get the actual schema:
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      SQLCG_DB_PATH=/tmp/sqlcg_timing/graph.db uv run python -c "…)
+  ⎿  No matches found
+  ⎿  Allowed by auto mode classifier
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      SQLCG_DB_PATH=/tmp/sqlcg_timing/graph.db uv run python -c "…)
+  ⎿  Traceback (most recent call last):
+       File "<string>", line 4, in <module>
+     TypeError: KuzuBackend.run_read() missing 1 required positional argument: 'params'
+  ⎿  Allowed by auto mode classifier
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      SQLCG_DB_PATH=/tmp/sqlcg_timing/graph.db uv run python -c "…)
+  ⎿  REL | SELECTS_FROM
+     REL | STAR_SOURCE
+     REL | QUERY_DEFINED_IN
+     … +14 lines (ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+● Got the schema (File, SqlTable, SqlQuery, DEFINED_IN, QUERY_DEFINED_IN, INSERTS_INTO). Let me locate
+  the defining files for the seed anchors:
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      SQLCG_DB_PATH=/tmp/sqlcg_timing/graph.db uv run python -c "…)
+  ⎿  ### ba.wtfa_kpi_rotatie_bouwmarkt
+        DEFINED_IN     : ['/home/ignwrad/Projects/dwh/ddl/changelogs/BA-TABLES/WTFA_KPI_ROTATIE_BO
+     UWMARKT.sql']
+     … +22 lines (ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+● The graph points me to the real compute: etl/sql/fact/wtfa_kpi_rotatie_bouwmarkt.sql. Let me read the
+  actual SQL to establish ground truth for ma_rotatie_totaal (and note wtfv_voorraad_dagstand has no
+  DEFINED_IN — a gap worth flagging):
+
+● Bash(cd /home/ignwrad/Projects/dwh
+      f=etl/sql/fact/wtfa_kpi_rotatie_bouwmarkt.sql…)
+  ⎿  === file size / line count ===
+     348 etl/sql/fact/wtfa_kpi_rotatie_bouwmarkt.sql
+     === how ma_rotatie_totaal is computed (context) ===
+     … +48 lines (ctrl+o to expand)
+  ⎿  Shell cwd was reset to /home/ignwrad/Projects/sql-code-graph
+
+● I read the actual ETL and now have SQL-verified ground truth for the first anchor. Here's the compute
+  (etl/sql/fact/wtfa_kpi_rotatie_bouwmarkt.sql):
+
+  ma_rotatie_totaal = NVL(rotatie_totaal, 0)
+  rotatie_totaal    = afzet_totaal_meetperiode / NULLIFZERO(dagen_null_facing_meetperiode / 7)
+                      └─ afzet  CTE  ← FROM ba.wtfe_verkoopinfo      (sales → numerator)
+                      └─ voorraad CTE ← JOIN ba.wtfv_voorraad_dagstand (stock → null-facing days,
+  denominator)
+
+  So the value of ma_rotatie_totaal is sales ÷ stock-days — exactly the business intuition. The graph's
+  direct-mode answer (wtfe_verkoopinfo + wtfv_voorraad_dagstand) is correct at table level. ✓
+
+  Proposed seed (draft — your confirmation needed on the judgment calls)
+
+  ┌─────┬─────────────────────────────────────────────────┬─────────────────────────┬──────────────┐
+  │  #  │                     Anchor                      │        Assertion        │  Source /    │
+  │     │                                                 │                         │     type     │
+  ├─────┼─────────────────────────────────────────────────┼─────────────────────────┼──────────────┤
+  │     │                                                 │ upstream value-sources  │ SQL-verified │
+  │ 1   │ ba.wtfa_kpi_rotatie_bouwmarkt.ma_rotatie_totaal │ = {wtfe_verkoopinfo,    │  (truth)     │
+  │     │                                                 │ wtfv_voorraad_dagstand} │              │
+  ├─────┼─────────────────────────────────────────────────┼─────────────────────────┼──────────────┤
+  │     │                                                 │ downstream blast radius │ proves       │
+  │ 2   │ ba.wtfe_verkoopinfo                             │  must include tables at │ F-CLOSURE    │
+  │     │                                                 │  depth ≥6 (the 128-set) │              │
+  ├─────┼─────────────────────────────────────────────────┼─────────────────────────┼──────────────┤
+  │     │                                                 │ blast radius must       │ proves       │
+  │ 3   │ (any anchor)                                    │ contain zero *_bck*     │ F-HYGIENE    │
+  │     │                                                 │ tables                  │              │
+  ├─────┼─────────────────────────────────────────────────┼─────────────────────────┼──────────────┤
+  │     │                                                 │ must resolve a defining │              │
+  │ 4   │ ba.wtfv_voorraad_dagstand                       │  file (currently        │ proves       │
+  │     │                                                 │ DEFINED_IN is empty —   │ A-DEFINE     │
+  │     │                                                 │ graph gap)              │              │
+  └─────┴─────────────────────────────────────────────────┴─────────────────────────┴──────────────┘
+
+  Two judgment calls I need you on (the domain part bootstrap can't decide):
+
+  1. For #1, the value of ma_rotatie_totaal depends on wtfe_verkoopinfo + wtfv_voorraad_dagstand. But
+  the ETL also joins ba.wtfs_artikel_wissel (article-replacement remapping) and ba.wtda_datum (date
+  grain). For backfill purposes, do those count as upstream triggers (a change to wtfs_artikel_wissel →
+  recompute rotatie)? Or only the two value-sources? This is exactly the column-precise-vs-table
+  question, made concrete.
+  2. A real finding worth your eye: ba.wtfv_voorraad_dagstand has no DEFINED_IN in the graph — its DDL
+  is via a clone template (maak_clone_voorraad_tabellen.sql), so A-DEFINE would currently fail to
+  locate a core source table. Is that table created by a template/clone in your world (i.e. expected),
+  or should it have a real DDL?
+
+  Planner's still running — I'll fold whatever you decide into the seed. Which way on the
+  backfill-trigger question: value-sources only, or all join inputs?
+
+✻ Waiting for 1 background agent to finish
+
+● Agent "Plan blast-radius anchor sprint" completed · 6m 24s
+
+● Planner's done — plan/sprint_10_anchor_tools.md is committed. Clean breakdown:
+
+  ┌────────────────┬──────────────────────────────────────────────────┬────────────────────────────┐
+  │     Phase      │                Agents (parallel)                 │            PRs             │
+  ├────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+  │ 1 — foundation │ A: PR-01 F-CLOSURE · B: PR-02 F-HYGIENE          │ disjoint files ✓           │
+  ├────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+  │ 2 — track A    │ PR-04 (scope+risk) → PR-05 (backfill+diff)       │ share tools.py, sequential │
+  ├────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+  │ 2 — track B    │ PR-03 (find_definition) → PR-07 (golden harness) │                            │
+  ├────────────────┼──────────────────────────────────────────────────┼────────────────────────────┤
+  │ 3 — synthesis  │ PR-06 scope_change (after all)                   │ last                       │
+  └────────────────┴──────────────────────────────────────────────────┴────────────────────────────┘
+  └────────────────┴──────────────────────────────────────────────────┴────────────────────────────┘
+
+  It also locked the design decision we discussed: column-precise traversal, rolled up to table — every
+  tool returns both affected_columns and affected_tables.
+
+  The planner's commit landed, so the race is over and I can merge. Let me lint the golden files,
+  commit them, and fast-forward master (local-only — you haven't said push):
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      echo "=== planner commit present? ==="; git log --oneline -2…)
+  ⎿  === planner commit present? ===
+     f312cb3 chore(plan): sprint-10 anchor tools for LLM DWH navigation
+     4e703e0 chore(checkpoint): perf scaling guard + branch WIP, fix lint/tests
+     … +12 lines (ctrl+o to expand)
+  ⎿  You've hit your session limit · resets 5:40pm (Europe/Paris)
+
+✻ Worked for 9m 8s
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 1. true all three of those affect the value for ma_rotatie_totaal, so if those change it also
+  affects all the upstream tables (tables that use ma_rotatie_totaal), 2. preferably the "real" ddl
+  but i don't want to create a hacky way around our sloppy dwh repo. and continue the work :)
