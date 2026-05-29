@@ -107,3 +107,8 @@ WHERE consumer_table <> table_qualified
 RETURN table_qualified, count(DISTINCT consumer_table) AS downstream_dependents
 ORDER BY downstream_dependents DESC, table_qualified
 LIMIT $k
+
+-- DEPENDENT_FILES_OF_TABLES
+UNWIND $tables AS tbl
+MATCH (t:SqlTable {qualified: tbl})<-[:SELECTS_FROM]-(q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
+RETURN DISTINCT f.path AS path
