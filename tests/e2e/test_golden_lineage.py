@@ -216,6 +216,56 @@ def _score(expected: set[str], actual: set[str]) -> dict:
     }
 
 
+def _downstream_count(db, table_qualified: str) -> int:
+    """Return the exact downstream dependent table count (integer fact).
+
+    Delegates to _table_blast_radius which already does BFS + noise filtering.
+    The count equals len(affected tables) — the same number the trust layer's
+    downstream_count field carries.
+    """
+    return len(_table_blast_radius(db, table_qualified))
+
+
+def _is_dead_code(db, table_qualified: str) -> bool:
+    """Return True when table_qualified has no within-corpus SELECTS_FROM consumers.
+
+    One Cypher read — mirrors the ANALYZE_UNUSED_TABLES predicate.
+    """
+    rows = db.run_read(
+        "MATCH (t:SqlTable {qualified: $tq})<-[:SELECTS_FROM]-() RETURN count(*) AS n",
+        {"tq": table_qualified},
+    )
+    n = rows[0]["n"] if rows else 0
+    return n == 0
+
+
+def _hub_rank(db, table_qualified: str, k: int = 1000) -> int | None:
+    """Return the 1-based hub rank of table_qualified, or None if not in top-k.
+
+    Runs the same HUB_RANKING Cypher with a large k (default 1000) so that a
+    table with genuine dependents that ranks below top-10 does not produce a
+    false-negative anchor failure.  Applies the same noise-filter defaults as
+    the shipped tool.
+    """
+    from sqlcg.core.queries import HUB_RANKING_QUERY
+    from sqlcg.server.noise_filter import NoiseFilter
+
+    noise_filter = NoiseFilter(
+        patterns=_DEFAULT_BACKUP_PATTERNS,
+        schema_aliases={},
+    )
+    rows = db.run_read(HUB_RANKING_QUERY, {"k": k})
+    rank = 1
+    for row in rows:
+        tq = row["table_qualified"]
+        if noise_filter.is_noise(tq):
+            continue
+        if tq == table_qualified:
+            return rank
+        rank += 1
+    return None
+
+
 def evaluate() -> list[dict]:
     """Score every golden column against the graph. Returns per-column results."""
     golden = _load_golden()
@@ -281,6 +331,76 @@ def evaluate() -> list[dict]:
                     n_expected=len(exp_up),
                 )
                 results.append(rr)
+
+            # Answer-anchor scoring (trust layer). Three independently-gated keys,
+            # each scored as a binary pass/fail with recall=1.0 for a match.
+            # Gated on table_status: curated (same gate as blast-radius anchors).
+            if target_table:
+                if "expected_downstream_count" in entry:
+                    expected_count = entry["expected_downstream_count"]
+                    actual_count = _downstream_count(db, target_table)
+                    match = actual_count == expected_count
+                    rr = {
+                        "target": target_table,
+                        "bucket": entry.get("bucket", ""),
+                        "status": table_status,
+                        "scope": "downstream_count",
+                        "recall": 1.0 if match else 0.0,
+                        "precision": 1.0 if match else 0.0,
+                        "f1": 1.0 if match else 0.0,
+                        "missing": [] if match else [str(expected_count)],
+                        "spurious": [],
+                        "backup_noise": 0,
+                        "n_expected": 1,
+                        "tp": 1 if match else 0,
+                        "fp": 0,
+                        "fn": 0 if match else 1,
+                    }
+                    results.append(rr)
+
+                if "expected_dead_code" in entry:
+                    expected_dc = entry["expected_dead_code"]
+                    actual_dc = _is_dead_code(db, target_table)
+                    match = actual_dc == expected_dc
+                    rr = {
+                        "target": target_table,
+                        "bucket": entry.get("bucket", ""),
+                        "status": table_status,
+                        "scope": "dead_code",
+                        "recall": 1.0 if match else 0.0,
+                        "precision": 1.0 if match else 0.0,
+                        "f1": 1.0 if match else 0.0,
+                        "missing": [] if match else [str(expected_dc)],
+                        "spurious": [],
+                        "backup_noise": 0,
+                        "n_expected": 1,
+                        "tp": 1 if match else 0,
+                        "fp": 0,
+                        "fn": 0 if match else 1,
+                    }
+                    results.append(rr)
+
+                if "expected_top_hub_rank" in entry:
+                    expected_rank = entry["expected_top_hub_rank"]
+                    actual_rank = _hub_rank(db, target_table)
+                    match = actual_rank is not None and actual_rank <= expected_rank
+                    rr = {
+                        "target": target_table,
+                        "bucket": entry.get("bucket", ""),
+                        "status": table_status,
+                        "scope": "hub_rank",
+                        "recall": 1.0 if match else 0.0,
+                        "precision": 1.0 if match else 0.0,
+                        "f1": 1.0 if match else 0.0,
+                        "missing": [] if match else [str(expected_rank)],
+                        "spurious": [],
+                        "backup_noise": 0,
+                        "n_expected": 1,
+                        "tp": 1 if match else 0,
+                        "fp": 0,
+                        "fn": 0 if match else 1,
+                    }
+                    results.append(rr)
     finally:
         db.close()
     return results
@@ -454,6 +574,198 @@ def test_evaluate_handles_missing_downstream_key(tmp_path, monkeypatch):
     assert len(results) >= 1
     # No table-level result was produced (no expected_downstream_tables key).
     assert all(r.get("scope", "column") == "column" for r in results)
+
+
+# --------------------------------------------------------------------------
+# Trust-layer unit scenarios — no golden file / no SQLCG_DB_PATH needed.
+# Exercise the three answer-anchor helpers on built in-memory graphs.
+# --------------------------------------------------------------------------
+
+
+def _mk_selects_from_chain(backend, tables: list[str]) -> None:
+    """Build a COLUMN_LINEAGE + SELECTS_FROM chain across the given tables.
+
+    Each table after the first has a query that selects from the previous table,
+    creating both COLUMN_LINEAGE (for _table_blast_radius) and SELECTS_FROM
+    (for _is_dead_code / _hub_rank) edges.
+    """
+    backend.init_schema()
+    for t in tables:
+        name = t.rsplit(".", 1)[-1]
+        backend.upsert_node(
+            "SqlTable",
+            t,
+            {
+                "qualified": t,
+                "catalog": "",
+                "db": "",
+                "name": name,
+                "kind": "TABLE",
+                "defined_in_file": "",
+            },
+        )
+        cid = f"{t}.col"
+        backend.upsert_node(
+            "SqlColumn",
+            cid,
+            {
+                "id": cid,
+                "catalog": "",
+                "db": "",
+                "table_name": name,
+                "col_name": "col",
+                "table_qualified": t,
+            },
+        )
+        backend.upsert_edge("SqlTable", t, "SqlColumn", cid, "HAS_COLUMN", {"source": ""})
+    for i, (a, b) in enumerate(zip(tables, tables[1:], strict=False)):
+        # COLUMN_LINEAGE for downstream BFS
+        backend.upsert_edge(
+            "SqlColumn",
+            f"{a}.col",
+            "SqlColumn",
+            f"{b}.col",
+            "COLUMN_LINEAGE",
+            {"transform": "SELECT", "confidence": 1.0, "query_id": f"q{i}"},
+        )
+        # SqlQuery + SELECTS_FROM for dead-code / hub-rank predicates
+        qid = f"q{i}_id"
+        backend.upsert_node(
+            "SqlQuery",
+            qid,
+            {
+                "id": qid,
+                "kind": "INSERT",
+                "sql": f"INSERT INTO {b} SELECT col FROM {a}",
+                "target_table": b,
+                "parsing_mode": "sqlglot",
+            },
+        )
+        backend.upsert_edge("SqlQuery", qid, "SqlTable", a, "SELECTS_FROM", {})
+
+
+def test_downstream_count_exact():
+    """_downstream_count returns the exact integer for a 3-table chain."""
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    backend = KuzuBackend(":memory:")
+    _mk_selects_from_chain(backend, ["ba.src", "ba.etl", "ba.mart"])
+
+    count = _downstream_count(backend, "ba.src")
+
+    assert count == 2, f"expected 2 downstream tables (etl, mart); got {count}"
+
+
+def test_is_dead_code_true_and_false():
+    """_is_dead_code returns True for no-consumer table, False for consumed table."""
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    backend = KuzuBackend(":memory:")
+    _mk_selects_from_chain(backend, ["ba.src", "ba.etl"])
+
+    # ba.src has no SELECTS_FROM incoming (nothing selects from it in this fixture);
+    # actually with our chain: a query selects FROM ba.src to produce ba.etl.
+    # So ba.etl is a consumer of ba.src — ba.src is not dead code.
+    # But ba.etl has no consumer — it IS dead code.
+    assert _is_dead_code(backend, "ba.etl") is True, "ba.etl has no consumers — dead code"
+    assert _is_dead_code(backend, "ba.src") is False, "ba.src is consumed by the etl query"
+
+
+def test_hub_rank_most_referenced_first():
+    """_hub_rank returns rank 1 for the most-referenced table in a fan-in fixture."""
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    backend = KuzuBackend(":memory:")
+    # ba.hub is consumed by c1, c2, c3; ba.lonely is consumed by c1 only
+    backend.init_schema()
+
+    def _add_table(t: str) -> None:
+        name = t.rsplit(".", 1)[-1]
+        backend.upsert_node(
+            "SqlTable",
+            t,
+            {
+                "qualified": t,
+                "catalog": "",
+                "db": "",
+                "name": name,
+                "kind": "TABLE",
+                "defined_in_file": "",
+            },
+        )
+
+    for t in ["ba.hub", "ba.lonely", "ba.c1", "ba.c2", "ba.c3"]:
+        _add_table(t)
+
+    # Add queries: c1, c2, c3 each select from hub; c1 also selects from lonely
+    for i, consumer in enumerate(["ba.c1", "ba.c2", "ba.c3"]):
+        qid = f"qhub{i}"
+        backend.upsert_node(
+            "SqlQuery",
+            qid,
+            {
+                "id": qid,
+                "kind": "INSERT",
+                "sql": "",
+                "target_table": consumer,
+                "parsing_mode": "sqlglot",
+            },
+        )
+        backend.upsert_edge("SqlQuery", qid, "SqlTable", "ba.hub", "SELECTS_FROM", {})
+
+    qlonely = "qlonely"
+    backend.upsert_node(
+        "SqlQuery",
+        qlonely,
+        {
+            "id": qlonely,
+            "kind": "INSERT",
+            "sql": "",
+            "target_table": "ba.c1",
+            "parsing_mode": "sqlglot",
+        },
+    )
+    backend.upsert_edge("SqlQuery", qlonely, "SqlTable", "ba.lonely", "SELECTS_FROM", {})
+
+    hub_rank = _hub_rank(backend, "ba.hub", k=1000)
+    lonely_rank = _hub_rank(backend, "ba.lonely", k=1000)
+
+    assert hub_rank == 1, f"ba.hub (3 consumers) must rank first; got rank={hub_rank}"
+    assert lonely_rank is not None and lonely_rank > 1, (
+        f"ba.lonely (1 consumer) must rank below hub; got rank={lonely_rank}"
+    )
+
+
+def test_evaluate_handles_missing_answer_keys(tmp_path, monkeypatch):
+    """evaluate() adds no non-column scope rows when all three answer-anchor keys
+    are absent from an entry (backward compat for existing golden files)."""
+    import sys
+
+    from sqlcg.core.kuzu_backend import KuzuBackend
+
+    db_path = str(tmp_path / "graph.db")
+    backend = KuzuBackend(db_path)
+    _mk_chain(backend, ["ba.source", "ba.etl"])
+    backend.close()
+
+    golden = tmp_path / "golden_lineage.yaml"
+    golden.write_text(
+        "mode: reachable_leaves\n"
+        "columns:\n"
+        "  - target: ba.etl.col\n"
+        "    expected_sources: [ba.source.col]\n"
+        "    status: draft\n"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "GOLDEN_FILE", golden)
+    monkeypatch.setenv("SQLCG_DB_PATH", db_path)
+
+    results = evaluate()
+
+    assert isinstance(results, list)
+    assert len(results) >= 1
+    # No downstream_count / dead_code / hub_rank rows (keys absent from entry).
+    non_column = [r for r in results if r.get("scope", "column") != "column"]
+    assert non_column == [], f"expected no answer-anchor rows; got {non_column}"
 
 
 if __name__ == "__main__":

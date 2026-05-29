@@ -125,7 +125,9 @@ def test_change_scope_terminal_is_safe(tmp_path, monkeypatch):
 
     result = tools.get_change_scope("ba.terminal_view")
 
-    assert result.risk_label == "safe", f"expected safe, got {result.risk_label}"
+    assert result.risk.label == "safe", f"expected safe, got {result.risk.label}"
+    assert result.risk.assertion_type == "heuristic"
+    assert result.downstream_count == len(result.affected_tables)
     assert len(result.defining_files) == 1
     assert len(result.upstream_tables) >= 1
     assert "ba.source_table" in result.upstream_tables
@@ -145,7 +147,12 @@ def test_change_scope_source_with_downstream(tmp_path, monkeypatch):
 
     result = tools.get_change_scope("ba.source")
 
-    assert result.risk_label in ("low", "medium", "high")
+    assert result.risk.label in ("low", "medium", "high")
+    assert result.risk.assertion_type == "heuristic"
+    assert result.downstream_count == len(result.affected_tables)
+    assert str(result.downstream_count) in result.risk.reason, (
+        f"downstream_count {result.downstream_count} must appear in reason: {result.risk.reason}"
+    )
     assert len(result.affected_tables) >= 1
     assert any("etl" in t for t in result.affected_tables), (
         f"expected an etl table in affected_tables, got {result.affected_tables}"
@@ -180,6 +187,29 @@ def test_risk_label_thresholds():
     assert tools._risk_label(3) == "low"
     assert tools._risk_label(15) == "medium"
     assert tools._risk_label(25) == "high"
+
+
+def test_change_scope_risk_is_fact_grounded(tmp_path, monkeypatch):
+    """Scenario E — risk Judgement carries a fact-grounded reason citing the count."""
+    _index_fixture(
+        tmp_path,
+        {
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "etl.sql": "CREATE TABLE ba.etl AS SELECT id FROM ba.source;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_change_scope("ba.source")
+
+    assert result.risk.assertion_type == "heuristic"
+    assert result.risk.label in ("safe", "low", "medium", "high")
+    assert result.risk.confidence == 0.6
+    assert result.risk.reason is not None
+    assert str(result.downstream_count) in result.risk.reason, (
+        f"downstream_count {result.downstream_count} must appear in reason: {result.risk.reason}"
+    )
+    assert result.downstream_count == len(result.affected_tables)
 
 
 # --------------------------------------------------------------------------
@@ -326,7 +356,8 @@ def test_scope_change_full_synthesis(tmp_path, monkeypatch):
     assert len(result.authoritative_files) >= 1
     assert result.authoritative_files[0].endswith("raw.sql")
     assert "ba.staged" in result.downstream_blast_radius
-    assert result.risk_label in ("low", "medium", "high")
+    assert result.risk.label in ("low", "medium", "high")
+    assert result.risk.assertion_type == "heuristic"
     assert len(result.backfill_order) >= 1
     assert result.truncated is False
 
@@ -361,5 +392,123 @@ def test_scope_change_undefined_table(tmp_path, monkeypatch):
 
     assert result.authoritative_files == []
     assert result.downstream_blast_radius == []
-    assert result.risk_label == "safe"
+    assert result.risk.label == "safe"
+    assert result.risk.assertion_type == "heuristic"
     assert result.hint is not None and len(result.hint) > 0
+
+
+# --------------------------------------------------------------------------
+# Trust Layer — analyze_unused
+# --------------------------------------------------------------------------
+
+
+def test_analyze_unused_fact_heuristic_separation(tmp_path, monkeypatch):
+    """Scenario A — used table absent, orphan table present as heuristic candidate."""
+    _index_fixture(
+        tmp_path,
+        {
+            "producer.sql": (
+                "CREATE TABLE ba.used (id INT);\nCREATE VIEW ba.consumer AS SELECT id FROM ba.used;"
+            ),
+            "orphan.sql": "CREATE TABLE ba.orphan (id INT);",
+        },
+        monkeypatch,
+    )
+
+    result = tools.analyze_unused()
+
+    candidate_names = [c.table_qualified for c in result.candidates]
+    assert "ba.orphan" in candidate_names, (
+        f"ba.orphan must be a dead-code candidate; got {candidate_names}"
+    )
+    assert "ba.used" not in candidate_names, (
+        f"ba.used must not be a candidate (it is consumed); got {candidate_names}"
+    )
+
+    orphan = next(c for c in result.candidates if c.table_qualified == "ba.orphan")
+    assert orphan.within_corpus_references == 0
+    assert orphan.dead_code.assertion_type == "heuristic"
+    assert orphan.dead_code.confidence == 0.5
+    assert orphan.dead_code.reason is not None and len(orphan.dead_code.reason) > 0
+
+    assert result.total_tables_scanned >= 2
+
+
+def test_analyze_unused_backup_excluded(tmp_path, monkeypatch):
+    """Scenario B — backup tables are not reported as dead-code candidates."""
+    _index_fixture(
+        tmp_path,
+        {
+            "orphan.sql": "CREATE TABLE ba.orphan (id INT);",
+            "bck.sql": "CREATE TABLE ba.orphan_bck (id INT);",
+        },
+        monkeypatch,
+    )
+
+    result = tools.analyze_unused()
+
+    candidate_names = [c.table_qualified for c in result.candidates]
+    assert all("_bck" not in n for n in candidate_names), (
+        f"backup tables must not appear in candidates: {candidate_names}"
+    )
+    assert "ba.orphan" in candidate_names
+
+
+# --------------------------------------------------------------------------
+# Trust Layer — get_hub_ranking
+# --------------------------------------------------------------------------
+
+
+def test_hub_ranking_exact_fact(tmp_path, monkeypatch):
+    """Scenario A — hub table with 3 consumers ranks first with exact count."""
+    _index_fixture(
+        tmp_path,
+        {
+            "hub.sql": "CREATE TABLE ba.hub (id INT);",
+            "c1.sql": "CREATE TABLE ba.c1 AS SELECT id FROM ba.hub;",
+            "c2.sql": "CREATE TABLE ba.c2 AS SELECT id FROM ba.hub;",
+            "c3.sql": "CREATE TABLE ba.c3 AS SELECT id FROM ba.hub;",
+            "lonely.sql": "CREATE TABLE ba.lonely (id INT);",
+            "lc1.sql": "CREATE TABLE ba.lc1 AS SELECT id FROM ba.lonely;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_hub_ranking(k=10)
+
+    assert len(result.top) >= 1, "ranking must be non-empty"
+    top_entry = result.top[0]
+    assert top_entry.table_qualified == "ba.hub", (
+        f"ba.hub (3 consumers) must rank first; got {top_entry.table_qualified}"
+    )
+    assert top_entry.downstream_dependents == 3, (
+        f"expected 3 distinct consumers for ba.hub; got {top_entry.downstream_dependents}"
+    )
+    assert top_entry.rank == 1
+
+    # HubEntry must carry no Judgement/confidence/reason attribute.
+    assert not hasattr(top_entry, "dead_code")
+    assert not hasattr(top_entry, "confidence")
+    assert not hasattr(top_entry, "reason")
+    assert not hasattr(top_entry, "assertion_type")
+
+
+def test_hub_ranking_k_cap_and_backup_excluded(tmp_path, monkeypatch):
+    """Scenario B — k caps results; backup tables never appear."""
+    _index_fixture(
+        tmp_path,
+        {
+            "hub.sql": "CREATE TABLE ba.hub (id INT);",
+            "c1.sql": "CREATE TABLE ba.c1 AS SELECT id FROM ba.hub;",
+            "hub_bck.sql": "CREATE TABLE ba.hub_bck (id INT);",
+            "bc1.sql": "CREATE TABLE ba.bc1 AS SELECT id FROM ba.hub_bck;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_hub_ranking(k=1)
+
+    assert len(result.top) <= 1
+    assert all("_bck" not in e.table_qualified for e in result.top), (
+        f"backup tables must not appear in hub ranking: {[e.table_qualified for e in result.top]}"
+    )
