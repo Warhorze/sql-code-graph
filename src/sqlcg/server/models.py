@@ -8,6 +8,9 @@ class LineageNode(BaseModel):
 
     name: str = Field(..., description="Name of the node (table or column)")
     kind: str = Field(..., description="Kind of node (table, column, query, etc.)")
+    table: str | None = Field(
+        None, description="Qualified table the column belongs to (schema.table)"
+    )
     file: str | None = Field(None, description="Source file path, if applicable")
     confidence: float | None = Field(None, description="Confidence score 0.0-1.0")
 
@@ -64,6 +67,9 @@ class DependencyNode(BaseModel):
 
     name: str = Field(..., description="Name of the node")
     kind: str = Field(..., description="Kind of node (table, column, etc.)")
+    table: str | None = Field(
+        None, description="Qualified table the column belongs to (schema.table)"
+    )
 
 
 class DependencyResult(BaseModel):

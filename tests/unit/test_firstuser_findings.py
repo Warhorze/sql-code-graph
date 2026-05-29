@@ -215,6 +215,85 @@ def test_S3_1_trace_column_lineage_deduplicates_nodes():
 
 
 # ---------------------------------------------------------------------------
+# Steps 2.1 + 2.3 (F3) — owning table surfaced on each traversal node
+# ---------------------------------------------------------------------------
+
+
+def test_S2_trace_lineage_node_carries_table():
+    """trace_column_lineage nodes must surface table_qualified as `table`."""
+    from sqlcg.server.tools import trace_column_lineage
+
+    def run_read_side_effect(query, params):
+        if "count" in query.lower() or "Repo" in query:
+            return [{"n": 1}]
+        if params.get("id") == "ba.tgt.col":
+            return [
+                {"id": "ba.src.col", "col_name": "col", "table_qualified": "ba.src"},
+            ]
+        return []
+
+    with patch("sqlcg.server.tools._open_backend") as mock_backend_ctx:
+        mock_db = MagicMock()
+        mock_db.run_read.side_effect = run_read_side_effect
+        mock_backend_ctx.return_value.__enter__.return_value = mock_db
+
+        result = trace_column_lineage("ba.tgt.col")
+
+    assert result.lineage, "Expected at least one lineage node"
+    node = result.lineage[0]
+    assert node.name == "col", f"name must be the bare column, got {node.name!r}"
+    assert node.table == "ba.src", f"node.table must be 'ba.src', got {node.table!r}"
+
+
+def test_S2_upstream_node_carries_table():
+    """get_upstream_dependencies nodes must surface table_qualified as `table`."""
+    from sqlcg.server.tools import get_upstream_dependencies
+
+    def run_read_side_effect(query, params):
+        if "count" in query.lower() or "Repo" in query:
+            return [{"n": 1}]
+        if params.get("id") == "ba.tgt.col":
+            return [{"id": "ba.src.col", "col_name": "col", "table_qualified": "ba.src"}]
+        return []
+
+    with patch("sqlcg.server.tools._open_backend") as mock_backend_ctx:
+        mock_db = MagicMock()
+        mock_db.run_read.side_effect = run_read_side_effect
+        mock_backend_ctx.return_value.__enter__.return_value = mock_db
+
+        result = get_upstream_dependencies("ba.tgt.col")
+
+    assert result.nodes, "Expected at least one dependency node"
+    assert result.nodes[0].table == "ba.src", (
+        f"node.table must be 'ba.src', got {result.nodes[0].table!r}"
+    )
+
+
+def test_S2_downstream_node_carries_table():
+    """get_downstream_dependencies nodes must surface table_qualified as `table`."""
+    from sqlcg.server.tools import get_downstream_dependencies
+
+    def run_read_side_effect(query, params):
+        if "count" in query.lower() or "Repo" in query:
+            return [{"n": 1}]
+        if params.get("id") == "ba.tgt.col":
+            return [{"id": "ba.dst.col", "col_name": "col", "table_qualified": "ba.dst"}]
+        return []
+
+    with patch("sqlcg.server.tools._open_backend") as mock_backend_ctx:
+        mock_db = MagicMock()
+        mock_db.run_read.side_effect = run_read_side_effect
+        mock_backend_ctx.return_value.__enter__.return_value = mock_db
+
+        result = get_downstream_dependencies("ba.tgt.col")
+
+    assert result.nodes, "Expected at least one dependency node"
+    assert result.nodes[0].table == "ba.dst", (
+        f"node.table must be 'ba.dst', got {result.nodes[0].table!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 4.1 — Hint contains schema-prefix example
 # ---------------------------------------------------------------------------
 

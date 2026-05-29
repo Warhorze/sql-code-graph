@@ -299,20 +299,23 @@ from a re-index without reset or from the same statement counted in multiple bat
       'wtfe_kpi_rotatie_webshop'` returns case-collapsed `table_qualified` values (all
       lowercase), and upstream lineage from `ba.wtfe_kpi_rotatie_webshop.ma_rotatie`
       returns a non-empty list.
-- [ ] C2: `TableRef`/`ColumnRef.full_id` is lowercase for any input case (unit).
-- [ ] C2: `trace_column_lineage("BA.T.COL")` resolves to the same graph node as
+- [x] C2: `TableRef`/`ColumnRef.full_id` is lowercase for any input case (unit).
+- [x] C2: `trace_column_lineage("BA.T.COL")` resolves to the same graph node as
       `trace_column_lineage("ba.t.col")` -- `_parse_column_ref` lowercases input (Step 1.4b).
-- [ ] C2b: scripting-mode `BA_TMP.X` source produces a single lowercase ref; with
+- [x] C2b: scripting-mode `BA_TMP.X` source produces a single lowercase ref; with
       `schema_aliases={"ba_tmp":"ba"}` it produces `ba.x` (unit).
-- [ ] F1: empty-lineage hint and the three traversal docstrings contain the literal
+- [x] F1: empty-lineage hint and the three traversal docstrings contain the literal
       `ba.table_name.column_name`.
-- [ ] F2: each traversal tool returns each upstream/downstream `node_id` at most once.
-- [ ] F3: every returned `LineageNode`/`DependencyNode` carries a non-null `table` equal
+- [x] F2: each traversal tool returns each upstream/downstream `node_id` at most once.
+- [x] F3: every returned `LineageNode`/`DependencyNode` carries a non-null `table` equal
       to the column's `table_qualified`, with `name` still the bare column.
-- [ ] F4: downstream empty hint contains "terminal output" and differs from the upstream
+      (Done 2026-05-29: models + queries + tool builders; `test_S2_*`.)
+- [x] F4: downstream empty hint contains "terminal output" and differs from the upstream
       hint.
-- [ ] F5: a measured per-id query-node count is recorded; code changed only if `n > 1`.
-- [ ] F6: the cross-file collision is no longer logged at WARNING; the `duplicate_ddl:`
+- [x] F5: a measured per-id query-node count is recorded; code changed only if `n > 1`.
+      (Measured 2026-05-29 on airbnb fixture: 10 ids, max count 1, n>1 count 0 — not
+      reproduced, no code change.)
+- [x] F6: the cross-file collision is no longer logged at WARNING; the `duplicate_ddl:`
       error entry is still recorded.
 - [ ] `uv run pytest`, `uv run pyright`, `uv run ruff check src tests` all pass.
 

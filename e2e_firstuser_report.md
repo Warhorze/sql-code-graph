@@ -92,9 +92,11 @@ A first-time user has no way to know the schema prefix without running a raw Cyp
 `ma_aantal` and `sn_artikel_s1` each appear twice in the result for `wtfa_kpi_rotatie_bouwmarkt`. The BFS `visited` guard prevents re-queuing but not duplicate emission when the same `node_id` arrives on two separate BFS frontier steps before it has been added to `visited`. Dedup should be applied to `lineage` before returning.
 
 ### F3 — No source table in lineage nodes
-**Severity: High — result is not actionable**
+**Severity: High — result is not actionable** — ✅ **FIXED 2026-05-29**
 
 Upstream returns bare column names (`ma_aantal`, `sn_artikel_s1`) with no table and no file. A data analyst cannot act on a column name without knowing which table it belongs to. The `LineageNode` model has a `file` field that is always `null`. At minimum, the node's `id` (which encodes `schema.table.column`) should be surfaced, or `table_name` should be a separate field.
+
+**Fix applied:** `LineageNode` and `DependencyNode` now carry a `table: str | None` field populated from `SqlColumn.table_qualified`. The two dependency queries (`GET_UPSTREAM_DEPENDENCIES`, `GET_DOWNSTREAM_DEPENDENCIES`) now `RETURN ... table_qualified`, and all three traversal tool builders set `table=row["table_qualified"]`. Each node now surfaces `name` (bare column) **and** `table` (`schema.table`). Covered by `test_S2_*` in `tests/unit/test_firstuser_findings.py`.
 
 ### F4 — Empty-downstream hint is ambiguous
 **Severity: Medium**
@@ -102,7 +104,15 @@ Upstream returns bare column names (`ma_aantal`, `sn_artikel_s1`) with no table 
 The empty-downstream hint text is identical whether (a) the column has no consumers in the indexed SQL, or (b) the lookup failed. These are very different situations. Hint should distinguish: *"No downstream consumers found — this column may be a terminal output. If you expected consumers, check that the consuming files were indexed."*
 
 ### F5 — Indexing time over 5-minute budget
-**Severity: Low (borderline)**
+**Severity: Low (borderline)** — duplicate-query-node lead ⛔ **not reproduced 2026-05-29**
+
+Measurement (airbnb fixture, 10 files): `MATCH (q:SqlQuery) RETURN q.id, count(*)` →
+10 distinct ids, max per-id count = 1, zero ids with `n > 1`. The `query_id = f"{path}:{i}"`
+key is unique per statement and `query_rows` is deduped at index time, so there is no
+node duplication to fix. The perf budget itself (throughput rewrite) remains out of scope
+per the plan; closed as "not reproduced — no code change."
+
+Original note follows.
 
 Indexing 1,340 files took ~7 minutes. The CLAUDE.md budget is 5 minutes for 1,600 files on a laptop. This run was 1,340 files in 7 minutes (~0.31 s/file), putting 1,600 files at ~8 minutes — nearly 2× over budget. Measured on WSL2; native Linux would be faster, but worth tracking.
 

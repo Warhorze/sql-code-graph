@@ -32,11 +32,11 @@ RETURN f.path AS file, q.sql AS sql, q.kind AS kind
 
 -- GET_DOWNSTREAM_DEPENDENCIES
 MATCH (src:SqlColumn {id: $id})-[:COLUMN_LINEAGE]->(dst:SqlColumn)
-RETURN dst.id AS id, dst.col_name AS col_name
+RETURN dst.id AS id, dst.col_name AS col_name, dst.table_qualified AS table_qualified
 
 -- GET_UPSTREAM_DEPENDENCIES
 MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
-RETURN src.id AS id, src.col_name AS col_name
+RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
 
 -- SEARCH_SQL_PATTERN
 MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)

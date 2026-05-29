@@ -538,6 +538,7 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                             LineageNode(
                                 name=row.get("col_name", ""),
                                 kind="column",
+                                table=row.get("table_qualified"),
                                 file=None,
                                 confidence=row.get("confidence"),
                             )
@@ -1024,6 +1025,7 @@ def get_downstream_dependencies(table_col: str, max_depth: int | None = None) ->
                             DependencyNode(
                                 name=row.get("col_name", ""),
                                 kind="column",
+                                table=row.get("table_qualified"),
                             )
                         )
                     queue.append((node_id, next_depth))
@@ -1128,6 +1130,7 @@ def get_upstream_dependencies(table_col: str, max_depth: int | None = None) -> D
                             DependencyNode(
                                 name=row.get("col_name", ""),
                                 kind="column",
+                                table=row.get("table_qualified"),
                             )
                         )
                     queue.append((node_id, next_depth))
