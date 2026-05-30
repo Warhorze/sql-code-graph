@@ -1,7 +1,10 @@
 ## Current State
 
-CURRENT FEATURE: F1 — living-codebase resync (DEVELOPER active — Phase 5 complete)
-  status: Phase 5 implemented on branch feat/sprint-10-anchor-tools; all tests green
+CURRENT FEATURE: F1 — living-codebase resync (DEVELOPER complete — all 5 phases)
+  status: All phases implemented on branch feat/sprint-10-anchor-tools; ready for compliance check
+  commit: 4317c77 (Phase 5); ecc1797 (Phase 4); a2664d7 (Phase 3); 3c312e9 (Phase 2); 0d372a3 (Phase 1)
+  tests: 608 passed / 0 failed (excl. gitignored DWH e2e perf-budget which is pre-existing); pyright clean; ruff clean
+  no deviations from plan
   plan: plan/living_codebase_resync.md (committed 4127ff6; reviewer fixes 727e0ba)
   plan-reviewer: PASS-WITH-FIXES — B1 (parallelism: _index_single_file not HardKillPool),
     B2 (dialect wiring keyword-only through BranchMonitor), W1 (test_branch_monitor assertion flip),
