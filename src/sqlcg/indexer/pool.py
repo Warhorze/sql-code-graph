@@ -285,7 +285,9 @@ class HardKillPool:
                 tidx = queue.pop(0)
                 path = tasks[tidx].get("path", "")
                 if kill_counts.get(path, 0) >= poison_retries:
-                    results[tidx] = _timeout_file(path, self._dialect, poison=True)
+                    results[tidx] = _timeout_file(
+                        path, self._dialect, timeout_s=per_task_timeout, poison=True
+                    )
                     logger.warning("Skipping %s — poisoned after %d kills", path, poison_retries)
                     if on_result is not None:
                         on_result()
@@ -375,7 +377,7 @@ class HardKillPool:
                     slot,
                     kill_counts[path],
                 )
-                results[tidx] = _timeout_file(path, self._dialect)
+                results[tidx] = _timeout_file(path, self._dialect, timeout_s=per_task_timeout)
                 if on_result is not None:
                     on_result()
                 self._respawn(w)
@@ -486,11 +488,14 @@ class HardKillPool:
 def _timeout_file(
     path: str,
     dialect: str | None,
+    timeout_s: float = 0.0,
     poison: bool = False,
 ) -> ParsedFile:
     pf = ParsedFile(path=Path(path), dialect=dialect)
-    msg = "skipped:poison" if poison else "timeout"
-    pf.errors.append(f"{msg} file={Path(path).name}")
+    if poison:
+        pf.errors.append(f"skipped:poison file={Path(path).name}")
+    else:
+        pf.errors.append(f"timeout:{timeout_s:.0f}s file={Path(path).name}")
     return pf
 
 

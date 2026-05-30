@@ -93,8 +93,12 @@ def _classify_error(msg: str) -> str:
     if not msg:
         return "other"
 
-    # Timeout errors
+    # Timeout errors (including pool-path poison retries)
     if msg.startswith("timeout:"):
+        return "timeout"
+
+    # Poison-retry: file repeatedly timed out in pool worker; treat as timeout bucket
+    if msg.startswith("skipped:poison"):
         return "timeout"
 
     # Skip markers

@@ -19,6 +19,10 @@ class KuzuConfig(BaseModel):
         default=0,
         description="KuzuDB buffer pool size in MB (0 = use KuzuDB default)",
     )
+    log_path: Path = Field(
+        default_factory=lambda: Path.home() / ".sqlcg" / "index.log",
+        description="Path for parse-warning log file written during indexing",
+    )
 
     @classmethod
     def from_env(cls) -> "KuzuConfig":
@@ -29,9 +33,11 @@ class KuzuConfig(BaseModel):
         """
         env_path = os.getenv("SQLCG_DB_PATH")
         env_buf = os.getenv("SQLCG_BUFFER_POOL_MB")
+        env_log = os.getenv("SQLCG_LOG_PATH")
         return cls(
             db_path=Path(env_path) if env_path else Path.home() / ".sqlcg" / "graph.db",
             buffer_pool_size_mb=int(env_buf) if env_buf else 0,
+            log_path=Path(env_log) if env_log else Path.home() / ".sqlcg" / "index.log",
         )
 
 
