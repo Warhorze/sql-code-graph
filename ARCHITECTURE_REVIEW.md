@@ -896,17 +896,20 @@ JSON editing. Tag-triggered GitHub Actions workflow publishes to PyPI automatica
 
 ### 9.2 Architecture Decisions
 
-**Settings file target**: `~/.claude/settings.json` under the `mcpServers` key.
-This is the same file used by both Claude Desktop and Claude Code. The `mcp.json`
-path previously targeted by `mcp setup --write` was incorrect and is removed.
+**Settings file target (updated v1.0.2)**: `sqlcg install` first attempts
+`claude mcp add -s user sql-code-graph <cmd> <args>` (the official Claude Code
+CLI write path). If `claude` is not on PATH or returns non-zero, it falls back
+to writing `~/.claude.json` directly under `mcpServers.user["sql-code-graph"]`.
+The previous target `~/.claude/settings.json` was incorrect — `claude mcp list`
+does not read that file — and has been removed from both `install.py` and
+`mcp.py` (GitHub issue #23).
 
-**Command detection at install time**: `shutil.which("uvx")` determines which
-invocation is written to the settings file. If `uvx` is available, the entry uses
-`{"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}`. Otherwise it
-falls back to `{"command": "sqlcg", "args": ["mcp", "start"]}`.
+**Command detection at install time**: `shutil.which("sqlcg")` is checked first;
+if not found, `shutil.which("uvx")` is used as fallback. The selected command is
+passed as the argument to `claude mcp add` or written to `~/.claude.json`.
 
-**Atomic write**: settings file is written via a `.tmp` sibling + `os.replace` to
-prevent data corruption if the process is interrupted.
+**Atomic write** (fallback path only): `~/.claude.json` is written via a `.tmp`
+sibling + `os.replace` to prevent data corruption if the process is interrupted.
 
 **Idempotency**: if the `sql-code-graph` key already exists in `mcpServers` with
 an identical value, the install command prints "Already configured" and exits 0

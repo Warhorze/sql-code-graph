@@ -1,11 +1,18 @@
 """Analyze command for lineage analysis."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from sqlcg.core.config import get_backend
 from sqlcg.core.schema import NodeLabel, RelType
+
+if TYPE_CHECKING:
+    from sqlcg.server.noise_filter import NoiseFilter
 
 app = typer.Typer(help="Lineage analysis")
 console = Console()
@@ -15,6 +22,7 @@ console = Console()
 def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Trace upstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -29,6 +37,28 @@ def upstream(  # noqa: B008
             "RETURN src.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not results and len(ref.split(".")) >= 3:
+            bare = _bare_ref(ref)
+            fallback_results = backend.run_read(
+                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src) "
+                "RETURN src.id AS id LIMIT 100",
+                {"bare": bare},
+            )
+            if fallback_results:
+                console.print(
+                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                    "The INSERT target may have been indexed without a schema prefix. "
+                    "Multiple tables with the same unqualified name in different schemas "
+                    "would all match — re-index with an explicit schema for precise results."
+                )
+                results = fallback_results
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            results = _filter_column_results(results, nf)
         _print_table(results, ["id"])
 
 
@@ -36,6 +66,7 @@ def upstream(  # noqa: B008
 def downstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Trace downstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -50,6 +81,28 @@ def downstream(  # noqa: B008
             "RETURN dst.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not results and len(ref.split(".")) >= 3:
+            bare = _bare_ref(ref)
+            fallback_results = backend.run_read(
+                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst) "
+                "RETURN dst.id AS id LIMIT 100",
+                {"bare": bare},
+            )
+            if fallback_results:
+                console.print(
+                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                    "The INSERT target may have been indexed without a schema prefix. "
+                    "Multiple tables with the same unqualified name in different schemas "
+                    "would all match — re-index with an explicit schema for precise results."
+                )
+                results = fallback_results
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            results = _filter_column_results(results, nf)
         _print_table(results, ["id"])
 
 
@@ -104,6 +157,43 @@ def unused(
             {},
         )
         _print_table(results, ["qualified"])
+
+
+def _bare_ref(ref: str) -> str:
+    """Strip schema prefix from a ref string, keeping table.column.
+
+    For a 3-part ref ("mart.fact_t.amount") this returns "fact_t.amount".
+    For a 2-part ref ("fact_t.amount") this returns the ref unchanged.
+    Never uses rsplit — that would yield only the column name for 3-part refs.
+    """
+    parts = ref.split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[1:])  # drop schema, keep table.column
+    return ref  # already bare (no schema prefix)
+
+
+def _col_id_to_table(col_id: str) -> str:
+    """Extract the table-qualified part from a column ID (schema.table.col → schema.table).
+
+    Column IDs follow the format: schema.table.column or table.column.
+    The table part is everything except the last component.
+
+    Args:
+        col_id: A column ID string from the graph.
+
+    Returns:
+        The table-qualified portion (all but the last dotted component).
+    """
+    parts = col_id.rsplit(".", 1)
+    return parts[0] if len(parts) == 2 else col_id
+
+
+def _filter_column_results(
+    results: list[dict],
+    nf: NoiseFilter,  # type: ignore[name-defined]
+) -> list[dict]:
+    """Filter column-ID result rows by NoiseFilter, dropping rows whose table is noise."""
+    return [r for r in results if not nf.is_noise(_col_id_to_table(r["id"]))]
 
 
 def _print_table(rows: list[dict], columns: list[str]) -> None:

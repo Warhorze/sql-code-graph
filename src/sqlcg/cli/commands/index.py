@@ -14,7 +14,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from sqlcg.core.config import get_backend, get_db_path, get_dialect
+from sqlcg.core.config import KuzuConfig, get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
@@ -54,6 +54,9 @@ def index_cmd(  # noqa: B008
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary console output"
     ),
+    verbose: bool = typer.Option(  # noqa: B008
+        False, "--verbose", "-v", help="Print parse warnings to stderr instead of log file"
+    ),
     debug: bool = typer.Option(  # noqa: B008
         False, "--debug", help="Show detailed log output during indexing"
     ),
@@ -68,10 +71,39 @@ def index_cmd(  # noqa: B008
     """
 
     import logging
+    import sys
 
     level = logging.DEBUG if debug else logging.CRITICAL
     logging.getLogger("sqlcg").setLevel(level)
     logging.getLogger("sqlglot").setLevel(level)
+
+    # Route parse warnings to stderr (--verbose) or to the configured log file.
+    sqlcg_log = logging.getLogger("sqlcg")
+
+    class _CountingHandler(logging.Handler):
+        """Counts WARNING+ records emitted during indexing."""
+
+        def __init__(self) -> None:
+            super().__init__(logging.WARNING)
+            self.count = 0
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.count += 1
+
+    _counter = _CountingHandler()
+    sqlcg_log.addHandler(_counter)
+
+    if verbose:
+        _warn_handler: logging.Handler = logging.StreamHandler(sys.stderr)
+        _warn_handler.setLevel(logging.WARNING)
+        sqlcg_log.addHandler(_warn_handler)
+        _warn_log_path = None
+    else:
+        _warn_log_path = KuzuConfig.from_env().log_path
+        _warn_log_path.parent.mkdir(parents=True, exist_ok=True)
+        _warn_handler = logging.FileHandler(_warn_log_path)
+        _warn_handler.setLevel(logging.WARNING)
+        sqlcg_log.addHandler(_warn_handler)
 
     # Set buffer pool size via env var if specified
     if buffer_pool_size > 0:
@@ -100,6 +132,16 @@ def index_cmd(  # noqa: B008
         # KuzuDB connection and released the lock by the time we get here.
         console.print("\n[yellow]Interrupted — no partial graph written. Re-run to index.[/yellow]")
         raise typer.Exit(130) from None
+    finally:
+        sqlcg_log.removeHandler(_warn_handler)
+        sqlcg_log.removeHandler(_counter)
+        _warn_handler.close()
+
+    if not verbose and not quiet and _counter.count > 0 and _warn_log_path is not None:
+        console.print(
+            f"[yellow]Parse warnings written to {_warn_log_path} "
+            "— use --verbose to show here.[/yellow]"
+        )
 
 
 def _run_index(

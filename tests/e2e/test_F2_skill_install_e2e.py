@@ -49,7 +49,6 @@ def _which_none(cmd: str) -> str | None:
 def fake_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Monkeypatched home + settings path for e2e tests."""
     settings_path = tmp_path / ".claude" / "settings.json"
-    monkeypatch.setattr("sqlcg.cli.commands.install._SETTINGS_PATH", settings_path)
     monkeypatch.setattr("sqlcg.cli.commands.uninstall._SETTINGS_PATH", settings_path)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return {"home": tmp_path, "settings": settings_path}

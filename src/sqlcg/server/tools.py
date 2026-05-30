@@ -183,6 +183,19 @@ def _assert_indexed(db: GraphBackend) -> None:
         )
 
 
+def _bare_ref(ref: str) -> str:
+    """Strip schema prefix from a ref string, keeping table.column.
+
+    For a 3-part ref ("mart.fact_t.amount") this returns "fact_t.amount".
+    For a 2-part ref ("fact_t.amount") this returns the ref unchanged.
+    Never uses rsplit — that would yield only the column name for 3-part refs.
+    """
+    parts = ref.split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[1:])  # drop schema, keep table.column
+    return ref  # already bare (no schema prefix)
+
+
 def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     """Parse column reference "table.column" or "catalog.db.table.column".
 
@@ -554,9 +567,54 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
 
         mermaid = _build_mermaid(col_id, edges) if edges else None
 
+        # Bare-name fallback: when the primary query returns empty and the ref has a
+        # schema component (3+ parts), retry with the schema prefix stripped.
+        # This handles unqualified INSERT targets indexed without a schema prefix.
+        bare_fallback_used = False
+        if not lineage and len(table_col.split(".")) >= 3:
+            bare = _bare_ref(table_col)
+            bare_queue: deque[tuple[str, int]] = deque([(bare, 0)])
+            bare_visited: set[str] = set()
+            bare_emitted: set[str] = set()
+            while bare_queue:
+                current_id, depth = bare_queue.popleft()
+                if current_id in bare_visited or (max_depth is not None and depth > max_depth):
+                    continue
+                if len(bare_visited) >= max_nodes:
+                    break
+                bare_visited.add(current_id)
+                rows = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": current_id})
+                for row in rows:
+                    node_id = row["id"]
+                    edges.append((node_id, current_id, row.get("transform") or "SELECT"))
+                    if node_id not in bare_visited and node_id not in bare_emitted:
+                        bare_emitted.add(node_id)
+                        lineage.append(
+                            LineageNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                                table=row.get("table_qualified"),
+                                file=None,
+                                confidence=row.get("confidence"),
+                            )
+                        )
+                    if node_id not in bare_visited:
+                        bare_queue.append((node_id, depth + 1))
+            if lineage:
+                bare_fallback_used = True
+                mermaid = _build_mermaid(bare, edges) if edges else None
+
         # Populate hint if result is empty (Step 4.1)
         hint = None
-        if not lineage:
+        if bare_fallback_used:
+            bare = _bare_ref(table_col)
+            hint = (
+                f"No results for '{table_col}'. Found lineage under bare name '{bare}'. "
+                "The INSERT target may have been indexed without a schema prefix. "
+                "Multiple tables with the same unqualified name in different schemas "
+                "would all match — re-index with an explicit schema for precise results."
+            )
+        elif not lineage:
             hint = (
                 "No lineage found. Ensure the column reference includes the schema prefix "
                 "(e.g., ba.table_name.column_name). Check that 'sqlcg db info' shows "

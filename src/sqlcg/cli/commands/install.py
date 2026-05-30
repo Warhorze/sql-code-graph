@@ -1,8 +1,19 @@
-"""Install sqlcg as an MCP server in Claude Code."""
+"""Install sqlcg as an MCP server in Claude Code.
+
+Write path (in priority order):
+  1. ``claude mcp add -s user sql-code-graph <cmd> <args>``  — the official
+     Claude Code CLI write path (reads from ~/.claude.json under the hood).
+  2. Fallback: write ``~/.claude.json`` directly under mcpServers.user when
+     the ``claude`` binary is not found or returns non-zero.
+
+The previous target (~/.claude/settings.json) was incorrect — Claude Code does
+NOT read MCP servers from that file. See ARCHITECTURE_REVIEW.md §9.2.
+"""
 
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,7 +22,6 @@ from rich.console import Console
 
 console = Console()
 
-_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _SERVER_KEY = "sql-code-graph"
 
 
@@ -28,7 +38,10 @@ def install_cmd(
         help="Repository root for --scope project (default: current directory).",
     ),
 ) -> None:
-    """Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json).
+    """Register sqlcg as an MCP server in Claude Code.
+
+    Runs ``claude mcp add -s user sql-code-graph <cmd> <args>`` when the
+    ``claude`` CLI is on PATH; otherwise writes ~/.claude.json directly.
 
     Also provisions a Claude skill file (SKILL.md) at the chosen location.
     Pass --scope project or --scope global to specify where the skill is written.
@@ -39,68 +52,81 @@ def install_cmd(
     resolved_scope = _resolve_scope(scope)
 
     if shutil.which("sqlcg"):
-        entry: dict = {"command": "sqlcg", "args": ["mcp", "start"]}
+        cmd_parts = ["sqlcg", "mcp", "start"]
     elif shutil.which("uvx"):
-        entry = {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
+        cmd_parts = ["uvx", "sql-code-graph", "mcp", "start"]
     else:
         console.print("[red]Error:[/red] Neither 'sqlcg' nor 'uvx' found on PATH.")
         raise typer.Exit(1)
 
-    settings_path = _SETTINGS_PATH
-    if settings_path.exists():
+    entry: dict = {"command": cmd_parts[0], "args": cmd_parts[1:]}
+
+    if dry_run:
+        claude_bin = shutil.which("claude")
+        if claude_bin:
+            console.print("[dim]--dry-run: would run:[/dim]")
+            console.print(f"  claude mcp add -s user {_SERVER_KEY} {' '.join(cmd_parts)}")
+        else:
+            claude_json = Path.home() / ".claude.json"
+            console.print("[dim]--dry-run: would write to ~/.claude.json:[/dim]")
+            _preview_claude_json(claude_json, entry)
+        _provision_skill(resolved_scope, repo, dry_run=True)
+        return
+
+    # --- Try official claude CLI first ---
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        proc = subprocess.run(
+            ["claude", "mcp", "add", "-s", "user", _SERVER_KEY] + cmd_parts,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            console.print(f"[green]Configured:[/green] {_SERVER_KEY} via `claude mcp add`")
+            console.print("\nRestart Claude Code to pick up the new MCP server.")
+            _provision_skill(resolved_scope, repo, dry_run=False)
+            return
+        # Non-zero: log and fall through to ~/.claude.json fallback
+        console.print(
+            f"[yellow]Warning:[/yellow] `claude mcp add` returned rc={proc.returncode}; "
+            "falling back to ~/.claude.json write."
+        )
+        if proc.stderr:
+            console.print(f"[dim]{proc.stderr.strip()}[/dim]")
+
+    # --- Fallback: write ~/.claude.json directly ---
+    claude_json = Path.home() / ".claude.json"
+    if claude_json.exists():
         try:
-            settings: dict = json.loads(settings_path.read_text())
+            data: dict = json.loads(claude_json.read_text())
         except (json.JSONDecodeError, OSError, TypeError):
             console.print(
-                f"[yellow]Warning:[/yellow] {settings_path} contains invalid JSON — "
+                f"[yellow]Warning:[/yellow] {claude_json} contains invalid JSON — "
                 "mcpServers key will be added"
             )
-            settings = {}
+            data = {}
     else:
-        settings = {}
+        data = {}
 
-    mcp_servers: dict = settings.setdefault("mcpServers", {})
-
-    existing_entry = mcp_servers.get(_SERVER_KEY)
-    if existing_entry == entry:
-        cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
-        console.print(f"[green]Already configured:[/green] {_SERVER_KEY} → {cmd_str}")
-        # Still provision the skill even when MCP entry already exists
-        _provision_skill(resolved_scope, repo, dry_run)
+    existing = data.get("mcpServers", {}).get("user", {}).get(_SERVER_KEY)
+    if existing == entry:
+        console.print(f"[green]Already configured:[/green] {_SERVER_KEY} (in ~/.claude.json)")
+        _provision_skill(resolved_scope, repo, dry_run=False)
         return
 
-    # Print upgrade notice if switching from uvx to sqlcg
-    if (
-        existing_entry
-        and existing_entry.get("command") == "uvx"
-        and entry.get("command") == "sqlcg"
-    ):
-        console.print(
-            "[blue]Updating[/blue] MCP entry from [dim]uvx[/dim] to local "
-            "[green]sqlcg[/green] binary (faster startup). Writing…"
-        )
-
-    mcp_servers[_SERVER_KEY] = entry
-
-    if dry_run is True:
-        console.print("[dim]--dry-run: would write:[/dim]")
-        console.print_json(json.dumps(settings, indent=2))
-        _provision_skill(resolved_scope, repo, dry_run)
-        return
+    data.setdefault("mcpServers", {}).setdefault("user", {})[_SERVER_KEY] = entry
 
     try:
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = settings_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(settings, indent=2) + "\n")
-        os.replace(tmp, settings_path)
+        tmp = claude_json.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, claude_json)
     except (OSError, TypeError, AttributeError):
         pass  # Ignore file I/O errors in testing
 
-    cmd_str = f"{entry['command']} {' '.join(entry['args'])}"
+    cmd_str = " ".join(cmd_parts)
     console.print(f"[green]Configured:[/green] {_SERVER_KEY} → {cmd_str}")
-    console.print(f"[dim]Written to {settings_path}[/dim]")
+    console.print(f"[dim]Written to {claude_json}[/dim]")
 
-    # Note about cold cache if uvx was chosen
     if entry.get("command") == "uvx":
         console.print(
             "[yellow]Note:[/yellow] First startup downloads dependencies (~30s). "
@@ -108,9 +134,20 @@ def install_cmd(
         )
 
     console.print("\nRestart Claude Code to pick up the new MCP server.")
+    _provision_skill(resolved_scope, repo, dry_run=False)
 
-    # Provision the skill file
-    _provision_skill(resolved_scope, repo, dry_run)
+
+def _preview_claude_json(claude_json: Path, entry: dict) -> None:
+    """Print what would be written to ~/.claude.json without touching the file."""
+    if claude_json.exists():
+        try:
+            data: dict = json.loads(claude_json.read_text())
+        except (json.JSONDecodeError, OSError, TypeError):
+            data = {}
+    else:
+        data = {}
+    data.setdefault("mcpServers", {}).setdefault("user", {})[_SERVER_KEY] = entry
+    console.print_json(json.dumps(data, indent=2))
 
 
 def _resolve_scope(scope: str | None) -> str:
