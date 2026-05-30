@@ -328,6 +328,32 @@ provisioned by `install`, and add a short note in the install command help about
   architect-reviewer should record F2 (and its locked "install location is a user choice"
   decision) in the architecture review before merge, per the project flow.
 
+### Deviations
+
+#### Deviation 1: Existing test_install.py tests updated to pass --scope
+- **Reason**: Adding the --scope requirement (D2) to install_cmd means any call to `install`
+  on a non-TTY without `--scope` now errors. The 13 pre-existing tests in test_install.py and
+  test_install_message.py called `install` without `--scope`, so they all started failing.
+- **Change**: Added `--scope global` to all runner.invoke(app, ["install"]) calls in
+  test_install.py; added `Path.home()` monkeypatch to the fake_home fixture (needed for the
+  skill write path); passed `scope="global"` to direct `install_cmd()` calls in
+  test_install_message.py.
+- **Impact**: No test semantics weakened — the tests still verify MCP registration behavior
+  with the same assertions. The `--scope` addition is a necessary adaptation to the new
+  parameter, not a relaxation of correctness checks.
+- **Date**: 2026-05-30
+
+#### Deviation 2: _tool_is_heuristic recurses into nested Pydantic models
+- **Reason**: The plan specified inspecting a model's fields for Judgement-typed annotations.
+  UnusedTablesResult does not have a direct Judgement field — it has `candidates:
+  list[UnusedCandidate]` where UnusedCandidate has `dead_code: Judgement`. A shallow field
+  check would incorrectly label analyze_unused as fact.
+- **Change**: _tool_is_heuristic recurses into list[BaseModel] and Union[BaseModel] type args
+  one level deep, with a visited set to prevent cycles.
+- **Impact**: More accurate tagging; all drift-guard tests pass. No risk of false positives
+  since the recursion is bounded by the visited set.
+- **Date**: 2026-05-30
+
 ### Blocking Questions
 - None. All three open questions (D1/D2/D3) are resolved with grounded defaults above; the
   user may override any of them, but planning is not blocked.
