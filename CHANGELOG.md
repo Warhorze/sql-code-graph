@@ -1,3 +1,22 @@
+## v1.0.0 (2026-05-30)
+
+### Feat
+
+- **trust-layer**: `Judgement` discriminator (fact vs. heuristic) on risk/dead-code
+  outputs; `analyze_unused` + `get_hub_ranking` tools; golden-harness answer-anchors
+- **F1 living-codebase resync**: incremental branch-change resync via
+  `Indexer.resync_changed` + cross-file pass-2 affected closure; standalone
+  `sqlcg reindex`; `indexed_sha` metadata (schema v4); `post-merge` hook
+- **F2 bundled skill**: `sqlcg install` provisions a `SKILL.md` encoding the
+  fact/heuristic boundary; `sqlcg mcp best-practices` CLI command
+- **index**: `--profile` flag emitting per-stage and per-file timing
+- **analyze**: `failures` subcommand surfacing per-file parse-failure cause
+
+### Refactor
+
+- remove the INFORMATION_SCHEMA-CSV / `load-schema` path (zero measured edge delta)
+- compact the generated `SKILL.md` (~40% smaller, fact/heuristic-sorted tool table)
+
 ## v0.2.1 (2026-05-05)
 
 ### Fix

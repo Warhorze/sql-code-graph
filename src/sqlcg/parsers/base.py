@@ -6,6 +6,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# Module-level imports so tests can patch sqlcg.parsers.base.qualify / build_scope
+from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
+from sqlglot.optimizer.scope import build_scope as sqlglot_build_scope
+
+qualify = sqlglot_qualify
+build_scope = sqlglot_build_scope
+
 if TYPE_CHECKING:
     from sqlcg.lineage.schema_resolver import SchemaResolver
 
@@ -49,6 +56,20 @@ class TableRef:
     name: str = ""
     alias: str | None = None
 
+    def __post_init__(self) -> None:
+        """Normalize identity components to lowercase.
+
+        C2 design: lowercase catalog, db, and name so that full_id and graph keys
+        are lowercase, matching the schema side (ARCHITECTURE_REVIEW §2.6).
+        alias is NOT lowercased — it is not an identity field.
+        """
+        if self.catalog is not None:
+            object.__setattr__(self, "catalog", self.catalog.lower())
+        if self.db is not None:
+            object.__setattr__(self, "db", self.db.lower())
+        if self.name:
+            object.__setattr__(self, "name", self.name.lower())
+
     @property
     def full_id(self) -> str:
         """Return the fully qualified table identifier.
@@ -76,6 +97,20 @@ class ColumnRef:
 
     table: TableRef
     name: str = ""
+
+    def __post_init__(self) -> None:
+        """Normalize the column name to lowercase and strip surrounding quotes.
+
+        C2 design: lowercase the name so that full_id and graph keys
+        are lowercase, matching the schema side. sqlglot's lineage API
+        preserves surrounding double-quotes on quoted identifiers; strip them
+        so `"ma_aantal"` and `ma_aantal` map to the same graph node.
+        """
+        if self.name:
+            name = self.name
+            if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+                name = name[1:-1]
+            object.__setattr__(self, "name", name.lower())
 
     @property
     def full_id(self) -> str:
@@ -229,15 +264,22 @@ class SqlParser(ABC):
 
     DIALECT: str | None = None
 
-    def __init__(self, schema_resolver: "SchemaResolver"):
+    def __init__(
+        self,
+        schema_resolver: "SchemaResolver",
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize parser with schema resolver.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional staging-schema → canonical-schema map
+                (e.g. {"ba_tmp": "ba"}) applied at TableRef construction time
         """
         from sqlcg.utils.logging import getLogger
 
         self._schema = schema_resolver
+        self._schema_aliases: dict[str, str] = schema_aliases or {}
         self._log = getLogger(f"{__name__}.{self.__class__.__name__}")
 
     @abstractmethod
@@ -350,7 +392,7 @@ class SqlParser(ABC):
 
                     if table_name not in cte_sources:
                         # Convert table expression to TableRef
-                        ref = self._convert_table_expr_to_ref(table_expr)
+                        ref = self._apply_table_alias(self._convert_table_expr_to_ref(table_expr))
                         if ref:
                             tables.append(ref)
 
@@ -386,6 +428,17 @@ class SqlParser(ABC):
                 if name:
                     return TableRef(name=name)
                 return None
+
+    def _apply_table_alias(self, ref: "TableRef | None") -> "TableRef | None":
+        """Remap ref.db if it matches a schema alias (e.g. ba_tmp → ba)."""
+        if ref is None or not self._schema_aliases or not ref.db:
+            return ref
+        aliased = self._schema_aliases.get(ref.db.lower())
+        if aliased is None:
+            return ref
+        import dataclasses
+
+        return dataclasses.replace(ref, db=aliased)
 
     def _lineage_node_to_edges(
         self,
@@ -444,7 +497,7 @@ class SqlParser(ABC):
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=0.9,
+                            confidence=0.7,
                         )
                     )
                 except Exception as exc:
@@ -474,10 +527,12 @@ class SqlParser(ABC):
         if source is None:
             return None
         if isinstance(source, exp.Table):
-            return TableRef(
-                catalog=source.catalog if hasattr(source, "catalog") else None,
-                db=source.db if hasattr(source, "db") else None,
-                name=source.name if hasattr(source, "name") else str(source),
+            return self._apply_table_alias(
+                TableRef(
+                    catalog=source.catalog if hasattr(source, "catalog") else None,
+                    db=source.db if hasattr(source, "db") else None,
+                    name=source.name if hasattr(source, "name") else str(source),
+                )
             )
         # Subquery or CTE — return None (cannot resolve to a concrete table)
         return None
@@ -491,7 +546,6 @@ class SqlParser(ABC):
         dst_table: "TableRef | None" = None,
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
-        schema_sources: dict[str, Any] | None = None,
         scope: Any | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
@@ -510,7 +564,6 @@ class SqlParser(ABC):
             dst_table: Target table for lineage edges (e.g., for INSERT/CREATE)
             sources: Map of table names to SELECT bodies for temp table resolution
             query_sources: List of TableRef for source tables used for star resolution
-            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             scope: Pre-built sqlglot Scope for the query body (optional optimization).
                 When provided, sg_lineage() will reuse this scope instead of re-qualifying.
                 If not provided, a scope will be built from the extracted body before each
@@ -571,7 +624,7 @@ class SqlParser(ABC):
             # are expanded first (avoid rebuilding for each column, but only build
             # after sources are known)
             body_scope = None
-            combined_sources = {**(sources or {}), **(schema_sources or {})}
+            combined_sources = {**(sources or {})}
 
             # NEW (T-07-02): Add CTE bodies to combined_sources so that outer columns
             # can resolve through CTE names. This makes CTE-to-CTE chains resolvable.
@@ -612,6 +665,13 @@ class SqlParser(ABC):
                         )
                     continue
 
+                # Skip pure-literal expressions (NULL, numeric/string constants,
+                # zero-arg functions like CURRENT_TIMESTAMP()). sg_lineage would raise
+                # "Cannot find column '<literal>'" and emit a noise E1 error. An
+                # expression with at least one real exp.Column descendant is NOT skipped.
+                if not list(col_expr.find_all(exp.Column)):
+                    continue
+
                 if col_expr.alias:
                     col_name = col_expr.alias
                 elif isinstance(col_expr, exp.Column):
@@ -620,19 +680,15 @@ class SqlParser(ABC):
                         out.errors.append("col_lineage_skip:star:<empty_name>")
                         continue
                 else:
-                    # Best-effort: try .alias, then .name, then str representation.
-                    # sg_lineage may still fail; the existing exception handler records it.
-                    col_name = (
-                        col_expr.alias
-                        or (col_expr.name if hasattr(col_expr, "name") else None)
-                        or str(col_expr)[:40]
-                    )
-                    if not col_name or col_name == "*":
-                        out.errors.append("col_lineage_skip:expr_no_name:<empty>")
-                        continue
-                    out.errors.append(
-                        f"col_lineage_attempt:expr_fallback:{type(col_expr).__name__}"
-                    )
+                    # Unaliased expression (function call, arithmetic, CASE WHEN, …).
+                    # The historical fallback str(col_expr)[:40] passed garbage like
+                    # "YEAR(BOEKDATUM_FIS)" into sg_lineage and produced E2 noise.
+                    # Record a structured skip and continue — the target column is unnamed,
+                    # so the downstream graph cannot model the lineage anyway.
+                    # (T-09-03: FIX-E2-FUNC-FALLBACK)
+                    expr_type = type(col_expr).__name__
+                    out.errors.append(f"col_lineage_skip:func_fallback:{expr_type}")
+                    continue
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
                 # Skip when the expression has an explicit alias — the alias is the
@@ -677,25 +733,15 @@ class SqlParser(ABC):
                     # complex and not yet implemented (see sprint_06 T-05 deviation for details).
                     if body_scope is None and scope is None:
                         try:
-                            from sqlglot.optimizer.qualify import qualify
-                            from sqlglot.optimizer.scope import build_scope
-
-                            # Expand sources first (same as sg_lineage does)
+                            # Expand only file-level sources (CTEs, temp tables, CTAS bodies).
                             expanded_body = body
-                            if combined_sources:
-                                # Cast sources to Query type for expansion
-                                sources_to_expand = {}
-                                for k, v in combined_sources.items():
-                                    if isinstance(v, exp.Query):
-                                        sources_to_expand[k] = v
-                                    else:
-                                        # For non-Query objects, try to use as-is
-                                        # (sg_lineage's expand will handle type checking)
-                                        sources_to_expand[k] = v  # type: ignore
-
+                            expand_sources = {
+                                k: v for k, v in (sources or {}).items() if isinstance(v, exp.Query)
+                            }
+                            if expand_sources:
                                 expanded_body = exp.expand(
                                     body,
-                                    sources_to_expand,  # type: ignore
+                                    expand_sources,  # type: ignore
                                     dialect=self.DIALECT,
                                     copy=True,
                                 )
@@ -709,22 +755,23 @@ class SqlParser(ABC):
                                 identify=False,
                             )
                             body_scope = build_scope(qualified_body)
-                        except Exception:
-                            # If scope building fails, sg_lineage will fall back
+                        except Exception as _qualify_exc:
+                            # qualify() failure is non-fatal: sg_lineage falls back to
+                            # its own qualification. Record for observability.
+                            out.errors.append(
+                                f"col_lineage_skip:qualify_failed:{type(_qualify_exc).__name__}:{_qualify_exc}"
+                            )
                             body_scope = None
 
-                    # Only pass body_scope if it's non-None (optimization for reuse).
-                    # schema is NOT passed: resolver.as_dict() returns {table:[cols]}
-                    # which has nesting depth 1, causing sqlglot nesting-level errors.
-                    # sqlglot resolves column lineage structurally without schema.
-                    sg_kwargs = {
-                        "sources": combined_sources,
-                        "dialect": self.DIALECT,
-                    }
-                    if scope is not None:
-                        sg_kwargs["scope"] = scope
-                    elif body_scope is not None:
-                        sg_kwargs["scope"] = body_scope
+                    # When a scope is available it embeds full column→table resolution.
+                    # On the qualify-failed fallback path (no scope), pass only the small
+                    # set of file-level sources so sg_lineage can resolve CTEs/CTAS bodies.
+                    active_scope = scope if scope is not None else body_scope
+                    sg_kwargs: dict = {"dialect": self.DIALECT}
+                    if active_scope is not None:
+                        sg_kwargs["scope"] = active_scope
+                    else:
+                        sg_kwargs["sources"] = sources or {}
                     root = sg_lineage(col_name, body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges
@@ -744,7 +791,7 @@ class SqlParser(ABC):
                                 col_name,
                             )
                 except Exception as exc:
-                    self._log.warning(
+                    self._log.debug(
                         "column lineage extraction failed: file=%s col=%s error=%s",
                         path,
                         col_name,
@@ -792,6 +839,13 @@ class SqlParser(ABC):
                             else:
                                 projection_source = cte_body
 
+                            # Serialize CTE body once before the per-column loop.
+                            # Must serialize: passing the AST subtree causes a segfault
+                            # (parent pointers create cycles in sqlglot's qualify()).
+                            # Hoisted here so sg_lineage receives the same pre-serialized
+                            # string for every column rather than re-serializing O(N_cols) times.
+                            cte_body_sql = cte_body.sql(dialect=self.DIALECT)
+
                             # For each projection in the CTE, extract lineage.
                             # Only iterate projections from left branch for column names, but pass
                             # entire Union body to sg_lineage so sqlglot resolves both branches.
@@ -816,10 +870,6 @@ class SqlParser(ABC):
                                 if not cte_col_name or cte_col_name == "*":
                                     continue
                                 try:
-                                    # Serialize to SQL string before sg_lineage.
-                                    # Must serialize: passing the AST subtree causes a segfault
-                                    # (parent pointers create cycles in sqlglot's qualify()).
-                                    cte_body_sql = cte_body.sql(dialect=self.DIALECT)
                                     # No schema: resolver.as_dict() {table:[cols]} triggers
                                     # sqlglot nesting-level errors on fresh string parses.
                                     # sqlglot resolves CTE bodies structurally without schema.
@@ -892,7 +942,7 @@ class SqlParser(ABC):
                         pass
 
         except Exception as exc:
-            self._log.warning(
+            self._log.debug(
                 "column lineage extraction failed for entire statement: file=%s error=%s",
                 path,
                 exc,

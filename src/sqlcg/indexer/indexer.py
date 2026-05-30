@@ -1,13 +1,16 @@
 """Main indexer orchestrating parsing and graph persistence."""
 
+import multiprocessing as mp
+import queue
+import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.queries import STALE_VIEWS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.indexer.error_classify import _classify_error, dominant_cause
+from sqlcg.indexer.pool import HardKillPool
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -19,6 +22,30 @@ from sqlcg.utils.logging import getLogger
 logger = getLogger(__name__)
 
 
+def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
+    """Parse a single file in a subprocess; queue the ParsedFile (or exception).
+
+    parser_cls must be the *class* (pickleable), not an instance. The worker
+    instantiates the parser inside the child process so that any thread-local
+    state from the parent does not leak.
+
+    T-09-04: Parser constructors require a SchemaResolver. The subprocess gets a
+    fresh empty resolver; column resolution runs in infer-only mode, the same as
+    small-repo mode.
+    """
+    try:
+        parser = parser_cls(SchemaResolver(dialect=str(dialect) if dialect else None))
+        out = parser.parse_file(path, sql)
+        q.put(out)
+    except BaseException as exc:
+        # Send the exception back; parent will re-raise.
+        try:
+            q.put(exc)
+        except Exception:
+            # If exc isn't pickleable, send a RuntimeError summary instead.
+            q.put(RuntimeError(f"subprocess parse failed: {type(exc).__name__}: {exc}"))
+
+
 class Indexer:
     """Orchestrates SQL file parsing and graph persistence."""
 
@@ -28,12 +55,13 @@ class Indexer:
         dialect: str | None,
         db: GraphBackend,
         dbt_manifest: Path | None = None,
-        timeout_per_file: int = 30,
+        timeout_per_file: int = 5,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
-        schema_csv: Path | None = None,
         no_ddl: bool = False,
         batch_size: int = 50,
+        n_workers: int | None = None,
+        profile: bool = False,
     ) -> dict:
         """Full two-pass index with batched writes. Returns summary dict.
 
@@ -47,8 +75,6 @@ class Indexer:
                 indexing to tracked files; falls back to rglob when git
                 is unavailable or the directory is not a git repository.
             progress_callback: Optional callback(n, total) invoked every 100 files
-            schema_csv: Explicit path to INFORMATION_SCHEMA.COLUMNS CSV. When None,
-                auto-discovers <path>/.sqlcg/schema.csv if present.
             no_ddl: When True, skip DDL-only files from upsert into the graph
             batch_size: Number of files committed per KuzuDB transaction in the upsert pass.
                 Higher values reduce commit overhead but increase the per-batch recovery cost
@@ -56,6 +82,15 @@ class Indexer:
                 balance between throughput on large corpora (1,000+ files) and memory/lock
                 pressure on small ones. batch_size=1 reproduces the legacy per-file commit
                 behaviour. Must be >= 1.
+            n_workers: Number of worker processes in the persistent pool (default: cpu_count()).
+                Workers are spawn-mode so they never inherit the KuzuDB file descriptor.
+                Each worker holds two pre-built parsers (one per pass), paying the
+                cold-start cost once per run rather than per file.
+            profile: When True, attach a "profile" dict to the returned summary with
+                per-stage wall-time (pass1_parse_s, pass2_resolve_s, upsert_s,
+                star_expand_s, total_s), per-file ms, and the top-10 slowest files by
+                parse time. When False (default), no timing calls are made in the hot
+                loop — zero overhead.
 
         Returns:
             Dict with keys: files_parsed, parse_errors, tables_found,
@@ -63,15 +98,19 @@ class Indexer:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        # Load explicit INFORMATION_SCHEMA CSV if provided
-        if schema_csv and schema_csv.exists():
-            from sqlcg.cli.commands.load_schema import _load_schema_into_graph
 
-            _load_schema_into_graph(schema_csv, include_catalog=False, db=db)
+        # Timing accumulators — only assigned when profile=True; zero-initialised
+        # here so pyright can infer their types as float throughout the method.
+        _t_pass1_start: float = 0.0
+        _t_pass1_end: float = 0.0
+        _t_pass2_start: float = 0.0
+        _t_pass2_end: float = 0.0
+        _t_upsert_start: float = 0.0
+        _t_upsert_end: float = 0.0
+        _t_star_start: float = 0.0
+        _t_star_end: float = 0.0
 
         spec = load_ignore_spec(path)
-        schema_resolver = SchemaResolver(dialect=dialect)
-        parser = get_parser(dialect, schema_resolver)
         aggregator = CrossFileAggregator()
 
         files = list(walk_sql_files(path, spec, use_git=use_git))
@@ -79,53 +118,163 @@ class Indexer:
         parse_errors = 0
         total_files = len(files)
 
-        # Pass 1: parse all files
-        for i, file_path in enumerate(files, 1):
+        # Read all SQL files up-front; unreadable files get an empty string
+        # so the pool still produces a ParsedFile placeholder for them.
+        file_sqls: list[tuple[Path, str]] = []
+        for file_path in files:
             try:
-                sql = file_path.read_text(encoding="utf-8")
-                parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
-                aggregator.register_pass1(parsed)
-                pass1_results.append(parsed)
-                parse_errors += len(parsed.errors)
-            except KeyboardInterrupt:
-                logger.info("SIGINT received — flushing progress")
-                self._upsert_all(pass1_results, db)
-                raise
+                file_sqls.append((file_path, file_path.read_text(encoding="utf-8")))
             except Exception as exc:
-                logger.warning("Failed to parse %s: %s", file_path, exc)
+                logger.warning("Failed to read %s: %s", file_path, exc)
+                file_sqls.append((file_path, ""))
                 parse_errors += 1
 
-            # Invoke progress callback every 100 files
-            if progress_callback is not None and i % 100 == 0:
-                progress_callback(i, total_files)
+        p1_timeout = float(timeout_per_file) if timeout_per_file > 0 else float("inf")
+        p2_timeout = max(p1_timeout, 15.0) if timeout_per_file > 0 else float("inf")
 
-        # Optional: load dbt manifest
-        if dbt_manifest:
-            from sqlcg.indexer.dbt_adapter import load_dbt_manifest
+        from sqlcg.core.config import get_schema_aliases
 
-            load_dbt_manifest(dbt_manifest, schema_resolver)
+        schema_aliases = get_schema_aliases(path)
 
-        # Seed cross-file sources for pass-2 re-parsing
-        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+        p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
 
-        # Pass 2: resolve cross-file references
-        pass2_results: list[ParsedFile] = []
-        for parsed in pass1_results:
-            try:
-                resolved = aggregator.resolve_pass2(parser, parsed)
-                pass2_results.append(resolved)
-            except Exception as exc:
-                logger.warning("resolve_pass2 failed for %s: %s", parsed.path, exc)
-                pass2_results.append(parsed)
+        p1_done = 0
+        # Per-file parse times collected when profile=True.
+        # Each entry is (path_str, elapsed_ms) recorded at result-delivery time.
+        # CAVEAT (W1): this measures the wall time between consecutive worker-result
+        # deliveries to the coordinator, NOT the true in-worker parse duration. It
+        # reflects coordinator receive-order and scheduling overhead, so `slowest_files`
+        # is a proxy for "files whose results arrived after the longest gap", not an
+        # absolute per-file parse-latency ranking. Per-stage totals below ARE accurate.
+        # A true per-file timing would require worker-side start/end timestamps returned
+        # with each ParsedFile (follow-up; would touch pool.py).
+        _file_parse_times: list[tuple[str, float]] = []
+        _last_result_t: list[float] = []  # single-element list used as a nonlocal cell
 
-        # Load gold tables (information_schema-backed tables) before upserting
-        # to suppress DDL columns for tables with production-verified schemas
-        gold_rows = db.run_read(
-            "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
-            "RETURN DISTINCT t.qualified AS q",
-            {},
-        )
-        gold_tables: frozenset[str] = frozenset(row["q"] for row in gold_rows)
+        if profile:
+            _last_result_t.append(time.perf_counter())
+
+        def _p1_on_result() -> None:
+            nonlocal p1_done
+            p1_done += 1
+            if profile:
+                now = time.perf_counter()
+                elapsed_ms = (now - _last_result_t[0]) * 1000.0
+                # Associate elapsed time with the file that just completed.
+                # p1_done-1 is the 0-based index of the just-completed file.
+                file_idx = p1_done - 1
+                if file_idx < len(file_sqls):
+                    _file_parse_times.append((str(file_sqls[file_idx][0]), elapsed_ms))
+                _last_result_t[0] = now
+            if progress_callback is not None:
+                progress_callback(p1_done, total_files)
+
+        if profile:
+            _t_pass1_start = time.perf_counter()
+
+        try:
+            with HardKillPool(dialect, n_workers, schema_aliases=schema_aliases) as pool:
+                # Pass 1: parse all files in parallel
+                p1_raw = pool.map(
+                    p1_tasks,
+                    per_task_timeout=p1_timeout,
+                    on_result=_p1_on_result,
+                )
+
+                if profile:
+                    _t_pass1_end = time.perf_counter()
+
+                # Register pass-1 results with the aggregator
+                for i, (file_path, _sql) in enumerate(file_sqls):
+                    raw = p1_raw[i]
+                    if raw is None:
+                        parsed = ParsedFile(path=file_path, dialect=dialect)
+                        parsed.errors.append("pool_no_result")
+                        parse_errors += 1
+                    else:
+                        parsed = raw
+                        parse_errors += len(parsed.errors)
+                    aggregator.register_pass1(parsed)
+                    pass1_results.append(parsed)
+
+                # Optional: load dbt manifest into a transient resolver so that
+                # cross-file sources can reference dbt-managed tables.
+                # Note: dbt schema data is not propagated to pool workers; pass-2
+                # workers run with the information-schema CSV only.
+                if dbt_manifest:
+                    from sqlcg.indexer.dbt_adapter import load_dbt_manifest
+
+                    _dbt_resolver = SchemaResolver(dialect=dialect)
+                    load_dbt_manifest(dbt_manifest, _dbt_resolver)
+
+                # Seed cross-file CTAS bodies into the aggregator (main process only;
+                # workers receive per-task SQL string copies).
+                xfile_sources = aggregator.cross_file_sources
+
+                # Build pass-2 tasks: only files with cross-file dependencies
+                pass2_indices: list[int] = []
+                p2_tasks: list[dict] = []
+                for i, parsed in enumerate(pass1_results):
+                    if not aggregator._needs_pass2(parsed):
+                        continue
+                    dep_names = {(t.name or "").lower() for t in parsed.referenced_tables if t.name}
+                    # Serialize only the CTAS bodies this file needs (keeps payload small)
+                    xfile_sql: dict[str, str] = {}
+                    for name, body in xfile_sources.items():
+                        if name in dep_names:
+                            try:
+                                xfile_sql[name] = body.sql(dialect=dialect)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to serialize cross-file source %s: %s", name, exc
+                                )
+                    pass2_indices.append(i)
+                    p2_tasks.append(
+                        {
+                            "type": "parse_pass2",
+                            "path": str(parsed.path),
+                            "sql": file_sqls[i][1],
+                            "dependency_filter": dep_names,
+                            "xfile_sql": xfile_sql,
+                        }
+                    )
+
+                pass2_skipped = len(pass1_results) - len(pass2_indices)
+
+                if profile:
+                    _t_pass2_start = time.perf_counter()
+
+                # Pass 2: resolve cross-file references in parallel
+                p2_raw = pool.map(p2_tasks, per_task_timeout=p2_timeout)
+
+                if profile:
+                    _t_pass2_end = time.perf_counter()
+
+        except KeyboardInterrupt:
+            logger.info("SIGINT received — flushing pass-1 progress")
+            # pass1_results may be partial; upsert what we have
+            self._upsert_all(pass1_results, db)
+            raise
+
+        # Assemble final pass-2 results: start from pass-1, overlay pass-2 where available
+        pass2_results: list[ParsedFile] = list(pass1_results)
+        for k, orig_idx in enumerate(pass2_indices):
+            r = p2_raw[k]
+            if r is None or isinstance(r, BaseException):
+                logger.warning(
+                    "Pass-2 failed for %s (%s) — keeping pass-1 result",
+                    pass1_results[orig_idx].path,
+                    r,
+                )
+            else:
+                pass2_results[orig_idx] = r
+
+        # Build duplicate-DDL registry from in-memory results so _upsert_parsed_file
+        # can detect conflicts with a dict lookup instead of a per-table graph read.
+        defined_table_registry: dict[str, str] = {}
+        for pf in pass2_results:
+            for table in pf.defined_tables:
+                defined_table_registry.setdefault(table.full_id, pf.path_str)
 
         # Upsert all results and count quality distribution using batched transactions
         nonlocal_counts: dict = {
@@ -153,7 +302,9 @@ class Indexer:
                 for parsed_in_batch in batch:
                     try:
                         counts = self._upsert_parsed_file(
-                            parsed_in_batch, db, gold_tables=gold_tables
+                            parsed_in_batch,
+                            db,
+                            defined_table_registry=defined_table_registry,
                         )
                         nonlocal_counts["tables"] += counts["tables"]
                         nonlocal_counts["edges"] += counts["edges"]
@@ -167,6 +318,9 @@ class Indexer:
                         )
                         nonlocal_counts["quality"]["failed"] += 1
 
+        if profile:
+            _t_upsert_start = time.perf_counter()
+
         batch: list[ParsedFile] = []
         for parsed in pass2_results:
             skip_upsert = no_ddl and any("pure_ddl_skip" in e for e in parsed.errors)
@@ -179,11 +333,64 @@ class Indexer:
                 batch = []  # IMPORTANT — free the references so GC can reclaim parsed.statements
         _flush_batch(batch)  # final partial batch
 
+        if profile:
+            _t_upsert_end = time.perf_counter()
+            _t_star_start = time.perf_counter()
+
         # Post-ingestion: expand STAR_SOURCE edges into concrete COLUMN_LINEAGE edges
         star_edges_expanded = self._expand_star_sources(db)
 
-        return {
+        if profile:
+            _t_star_end = time.perf_counter()
+
+        # Persist the HEAD SHA so `sqlcg reindex` (no SHAs) can compute the delta.
+        # Silent on failure — non-git repos still index cleanly.
+        try:
+            import subprocess as _sp
+
+            _sha_result = _sp.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(path),
+                capture_output=True,
+                text=True,
+            )
+            if _sha_result.returncode == 0:
+                _head_sha = _sha_result.stdout.strip()
+                if _head_sha:
+                    db.set_indexed_sha(_head_sha)
+        except Exception as _sha_exc:
+            logger.debug("Could not write indexed_sha: %s", _sha_exc)
+
+        # Classify all errors into buckets for measurement and reporting
+        error_summary: dict[str, int] = {
+            "E1": 0,
+            "E2": 0,
+            "E3": 0,
+            "E5": 0,
+            "E8": 0,
+            "timeout": 0,
+            "pure_ddl_skip": 0,
+            "func_fallback": 0,
+            "qualify_failed": 0,
+            "other": 0,
+        }
+        for parsed in pass2_results:
+            for msg in parsed.errors:
+                bucket = _classify_error(msg)
+                if bucket in error_summary:
+                    error_summary[bucket] += 1
+
+        # Emit summary log line
+        summary_parts = [f"{k}: {v}" for k, v in error_summary.items() if v > 0]
+        logger.info(
+            "Indexing complete: %d files — %s",
+            len(pass2_results),
+            ", ".join(summary_parts) if summary_parts else "(no errors)",
+        )
+
+        result: dict = {
             "files_parsed": len(pass2_results),
+            "pass2_skipped": pass2_skipped,
             "parse_errors": parse_errors,
             "tables_found": nonlocal_counts["tables"],
             "lineage_edges_created": nonlocal_counts["edges"],
@@ -191,8 +398,371 @@ class Indexer:
             "star_sources": nonlocal_counts["star_sources"],
             "star_edges_expanded": star_edges_expanded,
             "quality": nonlocal_counts["quality"],
+            "error_summary": error_summary,
             "batch_size": batch_size,
         }
+
+        if profile:
+            pass1_s = _t_pass1_end - _t_pass1_start
+            pass2_s = _t_pass2_end - _t_pass2_start
+            upsert_s = _t_upsert_end - _t_upsert_start
+            star_s = _t_star_end - _t_star_start
+            total_s = pass1_s + pass2_s + upsert_s + star_s
+            n_files = max(len(pass2_results), 1)
+            slowest = sorted(_file_parse_times, key=lambda x: x[1], reverse=True)[:10]
+            result["profile"] = {
+                "pass1_parse_s": pass1_s,
+                "pass2_resolve_s": pass2_s,
+                "upsert_s": upsert_s,
+                "star_expand_s": star_s,
+                "total_s": total_s,
+                "files": len(pass2_results),
+                "ms_per_file": total_s / n_files * 1000.0,
+                "slowest_files": slowest,
+            }
+
+        return result
+
+    def resync_changed(
+        self,
+        root: Path,
+        old_sha: str,
+        new_sha: str,
+        db: GraphBackend,
+        dialect: str | None,
+        *,
+        batch_size: int = 50,
+        timeout_per_file: int = 5,
+        max_closure_depth: int = 3,
+    ) -> dict:
+        """Incrementally resync the graph after a git branch change or pull.
+
+        Only re-parses files in the git delta plus the cross-file pass-2
+        affected closure (files that SELECT_FROM tables defined in changed/deleted
+        files). Avoids a full corpus reindex for small branch deltas.
+
+        Algorithm (see plan/living_codebase_resync.md):
+          1. Compute git delta (added/modified/deleted .sql files).
+          2. Capture deleted files' table names BEFORE deletion.
+          3. Delete nodes for deleted files.
+          4. Pass-1 parse reparse_set (added+modified) via _index_single_file.
+          5. Re-harvest CTAS bodies for frontier definer files not already parsed.
+          6. Compute bounded closure (DEPENDENT_FILES_OF_TABLES, max_closure_depth).
+          7. Pass-2 re-resolve closure files + reparse_set, then bulk upsert.
+          8. Run _expand_star_sources once.
+          9. Write new_sha to metadata on success.
+
+        Falls back to full index_repo when:
+          - git_name_status_delta returns None (git unavailable / bad SHA).
+          - The closure frontier is still growing when max_closure_depth is reached.
+        In both fallback cases, fell_back_to_full=True is set in the summary.
+
+        Args:
+            root:              Repository root directory.
+            old_sha:           Previously-indexed git commit SHA.
+            new_sha:           Current git commit SHA.
+            db:                GraphBackend instance.
+            dialect:           SQL dialect (None for ANSI).
+            batch_size:        Files per KuzuDB transaction (same default as index_repo).
+            timeout_per_file:  Per-file parse timeout in seconds for _index_single_file.
+            max_closure_depth: Maximum BFS depth for closure walk; exceeding triggers
+                               full-index fallback.
+
+        Returns:
+            Dict with keys: added, modified, deleted, closure_resolved,
+            fell_back_to_full, batch_size.
+        """
+        from sqlcg.core.queries import (
+            DEPENDENT_FILES_OF_TABLES_QUERY,
+            GET_TABLES_DEFINED_IN_FILE_QUERY,
+        )
+        from sqlcg.indexer.git_delta import git_name_status_delta
+
+        summary: dict = {
+            "added": 0,
+            "modified": 0,
+            "deleted": 0,
+            "closure_resolved": 0,
+            "fell_back_to_full": False,
+            "batch_size": batch_size,
+        }
+
+        # ---- Step 1: Compute delta -----------------------------------------------
+        delta = git_name_status_delta(root, old_sha, new_sha)
+        if delta is None:
+            logger.warning(
+                "resync_changed: git_name_status_delta returned None for %s..%s — "
+                "falling back to full index_repo",
+                old_sha[:8],
+                new_sha[:8],
+            )
+            summary["fell_back_to_full"] = True
+            self.index_repo(
+                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+            )
+            return summary
+
+        reparse_set: set[Path] = delta.added | delta.modified
+        delete_set: set[Path] = delta.deleted
+
+        summary["added"] = len(delta.added)
+        summary["modified"] = len(delta.modified)
+        summary["deleted"] = len(delta.deleted)
+
+        # Nothing to do — delta is empty but we still update the SHA.
+        if not reparse_set and not delete_set:
+            logger.debug(
+                "resync_changed: empty delta %s..%s — no files to resync", old_sha[:8], new_sha[:8]
+            )
+            db.set_indexed_sha(new_sha)
+            return summary
+
+        # ---- Step 2: Capture deleted tables BEFORE deletion ---------------------
+        deleted_tables: list[str] = []
+        for del_path in delete_set:
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(del_path)})
+            deleted_tables.extend(row["table_qualified"] for row in rows)
+
+        # ---- Step 3: Delete nodes for deleted files --------------------------------
+        with db.transaction():
+            for del_path in delete_set:
+                db.delete_nodes_for_file(str(del_path))
+
+        # ---- Step 4: Pass-1 parse reparse_set via _index_single_file --------------
+        # B-1 mandate: use _index_single_file (subprocess isolation + per-file timeout),
+        # NOT HardKillPool (pool startup cost exceeds parsing cost for small deltas).
+        aggregator = CrossFileAggregator()
+        schema_resolver = SchemaResolver(dialect=dialect)
+        parser = get_parser(dialect, schema_resolver)
+
+        pass1_results: list[ParsedFile] = []
+        for file_path in reparse_set:
+            try:
+                sql = file_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning("resync_changed: cannot read %s: %s — skipping", file_path, exc)
+                placeholder = ParsedFile(path=file_path, dialect=dialect)
+                placeholder.errors.append(f"read_error:{exc}")
+                aggregator.register_pass1(placeholder)
+                pass1_results.append(placeholder)
+                continue
+            try:
+                parsed = self._index_single_file(parser, file_path, sql, timeout_per_file)
+            except Exception as exc:
+                logger.warning("resync_changed: parse failed %s: %s", file_path, exc)
+                parsed = ParsedFile(path=file_path, dialect=dialect)
+                parsed.errors.append(f"parse_error:{exc}")
+            aggregator.register_pass1(parsed)
+            pass1_results.append(parsed)
+
+        # ---- Step 5: Compute closure via BFS over DEPENDENT_FILES_OF_TABLES ------
+        # Seed frontier with tables defined in reparse_set + deleted_tables.
+        frontier_tables: list[str] = list(deleted_tables)
+        for pf in pass1_results:
+            frontier_tables.extend(t.full_id for t in pf.defined_tables)
+
+        # Remove duplicates while preserving order
+        seen_tables: set[str] = set(frontier_tables)
+        frontier_tables = list({t: None for t in frontier_tables}.keys())
+
+        # Already-visited files (don't re-resolve the same file twice)
+        visited_files: set[str] = {str(p) for p in reparse_set} | {str(p) for p in delete_set}
+        closure_files: set[str] = set()
+
+        fell_back = False
+        for depth in range(max_closure_depth):
+            if not frontier_tables:
+                break
+            rows = db.run_read(DEPENDENT_FILES_OF_TABLES_QUERY, {"tables": frontier_tables})
+            new_files: list[str] = [row["path"] for row in rows if row["path"] not in visited_files]
+            if not new_files:
+                break
+
+            # Check if frontier is still growing at the depth cap
+            if depth == max_closure_depth - 1:
+                # Frontier still producing new files at the last allowed depth —
+                # fall back to full reindex (correctness guarantee).
+                logger.warning(
+                    "resync_changed: closure frontier still growing at depth %d — "
+                    "falling back to full index_repo",
+                    max_closure_depth,
+                )
+                fell_back = True
+                break
+
+            for fp in new_files:
+                if fp not in visited_files:
+                    closure_files.add(fp)
+                    visited_files.add(fp)
+
+            # Advance frontier: tables defined in these newly-found files
+            next_tables: list[str] = []
+            for fp in new_files:
+                t_rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": fp})
+                next_tables.extend(row["table_qualified"] for row in t_rows)
+            new_frontier = [t for t in next_tables if t not in seen_tables]
+            seen_tables.update(new_frontier)
+            frontier_tables = new_frontier
+
+        if fell_back:
+            summary["fell_back_to_full"] = True
+            self.index_repo(
+                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+            )
+            return summary
+
+        summary["closure_resolved"] = len(closure_files)
+
+        # ---- Step 5b: Re-harvest CTAS bodies for definer files the closure needs ---
+        # W-2: only look up definers for referenced tables NOT already satisfied in-memory
+        # (from reparse_set pass-1). Deleted definers return no row — register nothing.
+        in_memory_bare_names: set[str] = set()
+        for _pf in pass1_results:
+            for _stmt in _pf.statements:
+                if _stmt.target and _stmt.target.name:
+                    in_memory_bare_names.add(_stmt.target.name.lower())
+        # Collect all bare table names referenced by closure files (need their CTAS bodies)
+        closure_ref_tables: set[str] = set()
+        for cl_path in closure_files:
+            try:
+                cl_rows = db.run_read(
+                    "MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery) "
+                    "MATCH (q)-[:SELECTS_FROM]->(t:SqlTable) "
+                    "RETURN DISTINCT t.name AS name",
+                    {"path": cl_path},
+                )
+                for row in cl_rows:
+                    bare = (row["name"] or "").lower()
+                    if bare and bare not in in_memory_bare_names:
+                        closure_ref_tables.add(bare)
+            except Exception as exc:
+                logger.debug("resync_changed: could not query refs for %s: %s", cl_path, exc)
+
+        # For each unsatisfied referenced table, look up its defining file and parse it
+        # (pass-1 only — to harvest CTAS body; do NOT upsert unless in reparse_set).
+        harvested_definer_paths: set[str] = set()
+        for bare_name in closure_ref_tables:
+            # Try to find a defining table by bare name (approximate match on qualified)
+            # We look up via GET_TABLE_DEFINING_FILES using the bare name as the qualified key
+            # first, but we do a broader search since the table might be qualified differently.
+            try:
+                def_rows = db.run_read(
+                    "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
+                    "WHERE t.name = $name "
+                    "RETURN DISTINCT f.path AS file_path",
+                    {"name": bare_name.upper()},
+                )
+                if not def_rows:
+                    # Try lowercase match
+                    def_rows = db.run_read(
+                        "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
+                        "WHERE t.name = $name "
+                        "RETURN DISTINCT f.path AS file_path",
+                        {"name": bare_name},
+                    )
+                for row in def_rows:
+                    definer_fp = row["file_path"]
+                    if definer_fp in visited_files or definer_fp in harvested_definer_paths:
+                        continue
+                    harvested_definer_paths.add(definer_fp)
+                    try:
+                        def_path = Path(definer_fp)
+                        def_sql = def_path.read_text(encoding="utf-8")
+                        def_parsed = self._index_single_file(
+                            parser, def_path, def_sql, timeout_per_file
+                        )
+                        # Harvest only — register for cross_file_sources but do NOT upsert
+                        aggregator.register_pass1(def_parsed)
+                    except Exception as exc:
+                        logger.debug(
+                            "resync_changed: could not harvest definer %s: %s", definer_fp, exc
+                        )
+            except Exception as exc:
+                logger.debug("resync_changed: definer lookup for %r failed: %s", bare_name, exc)
+
+        # Seed cross-file CTAS bodies into the schema resolver
+        schema_resolver.register_cross_file_sources(aggregator.cross_file_sources)
+        schema_resolver.add_view_sources(aggregator.sources)
+
+        # ---- Step 6: Pass-2 re-resolve closure files (in-process, no subprocess) --
+        # Closure files: re-parse with cross_file_sources seeded; then upsert.
+        closure_results: list[ParsedFile] = []
+        for cl_path_str in closure_files:
+            cl_path = Path(cl_path_str)
+            try:
+                cl_sql = cl_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "resync_changed: cannot read closure file %s: %s — skipping", cl_path, exc
+                )
+                continue
+            try:
+                cl_parsed = parser.parse_file(cl_path, cl_sql)
+            except Exception as exc:
+                logger.warning("resync_changed: parse failed for closure file %s: %s", cl_path, exc)
+                cl_parsed = ParsedFile(path=cl_path, dialect=dialect)
+                cl_parsed.errors.append(f"parse_error:{exc}")
+            closure_results.append(cl_parsed)
+
+        # ---- Step 7: Batched bulk upsert (same _flush_batch path as index_repo) ----
+        all_results = pass1_results + closure_results
+
+        # Build a registry for duplicate DDL detection
+        defined_table_registry: dict[str, str] = {}
+        for pf in all_results:
+            for table in pf.defined_tables:
+                defined_table_registry.setdefault(table.full_id, pf.path_str)
+
+        # Delete old nodes for reparsed files before upserting fresh data
+        with db.transaction():
+            for pf in pass1_results:
+                db.delete_nodes_for_file(pf.path_str)
+            for pf in closure_results:
+                db.delete_nodes_for_file(pf.path_str)
+
+        # Flush in batches using the same pattern as index_repo._flush_batch
+        batch: list[ParsedFile] = []
+        for pf in all_results:
+            batch.append(pf)
+            if len(batch) >= batch_size:
+                with db.transaction():
+                    for pf_in_batch in batch:
+                        try:
+                            self._upsert_parsed_file(
+                                pf_in_batch,
+                                db,
+                                defined_table_registry=defined_table_registry,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "resync_changed: upsert failed for %s: %s — skipping",
+                                pf_in_batch.path,
+                                exc,
+                            )
+                batch = []
+        if batch:
+            with db.transaction():
+                for pf_in_batch in batch:
+                    try:
+                        self._upsert_parsed_file(
+                            pf_in_batch,
+                            db,
+                            defined_table_registry=defined_table_registry,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "resync_changed: upsert failed for %s: %s — skipping",
+                            pf_in_batch.path,
+                            exc,
+                        )
+
+        # ---- Step 8: Single star expansion (same as index_repo) ------------------
+        self._expand_star_sources(db)
+
+        # ---- Step 9: Persist new SHA on success ----------------------------------
+        db.set_indexed_sha(new_sha)
+
+        return summary
 
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
         """Re-index a single file and its dependent views.
@@ -211,15 +781,7 @@ class Indexer:
             sql = Path(file_path).read_text(encoding="utf-8")
             parsed = parser.parse_file(Path(file_path), sql)
 
-            # Load gold tables for this re-index call
-            gold_rows = db.run_read(
-                "MATCH (t:SqlTable)-[r:HAS_COLUMN {source: 'information_schema'}]->() "
-                "RETURN DISTINCT t.qualified AS q",
-                {},
-            )
-            gold_tables = frozenset(row["q"] for row in gold_rows)
-
-            self._upsert_parsed_file(parsed, db, gold_tables=gold_tables)
+            self._upsert_parsed_file(parsed, db)
 
         for row in stale_views:
             self._reindex_view_definition(row["view_name"], db, dialect)
@@ -229,7 +791,13 @@ class Indexer:
         self._expand_star_sources(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
-        """Parse one file, with optional timeout.
+        """Parse one file, with optional timeout via subprocess isolation.
+
+        T-09-04: Subprocess isolation via multiprocessing.Process + spawn context.
+        When timeout > 0, runs the parser in a separate OS process and sends SIGKILL
+        if the timeout fires. This is the only reliable way to hard-terminate a
+        long-running parser that might be stuck in sqlglot's qualify() or lineage
+        calls. For timeout <= 0, runs in-process (same as the parent).
 
         Args:
             parser: SqlParser instance
@@ -243,15 +811,51 @@ class Indexer:
         if timeout <= 0:
             return parser.parse_file(path, sql)
 
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(parser.parse_file, path, sql)
-            try:
-                return future.result(timeout=timeout)
-            except FuturesTimeout:
-                logger.warning("Timeout parsing %s (>%ds) — skipping", path, timeout)
-                out = ParsedFile(path=path, dialect=parser.DIALECT)
-                out.errors.append(f"timeout:{timeout}s")
-                return out
+        ctx = mp.get_context("spawn")  # avoid fork-inherit pitfalls (KuzuDB connection FD etc.)
+        # Unbounded queue: the child writes one large ParsedFile (192–552 KB pickled).
+        # Using maxsize=1 with proc.join()-before-q.get() deadlocks when the result
+        # exceeds the OS pipe buffer (~64 KB) — child blocks at exit waiting for the
+        # parent to drain the pipe, while the parent blocks on join() waiting for the
+        # child to exit. Fix: read from the queue FIRST (drives the pipe drain), then join.
+        q: mp.Queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_subprocess_parse_worker,
+            args=(parser.__class__, parser.DIALECT, path, sql, q),
+            daemon=True,
+        )
+        proc.start()
+
+        # q.get() with the full timeout both bounds wall time and drains the pipe so
+        # the child can exit cleanly. proc.join() after is just cleanup.
+        try:
+            result = q.get(timeout=timeout)
+        except queue.Empty:
+            out = ParsedFile(path=path, dialect=parser.DIALECT)
+            if proc.is_alive():
+                # Hard kill — this is the whole point of T-09-04.
+                proc.kill()  # SIGKILL on POSIX; TerminateProcess on Windows
+                proc.join(timeout=5)
+                logger.warning("Timeout parsing %s (>%ds) — subprocess killed", path, timeout)
+                out.errors.append(
+                    f"timeout:{timeout}s"
+                    f" file={path.name}"
+                    f" size={len(sql)}B"
+                    f" dialect={parser.DIALECT or 'ansi'}"
+                )
+            else:
+                logger.warning("Subprocess for %s exited but produced no result", path)
+                out.errors.append("subprocess_empty_result")
+            return out
+
+        proc.join(timeout=5)  # cleanup; child should have exited by now
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5)
+
+        if isinstance(result, BaseException):
+            # Worker raised — re-raise into the caller (matches pre-T-09-04 thread behaviour).
+            raise result
+        return result
 
     @staticmethod
     def _qid(full_id: str) -> str:
@@ -262,54 +866,63 @@ class Indexer:
         self,
         parsed: ParsedFile,
         db: GraphBackend,
-        gold_tables: frozenset[str] = frozenset(),
+        defined_table_registry: dict[str, str] | None = None,
     ) -> dict:
-        """Map ParsedFile → graph nodes/edges.
+        """Map ParsedFile → graph nodes/edges using bulk upsert.
 
         Args:
             parsed: ParsedFile to upsert
             db: GraphBackend instance
-            gold_tables: Set of table full_ids with information_schema-backed columns
-                        (skip DDL column writes for these tables)
 
         Returns:
-            Dict with keys: tables, edges, columns_defined
+            Dict with keys: tables, edges, columns_defined, star_sources
         """
-        counts = {"tables": 0, "edges": 0, "columns_defined": 0}
+        counts = {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
 
-        # Upsert File node
-        db.upsert_node(
-            NodeLabel.FILE,
-            parsed.path_str,
+        # --- Phase A: collect rows from parsed model ---
+
+        file_rows: list[dict] = []
+        table_rows: list[dict] = []  # NodeLabel.TABLE
+        column_rows: list[dict] = []  # NodeLabel.COLUMN
+        query_rows: list[dict] = []  # NodeLabel.QUERY
+
+        defined_in_edges: list[dict] = []  # TABLE -> FILE
+        has_column_edges: list[dict] = []  # TABLE -> COLUMN
+        query_defined_in_edges: list[dict] = []  # QUERY -> FILE
+        selects_from_edges: list[dict] = []  # QUERY -> TABLE
+        column_lineage_edges: list[dict] = []  # COLUMN -> COLUMN
+        star_source_edges: list[dict] = []  # QUERY -> TABLE
+
+        # File node
+        cause, failed = dominant_cause(parsed.errors)
+        file_rows.append(
             {
                 "path": parsed.path_str,
                 "dialect": parsed.dialect or "",
-            },
+                "parse_failed": failed,
+                "parse_cause": cause,
+            }
         )
 
-        # Upsert defined tables (with duplicate DDL detection)
+        # Defined tables
         for table in parsed.defined_tables:
             # Guard: detect duplicate DDL for the same table across files
-            existing = db.run_read(
-                f"MATCH (t:{NodeLabel.TABLE} {{qualified: $qid}}) RETURN t.defined_in_file AS f",
-                {"qid": table.full_id},
-            )
-            if existing and existing[0]["f"] and existing[0]["f"] != parsed.path_str:
-                logger.warning(
+            if defined_table_registry is not None:
+                first_file = defined_table_registry.get(table.full_id)
+            else:
+                first_file = None
+            if first_file and first_file != parsed.path_str:
+                logger.debug(
                     "Table %s already defined in %s — %s will add columns to the union; "
                     "star expansion may include columns from the earlier DDL file",
                     table.full_id,
-                    existing[0]["f"],
+                    first_file,
                     parsed.path_str,
                 )
                 if hasattr(parsed, "errors"):
-                    parsed.errors.append(
-                        f"duplicate_ddl:{table.full_id}:already_in:{existing[0]['f']}"
-                    )
+                    parsed.errors.append(f"duplicate_ddl:{table.full_id}:already_in:{first_file}")
 
-            db.upsert_node(
-                NodeLabel.TABLE,
-                table.full_id,
+            table_rows.append(
                 {
                     "qualified": table.full_id,
                     "name": table.name,
@@ -317,16 +930,9 @@ class Indexer:
                     "db": table.db or "",
                     "kind": "TABLE",
                     "defined_in_file": parsed.path_str,
-                },
+                }
             )
-            db.upsert_edge(
-                NodeLabel.TABLE,
-                table.full_id,
-                NodeLabel.FILE,
-                parsed.path_str,
-                RelType.DEFINED_IN,
-                {},
-            )
+            defined_in_edges.append({"src_key": table.full_id, "dst_key": parsed.path_str})
             counts["tables"] += 1
 
         # Build a map of target.full_id -> QueryNode for column lookup
@@ -339,25 +945,15 @@ class Indexer:
         # Compute set of defined table IDs for quick lookup
         defined_table_ids = {t.full_id for t in parsed.defined_tables}
 
-        # Upsert DDL columns and HAS_COLUMN edges
+        # DDL columns and HAS_COLUMN edges
         for table in parsed.defined_tables:
-            # Check if this table is covered by information_schema (gold table)
-            if table.full_id in gold_tables:
-                logger.debug(
-                    "Skipping DDL columns for %s — information_schema takes precedence",
-                    table.full_id,
-                )
-                continue
-
             qnode = defined_by_query.get(table.full_id)
             if not qnode:
                 continue
 
             for col_name in qnode.defined_columns:
                 col_id = f"{table.full_id}.{col_name}"
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    col_id,
+                column_rows.append(
                     {
                         "id": col_id,
                         "col_name": col_name,
@@ -365,24 +961,17 @@ class Indexer:
                         "catalog": table.catalog or "",
                         "db": table.db or "",
                         "table_name": table.name,
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.TABLE,
-                    table.full_id,
-                    NodeLabel.COLUMN,
-                    col_id,
-                    RelType.HAS_COLUMN,
-                    {"source": "ddl"},
+                has_column_edges.append(
+                    {"src_key": table.full_id, "dst_key": col_id, "source": "ddl"}
                 )
                 counts["columns_defined"] += 1
 
-        # Upsert query nodes
+        # Query nodes and related edges
         for i, stmt in enumerate(parsed.statements):
             query_id = f"{parsed.path_str}:{i}"
-            db.upsert_node(
-                NodeLabel.QUERY,
-                query_id,
+            query_rows.append(
                 {
                     "id": query_id,
                     "file_path": parsed.path_str,
@@ -393,22 +982,13 @@ class Indexer:
                     "parse_failed": stmt.parse_failed,
                     "confidence": stmt.confidence,
                     "parsing_mode": stmt.parsing_mode,
-                },
+                }
             )
-            db.upsert_edge(
-                NodeLabel.QUERY,
-                query_id,
-                NodeLabel.FILE,
-                parsed.path_str,
-                RelType.QUERY_DEFINED_IN,
-                {},
-            )
+            query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
 
             # Source table edges
             for src_table in stmt.sources:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    src_table.full_id,
+                table_rows.append(
                     {
                         "qualified": src_table.full_id,
                         "name": src_table.name,
@@ -416,24 +996,15 @@ class Indexer:
                         "db": src_table.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.QUERY,
-                    query_id,
-                    NodeLabel.TABLE,
-                    src_table.full_id,
-                    RelType.SELECTS_FROM,
-                    {},
-                )
+                selects_from_edges.append({"src_key": query_id, "dst_key": src_table.full_id})
 
             # Column lineage edges
             for edge in stmt.column_lineage:
                 src_id = edge.src.full_id
                 dst_id = edge.dst.full_id
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    src_id,
+                column_rows.append(
                     {
                         "id": src_id,
                         "col_name": edge.src.name,
@@ -441,11 +1012,9 @@ class Indexer:
                         "catalog": edge.src.table.catalog or "",
                         "db": edge.src.table.db or "",
                         "table_name": edge.src.table.name,
-                    },
+                    }
                 )
-                db.upsert_node(
-                    NodeLabel.COLUMN,
-                    dst_id,
+                column_rows.append(
                     {
                         "id": dst_id,
                         "col_name": edge.dst.name,
@@ -453,27 +1022,22 @@ class Indexer:
                         "catalog": edge.dst.table.catalog or "",
                         "db": edge.dst.table.db or "",
                         "table_name": edge.dst.table.name,
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.COLUMN,
-                    src_id,
-                    NodeLabel.COLUMN,
-                    dst_id,
-                    RelType.COLUMN_LINEAGE,
+                column_lineage_edges.append(
                     {
+                        "src_key": src_id,
+                        "dst_key": dst_id,
                         "transform": edge.transform,
                         "confidence": edge.confidence,
                         "query_id": query_id,
-                    },
+                    }
                 )
                 counts["edges"] += 1
 
             # STAR_SOURCE edges for graph-backend expansion
             for star in stmt.star_sources:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    star.source.full_id,
+                table_rows.append(
                     {
                         "qualified": star.source.full_id,
                         "name": star.source.name,
@@ -481,28 +1045,23 @@ class Indexer:
                         "db": star.source.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
-                db.upsert_edge(
-                    NodeLabel.QUERY,
-                    query_id,
-                    NodeLabel.TABLE,
-                    star.source.full_id,
-                    RelType.STAR_SOURCE,
+                star_source_edges.append(
                     {
+                        "src_key": query_id,
+                        "dst_key": star.source.full_id,
                         "qualifier": star.qualifier or "<unqualified>",
                         "target_table": stmt.target.full_id if stmt.target else "",
                         "confidence": 0.8,
-                    },
+                    }
                 )
-                counts["star_sources"] = counts.get("star_sources", 0) + 1
+                counts["star_sources"] += 1
 
             # Upsert target table node (if not already a defined_table)
             # so that star expansion can create destination columns
             if stmt.target and stmt.target.full_id not in defined_table_ids:
-                db.upsert_node(
-                    NodeLabel.TABLE,
-                    stmt.target.full_id,
+                table_rows.append(
                     {
                         "qualified": stmt.target.full_id,
                         "name": stmt.target.name,
@@ -510,8 +1069,38 @@ class Indexer:
                         "db": stmt.target.db or "",
                         "kind": "TABLE",
                         "defined_in_file": "",
-                    },
+                    }
                 )
+
+        # --- Phase B: deduplicate rows within each group ---
+        # Cypher MERGE is idempotent under deduplication, but we deduplicate in Python
+        # to reduce payload size
+        table_rows = list({r["qualified"]: r for r in table_rows}.values())
+        column_rows = list({r["id"]: r for r in column_rows}.values())
+        query_rows = list({r["id"]: r for r in query_rows}.values())
+
+        # --- Phase C: flush in dependency order (nodes before their edges) ---
+        db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)
+        db.upsert_nodes_bulk(NodeLabel.TABLE, table_rows)
+        db.upsert_nodes_bulk(NodeLabel.COLUMN, column_rows)
+        db.upsert_nodes_bulk(NodeLabel.QUERY, query_rows)
+
+        db.upsert_edges_bulk(NodeLabel.TABLE, NodeLabel.FILE, RelType.DEFINED_IN, defined_in_edges)
+        db.upsert_edges_bulk(
+            NodeLabel.TABLE, NodeLabel.COLUMN, RelType.HAS_COLUMN, has_column_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.FILE, RelType.QUERY_DEFINED_IN, query_defined_in_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.TABLE, RelType.SELECTS_FROM, selects_from_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.COLUMN, NodeLabel.COLUMN, RelType.COLUMN_LINEAGE, column_lineage_edges
+        )
+        db.upsert_edges_bulk(
+            NodeLabel.QUERY, NodeLabel.TABLE, RelType.STAR_SOURCE, star_source_edges
+        )
 
         return counts
 

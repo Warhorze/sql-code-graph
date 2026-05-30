@@ -4,14 +4,14 @@
 > change between releases without a deprecation period. Pin to an exact version
 > in production. Re-indexing is always the migration path.
 
-> **Dialect coverage.** This tool has been developed and tested against a
-> production Snowflake data warehouse with ~1,400 SQL files. Other dialects
-> (`bigquery`, `postgres`, `ansi`, `tsql`) are wired up but have not been
-> exercised against a real corpus — edge cases will surface. If you use sqlcg
-> with a non-Snowflake dialect and hit parse failures or missing lineage, please
-> [open an issue](https://github.com/Warhorze/sql-code-graph/issues) with a
-> minimal reproducer; we want to support other dialects but need a corpus to
-> develop against.
+> **Dialect support.** sqlcg is built on [sqlglot](https://github.com/tobymao/sqlglot),
+> so in theory it can work for any dialect sqlglot parses. In practice we've only
+> tested it against a production **Snowflake** warehouse (~1,400 SQL files) — and
+> getting that one dialect working properly was already challenging. Other dialects
+> (`bigquery`, `postgres`, `ansi`, `tsql`, `dbt`) may well work, but their lineage
+> hasn't been validated, so expect rough edges. We'd gladly collaborate to get
+> another dialect integrated — [open an issue](https://github.com/Warhorze/sql-code-graph/issues)
+> with a minimal, anonymised corpus we can test against.
 
 SQL lineage and dependency analysis as an MCP server for Claude Code.
 
@@ -66,7 +66,7 @@ sqlcg install
 # Only git-tracked files are indexed — build artefacts, node_modules,
 # and .venv are ignored automatically.
 sqlcg db init
-sqlcg index ./sql --dialect snowflake   # or: bigquery, postgres, ansi
+sqlcg index ./sql --dialect snowflake   # snowflake is the only tested dialect
 
 # 5. (Optional) Keep the graph fresh on branch switches
 cd /your/sql/repo
@@ -83,7 +83,7 @@ To avoid passing `--dialect` every time, create `.sqlcg.toml` in your repo root:
 
 ```toml
 [sqlcg]
-dialect = "snowflake"   # snowflake | bigquery | postgres | ansi
+dialect = "snowflake"   # the only tested dialect
 ```
 
 The git hook and `sqlcg index --dialect auto` both read this file.
@@ -125,7 +125,7 @@ Quality is shown per-file after `sqlcg index` and in `sqlcg gain` Section F.
 
 **What causes TABLE_ONLY?** Mostly `SELECT *` — sqlglot can't trace column names through
 a wildcard without knowing the source table's columns. See [Resolving SELECT *](#resolving-select-)
-below to fix this without rewriting your ETLs.
+below for how sqlcg expands wildcards automatically from your DDL and CTAS bodies.
 
 **What causes SCRIPTING_FALLBACK?** Snowflake `$$` procedure bodies or `BEGIN…END` scripting
 blocks. sqlglot parses the block as a raw `Command` node and extracts DML via tokenizer
@@ -135,75 +135,60 @@ Check `sqlcg db info` for the parsing mode distribution across all indexed queri
 
 ## Resolving SELECT *
 
-By default, `SELECT *` ETLs produce `TABLE_ONLY` parse quality because sqlglot needs
-to know the source table's column list to expand the wildcard. The fastest fix is to
-provide your production information schema as a CSV — sqlcg uses it as the authoritative
-column source, replacing any DDL-inferred columns.
+A `SELECT *` ETL produces `TABLE_ONLY` parse quality because sqlglot needs the source
+table's column list to expand the wildcard into individual columns. sqlcg resolves this
+**automatically, with no extra setup** — there is no CSV to export or command to run.
 
-**Step 1 — Export from Snowflake** (run in a worksheet, export as CSV):
+Wildcards are expanded from two sources harvested while indexing:
 
-```sql
-SELECT
-    TABLE_CATALOG,
-    TABLE_SCHEMA,
-    TABLE_NAME,
-    COLUMN_NAME,
-    ORDINAL_POSITION,
-    DATA_TYPE
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
-ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
-```
+1. **DDL files** — `CREATE TABLE` / `CREATE VIEW` statements give sqlcg the column list
+   for any table they define.
+2. **Cross-file CTAS bodies** — a `CREATE TABLE … AS SELECT` (or CTE) in one file is used
+   to resolve `SELECT *` against that table in another file.
 
-**Step 2 — Drop it in your repo**:
+So the only thing you need to do is **index the DDL alongside your ETLs** — point `sqlcg
+index` at a path that contains both (e.g. the repo root, or both `ddl/` and `etl/`). The
+more of your `CREATE` statements sqlcg can see, the more wildcards it resolves.
 
 ```bash
-cp ~/Downloads/columns.csv <your-sql-repo>/.sqlcg/schema.csv
+sqlcg index . --dialect snowflake   # index DDL + ETLs together
 ```
 
-**Step 3 — Index your ETL folder only**:
+After indexing, `sqlcg db info` shows non-zero `STAR_EXPANSION lineage edges`, and
+`trace_column_lineage` returns results for queries that previously returned empty.
 
-```bash
-sqlcg index etl/
-```
-
-That's the entire workflow. `sqlcg index` auto-discovers `.sqlcg/schema.csv` and loads
-it before indexing — no separate command needed. Point it at your ETL folder rather
-than the full repo: fewer files to scan, faster indexing, and the schema CSV covers
-what DDL parsing was doing anyway.
-
-<!-- TODO: add benchmark numbers after testing — expected savings from ETL-folder-only
-     indexing vs full-repo scan (file count ratio, wall-clock time, star edges resolved) -->
-
-After indexing, `sqlcg db info` will show non-zero `STAR_EXPANSION lineage edges`,
-and `trace_column_lineage` will return results for queries that previously returned
-empty.
-
-**Alternative: explicit load**
-
-If your schema CSV lives elsewhere or you want to refresh it without re-indexing:
-
-```bash
-sqlcg load-schema /path/to/columns.csv   # load or refresh schema
-sqlcg index etl/                         # re-index using updated schema
-```
-
-**Precedence**: production CSV > DDL files > nothing. Partial CSVs are fine — tables
-not covered fall back to DDL-inferred columns automatically.
+> **Note:** earlier versions accepted an exported `INFORMATION_SCHEMA` CSV (`sqlcg
+> load-schema`). That path was **removed** — profiling showed it added zero lineage
+> edges over DDL + cross-file CTAS resolution on a real warehouse. DDL is now the
+> single source of column truth; no CSV is needed or accepted.
 
 ## MCP tools reference
 
 | Tool | Description |
 |------|-------------|
 | `index_repo(repo_path, dialect)` | Index a directory of SQL files |
-| `trace_column_lineage(table_col)` | Trace column lineage upstream |
-| `find_table_usages(table_name)` | Find all queries that read a table |
+| **Lineage & dependencies** | |
+| `trace_column_lineage(table_col)` | Trace a column's value upstream to its sources |
 | `get_upstream_dependencies(table_col)` | Full upstream dependency chain |
 | `get_downstream_dependencies(table_col)` | Full downstream dependency chain |
+| `find_table_usages(table_name)` | Find all queries that read a table |
+| `find_definition(table_qualified)` | Find where a table/view is defined |
+| **Change impact** | |
+| `get_change_scope(table_qualified)` | Blast radius of changing a table (impact + risk) |
+| `diff_impact(changed_files)` | What a set of changed files affects downstream |
+| `get_backfill_order(table_qualified)` | Topological rebuild/backfill order |
+| `scope_change(target)` | Synthesised change-scope summary for a target |
+| **Search & meta** | |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
 | `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
 | `db_info()` | Graph health, node counts, parse quality breakdown, warnings |
 | `execute_cypher(query)` | Raw Cypher query against the graph |
+| `submit_feedback(...)` | Report a false positive/negative to improve metrics |
+
+> **Input format**: lineage/dependency tools expect a **schema-qualified** column
+> reference — `schema.table.column` (e.g. `ba.orders.customer_id`), not a bare
+> `table.column`. Each returned node carries both `name` (the bare column) and
+> `table` (the owning `schema.table`), so results are navigable without a second lookup.
 
 > **LLM agent tip**: call `db_info()` before lineage queries to check that
 > `SqlColumn > 0` and `warnings` is empty. If `parse_quality["scripting_block"]`
@@ -217,32 +202,40 @@ Full option reference: [docs/cli.md](docs/cli.md)
 ```bash
 sqlcg install                          # register MCP server in Claude Code
 sqlcg db init                          # initialise graph database
-sqlcg index <path> --dialect <d>       # index SQL files
+sqlcg index <path> --dialect snowflake # index SQL files (snowflake is the tested dialect)
 sqlcg index <path> --dialect auto      # read dialect from .sqlcg.toml
-sqlcg load-schema <csv>                # load production schema (auto-discovered from .sqlcg/schema.csv)
-sqlcg load-schema <csv> --include-catalog  # use 3-part names (CATALOG.SCHEMA.TABLE)
+sqlcg index <path> --profile           # index + print per-stage timing and slowest files
+sqlcg reindex <path> --from <sha> --to <sha>  # incremental resync of only changed files
+sqlcg analyze unused                   # tables with no query references
+sqlcg analyze upstream/downstream      # trace lineage from the CLI
+sqlcg find table/column/pattern        # search the graph
 sqlcg watch <path>                     # watch for file changes
-sqlcg git install-hooks                # install post-checkout hook
+sqlcg git install-hooks                # install post-checkout + post-merge resync hooks
 sqlcg gain                             # show usage metrics
 sqlcg report                           # generate FP/error report
+sqlcg mcp best-practices               # print the fact/heuristic boundary for the MCP tools
 sqlcg mcp start                        # start MCP server manually
 sqlcg version                          # show installed version
 ```
 
 ## Supported dialects
 
+sqlcg is built on [sqlglot](https://github.com/tobymao/sqlglot), so other dialects
+*can* be parsed in theory. Only Snowflake has been tested against a real corpus,
+though — the table reflects what's actually been exercised, not what sqlglot can do.
+
 | Dialect | Status |
 |---------|--------|
-| `snowflake` | Tested against a production DWH (~1,400 files) |
-| `bigquery` | Wired up, untested against a real corpus |
-| `postgres` | Wired up, untested against a real corpus |
-| `ansi` | Wired up, untested against a real corpus |
-| `tsql` | Wired up, untested against a real corpus |
-| `dbt` | Via optional extra, untested against a real corpus |
+| `snowflake` | ✅ Tested against a production DWH (~1,400 files) |
+| `bigquery` | ⚠️ Unproven — parses via sqlglot, lineage not validated |
+| `postgres` | ⚠️ Unproven — parses via sqlglot, lineage not validated |
+| `ansi` | ⚠️ Unproven — parses via sqlglot, lineage not validated |
+| `tsql` | ⚠️ Unproven — parses via sqlglot, lineage not validated |
+| `dbt` | ⚠️ Unproven — via optional extra, lineage not validated |
 
-If you use a non-Snowflake dialect and run into issues, open an issue with a
-minimal SQL reproducer. Contributions of test fixtures from real (anonymised)
-corpora are especially welcome.
+Want another dialect properly supported? We'd be glad to collaborate — open an issue
+with a minimal, anonymised corpus we can develop and test against. Getting Snowflake
+right was real work, so a representative corpus is what makes the difference.
 
 ## Development
 

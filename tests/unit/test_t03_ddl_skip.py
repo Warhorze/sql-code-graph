@@ -11,14 +11,14 @@ class TestPureDDLFileSkip:
     """Test pure-DDL file detection and early skip."""
 
     def test_pure_ddl_file_returns_early_with_skip_marker(self):
-        """Pure-DDL file must be marked with parse_mode:pure_ddl_skip and skip lineage."""
+        """Pure-DDL file must be marked with col_lineage_skip:pure_ddl_file and skip lineage."""
         sql = "ALTER TABLE t1 ADD COLUMN c1 VARCHAR; ALTER TABLE t2 DROP COLUMN c2;"
         parser = SnowflakeParser(SchemaResolver())
 
         parsed = parser.parse_file(Path("test.sql"), sql)
 
         # Error marker must be present
-        assert "parse_mode:pure_ddl_skip" in parsed.errors
+        assert "col_lineage_skip:pure_ddl_file" in parsed.errors
         # Statements should be processed (for table definitions) but have no lineage
         assert len(parsed.statements) > 0
         # Column lineage edges should be empty (skipped for DDL-only files)
@@ -56,7 +56,7 @@ class TestPureDDLFileSkip:
         parsed = parser.parse_file(Path("test.sql"), sql)
 
         # Pure CREATE TABLE without body should be marked as pure-DDL
-        assert "parse_mode:pure_ddl_skip" in parsed.errors
+        assert "col_lineage_skip:pure_ddl_file" in parsed.errors
         # Statements should be processed (for table definitions)
         assert len(parsed.statements) > 0
         # But no column lineage should be extracted
@@ -71,7 +71,7 @@ class TestPureDDLFileSkip:
         parsed = parser.parse_file(Path("test.sql"), sql)
 
         # DDL-only file should be marked as pure-DDL
-        assert "parse_mode:pure_ddl_skip" in parsed.errors
+        assert "col_lineage_skip:pure_ddl_file" in parsed.errors
         # Statements should be processed
         assert len(parsed.statements) > 0
         # But no column lineage

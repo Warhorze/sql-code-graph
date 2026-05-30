@@ -27,12 +27,17 @@ def register(dialect: str | None):
     return decorator
 
 
-def get_parser(dialect: str | None, schema_resolver: "SchemaResolver") -> "SqlParser":
+def get_parser(
+    dialect: str | None,
+    schema_resolver: "SchemaResolver",
+    schema_aliases: dict[str, str] | None = None,
+) -> "SqlParser":
     """Get a parser instance for the given dialect.
 
     Args:
         dialect: SQL dialect identifier (None for ANSI, "snowflake", etc.)
         schema_resolver: SchemaResolver instance for table/column lookups
+        schema_aliases: Optional staging-schema → canonical-schema map
 
     Returns:
         SqlParser instance for the given dialect
@@ -43,4 +48,4 @@ def get_parser(dialect: str | None, schema_resolver: "SchemaResolver") -> "SqlPa
     cls = PARSERS.get(dialect) or PARSERS.get(None)
     if cls is None:
         raise ValueError(f"No parser registered for dialect {dialect!r}")
-    return cls(schema_resolver)
+    return cls(schema_resolver, schema_aliases=schema_aliases or {})

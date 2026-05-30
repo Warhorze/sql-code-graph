@@ -1,0 +1,21 @@
+{
+  "label": "N=100 without schema_csv",
+  "run_date": "2026-05-28T14:34:04",
+  "n_sample": 100,
+  "seed": 42,
+  "schema_csv": null,
+  "total_files": 100,
+  "runtime_seconds": 10.13,
+  "rss_delta_kb": 115592,
+  "lineage_edges": 7259,
+  "parse_errors": 442,
+  "tables_found": 257,
+  "columns_defined": 2075,
+  "star_edges_expanded": 2145,
+  "pass2_skipped": 86,
+  "budget_check": {
+    "extrapolated_seconds": 162.12,
+    "budget_seconds": 300,
+    "passes_budget": true
+  }
+}

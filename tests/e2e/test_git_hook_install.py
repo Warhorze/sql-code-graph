@@ -77,20 +77,21 @@ def test_hook_skips_on_file_checkout(temp_git_repo):
     assert result.returncode == 0
 
 
-def test_hook_runs_sqlcg_on_branch_checkout(temp_git_repo):
-    """E2E: test that hook calls sqlcg index on branch checkout ($3=1)."""
+def test_hook_runs_sqlcg_reindex_on_branch_checkout(temp_git_repo):
+    """E2E: test that hook calls sqlcg reindex with SHA args on branch checkout ($3=1)."""
     hook_path = temp_git_repo / ".git" / "hooks" / "post-checkout"
 
     runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
     assert hook_path.exists()
 
-    # The hook script should call sqlcg index when $3=1
     hook_content = hook_path.read_text()
 
-    # Verify the hook would call sqlcg index
-    assert "sqlcg index" in hook_content
-    assert '--dialect auto' in hook_content
-    assert '--quiet' in hook_content
+    # post-checkout must call sqlcg reindex --from $1 --to $2 (incremental resync)
+    assert "sqlcg reindex" in hook_content
+    assert '--from "$1"' in hook_content
+    assert '--to "$2"' in hook_content
+    assert "--dialect auto" in hook_content
+    assert "--quiet" in hook_content
 
     # Verify the condition check for branch checkout
     assert '[ "$3" = "1" ]' in hook_content
@@ -111,5 +112,5 @@ def test_idempotency_no_duplicate_hook_lines(temp_git_repo):
     assert sentinel_count == 1, f"Expected 1 sentinel, found {sentinel_count}"
 
     # All three installs should report success/idempotency
-    hook_lines = content.count("sqlcg index")
-    assert hook_lines == 1, f"Expected 1 sqlcg index line, found {hook_lines}"
+    hook_lines = content.count("sqlcg reindex")
+    assert hook_lines == 1, f"Expected 1 sqlcg reindex line, found {hook_lines}"

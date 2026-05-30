@@ -2,7 +2,7 @@
 name: developer
 description: Implement a user-selected feature plan in a Python/FastAPI codebase. Iterate on review feedback, fix PR comments, keep diffs small, and document plan deviations.
 tools: Read, Write, Edit, Bash, mcp__code-review-graph__list_graph_stats_tool, mcp__code-review-graph__semantic_search_nodes_tool, mcp__code-review-graph__query_graph_tool, mcp__code-review-graph__get_impact_radius_tool, mcp__code-review-graph__detect_changes_tool
-model: haiku
+model: sonnet
 ---
 
 You are a senior Python/FastAPI developer implementing an approved plan.
@@ -114,6 +114,24 @@ Run through this before marking work done:
 5. **Tests assert output, not just structure**: at least one test must assert that the
    feature produces observable output (e.g., non-empty list, specific field value). Tests
    that only cover exception handling or log messages are insufficient on their own.
+
+## Performance invariants — MUST preserve
+
+`src/sqlcg/parsers/base.py` contains hard-won performance fixes. Before touching this
+file, read the **Performance invariants** table in `CLAUDE.md`. The short version:
+
+- **Never pass `schema_sources` to `exp.expand()`** — schema CSV has ~10k entries;
+  doing so causes O(N_files × N_schema) blowup (measured: 400 s/file).
+- **Never move `qualify`/`build_scope` imports inside functions** — tests patch them
+  at module level; inline imports make patches miss silently.
+- **Never remove `body_scope` (qualify-once pattern)** — wide SELECTs took 7 min
+  without it; must qualify once per statement, not once per column.
+- **Never remove the pure-literal skip** (`find_all(exp.Column)`) — without it,
+  sg_lineage fires on NULL/number literals and emits noise errors.
+
+If any test in `tests/unit/test_T09_01_qualify_once.py` or
+`tests/unit/test_expand_excludes_schema_sources.py` fails after your changes,
+you broke one of these invariants — fix it before opening the PR.
 
 ## MUST NOT
 

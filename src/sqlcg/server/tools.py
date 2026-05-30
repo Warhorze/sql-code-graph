@@ -1,17 +1,26 @@
 """MCP tools for SQL code graph queries and indexing."""
 
+import functools
 import re
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
-from sqlcg.core.config import get_db_path
+from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
+    ANALYZE_UNUSED_TABLES_QUERY,
+    FIND_DEFINITION_QUERY,
     FIND_TABLE_USAGES_QUERY,
+    GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_TABLE_DEFINING_FILES_QUERY,
+    GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+    GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
+    HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
     LIST_DIALECTS_AND_REPOS_QUERY,
     SEARCH_SQL_PATTERN_QUERY,
@@ -22,20 +31,63 @@ from sqlcg.indexer.indexer import Indexer
 from sqlcg.metrics.store import MetricsStore
 from sqlcg.server.exceptions import InvalidColumnRefError, NotIndexedError
 from sqlcg.server.models import (
+    BackfillOrderResult,
+    ChangeScopeResult,
     DbInfoResult,
+    DefinitionFile,
+    DefinitionResult,
     DependencyNode,
     DependencyResult,
     DialectRepo,
     DialectRepoResult,
+    DiffImpactResult,
+    HubEntry,
+    HubRankingResult,
+    Judgement,
     LineageNode,
     LineageResult,
+    ScopeChangeResult,
     SqlPatternMatch,
     SqlPatternResult,
     TableUsage,
     TableUsageResult,
+    UnusedCandidate,
+    UnusedTablesResult,
 )
-from sqlcg.server.server import mcp  # noqa: F401
-from sqlcg.utils.logging import getLogger
+from sqlcg.server.noise_filter import NoiseFilter
+
+
+def _build_mermaid(root_id: str, edges: list[tuple[str, str, str]]) -> str:
+    """Build a Mermaid LR flowchart from a list of (src_id, dst_id, transform) edges."""
+
+    def _nid(col_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "_", col_id)
+
+    def _label(col_id: str) -> str:
+        parts = col_id.rsplit(".", 1)
+        if len(parts) == 2:
+            return f"{parts[0]}\n{parts[1]}"
+        return col_id
+
+    lines = ["flowchart LR"]
+    seen_nodes: set[str] = set()
+    seen_edges: set[tuple[str, str]] = set()
+    for src, dst, transform in edges:
+        for col_id in (src, dst):
+            nid = _nid(col_id)
+            if nid not in seen_nodes:
+                seen_nodes.add(nid)
+                lines.append(f'    {nid}["{_label(col_id)}"]')
+        edge_key = (_nid(src), _nid(dst))
+        if edge_key not in seen_edges:
+            seen_edges.add(edge_key)
+            label = f"|{transform}|" if transform else ""
+            lines.append(f"    {_nid(src)} -->{label} {_nid(dst)}")
+    return "\n".join(lines)
+
+
+from sqlcg.server.server import mcp  # noqa: E402, F401
+from sqlcg.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger(__name__)
 
@@ -102,6 +154,19 @@ def _get_backend() -> GraphBackend:
     return _backend
 
 
+@contextmanager
+def _open_backend():
+    """Context manager to get the initialized backend.
+
+    Used for testing and context-manager-style access patterns.
+    """
+    backend = _get_backend()
+    try:
+        yield backend
+    finally:
+        pass
+
+
 def _assert_indexed(db: GraphBackend) -> None:
     """Check that the graph has indexed repos.
 
@@ -122,7 +187,7 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     """Parse column reference "table.column" or "catalog.db.table.column".
 
     Args:
-        col_ref: Column reference string
+        col_ref: Column reference string (e.g., "ba.table.column")
 
     Returns:
         Tuple of (table_id, column_name)
@@ -130,6 +195,9 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     Raises:
         InvalidColumnRefError: If format is invalid
     """
+    # Step 1.4b: Lowercase the input to match lowercased graph keys (C2)
+    col_ref = col_ref.lower()
+
     parts = col_ref.split(".")
     if len(parts) < 2:
         raise InvalidColumnRefError(
@@ -140,6 +208,139 @@ def _parse_column_ref(col_ref: str) -> tuple[str, str]:
     column_name = parts[-1]
     table_id = ".".join(parts[:-1])
     return table_id, column_name
+
+
+# Shared safety cap for all BFS closures (matches the per-tool guard in PR-01).
+_MAX_CLOSURE_NODES = 50000
+
+
+def _affected_columns_closure(
+    db: GraphBackend, start_col_ids: list[str], max_depth: int | None = None
+) -> tuple[list[str], int, bool]:
+    """BFS downstream over COLUMN_LINEAGE from a set of starting columns.
+
+    Returns (affected_col_ids, depth_reached, truncated). The starting columns
+    themselves are NOT included in affected_col_ids — only their transitive
+    downstream consumers. Honours the same 50k-node safety cap as the per-column
+    dependency tools (PR-01).
+    """
+    visited: set[str] = set()
+    emitted: set[str] = set()
+    affected: list[str] = []
+    queue: deque[tuple[str, int]] = deque((cid, 0) for cid in start_col_ids)
+    depth_reached = 0
+    truncated = False
+
+    while queue:
+        current_id, depth = queue.popleft()
+
+        if current_id in visited or (max_depth is not None and depth > max_depth):
+            continue
+
+        if len(visited) >= _MAX_CLOSURE_NODES:
+            truncated = True
+            break
+
+        visited.add(current_id)
+        depth_reached = max(depth_reached, depth)
+
+        rows = db.run_read(GET_DOWNSTREAM_DEPENDENCIES_QUERY, {"id": current_id})
+        for row in rows:
+            node_id = row["id"]
+            next_depth = depth + 1
+            if node_id not in visited and (max_depth is None or next_depth <= max_depth):
+                if node_id not in emitted:
+                    emitted.add(node_id)
+                    affected.append(node_id)
+                queue.append((node_id, next_depth))
+            elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                truncated = True
+
+    return affected, depth_reached, truncated
+
+
+def _rollup_to_tables(col_ids: list[str]) -> list[str]:
+    """Roll up a list of column ids (table_qualified.col_name) to a deduplicated,
+    order-preserving list of table_qualified strings."""
+    tables: list[str] = []
+    seen: set[str] = set()
+    for cid in col_ids:
+        table_qualified = cid.rsplit(".", 1)[0]
+        if table_qualified not in seen:
+            seen.add(table_qualified)
+            tables.append(table_qualified)
+    return tables
+
+
+def _dedup_preserve_order(items: list[str]) -> list[str]:
+    """Deduplicate a list while preserving first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _risk_label(affected_table_count: int) -> str:
+    """Map a downstream affected-table count to a coarse risk label.
+
+    0 -> "safe", 1-5 -> "low", 6-20 -> "medium", >20 -> "high".
+    """
+    if affected_table_count == 0:
+        return "safe"
+    if affected_table_count <= 5:
+        return "low"
+    if affected_table_count <= 20:
+        return "medium"
+    return "high"
+
+
+def _kahn_topological_sort(affected_tables: list[str], db: GraphBackend) -> tuple[list[str], bool]:
+    """Order affected tables so producers come before consumers (rebuild order).
+
+    Builds an adjacency list from SELECTS_FROM edges *within* the affected set
+    (a table's producing query selecting from another affected table is an edge
+    producer -> consumer) and runs Kahn's algorithm. Returns
+    (ordered_tables, had_cycle). On a cycle the acyclic prefix is emitted in
+    topological order and the remaining cyclic tables are appended in input
+    order — no exception is raised.
+    """
+    table_set = set(affected_tables)
+    successors: dict[str, set[str]] = {t: set() for t in affected_tables}
+    indegree: dict[str, int] = {t: 0 for t in affected_tables}
+
+    for table in affected_tables:
+        rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": table})
+        for row in rows:
+            src = row["upstream_table"]
+            if src in table_set and src != table and table not in successors[src]:
+                successors[src].add(table)
+                indegree[table] += 1
+
+    # Sort the zero-indegree frontier for deterministic output.
+    ready: deque[str] = deque(sorted(t for t in affected_tables if indegree[t] == 0))
+    order: list[str] = []
+    while ready:
+        node = ready.popleft()
+        order.append(node)
+        for consumer in sorted(successors[node]):
+            indegree[consumer] -= 1
+            if indegree[consumer] == 0:
+                ready.append(consumer)
+
+    if len(order) != len(affected_tables):
+        remaining = [t for t in affected_tables if t not in set(order)]
+        logger.warning(
+            "Cycle detected among %d affected tables; appending in input order: %s",
+            len(remaining),
+            remaining,
+        )
+        order.extend(remaining)
+        return order, True
+
+    return order, False
 
 
 def _record_tool_call(tool_name: str, duration_ms: float, success: bool = True) -> None:
@@ -166,6 +367,7 @@ def _timed_tool(tool_name: str):
     """
 
     def decorator(func):
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             start_time = time.time()
             try:
@@ -273,15 +475,21 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
 
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
-def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
+def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
     """Trace upstream lineage of a column.
 
-    Traverses COLUMN_LINEAGE edges backward up to max_depth levels.
+    Traverses COLUMN_LINEAGE edges backward. When max_depth is None, computes
+    the full transitive closure. When max_depth is an integer, stops at that depth.
+
+    Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
+    lineage lookups. Column references must include both the table and column names.
 
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
-        max_depth: Maximum number of hops to traverse
+                   or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         LineageResult with list of upstream column nodes
@@ -290,58 +498,74 @@ def trace_column_lineage(table_col: str, max_depth: int = 5) -> LineageResult:
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    lineage: list[LineageNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        lineage: list[LineageNode] = []
+        edges: list[tuple[str, str, str]] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or (max_depth is not None and depth > max_depth):
+                continue
 
-        visited.add(current_id)
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                break
 
-        # Query for upstream columns (reverse direction)
-        rows = db.run_read(
-            TRACE_COLUMN_LINEAGE_QUERY,
-            {"id": current_id},
-        )
+            visited.add(current_id)
 
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                lineage.append(
-                    LineageNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                        file=None,
-                        confidence=None,
-                    )
-                )
-                queue.append((node_id, depth + 1))
+            # Query for upstream columns (reverse direction)
+            rows = db.run_read(
+                TRACE_COLUMN_LINEAGE_QUERY,
+                {"id": current_id},
+            )
 
-    # Populate hint if result is empty
-    hint = None
-    if not lineage:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
+            for row in rows:
+                node_id = row["id"]
+                edges.append((node_id, current_id, row.get("transform") or "SELECT"))
+                if node_id not in visited:
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        lineage.append(
+                            LineageNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                                table=row.get("table_qualified"),
+                                file=None,
+                                confidence=row.get("confidence"),
+                            )
+                        )
+                    queue.append((node_id, depth + 1))
 
-    return LineageResult(column=table_col, lineage=lineage, hint=hint)
+        mermaid = _build_mermaid(col_id, edges) if edges else None
+
+        # Populate hint if result is empty (Step 4.1)
+        hint = None
+        if not lineage:
+            hint = (
+                "No lineage found. Ensure the column reference includes the schema prefix "
+                "(e.g., ba.table_name.column_name). Check that 'sqlcg db info' shows "
+                "SqlColumn > 0. If SqlColumn is 0, column lineage was not extracted — "
+                "check parse errors. Submit feedback with submit_feedback tool if this "
+                "was a false negative."
+            )
+
+        return LineageResult(column=table_col, lineage=lineage, mermaid=mermaid, hint=hint)
 
 
 @mcp.tool()
@@ -352,7 +576,7 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     Searches for SELECTS_FROM relationships pointing to the table.
 
     Args:
-        table_name: Table name to search for
+        table_name: Table name to search for (e.g. "ba.table_name")
 
     Returns:
         TableUsageResult with list of queries using this table
@@ -360,47 +584,409 @@ def find_table_usages(table_name: str) -> TableUsageResult:
     Raises:
         NotIndexedError: If no repos have been indexed
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    rows = db.run_read(
-        FIND_TABLE_USAGES_QUERY,
-        {"name": table_name},
-    )
+        # Step 1.4: Lowercase the input to match lowercased SqlTable.name (C2)
+        rows = db.run_read(
+            FIND_TABLE_USAGES_QUERY,
+            {"name": table_name.lower()},
+        )
 
-    usages: list[TableUsage] = []
-    for row in rows:
-        usages.append(
-            TableUsage(
-                query_file=row["file"],
-                sql=row.get("sql"),
-                kind=row.get("kind"),
+        usages: list[TableUsage] = []
+        for row in rows:
+            usages.append(
+                TableUsage(
+                    query_file=row["file"],
+                    sql=row.get("sql"),
+                    kind=row.get("kind"),
+                )
             )
+
+        # Populate hint if result is empty
+        hint = None
+        if not usages:
+            hint = (
+                "No usages found for this table. The table may not be referenced by any "
+                "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
+                "Run 'analyze impact <table>' from the CLI to cross-check."
+            )
+
+        return TableUsageResult(table=table_name, usages=usages, hint=hint)
+
+
+@mcp.tool()
+@_timed_tool("find_definition")
+def find_definition(table_qualified: str) -> DefinitionResult:
+    """Find where a table is authoritatively defined.
+
+    Returns every file that defines the table via a DEFINED_IN edge. Backup
+    snapshots (e.g. ``*_bck``) are still returned but flagged ``is_backup=True``
+    and listed in ``noise_excluded`` so the LLM can see them without being misled
+    into treating a backup as the source of truth.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        DefinitionResult listing definition files, duplicate-DDL flag, and noise.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+
+        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": table_qualified.lower()})
+        noise_filter = NoiseFilter.from_config()
+
+        duplicate_ddl = len(rows) > 1
+        definitions: list[DefinitionFile] = []
+        noise_excluded: list[str] = []
+        for row in rows:
+            is_backup = noise_filter.is_noise(row["table_qualified"])
+            definitions.append(
+                DefinitionFile(
+                    file_path=row["file_path"],
+                    kind=row.get("kind"),
+                    is_backup=is_backup,
+                    is_authoritative=(not is_backup and not duplicate_ddl),
+                )
+            )
+            if is_backup:
+                noise_excluded.append(row["file_path"])
+
+        hint = None
+        if not definitions:
+            hint = (
+                "No definition found. The table may not be indexed, or it is created "
+                "dynamically (e.g. CREATE TABLE AS in a scripting block that did not parse). "
+                "Confirm the qualified name (schema.table) and that the defining DDL file "
+                "was indexed."
+            )
+
+        return DefinitionResult(
+            table_qualified=table_qualified,
+            definitions=definitions,
+            duplicate_ddl=duplicate_ddl,
+            noise_excluded=noise_excluded,
+            hint=hint,
         )
 
-    # Populate hint if result is empty
-    hint = None
-    if not usages:
-        hint = (
-            "No usages found for this table. The table may not be referenced by any "
-            "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
-            "Run 'analyze impact <table>' from the CLI to cross-check."
+
+@mcp.tool()
+@_timed_tool("get_change_scope")
+def get_change_scope(table_qualified: str) -> ChangeScopeResult:
+    """Return the minimal reading set and risk for changing a table.
+
+    Bundles, in one call: the defining file(s), direct upstream input tables,
+    the full-depth downstream blast radius (column-precise, rolled up to tables),
+    and a coarse risk label. Backup/noise tables are excluded from the blast
+    radius and reported in ``noise_excluded``.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        ChangeScopeResult with defining files, upstreams, affected columns/tables,
+        and risk label.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    target = table_qualified.lower()
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
+        defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
+
+        up_rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": target})
+        upstream_raw = _dedup_preserve_order(
+            [r["upstream_table"] for r in up_rows if r["upstream_table"]]
+        )
+        upstream_tables, _ = noise_filter.filter_nodes(upstream_raw)
+
+        col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": target})
+        start_cols = [r["col_id"] for r in col_rows]
+        affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
+
+        affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        kept_tables = set(affected_tables)
+        affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
+
+        n = len(affected_tables)
+        risk = Judgement(
+            assertion_type="heuristic",
+            label=_risk_label(n),
+            confidence=0.6,
+            reason=(
+                f"{n} downstream dependent table(s); thresholds safe=0/low<=5/medium<=20/high>20"
+            ),
         )
 
-    return TableUsageResult(table=table_name, usages=usages, hint=hint)
+        hint = None
+        if not defining_files and not affected_tables and not upstream_tables:
+            hint = (
+                "No scope found for this table. Confirm the qualified name (schema.table) "
+                "and that the defining/consuming SQL files were indexed."
+            )
+
+        return ChangeScopeResult(
+            target=table_qualified,
+            defining_files=defining_files,
+            upstream_tables=upstream_tables,
+            affected_columns=affected_columns,
+            affected_tables=affected_tables,
+            downstream_count=n,
+            risk=risk,
+            noise_excluded=noise_excluded,
+            truncated=truncated,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("get_backfill_order")
+def get_backfill_order(table_qualified: str) -> BackfillOrderResult:
+    """Return the topological rebuild order for a table's downstream blast radius.
+
+    Computes the full-depth downstream affected table set (noise-filtered) and
+    orders it so that producers are rebuilt before consumers. If a dependency
+    cycle is present the order degrades gracefully (acyclic prefix first, cyclic
+    remainder appended) and ``hint`` reports the cycle.
+
+    Args:
+        table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        BackfillOrderResult with the rebuild order and column-precise blast radius.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    target = table_qualified.lower()
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": target})
+        start_cols = [r["col_id"] for r in col_rows]
+        affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
+
+        affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        kept_tables = set(affected_tables)
+        affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
+
+        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+
+        hint = None
+        if had_cycle:
+            hint = (
+                "Dependency cycle detected among affected tables; backfill order is "
+                "approximate (cyclic tables appended in input order)."
+            )
+        elif not order:
+            hint = "No downstream consumers — nothing to backfill."
+
+        return BackfillOrderResult(
+            target=table_qualified,
+            backfill_order=order,
+            affected_columns=affected_columns,
+            noise_excluded=noise_excluded,
+            truncated=truncated,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("diff_impact")
+def diff_impact(changed_files: list[str]) -> DiffImpactResult:
+    """Return the union downstream blast radius for a set of changed files.
+
+    The CI / agent integration point: given the file paths that changed, resolve
+    the tables defined in them, compute each table's full-depth downstream blast
+    radius, union and noise-filter the result, flag presentation-facing tables
+    (config-driven prefixes), and return a topological rebuild order.
+
+    Args:
+        changed_files: SQL file paths that changed (must match indexed File.path)
+
+    Returns:
+        DiffImpactResult with changed tables, union blast radius, presentation
+        subset, and rebuild order.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+        prefixes = get_presentation_prefixes(Path.cwd())
+
+        changed_tables: list[str] = []
+        seen_changed: set[str] = set()
+        for file_path in changed_files:
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": file_path})
+            for row in rows:
+                tq = row["table_qualified"]
+                if tq not in seen_changed:
+                    seen_changed.add(tq)
+                    changed_tables.append(tq)
+
+        all_affected_cols: list[str] = []
+        affected_seen: set[str] = set()
+        truncated = False
+        for tq in changed_tables:
+            col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": tq})
+            start_cols = [r["col_id"] for r in col_rows]
+            cols, _depth, tr = _affected_columns_closure(db, start_cols, max_depth=None)
+            truncated = truncated or tr
+            for col in cols:
+                if col not in affected_seen:
+                    affected_seen.add(col)
+                    all_affected_cols.append(col)
+
+        affected_tables_all = [
+            t for t in _rollup_to_tables(all_affected_cols) if t not in seen_changed
+        ]
+        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]
+        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+
+        hint = None
+        if not changed_tables:
+            hint = (
+                "No tables are defined in the given files. Confirm the paths match indexed "
+                "File.path values (absolute paths as stored by the indexer)."
+            )
+        elif had_cycle:
+            hint = (
+                "Dependency cycle detected among affected tables; backfill order is "
+                "approximate (cyclic tables appended in input order)."
+            )
+
+        return DiffImpactResult(
+            changed_files=changed_files,
+            changed_tables=changed_tables,
+            affected_tables=affected_tables,
+            presentation_facing=presentation_facing,
+            backfill_order=order,
+            noise_excluded=noise_excluded,
+            truncated=truncated,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("scope_change")
+def scope_change(target: str) -> ScopeChangeResult:
+    """One-call synthesis of everything an LLM needs before changing a table.
+
+    Delegates to the already-implemented anchor tools — find_definition,
+    get_change_scope, get_backfill_order — and assembles their results into a
+    single response. No query logic is reimplemented here. Each delegate call is
+    isolated: a failure in one is logged and surfaced in ``hint`` without
+    blanking the rest of the response.
+
+    Args:
+        target: Qualified table name being changed (e.g. "ba.wtfe_verkoopinfo")
+
+    Returns:
+        ScopeChangeResult bundling authoritative files, upstream inputs,
+        downstream blast radius (table + column precise), rebuild order, and risk.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    authoritative_files: list[str] = []
+    upstream_inputs: list[str] = []
+    downstream_blast_radius: list[str] = []
+    affected_columns: list[str] = []
+    backfill_order: list[str] = []
+    downstream_count = 0
+    risk: Judgement = Judgement(
+        assertion_type="heuristic",
+        label="safe",
+        confidence=0.6,
+        reason="0 downstream dependent table(s); thresholds safe=0/low<=5/medium<=20/high>20",
+    )
+    noise_excluded: list[str] = []
+    truncated = False
+    hints: list[str] = []
+
+    try:
+        definition = find_definition(target)
+        authoritative_files = [d.file_path for d in definition.definitions if d.is_authoritative]
+        noise_excluded.extend(definition.noise_excluded)
+        if definition.hint:
+            hints.append(definition.hint)
+    except Exception as exc:
+        logger.warning("scope_change: find_definition(%s) failed: %s", target, exc)
+        hints.append(f"find_definition failed: {exc}")
+
+    try:
+        scope = get_change_scope(target)
+        upstream_inputs = scope.upstream_tables
+        downstream_blast_radius = scope.affected_tables
+        affected_columns = scope.affected_columns
+        downstream_count = scope.downstream_count
+        risk = scope.risk
+        noise_excluded.extend(scope.noise_excluded)
+        truncated = truncated or scope.truncated
+        if scope.hint:
+            hints.append(scope.hint)
+    except Exception as exc:
+        logger.warning("scope_change: get_change_scope(%s) failed: %s", target, exc)
+        hints.append(f"get_change_scope failed: {exc}")
+
+    try:
+        backfill = get_backfill_order(target)
+        backfill_order = backfill.backfill_order
+        noise_excluded.extend(backfill.noise_excluded)
+        truncated = truncated or backfill.truncated
+        if backfill.hint:
+            hints.append(backfill.hint)
+    except Exception as exc:
+        logger.warning("scope_change: get_backfill_order(%s) failed: %s", target, exc)
+        hints.append(f"get_backfill_order failed: {exc}")
+
+    noise_excluded = _dedup_preserve_order(noise_excluded)
+    hint = " | ".join(hints) if hints else None
+
+    return ScopeChangeResult(
+        target=target,
+        authoritative_files=authoritative_files,
+        upstream_inputs=upstream_inputs,
+        downstream_blast_radius=downstream_blast_radius,
+        affected_columns=affected_columns,
+        backfill_order=backfill_order,
+        downstream_count=downstream_count,
+        risk=risk,
+        noise_excluded=noise_excluded,
+        truncated=truncated,
+        hint=hint,
+    )
 
 
 @mcp.tool()
 @_timed_tool("get_downstream_dependencies")
-def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+def get_downstream_dependencies(table_col: str, max_depth: int | None = None) -> DependencyResult:
     """Find all downstream dependencies of a column.
 
     Traverses COLUMN_LINEAGE edges forward to find columns that depend on this one.
+    When max_depth is None, computes the full transitive closure. When max_depth is
+    an integer, stops at that depth.
 
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
-        max_depth: Maximum number of hops to traverse
+                   or "catalog.db.table.column" (e.g., "ba.table.column")
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         DependencyResult with list of downstream column nodes
@@ -409,69 +995,103 @@ def get_downstream_dependencies(table_col: str, max_depth: int = 5) -> Dependenc
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    nodes: list[DependencyNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        nodes: list[DependencyNode] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
+        depth_reached = 0
+        truncated = False
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or (max_depth is not None and depth > max_depth):
+                continue
 
-        visited.add(current_id)
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                truncated = True
+                break
 
-        # Query for downstream columns (forward direction)
-        rows = db.run_read(
-            GET_DOWNSTREAM_DEPENDENCIES_QUERY,
-            {"id": current_id},
+            visited.add(current_id)
+            depth_reached = max(depth_reached, depth)
+
+            # Query for downstream columns (forward direction)
+            rows = db.run_read(
+                GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+                {"id": current_id},
+            )
+
+            for row in rows:
+                node_id = row["id"]
+                next_depth = depth + 1
+                if node_id not in visited and (max_depth is None or next_depth <= max_depth):
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        nodes.append(
+                            DependencyNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                                table=row.get("table_qualified"),
+                            )
+                        )
+                    queue.append((node_id, next_depth))
+                elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                    truncated = True
+
+        # Populate hint if result is empty (Step 4.2)
+        hint = None
+        if not nodes:
+            hint = (
+                "No downstream consumers found — this column may be a terminal output. "
+                "If you expected consumers, confirm the consuming files were indexed "
+                "and that the column reference includes the schema prefix "
+                "(e.g., ba.table_name.column_name)."
+            )
+
+        if truncated and max_depth is None:
+            hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
+
+        return DependencyResult(
+            root=table_col,
+            nodes=nodes,
+            truncated=truncated,
+            depth_reached=depth_reached,
+            hint=hint,
         )
-
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                nodes.append(
-                    DependencyNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                    )
-                )
-                queue.append((node_id, depth + 1))
-
-    # Populate hint if result is empty
-    hint = None
-    if not nodes:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
-
-    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
 @_timed_tool("get_upstream_dependencies")
-def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyResult:
+def get_upstream_dependencies(table_col: str, max_depth: int | None = None) -> DependencyResult:
     """Find all upstream dependencies of a column.
 
     Traverses COLUMN_LINEAGE edges backward to find columns this one depends on.
+    When max_depth is None, computes the full transitive closure. When max_depth is
+    an integer, stops at that depth.
+
+    Require schema-qualified input (e.g., ba.table_name.column_name) for accurate
+    lookups.
 
     Args:
         table_col: Column reference in format "table.column"
-                   or "catalog.db.table.column"
-        max_depth: Maximum number of hops to traverse
+                   or "catalog.db.table.column" (e.g., "ba.table_name.column_name")
+        max_depth: Maximum number of hops to traverse. If None, computes full closure.
+                   Safety cap: stops at 50,000 nodes to prevent pathological graphs from
+                   hanging the server.
 
     Returns:
         DependencyResult with list of upstream column nodes
@@ -480,56 +1100,84 @@ def get_upstream_dependencies(table_col: str, max_depth: int = 5) -> DependencyR
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
-    db = _get_backend()
-    _assert_indexed(db)
+    with _open_backend() as db:
+        _assert_indexed(db)
 
-    try:
-        table_id, col_name = _parse_column_ref(table_col)
-    except InvalidColumnRefError:
-        raise
+        try:
+            table_id, col_name = _parse_column_ref(table_col)
+        except InvalidColumnRefError:
+            raise
 
-    # Construct the full column id
-    col_id = f"{table_id}.{col_name}"
+        # Construct the full column id
+        col_id = f"{table_id}.{col_name}"
 
-    nodes: list[DependencyNode] = []
-    visited: set[str] = set()
-    queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        nodes: list[DependencyNode] = []
+        visited: set[str] = set()
+        emitted: set[str] = set()  # Step 3.1: track emitted nodes to prevent duplicates
+        queue: deque[tuple[str, int]] = deque([(col_id, 0)])
+        max_nodes = 50000
+        depth_reached = 0
+        truncated = False
 
-    while queue:
-        current_id, depth = queue.popleft()
+        while queue:
+            current_id, depth = queue.popleft()
 
-        if current_id in visited or depth > max_depth:
-            continue
+            if current_id in visited or (max_depth is not None and depth > max_depth):
+                continue
 
-        visited.add(current_id)
+            # Safety cap: stop if we've visited too many nodes
+            if len(visited) >= max_nodes:
+                truncated = True
+                break
 
-        # Query for upstream columns (reverse direction)
-        rows = db.run_read(
-            GET_UPSTREAM_DEPENDENCIES_QUERY,
-            {"id": current_id},
+            visited.add(current_id)
+            depth_reached = max(depth_reached, depth)
+
+            # Query for upstream columns (reverse direction)
+            rows = db.run_read(
+                GET_UPSTREAM_DEPENDENCIES_QUERY,
+                {"id": current_id},
+            )
+
+            for row in rows:
+                node_id = row["id"]
+                next_depth = depth + 1
+                if node_id not in visited and (max_depth is None or next_depth <= max_depth):
+                    # Step 3.1: only emit each node_id once
+                    if node_id not in emitted:
+                        emitted.add(node_id)
+                        nodes.append(
+                            DependencyNode(
+                                name=row.get("col_name", ""),
+                                kind="column",
+                                table=row.get("table_qualified"),
+                            )
+                        )
+                    queue.append((node_id, next_depth))
+                elif node_id not in visited and max_depth is not None and next_depth > max_depth:
+                    truncated = True
+
+        # Populate hint if result is empty (Step 4.1)
+        hint = None
+        if not nodes:
+            hint = (
+                "No lineage found. Ensure the column reference includes the schema "
+                "prefix (e.g., ba.table_name.column_name). Check that 'sqlcg db info' "
+                "shows SqlColumn > 0. If SqlColumn is 0, column lineage was not "
+                "extracted — check parse errors. Submit feedback with "
+                "submit_feedback tool if this was a false negative."
+            )
+
+        if truncated and max_depth is None:
+            hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
+
+        return DependencyResult(
+            root=table_col,
+            nodes=nodes,
+            truncated=truncated,
+            depth_reached=depth_reached,
+            hint=hint,
         )
-
-        for row in rows:
-            node_id = row["id"]
-            if node_id not in visited:
-                nodes.append(
-                    DependencyNode(
-                        name=row.get("col_name", ""),
-                        kind="column",
-                    )
-                )
-                queue.append((node_id, depth + 1))
-
-    # Populate hint if result is empty
-    hint = None
-    if not nodes:
-        hint = (
-            "No lineage found. Check that 'sqlcg db info' shows SqlColumn > 0. "
-            "If SqlColumn is 0, column lineage was not extracted — check parse errors. "
-            "Submit feedback with submit_feedback tool if this was a false negative."
-        )
-
-    return DependencyResult(root=table_col, nodes=nodes, hint=hint)
 
 
 @mcp.tool()
@@ -642,14 +1290,11 @@ def db_info() -> DbInfoResult:
         result = db.run_read(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
         node_counts[str(label)] = result[0]["count"] if result else 0
 
-    edges_result = db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {}
-    )
+    edges_result = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {})
     column_lineage_edges = edges_result[0]["count"] if edges_result else 0
 
     mode_rows = db.run_read(
-        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
-        " COUNT(q) AS cnt ORDER BY cnt DESC",
+        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC",
         {},
     )
     parse_quality: dict[str, int] = {}
@@ -658,13 +1303,9 @@ def db_info() -> DbInfoResult:
 
     warnings: list[str] = []
     if node_counts.get("Repo", 0) == 0:
-        warnings.append(
-            "Database is empty. Run 'sqlcg db init' then 'sqlcg index <path>'."
-        )
+        warnings.append("Database is empty. Run 'sqlcg db init' then 'sqlcg index <path>'.")
     elif node_counts.get("SqlQuery", 0) == 0:
-        warnings.append(
-            "No queries indexed. Run 'sqlcg index <path>' to populate the graph."
-        )
+        warnings.append("No queries indexed. Run 'sqlcg index <path>' to populate the graph.")
     elif node_counts.get("SqlColumn", 0) == 0:
         warnings.append(
             "SqlColumn count is 0 — column lineage was not extracted. "
@@ -794,3 +1435,118 @@ def submit_feedback(
             return {"status": "skipped"}
     else:
         return {"status": "skipped"}
+
+
+@mcp.tool()
+@_timed_tool("analyze_unused")
+def analyze_unused() -> UnusedTablesResult:
+    """Find tables with no within-corpus consumers (dead-code candidates).
+
+    Identifies SqlTable nodes that no SqlQuery selects from (zero SELECTS_FROM
+    incoming edges). Each candidate carries a heuristic dead_code Judgement
+    (confidence=0.5) because the table may be consumed externally — by BI tools,
+    an API layer, or COPY INTO statements — which are invisible to the corpus.
+
+    Backup/noise tables are excluded via NoiseFilter so snapshot tables do not
+    pollute the results.
+
+    Returns:
+        UnusedTablesResult with the dead-code candidate list and total table count.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        # Single aggregation — no Python per-row graph traversal.
+        unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
+        total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+        total_tables_scanned = total_rows[0]["n"] if total_rows else 0
+
+        candidates: list[UnusedCandidate] = []
+        for row in unused_rows:
+            tq = row["table_qualified"]
+            if noise_filter.is_noise(tq):
+                continue
+            candidates.append(
+                UnusedCandidate(
+                    table_qualified=tq,
+                    within_corpus_references=0,
+                    dead_code=Judgement(
+                        assertion_type="heuristic",
+                        label="dead_code_candidate",
+                        confidence=0.5,
+                        reason=(
+                            "zero within-corpus SELECTS_FROM references; "
+                            "may be consumed externally (BI, API, COPY INTO)"
+                        ),
+                    ),
+                )
+            )
+
+        hint = None
+        if not candidates:
+            hint = (
+                "No unused-table candidates found. All indexed tables have at least one "
+                "within-corpus consumer, or the graph is empty."
+            )
+
+        return UnusedTablesResult(
+            candidates=candidates,
+            total_tables_scanned=total_tables_scanned,
+            hint=hint,
+        )
+
+
+@mcp.tool()
+@_timed_tool("get_hub_ranking")
+def get_hub_ranking(k: int = 10) -> HubRankingResult:
+    """Return the top-k tables by downstream dependent count (hub/centrality ranking).
+
+    Counts, for each table, the number of DISTINCT consuming tables whose SqlQuery
+    selects from it. All fields are deterministic graph facts — no heuristic
+    Judgement is attached. Re-ranks after noise filtering so rank is contiguous.
+
+    Backup/noise tables are excluded via NoiseFilter.
+
+    Args:
+        k: Maximum number of results to return (default 10).
+
+    Returns:
+        HubRankingResult with the top-k ranked entries.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        noise_filter = NoiseFilter.from_config()
+
+        # Single aggregation — no Python per-row graph calls.
+        rows = db.run_read(HUB_RANKING_QUERY, {"k": k})
+
+        top: list[HubEntry] = []
+        rank = 1
+        for row in rows:
+            tq = row["table_qualified"]
+            if noise_filter.is_noise(tq):
+                continue
+            top.append(
+                HubEntry(
+                    table_qualified=tq,
+                    downstream_dependents=int(row["downstream_dependents"]),
+                    rank=rank,
+                )
+            )
+            rank += 1
+
+        hint = None
+        if not top:
+            hint = (
+                "No hub candidates found. Either no tables have downstream consumers, "
+                "or all candidates were excluded by the noise filter."
+            )
+
+        return HubRankingResult(top=top, k=k, hint=hint)

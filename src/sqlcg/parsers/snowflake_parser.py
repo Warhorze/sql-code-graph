@@ -37,24 +37,38 @@ class SnowflakeParser(AnsiParser):
     - Colon-qualified identifiers (Gap 1)
     - LATERAL FLATTEN operations (Gap 2)
     - Dynamic identifiers (Gap 3)
+    - WITH TAG clause stripping (Gap 4)
+    - ALTER ... SET TAG statement stripping (Gap 4b)
     """
 
     DIALECT: str | None = "snowflake"
 
-    def __init__(self, schema_resolver: SchemaResolver):
+    def __init__(
+        self,
+        schema_resolver: SchemaResolver,
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize Snowflake parser.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional table alias map (bare lowercase name → canonical name)
         """
-        super().__init__(schema_resolver)
+        super().__init__(schema_resolver, schema_aliases=schema_aliases)
 
-    def parse_file(self, path: Path, sql: str) -> ParsedFile:
+    def parse_file(
+        self,
+        path: Path,
+        sql: str,
+        dependency_filter: set[str] | None = None,
+    ) -> ParsedFile:
         """Parse Snowflake SQL file with scripting block detection.
 
         Args:
             path: Path to the source file
             sql: SQL text to parse
+            dependency_filter: optional set of lowercased table names to filter cross-file sources
+                (passed to AnsiParser.parse_file; see that method for full documentation)
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -64,11 +78,11 @@ class SnowflakeParser(AnsiParser):
 
         # Check for scripting blocks
         if self._has_scripting_block(sql):
-            logger.info("Snowflake scripting block detected in %s, using DML extraction", path)
+            logger.debug("Snowflake scripting block detected in %s, using DML extraction", path)
             return self._parse_scripting_file(path, sql)
 
         # Otherwise use standard ANSI parsing with Snowflake dialect
-        return AnsiParser.parse_file(self, path, sql)  # type: ignore
+        return AnsiParser.parse_file(self, path, sql, dependency_filter=dependency_filter)  # type: ignore
 
     @staticmethod
     def _preprocess_snowflake_sql(sql: str) -> str:
@@ -77,6 +91,8 @@ class SnowflakeParser(AnsiParser):
         Handles:
         1. Gap 1: Normalise CREATE TEMP TABLE t IF NOT EXISTS to CREATE TEMPORARY TABLE t
         2. Gap 3: Strip UNPIVOT clauses (destructive but acceptable for partial lineage extraction)
+        3. Gap 4: Strip WITH TAG (...) clauses from column definitions
+        4. Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements
 
         Args:
             sql: Raw Snowflake SQL text
@@ -105,6 +121,37 @@ class SnowflakeParser(AnsiParser):
                 "",
                 sql,
                 flags=re.IGNORECASE,
+            )
+
+        # Gap 4: Strip "WITH TAG (...)" clauses from column definitions in
+        # CREATE [OR REPLACE] [DYNAMIC] TABLE statements. sqlglot's Snowflake
+        # dialect does not parse this clause and stalls past the 30s timeout
+        # on real DWH dynamic-table DDL. Stripping the clause loses only the
+        # tag metadata (we do not model it) and unblocks parsing of the AS
+        # SELECT body for column lineage.
+        #
+        # WITH TAG may contain up to two levels of nested parens, e.g.
+        #   WITH TAG (SCHEMA."tag_name"='value', other='v2')
+        # A column may carry multiple WITH TAG clauses (chained). Strip each
+        # occurrence independently; do not touch COMMENT or WITH MASKING
+        # POLICY clauses, which sqlglot already handles.
+        if "WITH TAG" in sql.upper():
+            sql = re.sub(
+                r"\s+WITH\s+TAG\s*\((?:[^()]*|\([^()]*\))*\)",
+                "",
+                sql,
+                flags=re.IGNORECASE,
+            )
+
+        # Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements.
+        # sqlglot emits these as exp.Command (unsupported syntax). They only carry tag
+        # metadata we don't model, so removing them is safe and cleans the error stream.
+        if "SET TAG" in sql.upper():
+            sql = re.sub(
+                r"ALTER\s+(?:DYNAMIC\s+)?(?:TABLE|VIEW)\s+[^;]*?MODIFY\s+COLUMN[^;]*?SET\s+TAG[^;]*?;",
+                "",
+                sql,
+                flags=re.IGNORECASE | re.DOTALL,
             )
 
         return sql
@@ -183,13 +230,14 @@ class SnowflakeParser(AnsiParser):
 
         Returns:
             ParsedFile with extracted DML statements
+
+        Note:
+            dependency_filter is not applied here — DML extraction bypasses sources_map seeding;
+            full xfile_sources used intentionally.
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
-
-        # Compute schema sources once per file
-        schema_sources = self._schema.as_sources_dict() if self._schema else {}
 
         # Initialize sources_map for temp table resolution.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
@@ -221,7 +269,6 @@ class SnowflakeParser(AnsiParser):
                             stmt_index,
                             out,
                             sources_map,
-                            schema_sources=schema_sources,
                         )
                         # Mark as parse_failed since we're in scripting mode
                         query_node.parse_failed = True
@@ -248,7 +295,7 @@ class SnowflakeParser(AnsiParser):
                         out.referenced_tables.extend(query_node.sources)
 
                     except Exception as exc:
-                        logger.warning(
+                        logger.debug(
                             "Failed to process extracted DML statement %d in %s: %s",
                             stmt_index,
                             path,
@@ -258,7 +305,7 @@ class SnowflakeParser(AnsiParser):
                         stmt_index += 1
 
             except Exception as exc:
-                logger.warning("Failed to parse extracted DML from %s: %s", path, exc)
+                logger.debug("Failed to parse extracted DML from %s: %s", path, exc)
                 out.errors.append(f"dml_extraction_error:{exc}")
 
         return out

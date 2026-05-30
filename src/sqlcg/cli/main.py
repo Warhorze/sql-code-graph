@@ -11,8 +11,8 @@ from sqlcg.cli.commands import (
     git,
     index,
     install,
-    load_schema,
     mcp,
+    reindex,
     report,
     uninstall,
     watch,
@@ -24,6 +24,12 @@ QUICK START:
   1. sqlcg db init
   2. sqlcg index <path> --dialect snowflake
   3. sqlcg git install-hooks
+  4. sqlcg install --scope project   # also provisions a Claude skill (SKILL.md)
+
+USING THE MCP TOOLS:
+  Read `sqlcg mcp best-practices` first — it explains the fact/heuristic
+  boundary so heuristic output (dead-code, risk) is never reported as fact.
+  See `sqlcg mcp --help` for all MCP commands.
 
 Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 """
@@ -39,7 +45,7 @@ app.add_typer(git.app, name="git")
 
 # Register single commands
 app.command("index")(index.index_cmd)
-app.command("load-schema")(load_schema.load_schema_cmd)
+app.command("reindex")(reindex.reindex_cmd)
 app.command("watch")(watch.watch_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)

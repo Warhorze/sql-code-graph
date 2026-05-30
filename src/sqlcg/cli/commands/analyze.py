@@ -68,6 +68,30 @@ def impact(  # noqa: B008
         _print_table(results, ["id", "kind"])
 
 
+@app.command("failures")
+def failures(
+    cause: str | None = typer.Option(  # noqa: B008
+        None, "--cause", help="Filter by E-code bucket (e.g. E5, timeout)"
+    ),
+    limit: int = typer.Option(100, "--limit", help="Maximum rows to return"),  # noqa: B008
+) -> None:
+    """List files that failed to parse, with their dominant cause (E-code bucket).
+
+    Requires a graph indexed with sqlcg >= v3 (schema version 3). Re-index
+    with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
+    an earlier version.
+    """
+    with get_backend() as backend:
+        cypher = (
+            f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
+            "AND ($cause IS NULL OR f.parse_cause = $cause) "
+            "RETURN f.path AS path, f.parse_cause AS cause "
+            f"ORDER BY f.parse_cause LIMIT {limit}"
+        )
+        rows = backend.run_read(cypher, {"cause": cause})
+        _print_table(rows, ["path", "cause"])
+
+
 @app.command("unused")
 def unused(
     threshold: int = typer.Option(0, "--threshold", help="Minimum reference count threshold"),

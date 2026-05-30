@@ -42,22 +42,6 @@ def test_index_synthetic_fixtures(tmp_path, monkeypatch):
     assert "Indexed" in result.output
 
 
-def test_index_schema_from_info_schema_exits_nonzero_on_missing_csv(tmp_path, monkeypatch):
-    """--schema-from-info-schema exits non-zero when the CSV file does not exist."""
-    monkeypatch.setenv("SQLCG_DB_PATH", str(tmp_path / "test.db"))
-
-    fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
-    if not fixtures_path.exists():
-        pytest.skip("Synthetic fixtures not found")
-
-    runner.invoke(app, ["db", "init"])
-    result = runner.invoke(
-        app,
-        ["index", str(fixtures_path), "--schema-from-info-schema", str(tmp_path / "missing.csv")],
-    )
-    assert result.exit_code != 0
-
-
 def test_find_table_after_index(tmp_path, monkeypatch):
     """Test finding tables after indexing."""
     monkeypatch.setenv("SQLCG_DB_PATH", str(tmp_path / "test.db"))
@@ -155,8 +139,6 @@ def test_index_with_batch_size_flag(tmp_path, monkeypatch):
 
     # Reset and test with explicit batch size
     runner.invoke(app, ["db", "reset"])
-    result_custom = runner.invoke(
-        app, ["index", str(fixtures_path), "--batch-size", "7"]
-    )
+    result_custom = runner.invoke(app, ["index", str(fixtures_path), "--batch-size", "7"])
     assert result_custom.exit_code == 0
     assert "Indexed" in result_custom.output

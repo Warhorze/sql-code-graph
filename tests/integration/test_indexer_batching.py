@@ -36,53 +36,34 @@ def test_batch_size_equivalence_1_vs_50(tmp_path):
     # Index with batch_size=1
     db1 = KuzuBackend(":memory:")
     db1.init_schema()
-    summary1 = Indexer().index_repo(
-        corpus_path, "snowflake", db1, use_git=False, batch_size=1
-    )
+    summary1 = Indexer().index_repo(corpus_path, "snowflake", db1, use_git=False, batch_size=1)
 
     state1 = {
         "tables": sorted(
-            r["q"]
-            for r in db1.run_read(
-                "MATCH (t:SqlTable) RETURN t.qualified AS q", {}
-            )
+            r["q"] for r in db1.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {})
         ),
-        "edges": db1.run_read(
-            "MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {}
-        )[0]["n"],
-        "columns": db1.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0][
-            "n"
-        ],
+        "edges": db1.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"],
+        "columns": db1.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"],
     }
     db1.close()
 
     # Index with batch_size=50
     db50 = KuzuBackend(":memory:")
     db50.init_schema()
-    summary50 = Indexer().index_repo(
-        corpus_path, "snowflake", db50, use_git=False, batch_size=50
-    )
+    summary50 = Indexer().index_repo(corpus_path, "snowflake", db50, use_git=False, batch_size=50)
 
     state50 = {
         "tables": sorted(
-            r["q"]
-            for r in db50.run_read(
-                "MATCH (t:SqlTable) RETURN t.qualified AS q", {}
-            )
+            r["q"] for r in db50.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {})
         ),
-        "edges": db50.run_read(
-            "MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {}
-        )[0]["n"],
-        "columns": db50.run_read(
-            "MATCH (c:SqlColumn) RETURN count(c) AS n", {}
-        )[0]["n"],
+        "edges": db50.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"],
+        "columns": db50.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"],
     }
     db50.close()
 
     # Verify identical graphs
     assert state1 == state50, (
-        f"Graphs differ: batch_size=1 produced {state1}, "
-        f"batch_size=50 produced {state50}"
+        f"Graphs differ: batch_size=1 produced {state1}, batch_size=50 produced {state50}"
     )
     assert summary1["files_parsed"] == summary50["files_parsed"]
     assert summary1["tables_found"] == summary50["tables_found"]
@@ -100,9 +81,7 @@ def test_batch_size_partial_batch_flushed(tmp_path):
 
     db = KuzuBackend(":memory:")
     db.init_schema()
-    summary = Indexer().index_repo(
-        corpus_path, "snowflake", db, use_git=False, batch_size=1000
-    )
+    summary = Indexer().index_repo(corpus_path, "snowflake", db, use_git=False, batch_size=1000)
 
     assert summary["files_parsed"] == 5
     assert summary["tables_found"] >= 5
@@ -147,9 +126,7 @@ def test_batch_size_one_bad_file_does_not_abort_peers(tmp_path, monkeypatch):
     db.init_schema()
 
     # Index normally first
-    summary = Indexer().index_repo(
-        corpus_path, "snowflake", db, use_git=False, batch_size=10
-    )
+    summary = Indexer().index_repo(corpus_path, "snowflake", db, use_git=False, batch_size=10)
 
     # Both files should be indexed
     assert summary["files_parsed"] == 2
@@ -157,14 +134,12 @@ def test_batch_size_one_bad_file_does_not_abort_peers(tmp_path, monkeypatch):
 
     # Verify both views exist in the graph
     tables = db.run_read(
-        "MATCH (t:SqlTable) WHERE t.name IN ['good1', 'good2'] RETURN t.name AS name "
-        "ORDER BY name",
+        "MATCH (t:SqlTable) WHERE t.name IN ['good1', 'good2'] RETURN t.name AS name ORDER BY name",
         {},
     )
     table_names = [r["name"] for r in tables]
     assert set(table_names) == {"good1", "good2"}, (
-        f"Expected both views; got {table_names}. "
-        f"Summary: {summary}"
+        f"Expected both views; got {table_names}. Summary: {summary}"
     )
     db.close()
 

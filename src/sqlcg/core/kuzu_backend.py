@@ -52,19 +52,20 @@ def _find_lock_holder(db_path: str) -> str:
 class KuzuBackend(GraphBackend):
     """KùzuDB implementation of the graph database backend."""
 
-    def __init__(self, db_path: str, buffer_pool_size_mb: int = 0):
+    def __init__(self, db_path: str, buffer_pool_size_mb: int = 0, read_only: bool = False):
         """Initialize KùzuDB backend.
 
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
             buffer_pool_size_mb: Buffer pool size in MB (0 = use KuzuDB default)
+            read_only: Open in read-only mode (allows concurrent indexing)
 
         Raises:
             RuntimeError: If the database is locked or cannot be opened.
         """
         self._db_path = db_path
         try:
-            kwargs = {}
+            kwargs: dict = {"read_only": read_only}
             if buffer_pool_size_mb > 0:
                 kwargs["buffer_pool_size"] = buffer_pool_size_mb * 1024 * 1024
             self._db = kuzu.database.Database(db_path, **kwargs)
@@ -206,6 +207,93 @@ class KuzuBackend(GraphBackend):
             logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
+    def upsert_nodes_bulk(self, label: str, rows: list[dict[str, Any]]) -> None:
+        """Bulk-upsert nodes of one label in a single backend round-trip."""
+        if not rows:
+            return
+        # Validate all property keys across all rows (same guard as upsert_node)
+        for row in rows:
+            self._validate_props(row)
+
+        pk_field = self._pk_field(label)
+        # Determine the property key set from the first row; require homogeneity.
+        keys = list(rows[0].keys())
+        if pk_field not in keys:
+            raise ValueError(
+                f"upsert_nodes_bulk({label}): every row must include primary key '{pk_field}'"
+            )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != set(keys):
+                raise ValueError(
+                    f"upsert_nodes_bulk({label}): row {i} has property keys "
+                    f"{sorted(row.keys())}, expected {sorted(keys)}"
+                )
+
+        set_keys = [k for k in keys if k != pk_field]
+        # UNWIND $rows AS row MERGE (n:Label {pk: row.pk}) SET n.k = row.k, ...
+        query = f"UNWIND $rows AS row MERGE (n:{label} {{{pk_field}: row.{pk_field}}})"
+        if set_keys:
+            set_parts = [f"n.{k} = row.{k}" for k in set_keys]
+            query += f" SET {', '.join(set_parts)}"
+
+        try:
+            self._conn.execute(query, {"rows": rows})
+        except Exception as e:
+            logger.error(f"upsert_nodes_bulk failed: {label} ({len(rows)} rows): {e}")
+            raise
+
+    def upsert_edges_bulk(
+        self,
+        src_label: str,
+        dst_label: str,
+        rel_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple."""
+        if not rows:
+            return
+        for row in rows:
+            # src_key/dst_key are not graph properties; validate the remainder.
+            props = {k: v for k, v in row.items() if k not in ("src_key", "dst_key")}
+            self._validate_props(props)
+
+        src_pk = self._pk_field(src_label)
+        dst_pk = self._pk_field(dst_label)
+
+        keys = list(rows[0].keys())
+        for required in ("src_key", "dst_key"):
+            if required not in keys:
+                raise ValueError(
+                    f"upsert_edges_bulk({src_label}->{rel_type}->{dst_label}): "
+                    f"every row must include '{required}'"
+                )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != set(keys):
+                raise ValueError(
+                    f"upsert_edges_bulk: row {i} has property keys {sorted(row.keys())}, "
+                    f"expected {sorted(keys)}"
+                )
+
+        prop_keys = [k for k in keys if k not in ("src_key", "dst_key")]
+        query = (
+            f"UNWIND $rows AS row "
+            f"MATCH (src:{src_label} {{{src_pk}: row.src_key}}) "
+            f"MATCH (dst:{dst_label} {{{dst_pk}: row.dst_key}}) "
+            f"MERGE (src)-[r:{rel_type}]->(dst)"
+        )
+        if prop_keys:
+            set_parts = [f"r.{k} = row.{k}" for k in prop_keys]
+            query += f" SET {', '.join(set_parts)}"
+
+        try:
+            self._conn.execute(query, {"rows": rows})
+        except Exception as e:
+            logger.error(
+                f"upsert_edges_bulk failed: {src_label}->{rel_type}->{dst_label} "
+                f"({len(rows)} rows): {e}"
+            )
+            raise
+
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute a read-only query and return results."""
         try:
@@ -277,6 +365,38 @@ class KuzuBackend(GraphBackend):
             logger.warning(f"Failed to read schema version: {e}")
             return None
 
+    def set_indexed_sha(self, sha: str) -> None:
+        """Persist the git SHA of the last successful index.
+
+        Uses MERGE so the call is safe whether the SchemaVersion node already
+        exists or not.  Mirrors the init_schema MERGE pattern.
+
+        Args:
+            sha: Git commit SHA string.
+        """
+        try:
+            self._conn.execute(
+                "MERGE (v:SchemaVersion {version: $version}) SET v.indexed_sha = $sha",
+                {"version": SCHEMA_VERSION, "sha": sha},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write indexed_sha: {e}")
+
+    def get_indexed_sha(self) -> str | None:
+        """Retrieve the git SHA of the last successful index.
+
+        Returns:
+            The stored SHA string, or None if never set.
+        """
+        try:
+            result = self.run_read(
+                "MATCH (v:SchemaVersion) RETURN v.indexed_sha AS sha LIMIT 1", {}
+            )
+            return result[0]["sha"] if result else None
+        except Exception as e:
+            logger.warning(f"Failed to read indexed_sha: {e}")
+            return None
+
     def close(self) -> None:
         """Close the database connection."""
         try:
@@ -307,11 +427,16 @@ class KuzuBackend(GraphBackend):
             yield self
             self._conn.execute("COMMIT")
             self._in_transaction = False
-        except Exception:
+        except Exception as exc:
+            self._in_transaction = False
+            if "No active transaction" in str(exc):
+                # KuzuDB killed the transaction internally (e.g. KU_UNREACHABLE assertion
+                # during a bulk write). Individual failures were already logged; the batch
+                # is lost but the indexer can continue.
+                logger.warning("Transaction invalidated by KuzuDB — batch not committed")
+                return
             try:
                 self._conn.execute("ROLLBACK")
-                self._in_transaction = False
             except Exception as rollback_err:
-                logger.error(f"Rollback failed: {rollback_err}")
-                self._in_transaction = False  # defensive reset
+                logger.debug("Rollback skipped: %s", rollback_err)
             raise

@@ -187,29 +187,6 @@ class TestT05ScopeReuse:
         assert len(stmt.sources) > 0
         # scope parameter should have been passed (checked by other test)
 
-    def test_scope_parameter_in_extract_signature(self):
-        """Verify that _extract_column_lineage accepts scope parameter."""
-        import inspect
-
-        from sqlcg.parsers.base import SqlParser
-
-        sig = inspect.signature(SqlParser._extract_column_lineage)
-        param_names = list(sig.parameters.keys())
-
-        # scope parameter should be in signature
-        assert "scope" in param_names
-
-    def test_scope_passed_to_extract_column_lineage(self):
-        """Verify that _extract_column_lineage signature includes scope parameter."""
-        import inspect
-
-        from sqlcg.parsers.base import SqlParser
-
-        # The signature should have scope parameter
-        sig = inspect.signature(SqlParser._extract_column_lineage)
-        param_names = list(sig.parameters.keys())
-        assert "scope" in param_names
-
     def test_build_scope_called_once_per_file(self):
         """Verify that build_scope is called once per statement (not per column)."""
         sql = "SELECT a, b, c, d, e FROM t1;"  # 5 columns
@@ -359,3 +336,114 @@ class TestT04DoParseHook:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestWithTagStripping:
+    """Failing acceptance tests for Fix A — WITH TAG (...) preprocessing.
+
+    All tests in this class MUST FAIL before Fix A is implemented and PASS after.
+    Named test_FixA_* to support pytest -k FixA selection.
+    """
+
+    def test_FixA_AC1_simple_removal(self):
+        """A-AC-1: _preprocess_snowflake_sql removes WITH TAG from a simple column definition."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = (
+            "CREATE OR REPLACE DYNAMIC TABLE foo (\n"
+            '    "Week koppelcode" WITH TAG (IA_DATAPRODUCTS."Semantic role"=\'dimension\')\n'
+            ") TARGET_LAG = '1 hour' AS SELECT 1;"
+        )
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper(), "WITH TAG must be stripped from column definition"
+        assert '"Week koppelcode"' in result, "column name must be preserved"
+        assert "TARGET_LAG" in result, "TARGET_LAG clause must survive"
+        assert "AS SELECT 1" in result, "AS SELECT body must survive"
+
+    def test_FixA_AC2_comment_preserved(self):
+        """A-AC-2: COMMENT clause is preserved when WITH TAG is stripped from the same column."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = (
+            "CREATE OR REPLACE DYNAMIC TABLE foo (\n"
+            "    \"col\" WITH TAG (NS.\"t\"='dim') COMMENT 'desc'\n"
+            ") TARGET_LAG = '1 hour' AS SELECT a FROM src;"
+        )
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper(), "WITH TAG must be stripped"
+        assert "COMMENT 'desc'" in result, "COMMENT clause must be preserved"
+
+    def test_FixA_AC3_chained_tags_both_removed(self):
+        """A-AC-3: Two chained WITH TAG clauses on the same column are both removed in one pass."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = "... \"col\" WITH TAG (a='b') WITH TAG (c='d') COMMENT 'k' ..."
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper(), "both WITH TAG clauses must be removed"
+        assert "COMMENT 'k'" in result, "COMMENT clause must remain after chained strip"
+
+    def test_FixA_AC4_nested_function_value(self):
+        """A-AC-4: WITH TAG containing one level of nested parens is fully removed."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = '... "col" WITH TAG (NS."t"=FUNC(\'x\')) ...'
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper(), "WITH TAG with nested parens must be removed"
+        assert "FUNC" not in result.upper(), "nested function value must be gone with the clause"
+
+    def test_FixA_AC5_no_with_tag_unchanged(self):
+        """A-AC-5: SQL containing no WITH TAG is returned string-equal."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = "SELECT a, b FROM t WHERE c > 0;"
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert result == sql, "SQL with no WITH TAG must be returned unchanged"
+
+    def test_FixA_AC6_wiring_preprocessor_strips_and_parse_produces_create_table(self):
+        """A-AC-6: Two-part wiring test.
+
+        Part 1 (the failing gate before Fix A): _preprocess_snowflake_sql must strip
+        WITH TAG from the SQL. This assertion fails before Fix A is applied.
+
+        Part 2 (smoke-test): parse_file produces a CREATE_TABLE with column lineage.
+        Note: sqlglot can parse small WITH TAG clauses without stalling; the DWH
+        timeout only occurs on the real 368-line files. Part 1 is the meaningful gate.
+        """
+        from pathlib import Path
+
+        from sqlcg.lineage.schema_resolver import SchemaResolver
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        # Use a multi-line string split to keep lines under 100 chars.
+        tag_val = "IA_DATAPRODUCTS.\"Semantic role\"='dimension'"
+        sql = (
+            "CREATE OR REPLACE DYNAMIC TABLE OUT_TBL (\n"
+            f"    \"Week koppelcode\" WITH TAG ({tag_val}) COMMENT 'Week',\n"
+            "    \"Amount\" COMMENT 'amount'\n"
+            ") TARGET_LAG = '1 hour' AS\n"
+            'SELECT a AS "Week koppelcode", b AS "Amount" FROM src;'
+        )
+        # Part 1: preprocessor output — FAILS before Fix A.
+        preprocessed = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in preprocessed.upper(), (
+            "_preprocess_snowflake_sql did not strip WITH TAG — Gap 4 block missing"
+        )
+        assert "COMMENT 'Week'" in preprocessed, "COMMENT clause must survive preprocessing"
+        # Part 2: wiring smoke-test.
+        parser = SnowflakeParser(SchemaResolver())
+        result = parser.parse_file(Path("dyn.sql"), sql)
+        assert len(result.statements) >= 1, "parse must produce at least one statement"
+        stmt = result.statements[0]
+        assert stmt.kind == "CREATE_TABLE", f"expected CREATE_TABLE, got {stmt.kind!r}"
+        assert len(stmt.column_lineage) >= 1, (
+            "AS SELECT body must produce at least one lineage edge"
+        )
+
+    def test_FixA_AC7_masking_policy_not_stripped(self):
+        """A-AC-7: WITH MASKING POLICY is not affected by the WITH TAG strip (regression guard)."""
+        from sqlcg.parsers.snowflake_parser import SnowflakeParser
+
+        sql = "... \"col\" WITH MASKING POLICY mp WITH TAG (a='b') ..."
+        result = SnowflakeParser._preprocess_snowflake_sql(sql)
+        assert "WITH TAG" not in result.upper(), "WITH TAG must be stripped"
+        assert "WITH MASKING POLICY" in result.upper(), "WITH MASKING POLICY must NOT be stripped"

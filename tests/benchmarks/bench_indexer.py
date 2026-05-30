@@ -48,7 +48,8 @@ class TestBenchIndexer:
         assert result["files_parsed"] == 5
         # TPC-H queries use correlated subqueries that produce dynamic-source skips;
         # assert the count is stable rather than zero.
-        assert result["parse_errors"] == 16
+        # T-05 (literal column skip) reduced false E1 errors from 16 to 14.
+        assert result["parse_errors"] == 14
 
     def test_bench_synthetic_throughput(self, benchmark, tmp_db):
         """Measure throughput on synthetic fixtures.

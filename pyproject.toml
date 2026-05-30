@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sql-code-graph"
-version = "0.3.1"
+version = "1.0.0"
 description = "SQL code graph analyzer and lineage tracer"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -78,6 +78,10 @@ select = [
 [tool.ruff.lint.isort]
 known-first-party = ["sqlcg"]
 
+[tool.ruff.lint.per-file-ignores]
+# skill.py holds the SKILL.md prose template; long markdown lines are intentional.
+"src/sqlcg/server/skill.py" = ["E501"]
+
 [tool.commitizen]
 name = "cz_conventional_commits"
 version_provider = "pep621"
@@ -98,4 +102,5 @@ markers = [
     "integration: integration tests",
     "e2e: end-to-end tests",
     "benchmark: benchmark tests",
+    "perf: wall-clock performance backstops (opt-in via -m perf)",
 ]

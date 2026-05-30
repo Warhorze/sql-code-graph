@@ -28,6 +28,8 @@ def uninstall_cmd(  # noqa: B008
     Step 1: Remove MCP registration from ~/.claude/settings.json
     Step 2: Optionally delete the KùzuDB graph database
     Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
+    Step 4: Remove sqlcg skill directory from ~/.claude/skills/sqlcg/ and
+            <repo>/.claude/skills/sqlcg/
     """
     # Step 1: Remove MCP entry from settings.json
     _step1_remove_mcp_entry()
@@ -43,6 +45,9 @@ def uninstall_cmd(  # noqa: B008
     # Step 3: Remove git hook sentinel block
     repo_path = repo if repo else Path.cwd()
     _step3_remove_git_hook(repo_path)
+
+    # Step 4: Remove sqlcg skill directory
+    _step4_remove_skill(repo_path)
 
 
 def _step1_remove_mcp_entry() -> None:
@@ -130,70 +135,89 @@ def _step2_delete_database(force: bool) -> None:
                 console.print(f"[yellow]Warning:[/yellow] Failed to delete metrics store: {e}")
 
 
-def _step3_remove_git_hook(repo_path: Path) -> None:
-    """Remove the git hook sentinel block from .git/hooks/post-checkout."""
-    hook_file = repo_path / ".git" / "hooks" / "post-checkout"
+def _strip_sentinel_block(content: str, sentinel: str) -> str:
+    """Strip the block introduced by sentinel from hook file content.
 
-    if not hook_file.exists():
-        console.print(f"[yellow]No git hook found in {repo_path}[/yellow]")
-        return
+    The block starts at the sentinel line and extends until an empty line that is followed
+    by non-empty content (end-of-block), or until the end of file.
 
-    # Read the file
-    content = hook_file.read_text()
-
-    # Strip the sentinel block: from "# sqlcg post-checkout hook" to the end of the block
-    # The block ends when we encounter a line that doesn't start with whitespace/# or is empty
-    # followed by non-empty content
+    Returns the stripped content (may be empty if the sentinel was the only content).
+    """
     lines = content.split("\n")
     filtered_lines = []
     skip_mode = False
 
     for i, line in enumerate(lines):
-        if "# sqlcg post-checkout hook" in line:
+        if sentinel in line:
             skip_mode = True
             continue
 
         if skip_mode:
-            # Skip all lines that are part of the hook block
-            # The block extends from the sentinel comment until we hit an empty line
-            # followed by non-hook content, or until the end of file
             if line.strip() == "":
-                # Check if there's content after this blank line that's not the hook
                 remaining = "\n".join(lines[i + 1 :]).strip()
                 if remaining:
-                    # There's content after this blank line, so end the skip mode
                     skip_mode = False
-                    filtered_lines.append("")  # Preserve the blank line separator
-                # else: blank line is at end of file, just skip it
-            # else: continue skipping
+                    filtered_lines.append("")  # Preserve blank-line separator
+                # else: trailing blank line — skip
+            # else: continue skipping body lines
             continue
 
         filtered_lines.append(line)
 
-    # Reconstruct the content
     if filtered_lines:
-        new_content = "\n".join(filtered_lines).strip() + "\n"
-    else:
-        new_content = ""
+        return "\n".join(filtered_lines).strip() + "\n"
+    return ""
+
+
+def _remove_single_hook(repo_path: Path, filename: str, sentinel: str) -> None:
+    """Strip the sqlcg sentinel block from one git hook file.
+
+    If the file becomes empty after stripping, delete it.
+    If the file does not exist, emit a notice and return.
+    """
+    hook_file = repo_path / ".git" / "hooks" / filename
+
+    if not hook_file.exists():
+        console.print(f"[yellow]No {filename} hook found in {repo_path}[/yellow]")
+        return
+
+    content = hook_file.read_text()
+
+    if sentinel not in content:
+        # Nothing to strip
+        return
+
+    new_content = _strip_sentinel_block(content, sentinel)
 
     if not new_content.strip():
-        # File became empty, delete it
         try:
             hook_file.unlink()
-            console.print(
-                f"[green]Removed git hook from {repo_path}/.git/hooks/post-checkout[/green]"
-            )
+            console.print(f"[green]Removed git hook from {repo_path}/.git/hooks/{filename}[/green]")
         except Exception as e:
             console.print(f"[yellow]Warning:[/yellow] Failed to delete hook file: {e}")
     else:
-        # Write back the filtered content
         try:
             hook_file.write_text(new_content)
-            console.print(
-                f"[green]Removed git hook from {repo_path}/.git/hooks/post-checkout[/green]"
-            )
+            console.print(f"[green]Removed git hook from {repo_path}/.git/hooks/{filename}[/green]")
         except Exception as e:
             console.print(f"[yellow]Warning:[/yellow] Failed to update hook file: {e}")
+
+
+# (filename, sentinel) pairs for all sqlcg-managed hooks
+_HOOK_SENTINELS: list[tuple[str, str]] = [
+    ("post-checkout", "# sqlcg post-checkout hook"),
+    ("post-merge", "# sqlcg post-merge hook"),
+]
+
+
+def _step3_remove_git_hook(repo_path: Path) -> None:
+    """Remove sqlcg sentinel blocks from all managed git hook files.
+
+    Strips both post-checkout and post-merge hooks. Deletes a hook file if it
+    becomes empty after stripping; preserves foreign content otherwise.
+    """
+    for filename, sentinel in _HOOK_SENTINELS:
+        _remove_single_hook(repo_path, filename, sentinel)
 
 
 def _get_db_path() -> str | None:
@@ -208,3 +232,37 @@ def _is_kuzu_backend(db_path: str) -> bool:
     """Check if the database is a KùzuDB backend (not Neo4j)."""
     backend = os.getenv("SQLCG_BACKEND", "kuzu").lower()
     return backend in ("kuzu", "")  # Default to kuzu if unset
+
+
+# Candidate skill directory locations to remove (global first, then project-relative)
+# Each entry is a callable(repo_path) -> Path resolving to the sqlcg skill dir.
+_SKILL_DIR_TARGETS = [
+    lambda repo_path: Path.home() / ".claude" / "skills" / "sqlcg",
+    lambda repo_path: repo_path / ".claude" / "skills" / "sqlcg",
+]
+
+
+def _step4_remove_skill(repo_path: Path) -> None:
+    """Remove the sqlcg-owned skill directory at all candidate locations.
+
+    Iterates over the global (~/.claude/skills/sqlcg/) and project-relative
+    (<repo>/.claude/skills/sqlcg/) directories. For each:
+    - If the directory exists, removes it with shutil.rmtree (ignoring errors)
+      and prints a green "Removed" notice.
+    - If the directory does not exist, prints a yellow "not found" notice.
+
+    Only the sqlcg/ subdirectory is ever removed — the parent skills/ dir and
+    any sibling skill directories are left untouched.
+    """
+    any_found = False
+    for target_fn in _SKILL_DIR_TARGETS:
+        skill_dir = target_fn(repo_path)
+        if skill_dir.exists():
+            any_found = True
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            console.print(f"[green]Removed skill directory:[/green] {skill_dir}")
+        else:
+            console.print(f"[yellow]Skill directory not found:[/yellow] {skill_dir}")
+
+    if not any_found:
+        console.print("[yellow]No skill directories found — nothing to remove.[/yellow]")

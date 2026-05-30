@@ -1,0 +1,23 @@
+{
+  "label": "300s pool plan — persistent spawn-mode worker pool",
+  "run_date": "2026-05-28",
+  "branch": "feat/fix-expand-qualify-perf",
+  "corpus_dir": "/home/ignwrad/Projects/dwh",
+  "dialect": "snowflake",
+  "total_files": 1340,
+  "baseline_wall_seconds": 1363.84,
+  "baseline_extrapolated_1600": 1211.59,
+  "baseline_passes_budget": false,
+  "pool_wall_seconds": 181.02,
+  "pool_extrapolated_1600": 216.14,
+  "pool_passes_budget": true,
+  "budget_seconds": 300,
+  "speedup_factor": 7.5,
+  "n_workers": "cpu_count() (default)",
+  "notes": [
+    "Baseline: per-file spawn, sequential pass-2 (biscim7f5.output / e2e_run_20260528_101413.output)",
+    "Pool warm-up paid once; workers hold pre-built parsers for both passes",
+    "Cross-file CTAS bodies sent as SQL strings (no AST pickling over pipe)",
+    "Both passes parallelised; pass-2 timeout floor raised to max(p1_timeout, 15s)"
+  ]
+}

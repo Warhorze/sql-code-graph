@@ -110,6 +110,30 @@ class Neo4jBackend(GraphBackend):
             logger.error(f"upsert_edge failed: {src_label} -> {rel_type} -> {dst_label}: {e}")
             raise
 
+    def upsert_nodes_bulk(self, label: str, rows: list[dict[str, Any]]) -> None:
+        """Bulk-upsert nodes of one label.
+
+        Neo4j adapter is not currently implemented. Use KuzuBackend instead.
+        """
+        raise NotImplementedError(
+            "Neo4j bulk upsert is not yet implemented. Use KuzuBackend instead."
+        )
+
+    def upsert_edges_bulk(
+        self,
+        src_label: str,
+        dst_label: str,
+        rel_type: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple.
+
+        Neo4j adapter is not currently implemented. Use KuzuBackend instead.
+        """
+        raise NotImplementedError(
+            "Neo4j bulk upsert is not yet implemented. Use KuzuBackend instead."
+        )
+
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Execute a read-only query and return results."""
         try:
@@ -159,6 +183,20 @@ class Neo4jBackend(GraphBackend):
         except Exception as e:
             logger.warning(f"Failed to read schema version: {e}")
             return None
+
+    def set_indexed_sha(self, sha: str) -> None:
+        """Persist the git SHA of the last successful index (Neo4j stub).
+
+        Neo4j support for indexed_sha is not yet implemented.
+        """
+        raise NotImplementedError("set_indexed_sha is not yet implemented for Neo4jBackend")
+
+    def get_indexed_sha(self) -> str | None:
+        """Retrieve the git SHA of the last successful index (Neo4j stub).
+
+        Neo4j support for indexed_sha is not yet implemented.
+        """
+        raise NotImplementedError("get_indexed_sha is not yet implemented for Neo4jBackend")
 
     def close(self) -> None:
         """Close the database connection."""

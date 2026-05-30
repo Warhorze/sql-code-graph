@@ -44,6 +44,12 @@ def test_transaction_default_warning(caplog):
         def upsert_edge(self, src_label, src_key, dst_label, dst_key, rel_type, properties):
             pass
 
+        def upsert_nodes_bulk(self, label, rows):
+            pass
+
+        def upsert_edges_bulk(self, src_label, dst_label, rel_type, rows):
+            pass
+
         def run_read(self, query, params):
             return []
 
@@ -55,6 +61,12 @@ def test_transaction_default_warning(caplog):
 
         def get_schema_version(self):
             return None
+
+        def get_indexed_sha(self):
+            return None
+
+        def set_indexed_sha(self, sha):
+            pass
 
         def close(self):
             pass

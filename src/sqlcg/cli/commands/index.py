@@ -5,6 +5,14 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 
 from sqlcg.core.config import get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
@@ -21,7 +29,7 @@ def index_cmd(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        30, "--timeout-per-file", help="Timeout per file in seconds"
+        5, "--timeout-per-file", help="Timeout per file in seconds"
     ),
     buffer_pool_size: int = typer.Option(  # noqa: B008
         0,
@@ -43,16 +51,27 @@ def index_cmd(  # noqa: B008
     no_ddl: bool = typer.Option(  # noqa: B008
         False, "--no-ddl", help="Skip table-node upserts for DDL-only files"
     ),
-    schema_from_info_schema: str | None = typer.Option(  # noqa: B008
-        None,
-        "--schema-from-info-schema",
-        help="Path to INFORMATION_SCHEMA.COLUMNS CSV (overrides .sqlcg/schema.csv convention).",
-    ),
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary console output"
     ),
+    debug: bool = typer.Option(  # noqa: B008
+        False, "--debug", help="Show detailed log output during indexing"
+    ),
+    profile: bool = typer.Option(  # noqa: B008
+        False, "--profile/--no-profile", help="Emit per-stage timing after indexing"
+    ),
 ) -> None:
-    """Index SQL files in a directory."""
+    """Index SQL files in a directory.
+
+    Schema aliases (staging schema → canonical schema) can be configured in
+    .sqlcg.toml under sqlcg.schema_aliases, e.g. da_tmp = "da".
+    """
+
+    import logging
+
+    level = logging.DEBUG if debug else logging.CRITICAL
+    logging.getLogger("sqlcg").setLevel(level)
+    logging.getLogger("sqlglot").setLevel(level)
 
     # Set buffer pool size via env var if specified
     if buffer_pool_size > 0:
@@ -79,29 +98,6 @@ def index_cmd(  # noqa: B008
             )
             raise typer.Exit(1)
 
-        # Auto-discover or explicitly load INFORMATION_SCHEMA CSV
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
-
-        _convention = path / ".sqlcg" / "schema.csv"
-        schema_csv: Path | None = (
-            Path(schema_from_info_schema)
-            if schema_from_info_schema
-            else (_convention if _convention.exists() else None)
-        )
-        if schema_csv:
-            try:
-                tables_loaded, cols_loaded = _load_schema_into_graph(
-                    schema_csv, include_catalog=False, db=backend
-                )
-                if not quiet:
-                    console.print(
-                        f"[blue]Schema[/blue] loaded {tables_loaded} tables, "
-                        f"{cols_loaded} columns from {schema_csv}"
-                    )
-            except ValueError as exc:
-                console.print(f"[red]Schema CSV error: {exc}[/red]")
-                raise typer.Exit(1) from exc
-
         abs_path = str(path.resolve())
         backend.upsert_node(
             NodeLabel.REPO,
@@ -115,39 +111,31 @@ def index_cmd(  # noqa: B008
         # Index the repository
         indexer = Indexer()
 
-        # Determine total files for progress callback
-        from sqlcg.indexer.walker import walk_sql_files
-        from sqlcg.utils.ignore import load_ignore_spec
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            redirect_stderr=True,
+        ) as progress:
+            task = progress.add_task("Parsing", total=None)
 
-        spec = load_ignore_spec(path)
-        files = list(walk_sql_files(path, spec, use_git=True))
-        total_files = len(files)
+            def _progress_callback(n: int, total_n: int) -> None:
+                progress.update(task, completed=n, total=total_n)
 
-        # Define progress callback
-        def _make_progress_callback(total: int):
-            """Create a progress callback that prints progress every 100 files.
-
-            The callback is only invoked every 100 files, so with fewer than 100 files
-            in the repository, no progress line is printed.
-            """
-
-            def callback(n: int, total_n: int) -> None:
-                console.print(f"\r  Indexed {n}/{total_n} files...", end="", highlight=False)
-
-            return callback
-
-        summary = indexer.index_repo(
-            path,
-            dialect,
-            backend,
-            dbt_manifest,
-            timeout_per_file,
-            progress_callback=_make_progress_callback(total_files),
-            schema_csv=None,
-            no_ddl=no_ddl,
-            batch_size=batch_size,
-        )
-        console.print()  # newline after carriage return progress line
+            summary = indexer.index_repo(
+                path,
+                dialect,
+                backend,
+                dbt_manifest,
+                timeout_per_file,
+                progress_callback=_progress_callback,
+                no_ddl=no_ddl,
+                batch_size=batch_size,
+                profile=profile,
+            )
 
         # Connect files to repo
         from sqlcg.core.schema import RelType
@@ -166,13 +154,49 @@ def index_cmd(  # noqa: B008
 
         # Print summary unless --quiet is specified
         if not quiet:
+            quality = summary.get("quality", {})
+            err = summary.get("error_summary", {})
+            n_full = quality.get("full", 0)
+            n_partial = quality.get("table_only", 0)
+            n_ddl = quality.get("scripting_fallback", 0)
+            n_failed = quality.get("failed", 0)
+            n_timeout = err.get("timeout", 0)
+
+            quality_parts = []
+            if n_full:
+                quality_parts.append(f"[green]{n_full} with column lineage[/green]")
+            if n_partial:
+                quality_parts.append(f"[yellow]{n_partial} table-only[/yellow]")
+            if n_ddl:
+                quality_parts.append(f"{n_ddl} DDL-only")
+            if n_timeout:
+                quality_parts.append(f"[red]{n_timeout} timed out[/red]")
+            if n_failed:
+                quality_parts.append(f"[red]{n_failed} failed[/red]")
+
             console.print(
                 f"[green]Indexed[/green] {summary['files_parsed']} files — "
-                f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges, "
-                f"{summary['parse_errors']} errors"
+                f"{summary['tables_found']} tables, {summary['lineage_edges_created']} edges"
             )
+            if quality_parts:
+                console.print("  " + " · ".join(quality_parts))
             if summary.get("lineage_edges_created", 0) == 0:
                 console.print(
                     "[yellow]Warning: 0 lineage edges extracted — column lineage "
                     "unavailable.[/yellow]"
                 )
+
+        if prof := summary.get("profile"):
+            console.print("\n[bold]Profile[/bold]")
+            console.print(
+                f"  pass1 parse:    {prof['pass1_parse_s']:.2f}s\n"
+                f"  pass2 resolve:  {prof['pass2_resolve_s']:.2f}s\n"
+                f"  upsert:         {prof['upsert_s']:.2f}s\n"
+                f"  star expand:    {prof['star_expand_s']:.2f}s\n"
+                f"  total:          {prof['total_s']:.2f}s\n"
+                f"  ms/file:        {prof['ms_per_file']:.1f}ms  ({prof['files']} files)"
+            )
+            if prof["slowest_files"]:
+                console.print("  [bold]Slowest files[/bold]")
+                for file_path, ms in prof["slowest_files"]:
+                    console.print(f"    {ms:8.1f}ms  {file_path}")

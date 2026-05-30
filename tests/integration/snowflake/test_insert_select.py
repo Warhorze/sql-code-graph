@@ -6,7 +6,6 @@ source table. This is correct behavior - the source table is accessed
 via SELECT within the INSERT statement.
 """
 
-
 import pytest
 
 from sqlcg.core.kuzu_backend import KuzuBackend
@@ -52,19 +51,16 @@ class TestInsertSelectEdges:
             "MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) "
             "WHERE t.qualified CONTAINS 'source_table' "
             "RETURN q.kind AS kind",
-            {}
+            {},
         )
-        assert len(rows) >= 1, \
-            "Expected at least one query selecting from source_table"
-        assert rows[0]["kind"] == "INSERT", \
-            "Expected INSERT query for source table selection"
+        assert len(rows) >= 1, "Expected at least one query selecting from source_table"
+        assert rows[0]["kind"] == "INSERT", "Expected INSERT query for source table selection"
 
     def test_insert_target_created_as_node(self, indexed_db):
         """Verify INSERT target table is created as a node."""
         rows = indexed_db.run_read(
             "MATCH (t:SqlTable) WHERE t.qualified CONTAINS 'target_table' "
             "RETURN t.qualified AS qualified",
-            {}
+            {},
         )
-        assert len(rows) >= 1, \
-            "Expected target_table to be created as a node"
+        assert len(rows) >= 1, "Expected target_table to be created as a node"

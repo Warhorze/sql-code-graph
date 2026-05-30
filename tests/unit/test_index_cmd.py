@@ -27,17 +27,18 @@ def test_zero_edges_warning_appears_in_output():
             if args:
                 printed_output.append(str(args[0]))
 
-        with patch("sqlcg.cli.commands.index.console") as mock_console, \
-             patch("sqlcg.cli.commands.index.get_backend") as mock_get_backend, \
-             patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class, \
-             patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path, \
-             patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect:
-
+        with (
+            patch("sqlcg.cli.commands.index.console") as mock_console,
+            patch("sqlcg.cli.commands.index.get_backend") as mock_get_backend,
+            patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
+            patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path,
+            patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
+        ):
             mock_console.print = mock_console_print
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = "4"  # Match SCHEMA_VERSION
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with zero edges
@@ -63,14 +64,14 @@ def test_zero_edges_warning_appears_in_output():
                 timeout_per_file=30,
                 buffer_pool_size=0,
                 no_ddl=False,
-                schema_from_info_schema=None,
                 quiet=False,
             )
 
             # Verify warning appears in output
             output_text = " ".join(printed_output).lower()
-            assert "0 lineage edges" in output_text or "warning" in output_text, \
+            assert "0 lineage edges" in output_text or "warning" in output_text, (
                 f"Expected zero-edges warning in output. Got: {printed_output}"
+            )
 
 
 def test_no_warning_when_edges_exist():
@@ -89,17 +90,18 @@ def test_no_warning_when_edges_exist():
             if args:
                 printed_output.append(str(args[0]))
 
-        with patch("sqlcg.cli.commands.index.console") as mock_console, \
-             patch("sqlcg.cli.commands.index.get_backend") as mock_get_backend, \
-             patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class, \
-             patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path, \
-             patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect:
-
+        with (
+            patch("sqlcg.cli.commands.index.console") as mock_console,
+            patch("sqlcg.cli.commands.index.get_backend") as mock_get_backend,
+            patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
+            patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path,
+            patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
+        ):
             mock_console.print = mock_console_print
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "2"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = "4"  # Match SCHEMA_VERSION
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with edges present
@@ -125,12 +127,12 @@ def test_no_warning_when_edges_exist():
                 timeout_per_file=30,
                 buffer_pool_size=0,
                 no_ddl=False,
-                schema_from_info_schema=None,
                 quiet=False,
             )
 
             # Verify no zero-edges warning
             output_text = " ".join(printed_output).lower()
             # When edges > 0, we should NOT see "0 lineage edges"
-            assert "0 lineage edges" not in output_text, \
+            assert "0 lineage edges" not in output_text, (
                 f"Should not warn about 0 edges when edges exist. Got: {printed_output}"
+            )

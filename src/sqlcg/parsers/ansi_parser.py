@@ -24,20 +24,36 @@ class AnsiParser(SqlParser):
 
     DIALECT: str | None = None
 
-    def __init__(self, schema_resolver: SchemaResolver):
+    def __init__(
+        self,
+        schema_resolver: SchemaResolver,
+        schema_aliases: dict[str, str] | None = None,
+    ):
         """Initialize ANSI parser.
 
         Args:
             schema_resolver: SchemaResolver instance for table/column lookups
+            schema_aliases: Optional table alias map (bare lowercase name → canonical name)
         """
-        super().__init__(schema_resolver)
+        super().__init__(schema_resolver, schema_aliases=schema_aliases)
 
-    def parse_file(self, path: Path, sql: str) -> ParsedFile:
+    def parse_file(
+        self,
+        path: Path,
+        sql: str,
+        dependency_filter: set[str] | None = None,
+    ) -> ParsedFile:
         """Parse SQL file and extract table/column lineage.
 
         Args:
             path: Path to the source file
             sql: SQL text to parse
+            dependency_filter: optional set of lowercased table names. When provided,
+                the cross-file sources seeded into `sources_map` are filtered to only those
+                whose name is in the set. Pass-1 callers (and direct test callers) pass
+                `None` to disable filtering; pass-2 callers
+                (`CrossFileAggregator.resolve_pass2`) compute this from the pass-1
+                `ParsedFile.referenced_tables`.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -48,14 +64,14 @@ class AnsiParser(SqlParser):
         statements, parse_errors = self._do_parse(sql)
         out.errors.extend(parse_errors)
         if not statements:
-            logger.warning("Failed to parse file %s", path)
+            logger.debug("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
             return out
 
         # Check for pure-DDL files (still parse table definitions but skip lineage)
         is_pure_ddl = self._is_pure_ddl_file(statements)
         if is_pure_ddl:
-            out.errors.append("parse_mode:pure_ddl_skip")
+            out.errors.append("col_lineage_skip:pure_ddl_file")
 
         # Check for scripting fallback
         for stmt in statements:
@@ -73,12 +89,26 @@ class AnsiParser(SqlParser):
             except Exception:
                 file_scopes.append(None)
 
-        # Compute schema sources once per file
-        schema_sources = self._schema.as_sources_dict() if self._schema else {}
+        # Compute as_dict once per file (not per statement)
+        schema_dict = self._schema.as_dict() if self._schema else {}
 
         # Initialize sources_map to accumulate temp table definitions.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
-        xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
+        # When `dependency_filter` is provided (pass 2), keep only those CTAS bodies
+        # the current file actually references — keeps exp.expand O(N_refs) instead
+        # of O(N_corpus_ctas).
+        if self._schema:
+            xfile_sources_all = self._schema.cross_file_sources()
+            if dependency_filter is not None:
+                xfile_sources = {
+                    name: body
+                    for name, body in xfile_sources_all.items()
+                    if name in dependency_filter
+                }
+            else:
+                xfile_sources = dict(xfile_sources_all)
+        else:
+            xfile_sources = {}
         sources_map: dict[str, Any] = xfile_sources
 
         # Process each statement
@@ -95,8 +125,8 @@ class AnsiParser(SqlParser):
                     out,
                     sources_map,
                     scope=scope,
-                    schema_sources=schema_sources,
                     skip_column_lineage=is_pure_ddl,
+                    schema_dict=schema_dict,
                 )
                 out.statements.append(query_node)
 
@@ -155,8 +185,8 @@ class AnsiParser(SqlParser):
         out: ParsedFile,
         sources_map: dict[str, Any] | None = None,
         scope: Any = None,
-        schema_sources: dict[str, Any] | None = None,
         skip_column_lineage: bool = False,
+        schema_dict: dict | None = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -167,7 +197,6 @@ class AnsiParser(SqlParser):
             out: ParsedFile object to append errors to
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
-            schema_sources: Map of table names to parsed exp.Select nodes from INFORMATION_SCHEMA
             skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
 
         Returns:
@@ -179,9 +208,9 @@ class AnsiParser(SqlParser):
         # Extract target table for CREATE/INSERT statements
         target = None
         if isinstance(stmt, exp.Create):
-            target = self._extract_target_table(stmt)
+            target = self._apply_table_alias(self._extract_target_table(stmt))
         elif isinstance(stmt, exp.Insert):
-            target = self._extract_insert_target(stmt)
+            target = self._apply_table_alias(self._extract_insert_target(stmt))
 
         # Extract source tables
         sources = []
@@ -202,13 +231,19 @@ class AnsiParser(SqlParser):
                 sources = self._real_tables(root_scope)
             else:
                 # Fallback to basic table extraction
-                sources = self._fallback_table_scan(stmt)
+                sources = [
+                    r
+                    for s in self._fallback_table_scan(stmt)
+                    if (r := self._apply_table_alias(s)) is not None
+                ]
                 parse_failed = True
         except Exception as exc:
-            logger.warning(
-                "Failed to build scope for statement %d in %s: %s", stmt_index, path, exc
-            )
-            sources = self._fallback_table_scan(stmt)
+            logger.debug("Failed to build scope for statement %d in %s: %s", stmt_index, path, exc)
+            sources = [
+                r
+                for s in self._fallback_table_scan(stmt)
+                if (r := self._apply_table_alias(s)) is not None
+            ]
             parse_failed = True
 
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
@@ -221,7 +256,11 @@ class AnsiParser(SqlParser):
 
             extraction = LineageExtraction(edges=[], star_sources=[])
         else:
-            schema = self._schema.as_dict() if self._schema else {}
+            schema = (
+                schema_dict
+                if schema_dict is not None
+                else (self._schema.as_dict() if self._schema else {})
+            )
             extraction = self._extract_column_lineage(
                 stmt,
                 path,
@@ -230,7 +269,6 @@ class AnsiParser(SqlParser):
                 dst_table=target,
                 sources=sources_map,
                 query_sources=sources,
-                schema_sources=schema_sources,
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources

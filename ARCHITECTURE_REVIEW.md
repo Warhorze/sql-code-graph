@@ -2517,3 +2517,310 @@ has been run yet — schedule one for the next sprint kickoff to quantify the li
    indexing flags a real collision.
 4. **Process improvement**: re-test DEFER tickets against current upstream before
    adding `xfail` markers (see 13.2.3).
+
+---
+
+## 14. Sprint 08 — Bulk Upsert, Pass-2 Skip, Timeout Fix, E1 Literal-Skip
+
+Review date: 2026-05-12
+Branch: `feat/sprint-08-perf-upsert`
+Tickets reviewed: T-01 (bulk upsert), T-02 (pass-2 skip), T-03 (timeout fix), T-05 (E1 literal-skip)
+Source: commits `020714c`–`81d30d8`; diff against master in
+[`src/sqlcg/core/graph_db.py`](src/sqlcg/core/graph_db.py),
+[`src/sqlcg/core/kuzu_backend.py`](src/sqlcg/core/kuzu_backend.py),
+[`src/sqlcg/core/neo4j_backend.py`](src/sqlcg/core/neo4j_backend.py),
+[`src/sqlcg/indexer/indexer.py`](src/sqlcg/indexer/indexer.py),
+[`src/sqlcg/lineage/aggregator.py`](src/sqlcg/lineage/aggregator.py),
+[`src/sqlcg/parsers/base.py`](src/sqlcg/parsers/base.py)
+
+### 14.1 T-01: Bulk Upsert Architecture
+
+#### What changed
+
+[`GraphBackend`](src/sqlcg/core/graph_db.py) gains two abstract methods:
+`upsert_nodes_bulk(label, rows)` and `upsert_edges_bulk(src_label, dst_label,
+rel_type, rows)`. [`KuzuBackend`](src/sqlcg/core/kuzu_backend.py) implements
+both with a single `UNWIND $rows AS row MERGE …` query per call. The
+[`_upsert_parsed_file`](src/sqlcg/indexer/indexer.py) method in the indexer was
+fully rewritten from a flat sequence of ~100 individual `upsert_node` / `upsert_edge`
+calls into a three-phase collect-deduplicate-flush pattern:
+
+- **Phase A** — iterate the `ParsedFile` model and accumulate typed row lists
+  (`file_rows`, `table_rows`, `column_rows`, `query_rows`, and five edge-list
+  variants).
+- **Phase B** — deduplicate within each list by primary key before flushing, so
+  re-encountered tables (a table appears as both a `defined_table` and a `source`
+  in the same file) are written once.
+- **Phase C** — issue one bulk call per non-empty group, reducing per-file
+  round-trips from ~100 to ~10 (2–4 node batches + 4–6 edge batches).
+
+[`Neo4jBackend`](src/sqlcg/core/neo4j_backend.py) receives stub implementations
+that raise `NotImplementedError`. `reindex_file` (the watch path) is deliberately
+left on the old per-row API — it processes one file at a time and a single
+transaction overhead there is acceptable.
+
+#### Correctness properties
+
+The homogeneity constraint (every row in a bulk call must share the same property
+key set) is enforced at call time in `KuzuBackend` — it raises `ValueError` on
+the first heterogeneous row. This matches the homogeneous schema that
+`_upsert_parsed_file` produces: all table rows have the same four fields, all
+column rows have the same three fields, etc. The constraint is internal rather
+than API-contractual (the docstring says "MAY raise") which means future callers
+that build heterogeneous batches will get a runtime error rather than a type error.
+This is an acceptable tradeoff for now given there is only one call site.
+
+`_validate_props` is applied per-row before the UNWIND query is issued, preserving
+the injection-safety guarantee from the single-row path.
+
+Identity deduplication is by primary key string equality. For `TABLE` nodes this is
+`full_id` (schema-qualified name). Tables with different qualifiers that represent
+the same physical object (e.g. `DWH.SCHEMA.T` vs `SCHEMA.T` in different files)
+will not be merged — this is consistent with the existing per-row behaviour and is
+not a regression.
+
+#### Neo4j gap
+
+Both bulk methods raise `NotImplementedError` on `Neo4jBackend`. If the Neo4j
+backend is ever activated for a production corpus, indexing will fail immediately
+on any file. The presence of a `NotImplementedError` stub means tests that use a
+`Neo4jBackend` instance will raise rather than silently producing wrong results,
+which is the correct failure mode. Implementing the Neo4j bulk path would require
+either the same UNWIND pattern (supported in Neo4j Cypher) or a `neo4j.BulkWriter`
+session. This is low priority while KuzuDB is the sole production backend.
+
+#### Risk: T-04 measurement not yet completed
+
+The 5-minute budget for 1,600 files remains unverified. The plan
+([`plan/sprint_08_perf_upsert.md`](plan/sprint_08_perf_upsert.md)) makes a
+credible case that bulk upsert plus pass-2 skip reduce round-trips by ~10×, which
+should bring the estimated 23-minute baseline well under budget. However, actual
+throughput numbers are absent from this branch. A post-merge measurement run is
+the first open follow-up listed in §14.5.
+
+### 14.2 T-02: Pass-2 Skip Predicate
+
+#### What changed
+
+[`CrossFileAggregator._needs_pass2(parsed)`](src/sqlcg/lineage/aggregator.py)
+returns `True` only when at least one statement source in `parsed` resolves against
+a table registered by a different file — specifically against `self.sources`
+(full-qualified `defined_tables` from other files) or `self.cross_file_sources`
+(CTAS body bare names from other files), after excluding same-file-defined tables
+from the cross-file set.
+
+`resolve_pass2` short-circuits immediately when `_needs_pass2` returns `False`:
+it returns the original `parsed` object unchanged without reading the file from
+disk or calling `parser.parse_file`. The indexer detects the skip using Python
+object identity (`resolved is parsed`) and increments `pass2_skipped` in the
+summary dict.
+
+#### CTE scope limitation
+
+The skip predicate examines `stmt.sources` — the statement-level source table
+list. This list is populated from the outermost `FROM`/`JOIN` clauses and from
+CTAS/INSERT targets. CTEs that are named in the top-level `WITH` clause but whose
+_body_ references a cross-file table are not represented in `stmt.sources` directly;
+they appear only in the inner `SELECT` sources list of the CTE body, which is not
+surfaced on `StatementNode.sources`.
+
+Consequence: a file containing only CTE-mediated cross-file references (no
+direct `FROM cross_file_table` in the outer `SELECT`) may be incorrectly classified
+as skip-eligible and miss the pass-2 re-parse. In practice this is rare —
+most ETL files in the DWH corpus have at least one direct `FROM` or `INSERT INTO`
+referencing a cross-file table. The risk is recorded here for the sprint that
+eventually adds deep CTE source introspection (see §14.5, follow-up 2).
+
+The identity semantics contract is documented in the `resolve_pass2` docstring:
+callers MUST NOT introduce a `.copy()` on the skip path, as that would silently
+break the identity check in the indexer.
+
+### 14.3 T-03: Timeout Fix and Thread-Leak Caveat
+
+#### What changed
+
+[`_index_single_file`](src/sqlcg/indexer/indexer.py) previously used a `with
+ThreadPoolExecutor(max_workers=1) as ex:` context manager. When the
+`future.result(timeout=N)` call raised `concurrent.futures.TimeoutError`,
+Python's context manager `__exit__` called `executor.shutdown(wait=True)`,
+which blocked indefinitely waiting for the still-running parser thread to
+finish — defeating the purpose of the timeout.
+
+The fix replaces the `with` block with an explicit `try/finally`, calling
+`executor.shutdown(wait=False, cancel_futures=True)` unconditionally on both
+the success path and the timeout path. `cancel_futures=True` was added in
+Python 3.9; the project requires 3.12, so this is safe.
+
+#### Thread-leak caveat
+
+`cancel_futures=True` cancels futures that have not yet started. Because
+`max_workers=1` and the future is submitted immediately before
+`future.result()`, the future will have already been picked up by the worker
+thread by the time `shutdown` is called. The running thread is therefore not
+cancelled — it is simply abandoned. The thread continues executing until
+sqlglot finishes parsing or raises. Its result is discarded.
+
+This is the documented and intended behaviour (see the docstring added in this
+commit). The leak is bounded: the indexer runs at `concurrency=1` (one file at
+a time), so at most one abandoned thread exists at any moment. The thread will
+exit naturally when sqlglot returns; it holds no database connection (parsing is
+pure-Python with no I/O). On a large repo with many timeout events, the process
+will accumulate threads temporarily, but because each thread is CPU-bound and
+eventually terminates, there is no permanent resource leak.
+
+A stricter mitigation — running sqlglot in a subprocess so the OS can forcibly
+kill it — was explicitly listed as a non-goal in the sprint plan. It remains an
+option if the production profiling in T-04 shows widespread timeout events.
+
+### 14.4 T-05: E1 Literal-Skip Parser Improvement
+
+#### What changed
+
+In [`parsers/base.py`](src/sqlcg/parsers/base.py) at the point where
+`_extract_column_lineage` iterates over projected column expressions, a
+two-line guard was added:
+
+```python
+if not list(col_expr.find_all(exp.Column)):
+    continue
+```
+
+Expressions that contain no `exp.Column` descendants — `NULL`, numeric literals,
+string literals, zero-argument functions such as `CURRENT_TIMESTAMP()`, and
+arithmetic on literals — are skipped without calling `sg_lineage`. This
+eliminates the 1,148 false `"Cannot find column 'NULL' in query"` (E1) fires
+observed in the production corpus baseline.
+
+#### Correctness
+
+The guard is conservative: any expression with at least one real column reference
+(e.g. `COALESCE(src_col, NULL)` or `amount * 0.9`) contains an `exp.Column` node
+and passes through unchanged. Only expressions that are fully literal pass the
+guard. `exp.Column` covers simple column references, qualified references
+(`schema.table.col`), and aliased columns — all syntactic forms that produce a
+meaningful lineage link. The `find_all` traversal is depth-unlimited, so nested
+literal expressions (e.g. `CASE WHEN NULL THEN NULL ELSE NULL END`) are correctly
+classified as column-free.
+
+The fix does not silence genuine E1 errors from unresolved column names — those
+arise in expressions that do contain `exp.Column` and reach `sg_lineage`, which
+may still raise. Only literal-only expressions are suppressed.
+
+#### Scope
+
+The fix is deliberately narrow: E1 errors from actual unresolved columns (e.g.
+a column spelled incorrectly or from a CTE body not available in the parse scope)
+are out of scope and remain visible in `parsed.errors`. The guard's comment in
+code makes this distinction explicit.
+
+### 14.5 Open Follow-ups from Sprint 08
+
+1. **T-04 measurement pending** — run a full index on the DWH/DDL/changelogs
+   corpus (target: 1,600 files), record timing and edge counts to
+   `plan/measurements/sprint_08_changelogs_fullindex.json`, and verify the
+   5-minute budget. Compare against the sprint-07 baseline
+   (`plan/measurements/sprint_07_changelogs_noschema.json`). If the budget is
+   not met, profile to determine whether the remaining bottleneck is commit
+   overhead, star-source expansion, or another factor.
+2. **CTE body sources not inspected by _needs_pass2** — files whose only
+   cross-file references are inside CTE bodies (no direct outer `FROM`) may
+   be incorrectly skipped. Low probability in the DWH corpus but worth adding
+   a regression fixture in the unit test if a real case is encountered.
+3. **Neo4j bulk upsert** — both methods are `NotImplementedError` stubs. If
+   Neo4j support is re-activated, implement using the same `UNWIND $rows MERGE`
+   pattern (Cypher syntax is identical) or the `neo4j.BulkWriter` session API.
+4. **Subprocess isolation for runaway parsers** — the current thread-abandon
+   approach is acceptable for infrequent timeouts. If T-04 measurement shows
+   a significant fraction of files timing out (>1%), consider migrating to a
+   subprocess with `multiprocessing.Process.kill()` to guarantee hard termination.
+
+---
+
+## 15. INFORMATION_SCHEMA feature removal (2026-05-29)
+
+**Decision**: removed the INFORMATION_SCHEMA-CSV feature end-to-end. It comprised
+two layers, both retired:
+
+1. **In-memory column-resolution sources** — [`SchemaResolver.add_information_schema()`](src/sqlcg/lineage/schema_resolver.py)
+   / `as_sources_dict()` / `mapping_schema()`, the `schema_sources` argument
+   threaded through [`base.py`](src/sqlcg/parsers/base.py) and both parsers, and
+   the per-edge `mapping_schema_tables` confidence scoring (1.0 schema-backed /
+   0.7 inferred). All edges are now uniformly inferred (confidence 0.7).
+2. **Graph-level authoritative schema** — the `sqlcg load-schema` CLI command,
+   the `--schema-from-info-schema` flag, `.sqlcg/schema.csv` auto-discovery, and
+   the "gold table" DDL-precedence path that suppressed DDL columns for
+   `information_schema`-backed tables.
+
+**Rationale**: profiling on the DWH corpus (N=100 sample, seed=42, 2026-05-28)
+measured **zero edge delta** between schema-loaded and no-schema runs (7241 vs
+7259 edges). Cross-file pass-2 CTAS resolution already dominated column lineage;
+CSV entries were registered but never consulted. The feature added a perf-sensitive
+surface (the O(N_files × N_schema) `expand()`/`sg_lineage` bloat the CLAUDE.md
+invariants existed to contain) for no measured coverage benefit.
+
+**Consequences**:
+- Schema now resolves purely from parsed DDL + cross-file CTAS bodies. Both
+  small-repo and large-repo flows use the same `sqlcg index <path>` command with
+  no schema export.
+- The two CLAUDE.md "Performance invariants" rows specific to schema_sources
+  (the `expand()`-excludes-schema and `mapping_schema_tables` confidence rows)
+  were retired; the surviving invariants (module-level imports, body_scope once,
+  pure-literal skip, scope-vs-sources, bulk upsert) are unaffected.
+- **Do not reintroduce** a schema-CSV ingestion path without a measured
+  lineage-coverage win to justify the perf surface.
+
+---
+
+## 16. v1.0 features — living-codebase resync (F1) + bundled skill (F2) (2026-05-30)
+
+### 16.1 F1 — incremental branch-change resync
+
+**Problem**: branch switches triggered a *full* reindex via two paths (the
+`post-checkout` git hook and `BranchMonitor`), flooding large repos on every
+`git checkout`. The per-file watch path was already incremental and was left
+unchanged.
+
+**Decision**: one git-diff entry point, `Indexer.resync_changed(root, old, new,
+db, dialect)`, replaces both full-reindex triggers. It re-parses only the changed
+files plus their **cross-file pass-2 affected closure** — files that
+`SELECTS_FROM` tables defined in changed/deleted files, walked transitively to
+`max_closure_depth=3` via the new `DEPENDENT_FILES_OF_TABLES` query. If the
+frontier is still growing at the cap it falls back to full `index_repo` (never
+silently wrong). Deletes capture the deleted file's tables *before*
+`delete_nodes_for_file`, then re-resolve dependents; CTAS bodies are re-harvested
+from definer files because stored `q.sql` is truncated (lossy).
+
+**Metadata**: `indexed_sha` persisted on the `SchemaVersion` singleton;
+`SCHEMA_VERSION` bumped 3→4 (re-index migration, no backward compat). Standalone
+`sqlcg reindex [<path>] --from <sha> --to <sha>` exposes the same path; without
+SHAs it diffs the stored `indexed_sha` against HEAD. Hooks generalized: both
+`post-checkout` and `post-merge` are written (each idempotent with its own
+sentinel); `uninstall` strips both.
+
+**Why safe for both scales**: small repos still run `sqlcg index <path>` with no
+new config; the closure walk + cap keeps large-repo resyncs bounded without
+degrading the small-repo path. Bulk-upsert and the once-per-statement scope
+invariants are untouched.
+
+### 16.2 F2 — Claude skill bundled in install
+
+**Decision**: `sqlcg install --scope {project|global}` provisions a `SKILL.md`
+that teaches an LLM the MCP tool surface and the trust-layer **fact/heuristic
+boundary**. The tool table is generated from the live FastMCP registry (16
+tools); the fact/heuristic tag is **derived from each tool's return model**
+(`_tool_is_heuristic` inspects for a `Judgement`-typed field, nested one level),
+not a hand-maintained list — a drift-guard test pins skill↔registry parity. The
+boundary doc has a single source (`render_body()`), reused by the
+`sqlcg mcp best-practices` CLI command and surfaced from top-level `--help`.
+
+**Locked decisions**: install location is a user choice (`--scope` flag +
+interactive TTY prompt; errors rather than guessing on non-TTY stdin); skill is
+generated at install time, frontmatter `version` from `sqlcg.__version__`; no
+packaging change (relies on existing `packages = ["src/sqlcg"]`); `uninstall`
+removes the skill, mirroring the F1 sentinel teardown.
+
+### 16.3 Open follow-ups
+- Staleness FACT (surfacing "graph N commits behind HEAD") is deferred; F1 only
+  persists the prerequisite `indexed_sha`.
+- `max_closure_depth=3` is a reasoned default, not yet calibrated against real
+  DWH chain depth — revisit if a deep chain is observed under-resolving.

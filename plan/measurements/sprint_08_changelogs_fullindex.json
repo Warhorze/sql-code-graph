@@ -1,0 +1,37 @@
+{
+  "label": "ddl/changelogs (sprint-08 baseline)",
+  "run_date": "2026-05-30T05:49:01",
+  "corpus_dir": "/home/ignwrad/Projects/dwh/ddl/changelogs",
+  "dialect": "snowflake",
+  "total_files": 801,
+  "runtime_seconds_total": 115.29,
+  "rss_delta_kb": 438512,
+  "pass2_skipped": 524,
+  "parse_errors": 2254,
+  "lineage_edges_created": 13484,
+  "tables_found": 1306,
+  "columns_defined": 9756,
+  "star_edges_expanded": 8849,
+  "batch_size": 50,
+  "anchor_omloopsnelheid": {
+    "lineage_edge_count": 0,
+    "sample_edges": []
+  },
+  "anchor_ma_aantal_op_order": {
+    "lineage_edge_count_total": 0,
+    "sample_edges": []
+  },
+  "parse_failed_queries": 1527,
+  "parse_errors_total": 2254,
+  "comparison_with_sprint_07": {
+    "parse_only_baseline_seconds": 119.6,
+    "e1_count_baseline": 1148,
+    "parse_errors_now": 2254,
+    "parse_errors_delta": 1106
+  },
+  "budget_check_1600_files": {
+    "extrapolated_seconds": 230.28,
+    "budget_seconds": 300,
+    "passes_budget": true
+  }
+}

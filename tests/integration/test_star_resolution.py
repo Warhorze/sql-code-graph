@@ -45,7 +45,7 @@ def test_ddl_columns_persisted(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
+        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
         "RETURN c.col_name AS n ORDER BY n",
         {},
     )
@@ -60,14 +60,14 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (c:SqlColumn {id: 'BA.src.amount'}) "
+        "MATCH (c:SqlColumn {id: 'ba.src.amount'}) "
         "RETURN c.id AS id, c.col_name AS n, c.table_qualified AS tq",
         {},
     )
     assert len(rows) == 1
-    assert rows[0]["id"] == "BA.src.amount"
+    assert rows[0]["id"] == "ba.src.amount"
     assert rows[0]["n"] == "amount"
-    assert rows[0]["tq"] == "BA.src"
+    assert rows[0]["tq"] == "ba.src"
 
 
 def test_ddl_column_count_in_index_summary(temp_db, tmp_path):
@@ -97,9 +97,9 @@ def test_star_source_edge_persisted(temp_db, star_repo):
         {},
     )
     assert len(rows) == 1, f"Expected 1 STAR_SOURCE edge, got {len(rows)}: {rows}"
-    assert rows[0]["src"] == "BA.src"
+    assert rows[0]["src"] == "ba.src"
     assert rows[0]["q"] == "<unqualified>"
-    assert rows[0]["tgt"] == "BA.tgt"
+    assert rows[0]["tgt"] == "ba.tgt"
     assert abs(rows[0]["conf"] - 0.8) < 1e-6
 
 
@@ -154,8 +154,8 @@ def test_star_expansion_creates_edges(temp_db, tmp_path):
         {},
     )
     assert rows == [
-        {"src": "BA.src.col1", "dst": "BA.tgt.col1", "c": pytest.approx(0.8)},
-        {"src": "BA.src.col2", "dst": "BA.tgt.col2", "c": pytest.approx(0.8)},
+        {"src": "ba.src.col1", "dst": "ba.tgt.col1", "c": pytest.approx(0.8)},
+        {"src": "ba.src.col2", "dst": "ba.tgt.col2", "c": pytest.approx(0.8)},
     ], f"Unexpected expansion edges: {rows}"
 
 
@@ -348,15 +348,17 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
     (tmp_path / "ddl_v1.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
     (tmp_path / "ddl_v2.sql").write_text("CREATE TABLE BA.src (col1 INT, col2 STRING);\n")
 
-    with caplog.at_level(logging.WARNING, logger="sqlcg.indexer.indexer"):
+    with caplog.at_level(logging.DEBUG, logger="sqlcg.indexer.indexer"):
         Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
-    # A WARNING containing both file references must have been emitted
+    # F6: duplicate DDL is now logged at DEBUG (not WARNING) — still must be emitted
     dup_warnings = [
-        r.message for r in caplog.records if r.levelno == logging.WARNING and "BA.src" in r.message
+        r.message
+        for r in caplog.records
+        if "ba.src" in r.message and "duplicate" in r.message.lower()
     ]
     assert len(dup_warnings) >= 1, (
-        "Expected a logger.warning about duplicate DDL for BA.src. "
+        "Expected a logger.debug about duplicate DDL for ba.src. "
         "Add the duplicate-DDL guard to _upsert_parsed_file."
     )
     # The warning must mention both files so the user can locate the conflict
@@ -375,8 +377,13 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     captured_errors: list[list[str]] = []
     original_upsert = Indexer._upsert_parsed_file
 
-    def recording_upsert(self, parsed, db, gold_tables=frozenset()):
-        result = original_upsert(self, parsed, db, gold_tables=gold_tables)
+    def recording_upsert(self, parsed, db, defined_table_registry=None):
+        result = original_upsert(
+            self,
+            parsed,
+            db,
+            defined_table_registry=defined_table_registry,
+        )
         captured_errors.append(list(parsed.errors))
         return result
 
@@ -391,7 +398,7 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     assert len(dup_errors) >= 1, (
         f"Expected at least one duplicate_ddl: error entry. All errors: {all_errors}"
     )
-    assert "BA.t" in dup_errors[0], (
+    assert "ba.t" in dup_errors[0], (
         f"duplicate_ddl error must name the conflicting table. Got: {dup_errors[0]}"
     )
 
@@ -404,164 +411,15 @@ def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     # Exactly one SqlTable node for BA.src
-    tables = temp_db.run_read("MATCH (t:SqlTable {qualified: 'BA.src'}) RETURN count(t) AS n", {})
+    tables = temp_db.run_read("MATCH (t:SqlTable {qualified: 'ba.src'}) RETURN count(t) AS n", {})
     assert tables[0]["n"] == 1, "Duplicate DDL must not create duplicate SqlTable nodes"
 
     # Both columns must be present (union of both DDL files)
     cols = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
+        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
         "RETURN c.col_name AS n ORDER BY n",
         {},
     )
     col_names = [r["n"] for r in cols]
     assert "col1" in col_names, "col1 from first DDL file must be in the graph"
     assert "col2" in col_names, "col2 from second DDL file must be in the graph"
-
-
-# ---------------------------------------------------------------------------
-# load-schema writes authoritative HAS_COLUMN edges
-# ---------------------------------------------------------------------------
-
-
-def _get_load_fn():
-    """Return a testable load-schema callable, or skip if load_schema is not yet implemented."""
-    try:
-        from sqlcg.cli.commands.load_schema import load_schema_cmd_test
-
-        return load_schema_cmd_test
-    except ImportError:
-        pass
-    try:
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
-
-        def _wrap(csv_path, include_catalog=False, db=None):
-            _load_schema_into_graph(csv_path, include_catalog, db)
-
-        return _wrap
-    except ImportError:
-        pytest.skip("load_schema module not yet implemented")
-
-
-def _csv(path, rows):
-    header = "TABLE_CATALOG,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,DATA_TYPE\n"
-    path.write_text(header + "".join(rows), encoding="utf-8")
-
-
-def test_load_schema_writes_has_column(temp_db, tmp_path):
-    """load_schema must write HAS_COLUMN edges tagged source='information_schema'."""
-    load = _get_load_fn()
-    csv_file = tmp_path / "cols.csv"
-    _csv(
-        csv_file,
-        [
-            "mydb,BA,orders,id,1,INT\n",
-            "mydb,BA,orders,amount,2,DECIMAL\n",
-            "mydb,BA,customers,id,1,INT\n",
-            "mydb,BA,customers,name,2,STRING\n",
-        ],
-    )
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-
-    rows = temp_db.run_read("MATCH ()-[r:HAS_COLUMN]->() RETURN r.source AS src", {})
-    assert len(rows) == 4, f"Expected 4 HAS_COLUMN edges, got {len(rows)}"
-    assert all(r["src"] == "information_schema" for r in rows)
-
-
-def test_gold_schema_suppresses_ddl_columns(temp_db, tmp_path):
-    """DDL indexing must not overwrite information_schema HAS_COLUMN edges."""
-    load = _get_load_fn()
-    csv_file = tmp_path / "cols.csv"
-    _csv(csv_file, ["mydb,BA,src,col1,1,INT\n", "mydb,BA,src,col2,2,STRING\n"])
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (col1 INT, col2 STRING, col3 DATE);\n")
-    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
-
-    rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
-    )
-    assert len(rows) == 2, f"Gold guard must block col3. Got {len(rows)} edges"
-    assert all(r["src"] == "information_schema" for r in rows)
-
-
-def test_partial_csv_leaves_ddl_intact(temp_db, tmp_path):
-    """A CSV covering only one table must leave uncovered tables' DDL columns intact."""
-    load = _get_load_fn()
-    csv_file = tmp_path / "cols.csv"
-    _csv(csv_file, ["mydb,BA,other,id,1,INT\n"])
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.src (col1 INT);\n")
-    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
-
-    rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'BA.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
-    )
-    assert len(rows) == 1
-    assert rows[0]["src"] == "ddl"
-
-
-def test_load_schema_idempotent(temp_db, tmp_path):
-    """Running load_schema twice on the same CSV must not create duplicate edges."""
-    load = _get_load_fn()
-    csv_file = tmp_path / "cols.csv"
-    _csv(csv_file, ["mydb,BA,src,col1,1,INT\n", "mydb,BA,src,col2,2,STRING\n"])
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-
-    rows = temp_db.run_read("MATCH ()-[r:HAS_COLUMN]->() RETURN count(r) AS n", {})
-    assert rows[0]["n"] == 2, f"Must not duplicate edges. Got {rows[0]['n']}"
-
-
-def test_case_insensitive_gold_guard(temp_db, tmp_path):
-    """Upper-case CSV names must match lower-case DDL via normalisation."""
-    load = _get_load_fn()
-    csv_file = tmp_path / "cols.csv"
-    _csv(csv_file, ["MYDB,BA,SRC,col1,1,INT\n", "MYDB,BA,SRC,col2,2,STRING\n"])
-    load(csv_path=csv_file, include_catalog=False, db=temp_db)
-
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE ba.src (col1 INT, col2 STRING, col3 DATE);\n")
-    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
-
-    rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[r:HAS_COLUMN]->() RETURN r.source AS src", {}
-    )
-    assert len(rows) == 2, f"Case normalisation must block col3. Got {len(rows)} edges"
-
-
-def test_index_with_manually_loaded_schema_csv(temp_db, tmp_path):
-    """CLI-style workflow: load schema CSV first, then index repo."""
-    try:
-        from sqlcg.cli.commands.load_schema import _load_schema_into_graph
-    except ImportError:
-        pytest.skip("load_schema not yet implemented")
-
-    sqlcg_dir = tmp_path / ".sqlcg"
-    sqlcg_dir.mkdir()
-    schema_csv = sqlcg_dir / "schema.csv"
-    _csv(
-        schema_csv,
-        [
-            "mydb,BA,src,col1,1,INT\n",
-            "mydb,BA,src,col2,2,STRING\n",
-        ],
-    )
-    # Need DDL for target table to enable full expansion
-    (tmp_path / "ddl.sql").write_text("CREATE TABLE BA.tgt (col1 INT, col2 STRING);\n")
-    (tmp_path / "etl.sql").write_text("INSERT INTO BA.tgt SELECT * FROM BA.src;\n")
-
-    # Manually load the schema CSV (as the CLI does) — this is index.py's responsibility
-    _load_schema_into_graph(schema_csv, include_catalog=False, db=temp_db)
-
-    # Then index_repo is called without auto-discovery (schema_csv=None)
-    Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False, schema_csv=None)
-
-    # Verify that the pre-loaded schema edges are present
-    rows = temp_db.run_read(
-        "MATCH ()-[r:HAS_COLUMN {source: 'information_schema'}]->() RETURN count(r) AS n", {}
-    )
-    assert rows[0]["n"] >= 2, "Pre-loaded schema.csv must have produced HAS_COLUMN edges"
-
-    # Verify that STAR_SOURCE edges were still detected and (optionally) expanded
-    star_sources = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
-    assert star_sources[0]["n"] >= 1, "index_repo must detect STAR_SOURCE edges"

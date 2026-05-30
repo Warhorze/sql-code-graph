@@ -35,6 +35,15 @@ class TestQuickStartInHelp:
         # Verify they're in order
         assert idx_1 < idx_2 < idx_3, "Steps should be in numeric order"
 
+    def test_help_nudges_to_mcp_best_practices(self):
+        """Top-level help points the reader at the MCP fact/heuristic best-practices."""
+        runner = CliRunner()
+        result = runner.invoke(app, ["--help"])
+
+        assert result.exit_code == 0
+        # `best-practices` is a single token — safe from rich word-wrapping
+        assert "best-practices" in result.output
+
     def test_help_contains_binary_package_note(self):
         """Test that help text includes the binary/package name note."""
         runner = CliRunner()
