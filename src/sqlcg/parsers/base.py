@@ -697,6 +697,13 @@ class SqlParser(ABC):
             # cosmetic for the SELECT and meaningless to the INSERT target. This block
             # overrides alias attribution for ALL positions (aliased or not).
             #
+            # Guards applied here mirror the main column loop to preserve skip markers:
+            #   - Star expressions → emit col_lineage_skip:star, register pos, skip sg_lineage
+            #   - Pure-literal (no Column descendant) → register pos, skip sg_lineage (silent)
+            #   - Unaliased non-Column (func/arith/CASE) → emit col_lineage_skip:func_fallback,
+            #     register pos, skip sg_lineage
+            #   - Plain Column / aliased expression → call sg_lineage (the #25 happy path)
+            #
             # CLAUDE.md invariant: body_no_with = body.copy() + strip-WITH happens ONCE
             # before the inner loop; only the single projection is swapped per column.
             positional_col_names: dict[int, str] = {}  # idx → insert_col_name
@@ -712,7 +719,42 @@ class SqlParser(ABC):
                     _insert_col = insert_cols_list[_ins_idx]
                     if not _insert_col:
                         continue
+                    # Register position first so the main loop always skips it,
+                    # regardless of which guard fires below.
                     positional_col_names[_ins_idx] = _insert_col
+
+                    # Guard 1: Star projection — emit skip marker (same as main loop).
+                    _inner_for_guard = (
+                        _col_expr.this if isinstance(_col_expr, exp.Alias) else _col_expr
+                    )
+                    if isinstance(_inner_for_guard, exp.Star) or (
+                        isinstance(_inner_for_guard, exp.Column)
+                        and isinstance(_inner_for_guard.this, exp.Star)
+                    ):
+                        _qualifier = (
+                            _inner_for_guard.table
+                            if isinstance(_inner_for_guard, exp.Column)
+                            else None
+                        )
+                        out.errors.append(f"col_lineage_skip:star:{_qualifier or '<unqualified>'}")
+                        continue  # no sg_lineage for star
+
+                    # Guard 2: Pure-literal — no Column descendants, nothing to trace.
+                    if not list(_col_expr.find_all(exp.Column)):
+                        continue  # silent skip, no sg_lineage
+
+                    # Guard 3: Unaliased non-Column expression (function, arithmetic, CASE …).
+                    # If the expression has no alias and is not a bare Column, the INSERT target
+                    # column name (_insert_col) is the positional override — but the expression
+                    # has no plain column reference to resolve through sg_lineage.
+                    # Emit func_fallback and skip, matching the main loop's behavior for
+                    # unaliased expressions that reach the else-branch.
+                    _unwrapped = _col_expr.this if isinstance(_col_expr, exp.Alias) else _col_expr
+                    if not _col_expr.alias and not isinstance(_unwrapped, exp.Column):
+                        _expr_type = type(_col_expr).__name__
+                        out.errors.append(f"col_lineage_skip:func_fallback:{_expr_type}")
+                        continue  # no sg_lineage for unaliased non-Column
+
                     # Positional mapping always wins — replace (or add) the alias with the
                     # INSERT target column name regardless of SELECT alias.
                     if _col_expr.alias and _col_expr.alias != _insert_col:
@@ -730,8 +772,17 @@ class SqlParser(ABC):
                     _aliased = exp.Alias(this=_inner.copy(), alias=_insert_col)
                     body_no_with.set("expressions", [_aliased])
                     _patched_sql = body_no_with.sql(dialect=self.DIALECT)
+                    # Pass sources= (not scope=) here: the patched SQL is a freshly
+                    # serialised string — the scope was built from the original body AST
+                    # and does not correspond to this new string. combined_sources carries
+                    # the temp-table / CTAS bodies that allow cross-statement expansion.
                     try:
-                        _root = sg_lineage(_insert_col, _patched_sql, dialect=self.DIALECT)
+                        _root = sg_lineage(
+                            _insert_col,
+                            _patched_sql,
+                            dialect=self.DIALECT,
+                            sources=combined_sources or {},
+                        )
                         if _root:
                             _new_edges = self._lineage_node_to_edges(
                                 _root,
