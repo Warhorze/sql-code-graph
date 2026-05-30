@@ -1,7 +1,22 @@
 ## Current State
 
-ACTIVE AGENT: plan-reviewer — feature F2 (bundle-claude-skill)
-  status: READY FOR IMPLEMENTATION
+ACTIVE AGENT: developer — feature F2 (bundle-claude-skill)
+  status: IMPLEMENTATION COMPLETE — all F2 tests green, full suite green
+  commits:
+    04754a3 feat(F2): Phase 1+2 — skill renderer with live registry + drift guard
+    ef1663a feat(F2): Phase 3+4+5 — install/uninstall skill + docs
+    35afd19 docs(F2): document deviations — test updates + nested Judgement inspection
+  test results: 721 passed / 0 failed (excl. gitignored DWH e2e); pyright clean; ruff clean
+  F2 test files:
+    test_F2_skill_render.py: 10 passed, 1 skipped (gate test satisfied)
+    test_F2_install_skill.py: 7 passed
+    test_F2_uninstall_skill.py: 3 passed
+    test_F2_skill_install_e2e.py: 3 passed
+  deviations:
+    D1: existing test_install.py tests updated to pass --scope global (D2 non-TTY error broke 13 pre-existing tests)
+    D2: _tool_is_heuristic recurses into nested Pydantic models (UnusedTablesResult needs depth-1 recursion)
+  branch: feat/sprint-10-anchor-tools
+  no PR yet — user instruction was do NOT push or open PR
   plan: plan/bundle_claude_skill.md (reviewed, corrections applied)
   branch: feat/sprint-10-anchor-tools
   corrections applied:
