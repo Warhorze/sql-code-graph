@@ -43,6 +43,13 @@ class HotOpCounters:
         self.build_scope = 0
         self.qualify = 0
         self.sg_lineage = 0
+        # Behavioural counters added after the v1.0.0 regression (commit 4234e5d
+        # dropped copy=False / moved body.copy() into the loop, and the original
+        # call-count axes above stayed green because they count CALLS, not per-call
+        # cost or the qualify-failure path). These pin the EXACT invariants:
+        self.scope_lineage_calls = 0  # sg_lineage calls that pass a pre-built scope
+        self.scope_without_copy_false = 0  # ...of those, how many omit copy=False
+        self.multi_proj_body_copy = 0  # .copy() of a multi-projection SELECT body
 
 
 @contextmanager
@@ -60,6 +67,7 @@ def count_hot_ops():
     _extract_column_lineage, so it is patched at the source. No single call
     passes through two wrappers — no double counting.
     """
+    import sqlglot.expressions as sqlglot_exp
     import sqlglot.lineage as sqlglot_lin
 
     import sqlcg.parsers.base as base_mod
@@ -70,10 +78,19 @@ def count_hot_ops():
         "lin_lineage": sqlglot_lin.lineage,
         "base_bs": base_mod.build_scope,
         "base_q": base_mod.qualify,
+        "exp_copy": sqlglot_exp.Expression.copy,
     }
 
     def lineage_wrap(*a, **k):
         c.sg_lineage += 1
+        # Invariant (regression #1, commit 4234e5d): when a pre-built scope is
+        # passed, copy=False MUST accompany it, else sqlglot deep-copies the whole
+        # scope per column (O(cols × scope_size)). The call count alone is linear
+        # and would not reveal the dropped kwarg — inspect it directly.
+        if k.get("scope") is not None:
+            c.scope_lineage_calls += 1
+            if k.get("copy") is not False:
+                c.scope_without_copy_false += 1
         return orig["lin_lineage"](*a, **k)
 
     def build_scope_wrap_factory(key):
@@ -90,15 +107,25 @@ def count_hot_ops():
 
         return wrap
 
+    def copy_wrap(self, *a, **k):
+        # Invariant (regression #3): the multi-projection body in the INSERT
+        # column-list aliasing path must be copied ONCE per statement, not per
+        # column. Count copies of a SELECT that still has >1 projection.
+        if isinstance(self, sqlglot_exp.Select) and len(self.expressions) > 1:
+            c.multi_proj_body_copy += 1
+        return orig["exp_copy"](self, *a, **k)
+
     sqlglot_lin.lineage = lineage_wrap
     base_mod.build_scope = build_scope_wrap_factory("base_bs")
     base_mod.qualify = qualify_wrap_factory("base_q")
+    sqlglot_exp.Expression.copy = copy_wrap
     try:
         yield c
     finally:
         sqlglot_lin.lineage = orig["lin_lineage"]
         base_mod.build_scope = orig["base_bs"]
         base_mod.qualify = orig["base_q"]
+        sqlglot_exp.Expression.copy = orig["exp_copy"]
 
 
 def assert_flat(base: int, doubled: int, label: str, slack: int = 2) -> None:
@@ -164,3 +191,77 @@ def test_per_statement_ops_flat_when_columns_double():
     assert_flat(base.qualify, doubled.qualify, "qualify")
     # sg_lineage is legitimately per-column; only bound its slope.
     assert_at_most_linear(base.sg_lineage, doubled.sg_lineage, "sg_lineage")
+
+
+# ---------------------------------------------------------------------------
+# Axis 2 — the v1.0.0 sub-class the call-count axis above could NOT catch.
+# Commit 4234e5d kept call counts flat/linear but (1) dropped copy=False so each
+# scope-path sg_lineage deep-copied the scope, (2) re-qualified per column on the
+# qualify-FAILURE path, and (3) copied the full body per column in the INSERT
+# aliasing path. These three guards pin those exact invariants behaviourally.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_path_sg_lineage_passes_copy_false():
+    """Regression #1: every sg_lineage call that carries a pre-built scope must also
+    pass copy=False. Otherwise sqlglot deep-copies the whole scope per column
+    (O(cols × scope_size); measured 28.8s on one 3,344-line file)."""
+    parser = AnsiParser(SchemaResolver(dialect=None))
+    with count_hot_ops() as c:
+        parser.parse_file(Path("scope.sql"), _wide_insert(COLS_BASE))
+
+    assert c.scope_lineage_calls > 0, (
+        "fixture did not exercise the scope= path; the guard would be vacuously green"
+    )
+    assert c.scope_without_copy_false == 0, (
+        f"{c.scope_without_copy_false} of {c.scope_lineage_calls} scope-path sg_lineage "
+        "calls omitted copy=False — sqlglot will deep-copy the scope per column "
+        "(O(cols × scope_size)). Restore copy=False (CLAUDE.md 'Performance invariants')."
+    )
+
+
+def test_insert_aliasing_body_copied_once_per_statement():
+    """Regression #3: the multi-projection body in the INSERT column-list aliasing
+    path must be copied ONCE per statement, not per column."""
+    parser_base = AnsiParser(SchemaResolver(dialect=None))
+    parser_2x = AnsiParser(SchemaResolver(dialect=None))
+    with count_hot_ops() as base:
+        parser_base.parse_file(Path("base.sql"), _wide_insert(COLS_BASE))
+    with count_hot_ops() as doubled:
+        parser_2x.parse_file(Path("doubled.sql"), _wide_insert(COLS_2X))
+
+    assert base.multi_proj_body_copy >= 1, (
+        "fixture did not exercise the INSERT-aliasing body copy; guard vacuously green"
+    )
+    assert_flat(base.multi_proj_body_copy, doubled.multi_proj_body_copy, "multi_proj_body_copy")
+
+
+def test_qualify_not_retried_per_column_when_it_fails():
+    """Regression #2: when qualify() raises for a statement, the parser must NOT
+    re-run qualify once per column. Build it once before the loop (with a single
+    schema-free retry) and fall through to the per-column sources= path."""
+    import sqlcg.parsers.base as base_mod
+
+    def _count_qualify_calls_when_failing(n_cols: int) -> int:
+        calls = 0
+        orig_q = base_mod.qualify
+
+        def always_raise(*a, **k):
+            nonlocal calls
+            calls += 1
+            raise ValueError("forced qualify failure (test)")
+
+        base_mod.qualify = always_raise
+        try:
+            AnsiParser(SchemaResolver(dialect=None)).parse_file(
+                Path("fail.sql"), _wide_insert(n_cols)
+            )
+        finally:
+            base_mod.qualify = orig_q
+        return calls
+
+    base_calls = _count_qualify_calls_when_failing(COLS_BASE)
+    doubled_calls = _count_qualify_calls_when_failing(COLS_2X)
+
+    assert base_calls >= 1, "fixture did not reach the qualify path"
+    assert_flat(base_calls, doubled_calls, "qualify (on the failure path)")

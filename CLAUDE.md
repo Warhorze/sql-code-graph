@@ -104,6 +104,9 @@ Any refactor that touches [`base.py`](src/sqlcg/parsers/base.py) or [`indexer.py
 | **`body_scope` built once per statement**, reused across all columns | `_extract_column_lineage` | Wide SELECTs (176 cols × 11 joins) took 7 min with per-column qualify; once-per-statement is the fix |
 | **Pure-literal skip** (`if not list(col_expr.find_all(exp.Column)): continue`) | column loop in `_extract_column_lineage` | Literals have no source column; without the skip sg_lineage raises noise E1 errors and wastes time |
 | When `body_scope` is available, **`sources=` is NOT passed to `sg_lineage`** | `sg_kwargs` construction | The scope already embeds full column→table resolution; passing `sources=` would make sg_lineage redundantly re-expand them |
+| When a scope is passed to `sg_lineage`, **`copy=False` + `trim_selects=False` are passed too** | `sg_kwargs` construction | Without `copy=False`, sqlglot deep-copies the whole scope on **every per-column call** → O(cols × scope_size). Regressed in `4234e5d`; measured 28.8s on one 3,344-line file |
+| **`body_scope` is built once per statement BEFORE the column loop** (with a schema-free qualify retry on failure), never lazily inside it | `_extract_column_lineage` | Building it inside the loop re-ran expand+qualify+build_scope for *every* column whenever qualify failed (the failure path). Regressed in `4234e5d` |
+| In the INSERT column-list aliasing path, **`body.copy()` + strip-WITH happen once** before the loop; only the single projection is swapped per column | `_extract_column_lineage` INSERT block | A full-body deepcopy per column is O(cols × body_size). Regressed in `4234e5d` |
 | **`_upsert_parsed_file` uses `upsert_nodes_bulk`/`upsert_edges_bulk`** (Phase A→B→C), never `upsert_node`/`upsert_edge` per row | `indexer.py` `_upsert_parsed_file` | Measured: bulk=181s vs per-node=1020s+ on 1,340-file DWH (~10 execute() calls per file vs ~14,500 total). Commit `4234e5d` accidentally regressed this by rewriting the method during C2 normalization. |
 
 Tests covering these invariants live in [`test_T09_01_qualify_once.py`](tests/unit/test_T09_01_qualify_once.py)
@@ -118,6 +121,15 @@ The scaling guard parses a fixture at size N and 2N and asserts these stay flat.
 class, not just the named ones, and uses deterministic op-counts (never wall-clock) so it cannot
 flake by machine speed. A red here means something started scaling — find what, do not raise the
 slack. When adding a new hot-path op that must be once-per-statement, add a counter for it there.
+
+The guard's **call-count** axes alone are not enough: the three `4234e5d` regressions kept call
+counts flat/linear but regressed *per-call cost* (`copy=False` dropped → per-column scope deepcopy),
+the *failure path* (per-column re-qualify only when qualify throws), and a *per-column body copy*
+(INSERT aliasing). A clean fixture stays green because its qualify succeeds and its scope is small.
+The guard therefore also pins these **behaviourally**: scope-path `sg_lineage` must pass `copy=False`;
+a forced qualify failure must not re-qualify per column; the INSERT body must be copied once. When
+adding a hot-path optimization, prefer a behavioural assertion (kwarg present, op once-per-statement)
+over a volume count — volume counts hide inside a too-simple fixture, which is how this shipped in v1.0.0.
 
 - When referring to files in docs or plans, use markdown hyperlinks (e.g. [`schema.py`](src/sqlcg/core/schema.py)) so stale references are immediately visible when file names change.
 - No backward compatibility. Re-index is the migration path.
