@@ -28,6 +28,8 @@ def uninstall_cmd(  # noqa: B008
     Step 1: Remove MCP registration from ~/.claude/settings.json
     Step 2: Optionally delete the KùzuDB graph database
     Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
+    Step 4: Remove sqlcg skill directory from ~/.claude/skills/sqlcg/ and
+            <repo>/.claude/skills/sqlcg/
     """
     # Step 1: Remove MCP entry from settings.json
     _step1_remove_mcp_entry()
@@ -43,6 +45,9 @@ def uninstall_cmd(  # noqa: B008
     # Step 3: Remove git hook sentinel block
     repo_path = repo if repo else Path.cwd()
     _step3_remove_git_hook(repo_path)
+
+    # Step 4: Remove sqlcg skill directory
+    _step4_remove_skill(repo_path)
 
 
 def _step1_remove_mcp_entry() -> None:
@@ -227,3 +232,37 @@ def _is_kuzu_backend(db_path: str) -> bool:
     """Check if the database is a KùzuDB backend (not Neo4j)."""
     backend = os.getenv("SQLCG_BACKEND", "kuzu").lower()
     return backend in ("kuzu", "")  # Default to kuzu if unset
+
+
+# Candidate skill directory locations to remove (global first, then project-relative)
+# Each entry is a callable(repo_path) -> Path resolving to the sqlcg skill dir.
+_SKILL_DIR_TARGETS = [
+    lambda repo_path: Path.home() / ".claude" / "skills" / "sqlcg",
+    lambda repo_path: repo_path / ".claude" / "skills" / "sqlcg",
+]
+
+
+def _step4_remove_skill(repo_path: Path) -> None:
+    """Remove the sqlcg-owned skill directory at all candidate locations.
+
+    Iterates over the global (~/.claude/skills/sqlcg/) and project-relative
+    (<repo>/.claude/skills/sqlcg/) directories. For each:
+    - If the directory exists, removes it with shutil.rmtree (ignoring errors)
+      and prints a green "Removed" notice.
+    - If the directory does not exist, prints a yellow "not found" notice.
+
+    Only the sqlcg/ subdirectory is ever removed — the parent skills/ dir and
+    any sibling skill directories are left untouched.
+    """
+    any_found = False
+    for target_fn in _SKILL_DIR_TARGETS:
+        skill_dir = target_fn(repo_path)
+        if skill_dir.exists():
+            any_found = True
+            shutil.rmtree(skill_dir, ignore_errors=True)
+            console.print(f"[green]Removed skill directory:[/green] {skill_dir}")
+        else:
+            console.print(f"[yellow]Skill directory not found:[/yellow] {skill_dir}")
+
+    if not any_found:
+        console.print("[yellow]No skill directories found — nothing to remove.[/yellow]")

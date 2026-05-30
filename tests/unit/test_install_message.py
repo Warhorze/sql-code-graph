@@ -26,7 +26,7 @@ def test_uvx_available_shows_cold_cache_message():
             mock_settings_path.with_suffix.return_value = MagicMock()
 
             with patch("sqlcg.cli.commands.install.console") as mock_console:
-                install_cmd()
+                install_cmd(scope="global")
 
                 # Verify that cold cache message was printed
                 str(mock_console.print.call_args_list)
@@ -61,7 +61,7 @@ def test_uvx_not_available_no_cold_cache_message():
             mock_settings_path.with_suffix.return_value = MagicMock()
 
             with patch("sqlcg.cli.commands.install.console") as mock_console:
-                install_cmd()
+                install_cmd(scope="global")
 
                 # Verify that sqlcg command is used
                 str(mock_console.print.call_args_list)

@@ -24,6 +24,7 @@ QUICK START:
   1. sqlcg db init
   2. sqlcg index <path> --dialect snowflake
   3. sqlcg git install-hooks
+  4. sqlcg install --scope project   # also provisions a Claude skill (SKILL.md)
 
 Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 """
