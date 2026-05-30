@@ -1,5 +1,14 @@
 ## Current State
 
+CURRENT: v1.0 release — STAGED, awaiting PyPI publish (user pushes the tag).
+  F1 living-codebase resync: COMPLETE (Phases 1-5). F2 bundled skill: COMPLETE
+  (+ compaction, `sqlcg mcp best-practices`, top-level help nudge, README docs).
+  Arch recorded in ARCHITECTURE_REVIEW.md §16. Version bumped 0.3.1 -> 1.0.0.
+  Plan: merge PR #21 (trust-layer + F1 + F2) -> master as a MERGE COMMIT, tag
+  v1.0.0 locally, STOP before `git push origin v1.0.0` (the tag-push triggers
+  release.yml -> PyPI, irreversible). User decisions: include docs / stage+stop
+  before publish / merge commit. Indexer verified end-to-end (10 files, 48 edges).
+
 ACTIVE AGENT: developer — feature F2 (bundle-claude-skill)
   status: IMPLEMENTATION COMPLETE — all F2 tests green, full suite green
   commits:

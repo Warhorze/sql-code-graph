@@ -2768,3 +2768,59 @@ invariants existed to contain) for no measured coverage benefit.
   pure-literal skip, scope-vs-sources, bulk upsert) are unaffected.
 - **Do not reintroduce** a schema-CSV ingestion path without a measured
   lineage-coverage win to justify the perf surface.
+
+---
+
+## 16. v1.0 features — living-codebase resync (F1) + bundled skill (F2) (2026-05-30)
+
+### 16.1 F1 — incremental branch-change resync
+
+**Problem**: branch switches triggered a *full* reindex via two paths (the
+`post-checkout` git hook and `BranchMonitor`), flooding large repos on every
+`git checkout`. The per-file watch path was already incremental and was left
+unchanged.
+
+**Decision**: one git-diff entry point, `Indexer.resync_changed(root, old, new,
+db, dialect)`, replaces both full-reindex triggers. It re-parses only the changed
+files plus their **cross-file pass-2 affected closure** — files that
+`SELECTS_FROM` tables defined in changed/deleted files, walked transitively to
+`max_closure_depth=3` via the new `DEPENDENT_FILES_OF_TABLES` query. If the
+frontier is still growing at the cap it falls back to full `index_repo` (never
+silently wrong). Deletes capture the deleted file's tables *before*
+`delete_nodes_for_file`, then re-resolve dependents; CTAS bodies are re-harvested
+from definer files because stored `q.sql` is truncated (lossy).
+
+**Metadata**: `indexed_sha` persisted on the `SchemaVersion` singleton;
+`SCHEMA_VERSION` bumped 3→4 (re-index migration, no backward compat). Standalone
+`sqlcg reindex [<path>] --from <sha> --to <sha>` exposes the same path; without
+SHAs it diffs the stored `indexed_sha` against HEAD. Hooks generalized: both
+`post-checkout` and `post-merge` are written (each idempotent with its own
+sentinel); `uninstall` strips both.
+
+**Why safe for both scales**: small repos still run `sqlcg index <path>` with no
+new config; the closure walk + cap keeps large-repo resyncs bounded without
+degrading the small-repo path. Bulk-upsert and the once-per-statement scope
+invariants are untouched.
+
+### 16.2 F2 — Claude skill bundled in install
+
+**Decision**: `sqlcg install --scope {project|global}` provisions a `SKILL.md`
+that teaches an LLM the MCP tool surface and the trust-layer **fact/heuristic
+boundary**. The tool table is generated from the live FastMCP registry (16
+tools); the fact/heuristic tag is **derived from each tool's return model**
+(`_tool_is_heuristic` inspects for a `Judgement`-typed field, nested one level),
+not a hand-maintained list — a drift-guard test pins skill↔registry parity. The
+boundary doc has a single source (`render_body()`), reused by the
+`sqlcg mcp best-practices` CLI command and surfaced from top-level `--help`.
+
+**Locked decisions**: install location is a user choice (`--scope` flag +
+interactive TTY prompt; errors rather than guessing on non-TTY stdin); skill is
+generated at install time, frontmatter `version` from `sqlcg.__version__`; no
+packaging change (relies on existing `packages = ["src/sqlcg"]`); `uninstall`
+removes the skill, mirroring the F1 sentinel teardown.
+
+### 16.3 Open follow-ups
+- Staleness FACT (surfacing "graph N commits behind HEAD") is deferred; F1 only
+  persists the prerequisite `indexed_sha`.
+- `max_closure_depth=3` is a reasoned default, not yet calibrated against real
+  DWH chain depth — revisit if a deep chain is observed under-resolving.
