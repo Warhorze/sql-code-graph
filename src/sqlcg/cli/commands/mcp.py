@@ -22,28 +22,34 @@ def _server_entry() -> dict:
 
 @app.command("setup")
 def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
-    """Print or write MCP server config JSON."""
+    """Print or write MCP server config JSON.
+
+    --print (default): print the JSON snippet for manual insertion.
+    --write: write to ~/.claude.json under mcpServers.user (the correct path
+             for Claude Code — not settings.json, which Claude Code does not read
+             for MCP servers).
+    """
     entry = _server_entry()
     if print_only:
         console.print_json(json.dumps({"mcpServers": {_SERVER_KEY: entry}}, indent=2))
         return
 
-    config_path = Path.home() / ".claude" / "settings.json"
-    if config_path.exists():
+    # Write to ~/.claude.json (correct path for Claude Code MCP servers)
+    claude_json = Path.home() / ".claude.json"
+    if claude_json.exists():
         try:
-            settings: dict = json.loads(config_path.read_text())
+            data: dict = json.loads(claude_json.read_text())
         except json.JSONDecodeError:
-            settings = {}
+            data = {}
     else:
-        settings = {}
+        data = {}
 
-    settings.setdefault("mcpServers", {})[_SERVER_KEY] = entry
+    data.setdefault("mcpServers", {}).setdefault("user", {})[_SERVER_KEY] = entry
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = config_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(settings, indent=2) + "\n")
-    os.replace(tmp, config_path)
-    console.print(f"[green]Configuration written to[/green] {config_path}")
+    tmp = claude_json.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, claude_json)
+    console.print(f"[green]Configuration written to[/green] {claude_json}")
     console.print("Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.")
 
 

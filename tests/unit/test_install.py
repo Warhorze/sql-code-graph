@@ -1,8 +1,13 @@
-"""Tests for sqlcg install command and mcp setup --write (Claude Code MCP registration)."""
+"""Tests for sqlcg install command and mcp setup --write (Claude Code MCP registration).
+
+PR-02 (#23): install now writes via `claude mcp add -s user` when the claude binary
+is on PATH, and falls back to ~/.claude.json when it is not. The previous target
+~/.claude/settings.json has been removed.
+"""
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -13,268 +18,240 @@ from sqlcg.cli.main import app
 runner = CliRunner()
 
 
-def _which_fallback_to_sqlcg(cmd: str) -> str | None:
-    """Mock implementation: return sqlcg if asked, None otherwise."""
-    if cmd == "sqlcg":
-        return "/usr/local/bin/sqlcg"
-    return None
+def _which_sqlcg(cmd: str) -> str | None:
+    return "/usr/local/bin/sqlcg" if cmd == "sqlcg" else None
 
 
-def _which_fallback_to_uvx(cmd: str) -> str | None:
-    """Mock implementation: return uvx if asked, None otherwise."""
-    if cmd == "uvx":
-        return "/usr/bin/uvx"
+def _which_uvx(cmd: str) -> str | None:
+    return "/usr/bin/uvx" if cmd == "uvx" else None
+
+
+def _which_nothing(_cmd: str) -> None:
     return None
 
 
 @pytest.fixture()
 def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect Path.home() to tmp_path so tests never touch ~/.claude."""
-    monkeypatch.setattr(
-        "sqlcg.cli.commands.install._SETTINGS_PATH",
-        tmp_path / ".claude" / "settings.json",
-    )
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
 
 
 # ---------------------------------------------------------------------------
-# sqlcg / uvx command selection — priority order
+# PR-02 Scenario A — claude available, claude mcp add succeeds
 # ---------------------------------------------------------------------------
 
 
-def test_scenario_a_prefers_sqlcg_when_available(fake_home: Path) -> None:
-    """Guard: sqlcg binary takes priority over uvx when both are on PATH."""
+def test_scenario_a_claude_available_runs_claude_mcp_add(
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When claude is on PATH and claude mcp add returns 0, no file is written."""
+
+    def which_impl(cmd: str) -> str | None:
+        if cmd in ("sqlcg", "claude"):
+            return f"/usr/local/bin/{cmd}"
+        return None
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stderr = ""
+
+    with patch("shutil.which", side_effect=which_impl):
+        with patch("subprocess.run", return_value=mock_proc) as mock_run:
+            result = runner.invoke(app, ["install", "--scope", "global"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+
+    # claude mcp add must have been called
+    subprocess_calls = mock_run.call_args_list
+    claude_call = next(
+        (c for c in subprocess_calls if c.args[0][0] == "claude"),
+        None,
+    )
+    assert claude_call is not None, (
+        "subprocess.run must be called with ['claude', 'mcp', 'add', ...]. "
+        f"Actual calls: {subprocess_calls}"
+    )
+    call_args = claude_call.args[0]
+    assert "mcp" in call_args and "add" in call_args and "-s" in call_args, (
+        f"claude mcp add -s user must be in call args: {call_args}"
+    )
+    assert "sql-code-graph" in call_args, f"Server key missing from args: {call_args}"
+
+    # No ~/.claude.json should have been written
+    assert not (fake_home / ".claude.json").exists(), (
+        "No ~/.claude.json should be written when claude mcp add succeeds"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-02 Scenario B — claude not available, falls back to ~/.claude.json
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_b_claude_not_available_writes_claude_json(
+    fake_home: Path,
+) -> None:
+    """When claude is not on PATH, install falls back to writing ~/.claude.json."""
 
     def which_impl(cmd: str) -> str | None:
         if cmd == "sqlcg":
             return "/usr/local/bin/sqlcg"
-        elif cmd == "uvx":
-            return "/usr/bin/uvx"
-        return None
+        return None  # claude not available
 
     with patch("shutil.which", side_effect=which_impl):
         result = runner.invoke(app, ["install", "--scope", "global"])
-    assert result.exit_code == 0, f"Expected exit_code 0, got {result.exit_code}: {result.output}"
-    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
-    entry = settings["mcpServers"]["sql-code-graph"]
-    assert entry["command"] == "sqlcg", (
-        f"When sqlcg is on PATH, entry command must be 'sqlcg', got {entry['command']}"
-    )
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+
+    claude_json = fake_home / ".claude.json"
+    assert claude_json.exists(), "~/.claude.json must be written as fallback"
+
+    data = json.loads(claude_json.read_text())
+    entry = data.get("mcpServers", {}).get("user", {}).get("sql-code-graph")
+    assert entry is not None, "mcpServers.user.sql-code-graph must be present in ~/.claude.json"
+    assert entry["command"] == "sqlcg"
     assert entry["args"] == ["mcp", "start"]
 
+    # Old path must not have been touched
+    assert not (fake_home / ".claude" / "settings.json").exists(), (
+        "~/.claude/settings.json must never be written by install_cmd"
+    )
 
-def test_scenario_b_falls_back_to_uvx_when_no_sqlcg(fake_home: Path) -> None:
-    """Guard: uvx is used as fallback when sqlcg is not on PATH."""
+
+# ---------------------------------------------------------------------------
+# PR-02 Scenario C — --dry-run prints command, writes nothing
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_c_dry_run_prints_command_no_write(
+    fake_home: Path,
+) -> None:
+    """--dry-run shows what would be run, writes no files."""
 
     def which_impl(cmd: str) -> str | None:
-        if cmd == "sqlcg":
-            return None
-        elif cmd == "uvx":
-            return "/usr/bin/uvx"
+        if cmd in ("sqlcg", "claude"):
+            return f"/usr/local/bin/{cmd}"
         return None
 
     with patch("shutil.which", side_effect=which_impl):
-        result = runner.invoke(app, ["install", "--scope", "global"])
-    assert result.exit_code == 0
-    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
-    entry = settings["mcpServers"]["sql-code-graph"]
-    assert entry["command"] == "uvx"
-    assert entry["args"] == ["sql-code-graph", "mcp", "start"]
+        result = runner.invoke(app, ["install", "--dry-run", "--scope", "global"])
 
-
-def test_scenario_c_updates_uvx_to_sqlcg(fake_home: Path) -> None:
-    """Guard: existing uvx entry is updated to sqlcg when sqlcg becomes available."""
-    settings_path = fake_home / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    # Pre-populate with uvx entry
-    settings_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "sql-code-graph": {"command": "uvx", "args": ["sql-code-graph", "mcp", "start"]}
-                }
-            }
-        )
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    assert not (fake_home / ".claude.json").exists(), "No file should be written with --dry-run"
+    assert not (fake_home / ".claude" / "settings.json").exists(), (
+        "No settings.json should be written with --dry-run"
     )
-
-    def which_impl(cmd: str) -> str | None:
-        if cmd == "sqlcg":
-            return "/usr/local/bin/sqlcg"
-        elif cmd == "uvx":
-            return "/usr/bin/uvx"
-        return None
-
-    with patch("shutil.which", side_effect=which_impl):
-        result = runner.invoke(app, ["install", "--scope", "global"])
-    assert result.exit_code == 0
-    assert "Updating" in result.output or "faster startup" in result.output, (
-        "When switching from uvx to sqlcg, upgrade notice should be printed. "
-        f"Output: {result.output}"
-    )
-    settings = json.loads(settings_path.read_text())
-    entry = settings["mcpServers"]["sql-code-graph"]
-    assert entry["command"] == "sqlcg", (
-        f"Entry command should be updated to 'sqlcg', got {entry['command']}"
+    # Output should mention the claude mcp add command or sql-code-graph
+    assert "sql-code-graph" in result.output, (
+        f"Output must mention the server key. Got: {result.output}"
     )
 
 
-def test_scenario_d_neither_on_path(fake_home: Path) -> None:
-    """Guard: exit with error when neither sqlcg nor uvx is on PATH."""
+# ---------------------------------------------------------------------------
+# Fallback path: neither sqlcg nor uvx on PATH → error
+# ---------------------------------------------------------------------------
+
+
+def test_neither_on_path_exits_with_error(fake_home: Path) -> None:
+    """Exit with error when neither sqlcg nor uvx is on PATH."""
     with patch("shutil.which", return_value=None):
         result = runner.invoke(app, ["install", "--scope", "global"])
     assert result.exit_code != 0, "Expected non-zero exit when neither tool is on PATH"
-    assert "found on PATH" in result.output or "Neither" in result.output, (
-        f"Error message should mention tools not on PATH. Output: {result.output}"
-    )
-
-
-def test_scenario_e_dry_run_with_sqlcg(fake_home: Path) -> None:
-    """Guard: --dry-run shows correct config when sqlcg is available."""
-    with patch("shutil.which", return_value="/usr/local/bin/sqlcg"):
-        result = runner.invoke(app, ["install", "--dry-run", "--scope", "global"])
-    assert result.exit_code == 0
-    assert not (fake_home / ".claude" / "settings.json").exists(), (
-        "No file should be written with --dry-run"
-    )
-    assert "sqlcg" in result.output
+    assert "found on PATH" in result.output or "Neither" in result.output
 
 
 # ---------------------------------------------------------------------------
-# File creation and merging
+# Fallback path: ~/.claude.json merge behaviour
 # ---------------------------------------------------------------------------
 
 
-def test_creates_settings_file_when_absent(fake_home: Path) -> None:
-    def which_impl(cmd: str) -> str | None:
-        if cmd == "sqlcg":
-            return "/usr/local/bin/sqlcg"
-        return None
+def test_fallback_merges_into_existing_claude_json(
+    fake_home: Path,
+) -> None:
+    """Existing keys in ~/.claude.json are preserved when adding the sqlcg entry."""
+    claude_json = fake_home / ".claude.json"
+    claude_json.write_text(json.dumps({"theme": "dark", "mcpServers": {"user": {"other": {}}}}))
 
-    with patch("shutil.which", side_effect=which_impl):
-        result = runner.invoke(app, ["install", "--scope", "global"])
-    assert result.exit_code == 0
-    assert (fake_home / ".claude" / "settings.json").exists()
-
-
-def test_creates_parent_directory_when_absent(fake_home: Path) -> None:
-    assert not (fake_home / ".claude").exists()
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
-        runner.invoke(app, ["install", "--scope", "global"])
-    assert (fake_home / ".claude").is_dir()
-
-
-def test_merges_into_existing_settings(fake_home: Path) -> None:
-    settings_path = fake_home / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text(json.dumps({"theme": "dark", "otherKey": 42}) + "\n")
-
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
+    with patch("shutil.which", side_effect=_which_sqlcg):
         runner.invoke(app, ["install", "--scope", "global"])
 
-    settings = json.loads(settings_path.read_text())
-    assert settings["theme"] == "dark"
-    assert settings["otherKey"] == 42
-    assert "sql-code-graph" in settings["mcpServers"]
+    data = json.loads(claude_json.read_text())
+    assert data["theme"] == "dark"
+    assert "other" in data["mcpServers"]["user"]
+    assert "sql-code-graph" in data["mcpServers"]["user"]
 
 
-def test_does_not_clobber_existing_mcp_servers(fake_home: Path) -> None:
-    settings_path = fake_home / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    existing = {"mcpServers": {"other-tool": {"command": "other", "args": []}}}
-    settings_path.write_text(json.dumps(existing))
-
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
+def test_fallback_idempotent_already_configured(
+    fake_home: Path,
+) -> None:
+    """Running install twice does not duplicate the key in ~/.claude.json."""
+    with patch("shutil.which", side_effect=_which_sqlcg):
         runner.invoke(app, ["install", "--scope", "global"])
+        result2 = runner.invoke(app, ["install", "--scope", "global"])
 
-    settings = json.loads(settings_path.read_text())
-    assert "other-tool" in settings["mcpServers"]
-    assert "sql-code-graph" in settings["mcpServers"]
+    assert result2.exit_code == 0
+    # Check "Already configured" message
+    assert "Already configured" in result2.output
 
-
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
-
-
-def test_idempotent_uvx(fake_home: Path) -> None:
-    with patch("shutil.which", side_effect=_which_fallback_to_uvx):
-        runner.invoke(app, ["install", "--scope", "global"])
-        result = runner.invoke(app, ["install", "--scope", "global"])
-    assert result.exit_code == 0
-    assert "Already configured" in result.output
-
-
-def test_idempotent_does_not_duplicate_key(fake_home: Path) -> None:
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
-        runner.invoke(app, ["install", "--scope", "global"])
-        runner.invoke(app, ["install", "--scope", "global"])
-
-    settings = json.loads((fake_home / ".claude" / "settings.json").read_text())
-    keys = list(settings["mcpServers"].keys())
+    claude_json = fake_home / ".claude.json"
+    data = json.loads(claude_json.read_text())
+    keys = list(data.get("mcpServers", {}).get("user", {}).keys())
     assert keys.count("sql-code-graph") == 1
 
 
-# ---------------------------------------------------------------------------
-# --dry-run
-# ---------------------------------------------------------------------------
+def test_fallback_survives_malformed_claude_json(
+    fake_home: Path,
+) -> None:
+    """Malformed ~/.claude.json is overwritten with a valid structure."""
+    claude_json = fake_home / ".claude.json"
+    claude_json.write_text("{ not valid json !!!")
 
-
-def test_dry_run_prints_config_without_writing(fake_home: Path) -> None:
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
-        result = runner.invoke(app, ["install", "--dry-run", "--scope", "global"])
-    assert result.exit_code == 0
-    assert not (fake_home / ".claude" / "settings.json").exists()
-    assert "sql-code-graph" in result.output
-
-
-# ---------------------------------------------------------------------------
-# Error resilience
-# ---------------------------------------------------------------------------
-
-
-def test_survives_malformed_existing_json(fake_home: Path) -> None:
-    settings_path = fake_home / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text("{ not valid json !!!")
-
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
+    with patch("shutil.which", side_effect=_which_sqlcg):
         result = runner.invoke(app, ["install", "--scope", "global"])
+
     assert result.exit_code == 0
-    settings = json.loads(settings_path.read_text())
-    assert "sql-code-graph" in settings["mcpServers"]
+    data = json.loads(claude_json.read_text())
+    assert "sql-code-graph" in data["mcpServers"]["user"]
 
 
 # ---------------------------------------------------------------------------
-# mcp setup --write
+# mcp setup --write writes to ~/.claude.json (not settings.json)
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_setup_write_merges_into_settings_json(
+def test_mcp_setup_write_writes_claude_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text(json.dumps({"theme": "dark", "mcpServers": {"other": {}}}))
+    """mcp setup --write writes to ~/.claude.json, not ~/.claude/settings.json."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with patch("shutil.which", side_effect=_which_sqlcg):
+        result = CliRunner().invoke(mcp_commands.app, ["setup", "--write"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    claude_json = tmp_path / ".claude.json"
+    assert claude_json.exists(), "~/.claude.json must be written by mcp setup --write"
+    data = json.loads(claude_json.read_text())
+    assert "sql-code-graph" in data["mcpServers"]["user"]
+    # Old settings.json path must not be touched
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_mcp_setup_write_merges_into_existing_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mcp setup --write preserves existing keys in ~/.claude.json."""
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({"theme": "dark", "mcpServers": {"user": {"other": {}}}}))
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
+    with patch("shutil.which", side_effect=_which_sqlcg):
         result = CliRunner().invoke(mcp_commands.app, ["setup", "--write"])
 
     assert result.exit_code == 0
-    settings = json.loads(settings_path.read_text())
-    assert settings["theme"] == "dark"
-    assert "other" in settings["mcpServers"]
-    assert "sql-code-graph" in settings["mcpServers"]
-    assert settings["mcpServers"]["sql-code-graph"]["command"] == "sqlcg"
-
-
-def test_mcp_setup_write_does_not_write_mcp_json(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    with patch("shutil.which", side_effect=_which_fallback_to_sqlcg):
-        CliRunner().invoke(mcp_commands.app, ["setup", "--write"])
-
-    assert not (tmp_path / ".claude" / "mcp.json").exists()
-    assert (tmp_path / ".claude" / "settings.json").exists()
+    data = json.loads(claude_json.read_text())
+    assert data["theme"] == "dark"
+    assert "other" in data["mcpServers"]["user"]
+    assert "sql-code-graph" in data["mcpServers"]["user"]
+    assert data["mcpServers"]["user"]["sql-code-graph"]["command"] == "sqlcg"

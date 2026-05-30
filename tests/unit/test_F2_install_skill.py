@@ -23,11 +23,7 @@ def _which_sqlcg(cmd: str) -> str | None:
 
 @pytest.fixture()
 def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect _SETTINGS_PATH and Path.home() to tmp_path."""
-    monkeypatch.setattr(
-        "sqlcg.cli.commands.install._SETTINGS_PATH",
-        tmp_path / ".claude" / "settings.json",
-    )
+    """Redirect Path.home() to tmp_path so tests never touch ~/.claude."""
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
 

@@ -27,11 +27,7 @@ def _which_none(cmd: str) -> str | None:
 
 @pytest.fixture()
 def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect _SETTINGS_PATH (install+uninstall) and Path.home() to tmp_path."""
-    monkeypatch.setattr(
-        "sqlcg.cli.commands.install._SETTINGS_PATH",
-        tmp_path / ".claude" / "settings.json",
-    )
+    """Redirect _SETTINGS_PATH (uninstall) and Path.home() to tmp_path."""
     monkeypatch.setattr(
         "sqlcg.cli.commands.uninstall._SETTINGS_PATH",
         tmp_path / ".claude" / "settings.json",
