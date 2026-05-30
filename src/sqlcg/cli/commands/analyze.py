@@ -1,11 +1,18 @@
 """Analyze command for lineage analysis."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from sqlcg.core.config import get_backend
 from sqlcg.core.schema import NodeLabel, RelType
+
+if TYPE_CHECKING:
+    from sqlcg.server.noise_filter import NoiseFilter
 
 app = typer.Typer(help="Lineage analysis")
 console = Console()
@@ -15,6 +22,7 @@ console = Console()
 def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Trace upstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -29,6 +37,11 @@ def upstream(  # noqa: B008
             "RETURN src.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            results = _filter_column_results(results, nf)
         _print_table(results, ["id"])
 
 
@@ -36,6 +49,7 @@ def upstream(  # noqa: B008
 def downstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Trace downstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -50,6 +64,11 @@ def downstream(  # noqa: B008
             "RETURN dst.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            results = _filter_column_results(results, nf)
         _print_table(results, ["id"])
 
 
@@ -104,6 +123,30 @@ def unused(
             {},
         )
         _print_table(results, ["qualified"])
+
+
+def _col_id_to_table(col_id: str) -> str:
+    """Extract the table-qualified part from a column ID (schema.table.col → schema.table).
+
+    Column IDs follow the format: schema.table.column or table.column.
+    The table part is everything except the last component.
+
+    Args:
+        col_id: A column ID string from the graph.
+
+    Returns:
+        The table-qualified portion (all but the last dotted component).
+    """
+    parts = col_id.rsplit(".", 1)
+    return parts[0] if len(parts) == 2 else col_id
+
+
+def _filter_column_results(
+    results: list[dict],
+    nf: NoiseFilter,  # type: ignore[name-defined]
+) -> list[dict]:
+    """Filter column-ID result rows by NoiseFilter, dropping rows whose table is noise."""
+    return [r for r in results if not nf.is_noise(_col_id_to_table(r["id"]))]
 
 
 def _print_table(rows: list[dict], columns: list[str]) -> None:

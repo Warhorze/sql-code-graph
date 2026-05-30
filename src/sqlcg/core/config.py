@@ -138,6 +138,7 @@ def get_noise_filter_patterns(path: Path) -> list[str]:
     """
     default_patterns = [
         "*_bck",
+        "*_bck_*",  # catches mid-suffix variants e.g. foo_bck_us39553, bar_bck_archive
         "*_bck_us",
         "*_bck_[0-9]*",
         "*_backup",

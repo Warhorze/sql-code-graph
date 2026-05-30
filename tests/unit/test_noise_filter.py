@@ -335,3 +335,101 @@ ignore_table_regexes = ["_bck"]
         filter = NoiseFilter.from_config(repo_root=tmp_path)
         assert filter.is_noise("ba.foo_bck_archive") is True
         assert filter.is_noise("ba.foo") is False
+
+
+# ---------------------------------------------------------------------------
+# PR-08 #27a — *_bck_* default glob catches mid-suffix variants
+# ---------------------------------------------------------------------------
+
+
+class TestBckStarDefaultGlob:
+    """#27a: *_bck_* must be in the default pattern list."""
+
+    def test_scenario_a_bck_star_catches_mid_suffix(self, tmp_path: "Path") -> None:
+        """Scenario A: default config matches foo_bck_us39553.
+
+        foo_bck_us39553 has an intermediate word after _bck_ — the old pattern
+        *_bck_us only matched _bck_us as a suffix, missing _bck_us39553.
+        The new *_bck_* pattern catches the whole class.
+        """
+        from sqlcg.server.noise_filter import NoiseFilter
+
+        # from_config with no .sqlcg.toml → uses default_patterns
+        nf = NoiseFilter.from_config(repo_root=tmp_path)
+        assert nf.is_noise("ba.foo_bck_us39553") is True, (
+            "*_bck_* default pattern must match foo_bck_us39553"
+        )
+
+    def test_scenario_b_bck_star_does_not_over_match_leading_bck(self, tmp_path: "Path") -> None:
+        """Scenario B: *_bck_* does not match names that start with bck_.
+
+        fnmatch('bck_tracker', '*_bck_*') is False because '*_bck_*' requires
+        at least one character before _bck_ (the leading *_ anchors to a char).
+        """
+        import fnmatch
+
+        assert fnmatch.fnmatch("bck_tracker", "*_bck_*") is False, (
+            "fnmatch('bck_tracker', '*_bck_*') must be False: "
+            "the pattern requires at least one char before _bck_"
+        )
+
+        from sqlcg.server.noise_filter import NoiseFilter
+
+        nf = NoiseFilter.from_config(repo_root=tmp_path)
+        assert nf.is_noise("ba.bck_tracker") is False, (
+            "*_bck_* must not match 'bck_tracker' (name starts with bck_, not _bck_)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PR-08 #27b — CLI analyze upstream respects NoiseFilter
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyzeNoiseFilter:
+    """#27b: analyze upstream/downstream applies NoiseFilter by default."""
+
+    def test_scenario_c_analyze_upstream_excludes_noise_by_default(self) -> None:
+        """Scenario C: backup table nodes are excluded from CLI output by default.
+
+        Uses a mock backend returning a backup node; verifies that with default
+        NoiseFilter the node is excluded, and with --raw it is returned.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from typer.testing import CliRunner
+
+        from sqlcg.cli.main import app
+
+        runner = CliRunner()
+        backup_id = "ba.src_bck_us99.amount"
+        normal_id = "ba.src.amount"
+
+        backend = MagicMock()
+        backend.__enter__ = MagicMock(return_value=backend)
+        backend.__exit__ = MagicMock(return_value=False)
+        backend.run_read = MagicMock(return_value=[{"id": backup_id}, {"id": normal_id}])
+
+        with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+            # Default: noise filtered out
+            result_default = runner.invoke(app, ["analyze", "upstream", "ba.fact.col"])
+
+        assert result_default.exit_code == 0, (
+            f"exit_code={result_default.exit_code}: {result_default.output}"
+        )
+        assert backup_id not in result_default.output, (
+            f"Backup node {backup_id!r} must be excluded by default NoiseFilter. "
+            f"Output: {result_default.output}"
+        )
+        assert normal_id in result_default.output, (
+            f"Normal node {normal_id!r} must appear in output. Output: {result_default.output}"
+        )
+
+        with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+            # --raw: backup node restored
+            result_raw = runner.invoke(app, ["analyze", "upstream", "ba.fact.col", "--raw"])
+
+        assert result_raw.exit_code == 0
+        assert backup_id in result_raw.output, (
+            f"Backup node {backup_id!r} must appear with --raw. Output: {result_raw.output}"
+        )
