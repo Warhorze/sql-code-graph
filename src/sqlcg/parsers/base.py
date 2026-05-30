@@ -619,10 +619,6 @@ class SqlParser(ABC):
             else:
                 return LineageExtraction(edges=edges, star_sources=star_sources)
 
-            # Build scope once from the body for all-column reuse (T-05 optimization)
-            # Defer scope building to just before the column loop to ensure sources
-            # are expanded first (avoid rebuilding for each column, but only build
-            # after sources are known)
             body_scope = None
             combined_sources = {**(sources or {})}
 
@@ -643,6 +639,54 @@ class SqlParser(ABC):
                                 # Use lowercase key to match the sources_map convention
                                 key = cte_alias.lower()
                                 combined_sources[key] = cte.this
+
+            # Build body_scope ONCE per statement, before the column loop, and reuse
+            # it for every column (CLAUDE.md invariant: "body_scope built once per
+            # statement"). If schema-qualify fails, retry schema-free so we STILL get
+            # a scope for the copy=False fast path; only if both fail do we fall back
+            # to the per-column sources= path. Building this lazily inside the loop
+            # (regressed in 4234e5d) meant a single qualify failure re-ran
+            # expand+qualify+build_scope for EVERY column → O(N_cols) full-body
+            # deepcopies per statement (measured: 229 qualify calls on one 460-line file).
+            if scope is None:
+                expanded_body = body
+                expand_sources = {
+                    k: v for k, v in (sources or {}).items() if isinstance(v, exp.Query)
+                }
+                if expand_sources:
+                    try:
+                        expanded_body = exp.expand(
+                            body,
+                            expand_sources,  # type: ignore
+                            dialect=self.DIALECT,
+                            copy=True,
+                        )
+                    except Exception:
+                        expanded_body = body
+                try:
+                    qualified_body = qualify(
+                        expanded_body,
+                        dialect=self.DIALECT,
+                        schema=schema,
+                        validate_qualify_columns=False,
+                        identify=False,
+                    )
+                    body_scope = build_scope(qualified_body)
+                except Exception as _qualify_exc:
+                    out.errors.append(
+                        f"col_lineage_skip:qualify_failed:{type(_qualify_exc).__name__}"
+                    )
+                    # Schema-free retry: still yields a scope for the copy=False path.
+                    try:
+                        qualified_body = qualify(
+                            expanded_body,
+                            dialect=self.DIALECT,
+                            validate_qualify_columns=False,
+                            identify=False,
+                        )
+                        body_scope = build_scope(qualified_body)
+                    except Exception:
+                        body_scope = None
 
             # Extract output columns
             for col_expr in col_expressions:
@@ -723,53 +767,23 @@ class SqlParser(ABC):
                         continue
 
                 try:
-                    # Build scope on first column for reuse across all columns (T-05 optimization).
-                    # NOTE: We build body_scope locally from the extracted body rather than
-                    # using a pre-built scope from the statement, because CREATE/INSERT statements
-                    # have their scope rooted at the outer statement, but the body passed here
-                    # is the inner SELECT. Reusing the outer scope would produce incorrect
-                    # qualification. The pre-built scope from parse_file would only be useful
-                    # if we had a mechanism to extract the matching inner scope, which is
-                    # complex and not yet implemented (see sprint_06 T-05 deviation for details).
-                    if body_scope is None and scope is None:
-                        try:
-                            # Expand only file-level sources (CTEs, temp tables, CTAS bodies).
-                            expanded_body = body
-                            expand_sources = {
-                                k: v for k, v in (sources or {}).items() if isinstance(v, exp.Query)
-                            }
-                            if expand_sources:
-                                expanded_body = exp.expand(
-                                    body,
-                                    expand_sources,  # type: ignore
-                                    dialect=self.DIALECT,
-                                    copy=True,
-                                )
-
-                            # Qualify the expanded body to prepare for scope building
-                            qualified_body = qualify(
-                                expanded_body,
-                                dialect=self.DIALECT,
-                                schema=schema,
-                                validate_qualify_columns=False,
-                                identify=False,
-                            )
-                            body_scope = build_scope(qualified_body)
-                        except Exception as _qualify_exc:
-                            # qualify() failure is non-fatal: sg_lineage falls back to
-                            # its own qualification. Record for observability.
-                            out.errors.append(
-                                f"col_lineage_skip:qualify_failed:{type(_qualify_exc).__name__}:{_qualify_exc}"
-                            )
-                            body_scope = None
-
                     # When a scope is available it embeds full column→table resolution.
                     # On the qualify-failed fallback path (no scope), pass only the small
                     # set of file-level sources so sg_lineage can resolve CTEs/CTAS bodies.
                     active_scope = scope if scope is not None else body_scope
                     sg_kwargs: dict = {"dialect": self.DIALECT}
                     if active_scope is not None:
+                        # scope= path: the pre-built scope already embeds full
+                        # column→table resolution. copy=False + trim_selects=False
+                        # suppress sqlglot's per-call AST deepcopy and per-column
+                        # trim — neither is needed when the scope is built once and
+                        # reused across all columns. Dropping these (regressed in
+                        # 4234e5d) makes lineage() deepcopy the whole scope per
+                        # column → O(columns × scope_size) (measured: 3.2M deepcopy
+                        # calls / ~3.8s on a 359-line file).
                         sg_kwargs["scope"] = active_scope
+                        sg_kwargs["copy"] = False
+                        sg_kwargs["trim_selects"] = False
                     else:
                         sg_kwargs["sources"] = sources or {}
                     root = sg_lineage(col_name, body, **sg_kwargs)
@@ -912,6 +926,13 @@ class SqlParser(ABC):
             # stops sg_lineage at the CTE name boundary (doesn't expand into bodies).
             if isinstance(stmt, exp.Insert) and isinstance(stmt.this, exp.Schema):
                 insert_cols = [c.name for c in stmt.this.expressions]
+                # Build the WITH-stripped body ONCE before the loop and only swap its
+                # single projection per column (regressed in 4234e5d, which moved the
+                # full-body body.copy() inside the loop → O(N_cols) full-body deepcopies
+                # for wide INSERT ... SELECT). Stripping WITH stops sg_lineage at the CTE
+                # name boundary.
+                body_no_with = body.copy()
+                body_no_with.set("with_", None)
                 for idx, col_expr in enumerate(col_expressions):
                     if idx >= len(insert_cols):
                         break
@@ -920,10 +941,8 @@ class SqlParser(ABC):
                     insert_col = insert_cols[idx]
                     if not insert_col:
                         continue
-                    # Build a patched SELECT: strip WITH, alias the expression with the
-                    # INSERT column name so sg_lineage can trace it.
-                    body_no_with = body.copy()
-                    body_no_with.set("with_", None)
+                    # Patch the shared body with this column's aliased expression so
+                    # sg_lineage can trace it to the INSERT column name.
                     aliased = exp.Alias(this=col_expr.copy(), alias=insert_col)
                     body_no_with.set("expressions", [aliased])
                     patched_sql = body_no_with.sql(dialect=self.DIALECT)

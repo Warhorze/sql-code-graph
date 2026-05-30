@@ -194,7 +194,14 @@ class HardKillPool:
     ) -> None:
         self._dialect = dialect
         self._schema_aliases: dict[str, str] = schema_aliases or {}
-        self._n = n_workers or os.cpu_count() or 4
+        # Leave 2 logical cores of headroom rather than spawning one worker per
+        # logical core. Parsing is CPU-bound, and the main process also does work
+        # between passes (closure resolution, batched upserts); saturating every
+        # core makes the largest files miss the per-file wall-clock timeout.
+        # Measured on the 1,453-file DWH corpus (after the once-per-statement parser
+        # fixes): cpu_count → 2 timeouts / 186s; cpu_count-2 → 0 timeouts / 131s
+        # (fewer timeouts AND faster, since timed-out files waste work + respawn churn).
+        self._n = n_workers or max(1, (os.cpu_count() or 4) - 2)
         self._ctx = mp.get_context("spawn")
         self._workers: list[_WorkerState] = []
 
