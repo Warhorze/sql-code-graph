@@ -13,6 +13,7 @@ bash scripts/generate_cli_docs.sh
 | Command | Description |
 | --- | --- |
 | `index` | Index SQL files in a directory. |
+| `reindex` | Incrementally resync the graph after a git branch change or pull. |
 | `watch` | Watch a directory and re-index on SQL file changes. |
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
@@ -37,6 +38,12 @@ QUICK START:
   1. sqlcg db init
   2. sqlcg index <path> --dialect snowflake
   3. sqlcg git install-hooks
+  4. sqlcg install --scope project   # also provisions a Claude skill (SKILL.md)
+
+USING THE MCP TOOLS:
+  Read `sqlcg mcp best-practices` first — it explains the fact/heuristic
+  boundary so heuristic output (dead-code, risk) is never reported as fact.
+  See `sqlcg mcp --help` for all MCP commands.
 
 Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
@@ -71,6 +78,35 @@ Schema aliases (staging schema → canonical schema) can be configured in
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
 | --debug | BOOLEAN | No | No | False | Show detailed log output during indexing |
 | --profile / --no-profile | BOOLEAN | No | No | False | Emit per-stage timing after indexing |
+
+## `sqlcg reindex`
+
+```bash
+sqlcg reindex [OPTIONS] PATH
+```
+
+Incrementally resync the graph after a git branch change or pull.
+
+When --from and --to are given (e.g. from the post-checkout hook), only the
+files that changed between those two SHAs are re-parsed, plus the cross-file
+pass-2 closure (files that SELECT FROM tables defined in changed files).
+
+Without --from/--to, reads the last-indexed SHA from the database and diffs it
+against the current HEAD. If no stored SHA is found, falls back to a full index.
+
+Exits with an error if the database schema version does not match the current
+build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --from | TEXT | No | No |  | Base git SHA (previously-indexed state) |
+| --to | TEXT | No | No |  | Target git SHA (defaults to HEAD when --from is given) |
+| --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
+| --quiet, -q | BOOLEAN | No | No | False | Suppress summary output |
+| --batch-size | INTEGER | No | No | 50 | Files per KuzuDB transaction (same default as index command) |
+| --timeout-per-file | INTEGER | No | No | 5 | Per-file parse timeout in seconds |
 
 ## `sqlcg watch`
 
@@ -147,11 +183,18 @@ sqlcg install [OPTIONS]
 
 Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json).
 
+Also provisions a Claude skill file (SKILL.md) at the chosen location.
+Pass --scope project or --scope global to specify where the skill is written.
+On a TTY without --scope, an interactive prompt asks for the location.
+On a non-TTY (CI, scripts) without --scope, the command exits with an error.
+
 ### Options
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --dry-run | BOOLEAN | No | No | False | Print config without writing |
+| --scope | TEXT | No | No |  | Install skill location: 'project' (under --repo) or 'global' (~/.claude/skills/). |
+| --repo | PATH | No | No |  | Repository root for --scope project (default: current directory). |
 
 ## `sqlcg uninstall`
 
@@ -164,6 +207,8 @@ Uninstall sqlcg from Claude Code and optionally clean up resources.
 Step 1: Remove MCP registration from ~/.claude/settings.json
 Step 2: Optionally delete the KùzuDB graph database
 Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
+Step 4: Remove sqlcg skill directory from ~/.claude/skills/sqlcg/ and
+        <repo>/.claude/skills/sqlcg/
 
 ### Options
 
@@ -425,6 +470,7 @@ MCP server commands
 | --- | --- |
 | `setup` | Print or write MCP server config JSON. |
 | `start` | Start the MCP server. |
+| `best-practices` | Print MCP tool best-practices (the fact/heuristic boundary). |
 
 ## `sqlcg mcp setup`
 
@@ -454,6 +500,23 @@ Start the MCP server.
 | --- | --- | --- | --- | --- | --- |
 | _none_ |  |  |  |  |  |
 
+## `sqlcg mcp best-practices`
+
+```bash
+sqlcg mcp best-practices [OPTIONS]
+```
+
+Print MCP tool best-practices (the fact/heuristic boundary).
+
+Same guidance as the bundled Claude skill — useful for humans or agents
+that have not installed the skill.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| _none_ |  |  |  |  |  |
+
 ## `sqlcg git`
 
 ```bash
@@ -476,8 +539,9 @@ sqlcg git install-hooks [OPTIONS]
 
 Install git hooks for sqlcg integration.
 
-Writes a post-checkout hook that triggers graph resync after branch switches.
-Idempotent: running multiple times produces one hook entry.
+Writes a post-checkout hook that triggers incremental resync after branch switches
+and a post-merge hook that triggers resync after pulls/merges.
+Idempotent: running multiple times produces one hook entry per hook.
 
 ### Options
 
