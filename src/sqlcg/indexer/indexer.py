@@ -251,9 +251,11 @@ class Indexer:
                     _t_pass2_end = time.perf_counter()
 
         except KeyboardInterrupt:
-            logger.info("SIGINT received — flushing pass-1 progress")
-            # pass1_results may be partial; upsert what we have
-            self._upsert_all(pass1_results, db)
+            # Kill workers and abort immediately. A partial pass-1-only result is
+            # an incomplete graph (no cross-file resolution, no star expansion);
+            # writing it would leave a misleading half-index. Re-run `sqlcg index`
+            # to index — re-indexing is the migration path.
+            logger.warning("Interrupted — workers killed; no partial graph written.")
             raise
 
         # Assemble final pass-2 results: start from pass-1, overlay pass-2 where available
@@ -1103,16 +1105,6 @@ class Indexer:
         )
 
         return counts
-
-    def _upsert_all(self, results: list[ParsedFile], db: GraphBackend) -> None:
-        """Upsert all parsed files.
-
-        Args:
-            results: List of ParsedFile objects
-            db: GraphBackend instance
-        """
-        for parsed in results:
-            self._upsert_parsed_file(parsed, db)
 
     def _expand_star_sources(self, db: GraphBackend) -> int:
         """Run the post-ingestion star expansion query.

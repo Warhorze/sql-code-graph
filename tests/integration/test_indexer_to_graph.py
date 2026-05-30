@@ -106,8 +106,18 @@ def test_walker_yields_only_sql_files(temp_db):
     assert len(files) >= 3
 
 
-def test_sigint_during_index_flushes_progress(temp_db):
-    """Test that SIGINT during index flushes progress to DB."""
+def test_sigint_during_index_aborts_without_partial_write(temp_db):
+    """SIGINT during indexing must re-raise and write NO partial graph.
+
+    A partial pass-1-only result is an incomplete graph (no cross-file
+    resolution, no star expansion); flushing it would leave a misleading
+    half-index that "keeps going" after the user expects the process to die.
+    The contract is: kill workers, abort, write nothing — re-run to index.
+
+    SIGINT lands in the main process while it blocks in HardKillPool.map
+    (the worker subprocesses ignore SIGINT), so we patch map to raise
+    KeyboardInterrupt — the same point the real interrupt surfaces.
+    """
     from unittest.mock import patch
 
     fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
@@ -116,29 +126,15 @@ def test_sigint_during_index_flushes_progress(temp_db):
 
     indexer = Indexer()
 
-    # Mock parser.parse_file to raise KeyboardInterrupt after first file
-    call_count = [0]
-
-    def mock_parse_file(file_path, sql):
-        call_count[0] += 1
-        if call_count[0] > 1:
-            raise KeyboardInterrupt("User interrupted")
-        # Return a valid parsed file for the first call
-        from sqlcg.parsers.registry import get_parser
-
-        parser = get_parser(None, None)
-        return parser.parse_file(file_path, sql)
-
-    with patch("sqlcg.parsers.ansi_parser.SqlParser.parse_file", side_effect=mock_parse_file):
-        try:
+    with patch(
+        "sqlcg.indexer.indexer.HardKillPool.map",
+        side_effect=KeyboardInterrupt("User interrupted"),
+    ):
+        with pytest.raises(KeyboardInterrupt):
             indexer.index_repo(fixtures_path, dialect=None, db=temp_db, timeout_per_file=30)
-        except KeyboardInterrupt:
-            pass  # Expected
 
-    # Even with SIGINT, at least the first file should have been upserted
-    # Verify by checking node count > 0
-    result = temp_db.run_read("MATCH (n) RETURN COUNT(*) as count", {})
-    count = result[0]["count"]
-
-    # Should have at least created some nodes from the first file
-    assert count > 0
+    # No indexed content should have been written: no partial flush on interrupt.
+    # (init_schema seeds a schema-version metadata node, so assert on File nodes,
+    # which only the upsert pass — skipped on interrupt — creates.)
+    result = temp_db.run_read("MATCH (f:File) RETURN COUNT(*) as count", {})
+    assert result[0]["count"] == 0

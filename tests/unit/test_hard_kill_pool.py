@@ -7,6 +7,9 @@ multi-worker logic.  Tests are ordered by increasing complexity.
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
+
+import pytest
 
 from sqlcg.indexer.pool import HardKillPool
 from sqlcg.parsers.base import ParsedFile
@@ -203,3 +206,47 @@ def test_pool_shutdown_terminates_workers():
     # After exit, all processes should have been joined / killed
     for p in procs:
         assert not p.is_alive(), f"Worker pid={p.pid} still alive after shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Scenario E — interrupt (Ctrl-C) hard-kills workers immediately, no hang
+# ---------------------------------------------------------------------------
+
+
+def test_pool_terminate_kills_workers_immediately():
+    """terminate() SIGKILLs every worker without a graceful handshake and
+    clears the worker list."""
+    pool = HardKillPool(None, n_workers=2)
+    pool._spawn_all()
+    procs = [w.process for w in pool._workers]
+    assert all(p.is_alive() for p in procs), "Workers should be alive after spawn"
+
+    pool.terminate()
+
+    assert pool._workers == [], "terminate() must clear the worker list"
+    for p in procs:
+        assert not p.is_alive(), f"Worker pid={p.pid} alive after terminate()"
+
+
+def test_pool_keyboardinterrupt_in_map_terminates_and_reraises(tmp_path):
+    """A KeyboardInterrupt raised in the dispatch loop (where SIGINT lands in the
+    main process) hard-kills all workers and re-raises — it never hangs waiting
+    on in-flight CPU-bound parses."""
+    p = tmp_path / "a.sql"
+    p.write_text("SELECT 1;", encoding="utf-8")
+    tasks = [_fast_task(str(p), "SELECT 1;")]
+
+    pool = HardKillPool(None, n_workers=2)
+    pool._spawn_all()
+    procs = [w.process for w in pool._workers]
+    try:
+        with patch.object(pool, "_run_map_loop", side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                pool.map(tasks, per_task_timeout=10.0)
+
+        # map's handler called terminate(): workers dead, list cleared.
+        assert pool._workers == []
+        for proc in procs:
+            assert not proc.is_alive(), f"Worker pid={proc.pid} alive after interrupt"
+    finally:
+        pool.shutdown()  # no-op if terminate already cleared the workers

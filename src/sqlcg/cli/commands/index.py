@@ -84,6 +84,35 @@ def index_cmd(  # noqa: B008
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    try:
+        _run_index(
+            path=path,
+            dialect=dialect,
+            dbt_manifest=dbt_manifest,
+            timeout_per_file=timeout_per_file,
+            no_ddl=no_ddl,
+            quiet=quiet,
+            batch_size=batch_size,
+            profile=profile,
+        )
+    except KeyboardInterrupt:
+        # The backend context manager (inside _run_index) has already closed the
+        # KuzuDB connection and released the lock by the time we get here.
+        console.print("\n[yellow]Interrupted — no partial graph written. Re-run to index.[/yellow]")
+        raise typer.Exit(130) from None
+
+
+def _run_index(
+    *,
+    path: Path,
+    dialect: str | None,
+    dbt_manifest: Path | None,
+    timeout_per_file: int,
+    no_ddl: bool,
+    quiet: bool,
+    batch_size: int,
+    profile: bool,
+) -> None:
     with get_backend() as backend:
         backend.init_schema()
 

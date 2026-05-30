@@ -329,6 +329,28 @@ class HardKillPool:
             w.task_start = time.monotonic()
             busy.add(slot)
 
+        try:
+            return self._run_map_loop(
+                tasks, results, busy, kill_counts, _assign, per_task_timeout, on_result, n_tasks
+            )
+        except KeyboardInterrupt:
+            # Workers ignore SIGINT and are CPU-bound, so they will not notice a
+            # graceful SHUTDOWN sentinel until their current parse finishes. On
+            # interrupt the user wants the process gone now — hard-kill outright.
+            self.terminate()
+            raise
+
+    def _run_map_loop(
+        self,
+        tasks: list[dict],
+        results: list[ParsedFile | None],
+        busy: set[int],
+        kill_counts: dict[str, int],
+        _assign: Callable[[int], None],
+        per_task_timeout: float,
+        on_result: Callable[[], None] | None,
+        n_tasks: int,
+    ) -> list[ParsedFile | None]:
         # Initial dispatch: fill all worker slots
         for i in range(min(self._n, n_tasks)):
             _assign(i)
@@ -411,6 +433,31 @@ class HardKillPool:
     # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
+
+    def terminate(self) -> None:
+        """Immediately SIGKILL every worker without a graceful handshake.
+
+        Unlike :meth:`shutdown`, this sends no ``_SHUTDOWN`` sentinel and does
+        not wait for in-flight parses. Workers ignore SIGINT and are CPU-bound,
+        so a graceful stop would block on the longest running parse; on
+        interrupt we kill outright so the process dies promptly.
+        """
+        for w in self._workers:
+            try:
+                w.conn.close()
+            except Exception:
+                pass
+            try:
+                if w.process.is_alive():
+                    w.process.kill()
+            except Exception:
+                pass
+        for w in self._workers:
+            try:
+                w.process.join(timeout=1)
+            except Exception:
+                pass
+        self._workers.clear()
 
     def shutdown(self) -> None:
         """Gracefully stop all workers, then force-kill any that linger."""
