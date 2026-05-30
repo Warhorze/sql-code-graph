@@ -743,17 +743,17 @@ class SqlParser(ABC):
                     if not list(_col_expr.find_all(exp.Column)):
                         continue  # silent skip, no sg_lineage
 
-                    # Guard 3: Unaliased non-Column expression (function, arithmetic, CASE …).
-                    # If the expression has no alias and is not a bare Column, the INSERT target
-                    # column name (_insert_col) is the positional override — but the expression
-                    # has no plain column reference to resolve through sg_lineage.
-                    # Emit func_fallback and skip, matching the main loop's behavior for
-                    # unaliased expressions that reach the else-branch.
-                    _unwrapped = _col_expr.this if isinstance(_col_expr, exp.Alias) else _col_expr
-                    if not _col_expr.alias and not isinstance(_unwrapped, exp.Column):
-                        _expr_type = type(_col_expr).__name__
-                        out.errors.append(f"col_lineage_skip:func_fallback:{_expr_type}")
-                        continue  # no sg_lineage for unaliased non-Column
+                    # NOTE: do NOT emit func_fallback here for unaliased non-Column
+                    # expressions (functions, arithmetic, CASE …). The main loop emits
+                    # func_fallback for such expressions because a plain SELECT/CREATE VIEW
+                    # gives them no output column name. The positional INSERT column list
+                    # DOES supply that name (_insert_col): below we wrap the expression as
+                    # Alias(expr, _insert_col) and let sg_lineage trace through it — exactly
+                    # as the aliased form (e.g. `DATE(col) AS a`) already resolves. Guard 2
+                    # (above) already dropped genuinely-untraceable pure-literal expressions
+                    # (no Column descendant). Skipping column-containing expressions here would
+                    # make the #25 positional feature do its work and then discard the result,
+                    # dropping real lineage edges (regressed by eb19f29; broke COALESCE).
 
                     # Positional mapping always wins — replace (or add) the alias with the
                     # INSERT target column name regardless of SELECT alias.
@@ -774,14 +774,23 @@ class SqlParser(ABC):
                     _patched_sql = body_no_with.sql(dialect=self.DIALECT)
                     # Pass sources= (not scope=) here: the patched SQL is a freshly
                     # serialised string — the scope was built from the original body AST
-                    # and does not correspond to this new string. combined_sources carries
-                    # the temp-table / CTAS bodies that allow cross-statement expansion.
+                    # and does not correspond to this new string.
+                    #
+                    # Use `sources` (the cross-statement temp/CTAS map), NOT
+                    # `combined_sources`. combined_sources additionally carries the
+                    # SAME-STATEMENT CTE bodies (added above). Since body_no_with strips
+                    # the WITH clause from the patched SQL, those CTE names become opaque
+                    # source relations — passing their bodies as sources= would expand them
+                    # away, collapsing intermediate CTE→target hops into the deepest source
+                    # (regressed by eb19f29; broke the MA_AANTAL_OP_ORDER anchor link 5).
+                    # Cross-statement temps (e.g. CREATE TEMP TABLE t) live in `sources`
+                    # and SHOULD still expand (E36 multi-temp: t → src).
                     try:
                         _root = sg_lineage(
                             _insert_col,
                             _patched_sql,
                             dialect=self.DIALECT,
-                            sources=combined_sources or {},
+                            sources=sources or {},
                         )
                         if _root:
                             _new_edges = self._lineage_node_to_edges(

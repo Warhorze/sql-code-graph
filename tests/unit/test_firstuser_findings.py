@@ -305,8 +305,9 @@ def test_S4_1_trace_lineage_empty_hint_contains_schema_prefix():
     with patch("sqlcg.server.tools._open_backend") as mock_backend_ctx:
         mock_db = MagicMock()
         mock_db.run_read.side_effect = [
-            [{"n": 1}],
-            [],
+            [{"n": 1}],  # _assert_indexed
+            [],  # primary BFS query — no lineage
+            [],  # PR-06 bare-name fallback BFS (3-part ref) — also empty
         ]
         mock_backend_ctx.return_value.__enter__.return_value = mock_db
 
