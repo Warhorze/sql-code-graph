@@ -7,9 +7,11 @@ classification and the ignore/suffix filter.
 import subprocess
 from pathlib import Path
 
+import pathspec
 import pytest
 
 from sqlcg.indexer.git_delta import git_name_status_delta
+from sqlcg.utils.ignore import is_ignored, load_ignore_spec
 
 
 @pytest.fixture
@@ -163,3 +165,72 @@ def test_multiple_changes_classified_correctly(git_repo):
     assert (git_repo / "new.sql").resolve() in delta.added
     assert (git_repo / "keep.sql").resolve() in delta.modified
     assert (git_repo / "delete_me.sql").resolve() in delta.deleted
+
+
+# ---------------------------------------------------------------------------
+# PR-03 — Fix reindex relative path crash (#24)
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_a_is_ignored_does_not_raise_with_relative_root(
+    tmp_path: Path,
+) -> None:
+    """Scenario A: is_ignored with a relative root does not raise ValueError.
+
+    Guards against the v1.0.2 regression: is_ignored called path.relative_to(root)
+    where root=Path(".") and path was an absolute resolved path — Python raised
+    ValueError. The fix adds root = Path(root).resolve() at the top of is_ignored
+    so that path.relative_to(root) always operates on two absolute paths.
+    """
+    import os
+
+    spec = pathspec.PathSpec.from_lines("gitwildmatch", [])
+    # Change CWD to tmp_path so that Path(".").resolve() == tmp_path,
+    # then use an absolute path under tmp_path as the file path.
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        abs_path = (tmp_path / "sub" / "foo.sql").resolve()
+        # This must not raise ValueError even though root is relative (Path("."))
+        result = is_ignored(abs_path, Path("."), spec)
+    finally:
+        os.chdir(old_cwd)
+    assert result is False
+
+
+def test_scenario_b_load_ignore_spec_does_not_raise_with_relative_root(
+    tmp_path: Path,
+) -> None:
+    """Scenario B: load_ignore_spec called with Path('.') returns a PathSpec."""
+    import os
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        spec = load_ignore_spec(Path("."))
+        assert isinstance(spec, pathspec.PathSpec)
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_scenario_c_git_delta_with_relative_root(git_repo: Path) -> None:
+    """Scenario C: git_name_status_delta called with Path('.') returns a Delta.
+
+    Guards the reindex-from-CWD code path: sqlcg reindex . passes Path(".")
+    which must be resolved before os.chdir-free git invocations.
+    """
+    import os
+
+    old_sha = _get_head(git_repo)
+    (git_repo / "new.sql").write_text("SELECT 1")
+    new_sha = _commit(git_repo, "add sql for relative-root test")
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(git_repo)
+        delta = git_name_status_delta(Path("."), old_sha, new_sha)
+    finally:
+        os.chdir(old_cwd)
+
+    assert delta is not None, "delta must not be None (git diff must succeed)"
+    assert (git_repo / "new.sql").resolve() in delta.added

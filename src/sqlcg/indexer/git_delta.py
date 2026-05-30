@@ -51,6 +51,7 @@ def git_name_status_delta(root: Path, old_sha: str, new_sha: str) -> Delta | Non
         unknown SHA, shallow clone, or git not available).  Callers MUST fall
         back to a full index_repo when None is returned.
     """
+    root = root.resolve()  # guard: caller may pass a relative path (e.g. Path("."))
     try:
         result = subprocess.run(
             ["git", "diff", "--name-status", old_sha, new_sha],

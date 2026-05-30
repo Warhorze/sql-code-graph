@@ -60,6 +60,9 @@ def reindex_cmd(  # noqa: B008
     from sqlcg.core.schema import SCHEMA_VERSION
     from sqlcg.indexer.indexer import Indexer
 
+    # Resolve to absolute path so ignore-spec and git delta receive an absolute root
+    path = path.resolve()
+
     # Resolve dialect
     if dialect == "auto":
         dialect = get_dialect(path)
