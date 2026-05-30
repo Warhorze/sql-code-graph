@@ -1,8 +1,10 @@
 """Unit tests for SQL base parser (parsers/base.py)."""
 
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
+import sqlglot.expressions as exp
 from sqlglot import parse_one
 
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -209,4 +211,110 @@ class TestStarColumnSkip:
         assert len(skip_errors) >= 1, f"Expected skip marker, got errors: {parsed.errors}"
         assert col_lineage_errors == [], (
             f"Star should not cause col_lineage error, got: {col_lineage_errors}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PR-05 — INSERT…SELECT positional column mapping (#25)
+# ---------------------------------------------------------------------------
+
+
+def _edges_as_tuples(parsed: ParsedFile) -> set[tuple[str, str]]:
+    """Extract (src.full_id, dst.full_id) tuples from a ParsedFile's lineage."""
+    result = set()
+    for stmt in parsed.statements:
+        for edge in stmt.column_lineage:
+            if edge.confidence > 0:
+                result.add((edge.src.full_id, edge.dst.full_id))
+    return result
+
+
+class TestInsertPositionalMapping:
+    """PR-05 (#25): INSERT column-list positional mapping overrides SELECT aliases."""
+
+    def test_scenario_a_alias_matches_positional_no_op(self) -> None:
+        """Scenario A (no-op): alias equals INSERT column name → edges attributed to INSERT cols.
+
+        INSERT INTO t (col1, col2) SELECT a AS col1, b AS col2 FROM src
+        should produce edges src.a → t.col1 and src.b → t.col2.
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+        sql = "INSERT INTO t (col1, col2) SELECT a AS col1, b AS col2 FROM src"
+        parsed = parser.parse_file(Path("test_a.sql"), sql)
+        edges = _edges_as_tuples(parsed)
+
+        assert any("col1" in dst for _, dst in edges), f"Expected edge to t.col1 but got: {edges}"
+        assert any("col2" in dst for _, dst in edges), f"Expected edge to t.col2 but got: {edges}"
+        # The alias names (col1, col2) match the INSERT columns — same result
+        assert not any("t.x" in dst or "t.y" in dst for _, dst in edges), (
+            f"Alias names x/y must not appear in edges: {edges}"
+        )
+
+    def test_scenario_b_alias_diverges_from_positional(self) -> None:
+        """Scenario B (the bug case): SELECT alias differs from INSERT column name.
+
+        INSERT INTO t (c1, c2, c3) SELECT a AS x, b AS y, c AS z FROM src
+        should produce edges src.a → t.c1, src.b → t.c2, src.c → t.c3
+        and NOT src.a → t.x, src.b → t.y, src.c → t.z.
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+        sql = "INSERT INTO t (c1, c2, c3) SELECT a AS x, b AS y, c AS z FROM src"
+        parsed = parser.parse_file(Path("test_b.sql"), sql)
+        edges = _edges_as_tuples(parsed)
+
+        # The INSERT column names (c1, c2, c3) must appear in dst
+        assert any("c1" in dst for _, dst in edges), (
+            f"Expected edge to t.c1 (positional) but got: {edges}"
+        )
+        assert any("c2" in dst for _, dst in edges), (
+            f"Expected edge to t.c2 (positional) but got: {edges}"
+        )
+        assert any("c3" in dst for _, dst in edges), (
+            f"Expected edge to t.c3 (positional) but got: {edges}"
+        )
+        # SELECT aliases (x, y, z) must NOT appear as dst column names
+        alias_dst = {
+            dst
+            for _, dst in edges
+            if dst.endswith(".x") or dst.endswith(".y") or dst.endswith(".z")
+        }
+        assert not alias_dst, (
+            f"SELECT aliases x/y/z must not appear as destination columns (positional "
+            f"override should have replaced them): found {alias_dst}"
+        )
+
+    def test_scenario_c_body_copy_called_once_per_insert(self) -> None:
+        """Scenario C — CLAUDE.md invariant: body.copy() called once per INSERT statement.
+
+        Parse a 5-column INSERT and assert that exp.Select.copy is called exactly
+        ONCE (for body_no_with = body.copy()), not once per column. This directly
+        pins the per-column full-body deepcopy regression from 4234e5d.
+        """
+        schema = SchemaResolver()
+        parser = AnsiParser(schema)
+
+        n_cols = 5
+        out_cols = ", ".join(f"c{i}" for i in range(n_cols))
+        src_cols = ", ".join(f"a{i} AS x{i}" for i in range(n_cols))
+        sql = f"INSERT INTO t ({out_cols}) SELECT {src_cols} FROM src"
+
+        # Count full-body SELECT.copy() calls (multi-expression SELECT only)
+        orig_copy = exp.Select.copy
+        full_body_copy_count = 0
+
+        def copy_counting(self: exp.Select, *a, **k):
+            nonlocal full_body_copy_count
+            if len(self.expressions) > 1:
+                full_body_copy_count += 1
+            return orig_copy(self, *a, **k)
+
+        with unittest.mock.patch.object(exp.Select, "copy", copy_counting):
+            parser.parse_file(Path("test_c.sql"), sql)
+
+        assert full_body_copy_count == 1, (
+            f"body.copy() must be called exactly ONCE per INSERT statement "
+            f"(CLAUDE.md invariant — no per-column body deepcopy). "
+            f"Called {full_body_copy_count} times for a {n_cols}-column INSERT."
         )

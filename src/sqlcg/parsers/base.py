@@ -688,8 +688,66 @@ class SqlParser(ABC):
                     except Exception:
                         body_scope = None
 
-            # Extract output columns
-            for col_expr in col_expressions:
+            # INSERT positional column-list mapping (#25 fix).
+            # Compute the positional_col_names skip-set BEFORE the main column loop
+            # so the main loop can skip positions already handled here.
+            #
+            # When an INSERT has an explicit column list (INSERT INTO t (c1, c2) SELECT ...),
+            # the target column name at position idx is authoritative — the SELECT alias is
+            # cosmetic for the SELECT and meaningless to the INSERT target. This block
+            # overrides alias attribution for ALL positions (aliased or not).
+            #
+            # CLAUDE.md invariant: body_no_with = body.copy() + strip-WITH happens ONCE
+            # before the inner loop; only the single projection is swapped per column.
+            positional_col_names: dict[int, str] = {}  # idx → insert_col_name
+            if isinstance(stmt, exp.Insert) and isinstance(stmt.this, exp.Schema):
+                insert_cols_list = [c.name for c in stmt.this.expressions]
+                # Build the WITH-stripped body ONCE here, before any per-column loop.
+                # Only the single projection is swapped per column below.
+                body_no_with = body.copy()
+                body_no_with.set("with_", None)
+                for _ins_idx, _col_expr in enumerate(col_expressions):
+                    if _ins_idx >= len(insert_cols_list):
+                        break
+                    _insert_col = insert_cols_list[_ins_idx]
+                    if not _insert_col:
+                        continue
+                    positional_col_names[_ins_idx] = _insert_col
+                    # Positional mapping always wins — replace (or add) the alias with the
+                    # INSERT target column name regardless of SELECT alias.
+                    if _col_expr.alias and _col_expr.alias != _insert_col:
+                        self._log.debug(
+                            "INSERT positional override: SELECT alias %r → INSERT col %r"
+                            " at position %d",
+                            _col_expr.alias,
+                            _insert_col,
+                            _ins_idx,
+                        )
+                    # If the expression is already an Alias(inner, old_alias), unwrap it
+                    # before re-wrapping — otherwise we produce Alias(Alias(inner, x), c1)
+                    # which serialises as "inner AS x AS c1" (syntax error).
+                    _inner = _col_expr.this if isinstance(_col_expr, exp.Alias) else _col_expr
+                    _aliased = exp.Alias(this=_inner.copy(), alias=_insert_col)
+                    body_no_with.set("expressions", [_aliased])
+                    _patched_sql = body_no_with.sql(dialect=self.DIALECT)
+                    try:
+                        _root = sg_lineage(_insert_col, _patched_sql, dialect=self.DIALECT)
+                        if _root:
+                            _new_edges = self._lineage_node_to_edges(
+                                _root,
+                                dst_col_name=_insert_col,
+                                dst_table=dst_table,
+                                path=path,
+                                out=out,
+                            )
+                            edges.extend(_new_edges)
+                    except Exception:
+                        pass
+
+            # Extract output columns — skip positions handled by the positional INSERT block
+            for loop_idx, col_expr in enumerate(col_expressions):
+                if loop_idx in positional_col_names:
+                    continue  # positional INSERT block already emitted this column
                 # Skip star projections — sg_lineage requires a concrete column name.
                 if isinstance(col_expr, exp.Star) or (
                     isinstance(col_expr, exp.Column) and isinstance(col_expr.this, exp.Star)
@@ -918,47 +976,6 @@ class SqlParser(ABC):
                                         cte_alias,
                                         cte_col_name,
                                     )
-
-            # INSERT column-list aliasing (T-07-02 link 5).
-            # When an INSERT has an explicit column list and the SELECT expression has
-            # no alias (e.g. SELECT SUM(x) FROM cte), the INSERT column at the same
-            # position provides the destination col name. Stripping the WITH clause
-            # stops sg_lineage at the CTE name boundary (doesn't expand into bodies).
-            if isinstance(stmt, exp.Insert) and isinstance(stmt.this, exp.Schema):
-                insert_cols = [c.name for c in stmt.this.expressions]
-                # Build the WITH-stripped body ONCE before the loop and only swap its
-                # single projection per column (regressed in 4234e5d, which moved the
-                # full-body body.copy() inside the loop → O(N_cols) full-body deepcopies
-                # for wide INSERT ... SELECT). Stripping WITH stops sg_lineage at the CTE
-                # name boundary.
-                body_no_with = body.copy()
-                body_no_with.set("with_", None)
-                for idx, col_expr in enumerate(col_expressions):
-                    if idx >= len(insert_cols):
-                        break
-                    if col_expr.alias:
-                        continue  # already handled by the main col loop
-                    insert_col = insert_cols[idx]
-                    if not insert_col:
-                        continue
-                    # Patch the shared body with this column's aliased expression so
-                    # sg_lineage can trace it to the INSERT column name.
-                    aliased = exp.Alias(this=col_expr.copy(), alias=insert_col)
-                    body_no_with.set("expressions", [aliased])
-                    patched_sql = body_no_with.sql(dialect=self.DIALECT)
-                    try:
-                        root = sg_lineage(insert_col, patched_sql, dialect=self.DIALECT)
-                        if root:
-                            new_edges = self._lineage_node_to_edges(
-                                root,
-                                dst_col_name=insert_col,
-                                dst_table=dst_table,
-                                path=path,
-                                out=out,
-                            )
-                            edges.extend(new_edges)
-                    except Exception:
-                        pass
 
         except Exception as exc:
             self._log.debug(

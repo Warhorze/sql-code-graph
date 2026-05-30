@@ -162,6 +162,17 @@ def _wide_insert(n_cols: int) -> str:
     return f"INSERT INTO db.s.tgt ({out_cols}) SELECT {src_cols} FROM db.s.src;"
 
 
+def _wide_select(n_cols: int) -> str:
+    """A single SELECT with n_cols aliased pass-through columns. Statement count
+    is always 1 and there is no INSERT column list, so all columns go through
+    the main column loop which exercises the scope= path of sg_lineage.
+    Used by the copy=False invariant test after the positional INSERT block was
+    moved before the main loop (PR-05 #25 — INSERT columns no longer reach the
+    scope= path)."""
+    cols = ", ".join(f"src.c{i} AS c{i}" for i in range(n_cols))
+    return f"SELECT {cols} FROM db.s.src;"
+
+
 # ---------------------------------------------------------------------------
 # Axis 1 — column count: per-statement ops must stay flat (parser hot path)
 # ---------------------------------------------------------------------------
@@ -205,13 +216,21 @@ def test_per_statement_ops_flat_when_columns_double():
 def test_scope_path_sg_lineage_passes_copy_false():
     """Regression #1: every sg_lineage call that carries a pre-built scope must also
     pass copy=False. Otherwise sqlglot deep-copies the whole scope per column
-    (O(cols × scope_size); measured 28.8s on one 3,344-line file)."""
+    (O(cols × scope_size); measured 28.8s on one 3,344-line file).
+
+    Note: uses _wide_select (not _wide_insert) because after PR-05 (#25) the
+    positional INSERT block processes all INSERT columns before the main column
+    loop, so INSERT columns never reach the scope= path. A SELECT fixture without
+    an INSERT column list exercises the scope= path correctly.
+    """
     parser = AnsiParser(SchemaResolver(dialect=None))
     with count_hot_ops() as c:
-        parser.parse_file(Path("scope.sql"), _wide_insert(COLS_BASE))
+        parser.parse_file(Path("scope.sql"), _wide_select(COLS_BASE))
 
     assert c.scope_lineage_calls > 0, (
-        "fixture did not exercise the scope= path; the guard would be vacuously green"
+        "fixture did not exercise the scope= path; the guard would be vacuously green. "
+        "Uses _wide_select (not _wide_insert) because INSERT positional block now "
+        "handles all INSERT columns before the main loop."
     )
     assert c.scope_without_copy_false == 0, (
         f"{c.scope_without_copy_false} of {c.scope_lineage_calls} scope-path sg_lineage "
