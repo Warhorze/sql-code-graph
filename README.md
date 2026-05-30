@@ -204,13 +204,16 @@ sqlcg install                          # register MCP server in Claude Code
 sqlcg db init                          # initialise graph database
 sqlcg index <path> --dialect snowflake # index SQL files (snowflake is the tested dialect)
 sqlcg index <path> --dialect auto      # read dialect from .sqlcg.toml
+sqlcg index <path> --profile           # index + print per-stage timing and slowest files
+sqlcg reindex <path> --from <sha> --to <sha>  # incremental resync of only changed files
 sqlcg analyze unused                   # tables with no query references
 sqlcg analyze upstream/downstream      # trace lineage from the CLI
 sqlcg find table/column/pattern        # search the graph
 sqlcg watch <path>                     # watch for file changes
-sqlcg git install-hooks                # install post-checkout hook
+sqlcg git install-hooks                # install post-checkout + post-merge resync hooks
 sqlcg gain                             # show usage metrics
 sqlcg report                           # generate FP/error report
+sqlcg mcp best-practices               # print the fact/heuristic boundary for the MCP tools
 sqlcg mcp start                        # start MCP server manually
 sqlcg version                          # show installed version
 ```
