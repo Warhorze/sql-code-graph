@@ -37,6 +37,23 @@ def upstream(  # noqa: B008
             "RETURN src.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not results and len(ref.split(".")) >= 3:
+            bare = _bare_ref(ref)
+            fallback_results = backend.run_read(
+                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src) "
+                "RETURN src.id AS id LIMIT 100",
+                {"bare": bare},
+            )
+            if fallback_results:
+                console.print(
+                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                    "The INSERT target may have been indexed without a schema prefix. "
+                    "Multiple tables with the same unqualified name in different schemas "
+                    "would all match — re-index with an explicit schema for precise results."
+                )
+                results = fallback_results
         if not raw:
             from sqlcg.server.noise_filter import NoiseFilter
 
@@ -64,6 +81,23 @@ def downstream(  # noqa: B008
             "RETURN dst.id AS id LIMIT 100",
             {"ref": ref},
         )
+        if not results and len(ref.split(".")) >= 3:
+            bare = _bare_ref(ref)
+            fallback_results = backend.run_read(
+                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst) "
+                "RETURN dst.id AS id LIMIT 100",
+                {"bare": bare},
+            )
+            if fallback_results:
+                console.print(
+                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                    "The INSERT target may have been indexed without a schema prefix. "
+                    "Multiple tables with the same unqualified name in different schemas "
+                    "would all match — re-index with an explicit schema for precise results."
+                )
+                results = fallback_results
         if not raw:
             from sqlcg.server.noise_filter import NoiseFilter
 
@@ -123,6 +157,19 @@ def unused(
             {},
         )
         _print_table(results, ["qualified"])
+
+
+def _bare_ref(ref: str) -> str:
+    """Strip schema prefix from a ref string, keeping table.column.
+
+    For a 3-part ref ("mart.fact_t.amount") this returns "fact_t.amount".
+    For a 2-part ref ("fact_t.amount") this returns the ref unchanged.
+    Never uses rsplit — that would yield only the column name for 3-part refs.
+    """
+    parts = ref.split(".")
+    if len(parts) >= 3:
+        return ".".join(parts[1:])  # drop schema, keep table.column
+    return ref  # already bare (no schema prefix)
 
 
 def _col_id_to_table(col_id: str) -> str:
