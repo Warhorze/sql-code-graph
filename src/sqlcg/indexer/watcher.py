@@ -17,7 +17,15 @@ logger = getLogger(__name__)
 class SqlFileEventHandler(FileSystemEventHandler):
     """Watchdog event handler for SQL file changes."""
 
-    def __init__(self, job_manager, db, ignore_spec: pathspec.PathSpec, root: Path, indexer=None):
+    def __init__(
+        self,
+        job_manager,
+        db,
+        ignore_spec: pathspec.PathSpec,
+        root: Path,
+        indexer=None,
+        dialect: str | None = None,
+    ):
         """Initialize the event handler.
 
         Args:
@@ -26,6 +34,7 @@ class SqlFileEventHandler(FileSystemEventHandler):
             ignore_spec: PathSpec with ignore patterns
             root: Root directory being watched
             indexer: Indexer instance (used by BranchMonitor)
+            dialect: SQL dialect threaded through to BranchMonitor (B-2).
         """
         super().__init__()
         self._jobs = job_manager
@@ -35,7 +44,7 @@ class SqlFileEventHandler(FileSystemEventHandler):
         # Create and start BranchMonitor if indexer is provided
         self._branch_monitor: BranchMonitor | None = None
         if indexer is not None:
-            self._branch_monitor = BranchMonitor(root, job_manager, indexer, db)
+            self._branch_monitor = BranchMonitor(root, job_manager, indexer, db, dialect=dialect)
             self._branch_monitor.start()
 
     def _is_sql(self, path: str | bytes) -> bool:
@@ -90,14 +99,23 @@ class SqlFileEventHandler(FileSystemEventHandler):
 
 
 class BranchMonitor(threading.Thread):
-    """Background thread that detects branch changes and triggers full resyncs.
+    """Background thread that detects branch changes and triggers incremental resyncs.
 
     Polls `git rev-parse --abbrev-ref HEAD` every 2 seconds. When the branch
-    changes, pauses the job manager, runs a full reindex, then resumes and
-    drains queued file events.
+    changes, pauses the job manager, captures old/new HEAD SHAs, calls
+    Indexer.resync_changed (incremental), then resumes and drains queued file events.
     """
 
-    def __init__(self, watched_path: Path, job_manager, indexer, db, _poll_interval: float = 2.0):
+    def __init__(
+        self,
+        watched_path: Path,
+        job_manager,
+        indexer,
+        db,
+        _poll_interval: float = 2.0,
+        *,
+        dialect: str | None = None,
+    ):
         """Initialize the branch monitor.
 
         Args:
@@ -106,28 +124,33 @@ class BranchMonitor(threading.Thread):
             indexer: Indexer instance
             db: GraphBackend instance
             _poll_interval: Polling interval in seconds (for testing)
+            dialect: SQL dialect for parsing during resync (keyword-only, B-2).
         """
-        # daemon=False ensures that if index_repo() is in-flight when shutdown is requested,
-        # the process will wait (via join(timeout=5) in watch.py) up to 5 seconds before exiting.
-        # This avoids data loss from killing an in-progress resync.
+        # daemon=False ensures that if resync_changed() is in-flight when shutdown is
+        # requested, the process will wait (via join(timeout=5) in watch.py) up to 5
+        # seconds before exiting. This avoids data loss from killing an in-progress resync.
         super().__init__(daemon=False)
         self._watched_path = watched_path
         self._job_manager = job_manager
         self._indexer = indexer
         self._db = db
+        self._dialect = dialect
         self._stop_event = threading.Event()
         self._current_branch: str | None = None
         self._poll_interval = _poll_interval
 
     def run(self) -> None:
-        """Poll git branch and trigger resync on change."""
+        """Poll git branch and trigger incremental resync on change."""
         while not self._stop_event.is_set():
             try:
                 branch = self._get_current_branch()
                 if branch is not None and branch != self._current_branch:
                     logger.debug("Branch change detected: %s -> %s", self._current_branch, branch)
+                    # Capture old SHA BEFORE updating _current_branch so we can compute the delta
+                    old_sha = self._get_current_head_sha()
                     self._current_branch = branch
-                    self._on_branch_change()
+                    new_sha = self._get_current_head_sha()
+                    self._on_branch_change(old_sha, new_sha)
             except subprocess.CalledProcessError:
                 # Not a git repo or git not available
                 logger.debug("Could not get current branch (not a git repo or git unavailable)")
@@ -160,17 +183,48 @@ class BranchMonitor(threading.Thread):
         )
         return result.stdout.strip()
 
-    def _on_branch_change(self) -> None:
-        """Handle branch change: pause, resync, resume, drain queue."""
+    def _get_current_head_sha(self) -> str:
+        """Return the current HEAD commit SHA.
+
+        Returns empty string on failure so callers fall back gracefully.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self._watched_path),
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    def _on_branch_change(self, old_sha: str, new_sha: str) -> None:
+        """Handle branch change: pause, incremental resync, resume, drain queue.
+
+        Uses Indexer.resync_changed instead of index_repo so only the changed
+        files (plus their pass-2 affected closure) are re-parsed. Falls back to
+        index_repo internally when the git delta is unavailable.
+
+        Args:
+            old_sha: HEAD SHA captured BEFORE the branch update.
+            new_sha: HEAD SHA captured AFTER the branch update.
+        """
         # Pause new file events
         self._job_manager.set_paused(True)
 
         # Cancel pending file timers
         self._job_manager.cancel_all()
 
-        # Run full resync
+        # Incremental resync — replaces the old index_repo call
         try:
-            self._indexer.index_repo(self._watched_path, dialect=None, db=self._db)
+            self._indexer.resync_changed(
+                self._watched_path,
+                old_sha,
+                new_sha,
+                db=self._db,
+                dialect=self._dialect,
+            )
         except Exception as exc:
             logger.error("Branch change resync failed: %s", exc)
         finally:

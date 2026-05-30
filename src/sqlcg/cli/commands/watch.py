@@ -48,7 +48,9 @@ def watch_cmd(  # noqa: B008
 
         spec = load_ignore_spec(path)
         job_manager = WatchJobManager(indexer, backend, dialect)
-        handler = SqlFileEventHandler(job_manager, backend, spec, path, indexer=indexer)
+        handler = SqlFileEventHandler(
+            job_manager, backend, spec, path, indexer=indexer, dialect=dialect
+        )
         observer = Observer()
         observer.schedule(handler, str(path), recursive=True)
         observer.start()

@@ -1,9 +1,19 @@
 ## Current State
 
-CURRENT FEATURE: F1 — living-codebase resync (architect-planner: plan written, now IDLE for plan-reviewer + dev Q&A)
-  plan: plan/living_codebase_resync.md
+CURRENT FEATURE: F1 — living-codebase resync (DEVELOPER active — Phase 5 complete)
+  status: Phase 5 implemented on branch feat/sprint-10-anchor-tools; all tests green
+  plan: plan/living_codebase_resync.md (committed 4127ff6; reviewer fixes 727e0ba)
+  plan-reviewer: PASS-WITH-FIXES — B1 (parallelism: _index_single_file not HardKillPool),
+    B2 (dialect wiring keyword-only through BranchMonitor), W1 (test_branch_monitor assertion flip),
+    W2 (re-harvest dedup + delete invariant). All folded in + committed.
+  approach: Indexer.resync_changed(old,new) replaces both full-reindex triggers (post-checkout
+    hook + BranchMonitor); cross-file pass-2 affected closure (transitive SELECTS_FROM dependents,
+    depth=3, full-index fallback at cap); + sqlcg reindex CLI; indexed_sha on SchemaVersion
+    (SCHEMA_VERSION 3->4); post-merge hook added, post-commit OUT; staleness fact = fast-follow.
+  open (non-blocking): max_closure_depth=3 default; post-merge uses stored-sha->HEAD delta.
   source draft: plan/v1_living_codebase_and_skill.md (F1 section)
   user decisions: PR #21 (trust-layer) = HOLD, do not merge yet; F1 chosen over F2 to go first.
+  MANDATE: shepherd F1 -> F2 -> single v1 release (delegate release to a Sonnet agent).
 last completed: trust-layer
 plan: plan/trust_layer.md
 feature: trust-layer (facts-vs-heuristics MCP payloads + analysis answer-anchors)

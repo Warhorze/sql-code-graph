@@ -62,6 +62,12 @@ def test_transaction_default_warning(caplog):
         def get_schema_version(self):
             return None
 
+        def get_indexed_sha(self):
+            return None
+
+        def set_indexed_sha(self, sha):
+            pass
+
         def close(self):
             pass
 
