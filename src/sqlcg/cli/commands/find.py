@@ -14,14 +14,24 @@ console = Console()
 @app.command("table")
 def find_table(  # noqa: B008
     name: str = typer.Argument(..., help="Table name to search for"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find a table by name."""
+    name = name.lower()  # graph keys are lowercased at index time (C2 normalization)
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE}) WHERE t.qualified CONTAINS $name "
             "RETURN t.qualified AS qualified, t.kind AS kind LIMIT 50",
             {"name": name},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            ids = [r["qualified"] for r in results]
+            kept, _ = nf.filter_nodes(ids)
+            kept_set = set(kept)
+            results = [r for r in results if r["qualified"] in kept_set]
         _print_table(results, ["qualified", "kind"])
 
 
@@ -30,6 +40,7 @@ def find_column(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference (table.column)"),  # noqa: B008
 ) -> None:
     """Find a column by table.column reference."""
+    ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN}) WHERE c.id CONTAINS $ref RETURN c.id AS id LIMIT 50",
