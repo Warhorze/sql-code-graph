@@ -26,6 +26,11 @@ QUICK START:
   3. sqlcg git install-hooks
   4. sqlcg install --scope project   # also provisions a Claude skill (SKILL.md)
 
+USING THE MCP TOOLS:
+  Read `sqlcg mcp best-practices` first — it explains the fact/heuristic
+  boundary so heuristic output (dead-code, risk) is never reported as fact.
+  See `sqlcg mcp --help` for all MCP commands.
+
 Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 """
 

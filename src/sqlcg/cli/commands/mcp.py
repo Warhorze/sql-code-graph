@@ -53,3 +53,15 @@ def mcp_start() -> None:
     from sqlcg.server.server import main as server_main
 
     server_main()
+
+
+@app.command("best-practices")
+def mcp_best_practices() -> None:
+    """Print MCP tool best-practices (the fact/heuristic boundary).
+
+    Same guidance as the bundled Claude skill — useful for humans or agents
+    that have not installed the skill.
+    """
+    from sqlcg.server.skill import render_body
+
+    typer.echo(render_body())

@@ -78,6 +78,10 @@ select = [
 [tool.ruff.lint.isort]
 known-first-party = ["sqlcg"]
 
+[tool.ruff.lint.per-file-ignores]
+# skill.py holds the SKILL.md prose template; long markdown lines are intentional.
+"src/sqlcg/server/skill.py" = ["E501"]
+
 [tool.commitizen]
 name = "cz_conventional_commits"
 version_provider = "pep621"

@@ -31,72 +31,29 @@ from sqlcg.server.models import (
 SKILL_NAME = "sqlcg"
 
 _FRONTMATTER_DESCRIPTION = (
-    "Teach Claude how to use the sqlcg MCP tools for SQL lineage analysis. "
-    "Encodes the fact/heuristic boundary so Claude never reports heuristic "
-    "output (dead-code candidates, risk ratings) as deterministic facts."
+    "Use the sqlcg MCP tools for SQL lineage analysis, honoring the "
+    "fact/heuristic boundary — never report a heuristic (dead-code candidates, "
+    "risk ratings) as a fact."
 )
 
-_PHILOSOPHY = """\
-## Philosophy: Facts vs. Heuristics
+_BOUNDARY = """\
+# sqlcg — SQL lineage analysis
 
-sqlcg tools return two categories of output:
-
-**Facts** are deterministic graph reads — counts, edges, file paths derived
-directly from the indexed SQL corpus. They are always accurate relative to
-what has been indexed. Treat them as ground truth.
-
-**Heuristics** are interpretations layered on top of facts. They carry a
-`confidence` score (an uncalibrated coarse self-assessment, not a calibrated
-probability) and a `reason` that cites the concrete facts it was derived from.
-You MUST NOT report heuristics to the user as facts. Always surface the
-`reason` and `confidence` alongside the interpretation, and make clear that
-the user should validate before acting.
-
-### Which outputs are heuristics?
-
-| Tool | Heuristic field | Why it is heuristic |
-|------|----------------|---------------------|
-| `analyze_unused` | `dead_code` per candidate | May be consumed externally. confidence=0.5. |
-| `get_change_scope` | `risk` | Downstream count vs. uncalibrated threshold. |
-| `scope_change` | `risk` | Same as get_change_scope. |
-
-All other tool outputs (lineage paths, dependency lists, file definitions,
-hub rankings, pattern matches) are **facts**: direct reads from the graph.
+**Facts**: deterministic graph reads (counts, edges, paths). Ground truth.
+**Heuristics**: interpretations carrying `confidence` (uncalibrated) + `reason`. \
+Never present as fact — surface `reason`/`confidence` and have the user validate. \
+Only `get_change_scope`/`scope_change` (`risk`) and `analyze_unused` \
+(`dead_code`, confidence 0.5) are heuristics; every other tool returns facts.
 """
 
 _WORKFLOWS = """\
-## Recommended Workflows
+## Workflows
 
-### Before changing a table
-1. Call `scope_change(<table>)` — returns authoritative files, upstream
-   inputs, downstream blast radius, backfill order, and a heuristic `risk`.
-2. Read the `authoritative_files` (the source of truth DDL/CTAS files).
-3. Follow `backfill_order` for the rebuild sequence.
-4. Surface `risk` to the user as a **heuristic** with its `reason` and
-   `confidence` — do not report it as a fact.
-
-### Tracing column lineage
-1. Call `trace_column_lineage(<schema.table.column>)`.
-2. The result is a **fact**: a direct graph traversal. An empty result
-   means the column was not resolved at index time, not that it has no
-   lineage — check `hint` for the likely cause.
-
-### Finding dead-code candidates
-1. Call `analyze_unused()`.
-2. Each `dead_code` field is a **heuristic** (confidence=0.5). The table
-   may be consumed by external BI tools, APIs, or COPY INTO statements.
-3. Always present the `reason` to the user before recommending deletion.
-
-### Assessing CI impact
-1. Call `diff_impact(<list_of_changed_files>)`.
-2. Result is a **fact**: union blast radius across all changed tables.
-3. Use `presentation_facing` to identify user-visible tables first.
-
-### Understanding the hub topology
-1. Call `get_hub_ranking(k=10)` to find the most-depended-on tables.
-2. All fields are **facts**: downstream_dependents is a direct edge count.
-3. High hub tables are high-risk targets for changes — but quantifying
-   that risk still requires `scope_change` for the threshold heuristic.
+- **Change a table**: `scope_change(t)` → read `authoritative_files`, follow `backfill_order`; treat `risk` as heuristic.
+- **Trace lineage**: `trace_column_lineage(schema.table.column)` (fact). Empty = unresolved at index time, not "no lineage" — check `hint`.
+- **Dead code**: `analyze_unused()` → each `dead_code` is heuristic; table may be consumed externally (BI/API/COPY INTO). Show `reason` before suggesting deletion.
+- **CI impact**: `diff_impact(changed_files)` (fact); `presentation_facing` flags user-visible tables.
+- **Hub topology**: `get_hub_ranking(k)` (fact); high hub = high-risk change target, quantify via `scope_change`.
 """
 
 # ---------------------------------------------------------------------------
@@ -244,28 +201,43 @@ def list_registered_tools() -> list[str]:
 
 
 def _generate_tool_table() -> str:
-    """Generate the Markdown tool table from the live registry and return models."""
-    registered = list_registered_tools()
-    lines: list[str] = [
-        "## Tool Reference",
-        "",
-        "| Tool | Purpose | Type |",
-        "|------|---------|------|",
-    ]
-    for tool_name in registered:
+    """Generate the compact Markdown tool table from the live registry.
+
+    Rows are grouped facts-first then heuristics-last so the boundary is
+    visible from the table alone (no separate heuristic list needed).
+    """
+    facts: list[str] = []
+    heuristics: list[str] = []
+    for tool_name in list_registered_tools():
         model = TOOL_RETURN_MODELS.get(tool_name, BaseModel)
-        tag = "heuristic" if _tool_is_heuristic(model) else "fact"
         purpose = _TOOL_PURPOSE.get(tool_name, "")
-        lines.append(f"| `{tool_name}` | {purpose} | {tag} |")
+        if _tool_is_heuristic(model):
+            heuristics.append(f"| `{tool_name}` | {purpose} | heuristic |")
+        else:
+            facts.append(f"| `{tool_name}` | {purpose} | fact |")
+    lines = ["## Tools", "", "| Tool | Purpose | Type |", "|---|---|---|"]
+    lines.extend(facts)
+    lines.extend(heuristics)
     lines.append("")
     return "\n".join(lines)
+
+
+def render_body() -> str:
+    """Return the skill body — boundary + generated tool table + workflows.
+
+    This is the human/agent-facing guidance without YAML frontmatter. Reused by
+    the `sqlcg mcp best-practices` CLI command so the boundary doc has a single
+    source and cannot drift from the bundled skill.
+    """
+    return _BOUNDARY + "\n" + _generate_tool_table() + "\n" + _WORKFLOWS
 
 
 def render_skill(version: str) -> str:
     """Return the full SKILL.md text.
 
-    Produces: YAML frontmatter + philosophy prose + generated tool table +
-    workflow prose. This is the single entry point the installer calls.
+    Produces: YAML frontmatter + the shared body (boundary prose + generated
+    tool table + workflow prose). This is the single entry point the installer
+    calls.
 
     Args:
         version: Version string to embed in the frontmatter (e.g. "0.3.1").
@@ -281,6 +253,4 @@ def render_skill(version: str) -> str:
         "---\n"
     )
 
-    tool_table = _generate_tool_table()
-
-    return frontmatter + "\n" + _PHILOSOPHY + "\n" + tool_table + "\n" + _WORKFLOWS
+    return frontmatter + "\n" + render_body()
