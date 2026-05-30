@@ -21,7 +21,7 @@ best lineage results, and that encodes the trust-layer **fact vs. heuristic** bo
 
 | Fact | Source | Symbol / line |
 |------|--------|---------------|
-| Install registers MCP server in `~/.claude/settings.json`; has `--dry-run`; uses `.tmp`+`os.replace` atomic write; idempotent (compares existing entry) | [`install.py`](../src/sqlcg/cli/commands/install.py) | `install_cmd` L17; `_SETTINGS_PATH` L13; atomic write L69-72; idempotent check L45-48 |
+| Install registers MCP server in `~/.claude/settings.json`; has `--dry-run`; uses `.tmp`+`os.replace` atomic write; idempotent (compares existing entry) | [`install.py`](../src/sqlcg/cli/commands/install.py) | `install_cmd` L17; `_SETTINGS_PATH` L13; atomic write L69-72; idempotent check L44-47 |
 | Uninstall runs 3 steps; Step 3 strips git-hook sentinel blocks via `(filename, sentinel)` table | [`uninstall.py`](../src/sqlcg/cli/commands/uninstall.py) | `uninstall_cmd` L17; `_step3_remove_git_hook` L208; `_HOOK_SENTINELS` L202; `_strip_sentinel_block` L133 |
 | Idempotent install idiom: per-item spec table, "sentinel already present → skip silently; foreign file → warn, do not clobber" | [`git.py`](../src/sqlcg/cli/commands/git.py) | `_HookSpec` namedtuple; `_install_single_hook` (sentinel check + skip + foreign-file warn); `_HOOKS` table |
 | MCP tools registered via `@mcp.tool()` — tool name = function name (FastMCP default; `_timed_tool` preserves it with `functools.wraps`) | [`tools.py`](../src/sqlcg/server/tools.py) | `@mcp.tool()` L388; `_timed_tool` L362 (`functools.wraps` L370); `mcp = FastMCP(...)` in [`server.py`](../src/sqlcg/server/server.py) L32 |
@@ -34,12 +34,18 @@ best lineage results, and that encodes the trust-layer **fact vs. heuristic** bo
 | Package version single source | [`__init__.py`](../src/sqlcg/__init__.py) | `__version__ = "0.3.1"` L3 |
 | Wheel packaging: `packages = ["src/sqlcg"]` (hatchling) | [`pyproject.toml`](../pyproject.toml) | `[tool.hatch.build.targets.wheel]` L89 |
 
-### Confirmed full MCP tool registry (17 tools — grep-confirmed, do not invent names)
+### Confirmed full MCP tool registry (16 tools — grep-confirmed, do not invent names)
+
+> **plan-reviewer correction (B1)**: `db_info` is NOT decorated with `@mcp.tool()` in
+> [`tools.py`](../src/sqlcg/server/tools.py) (L1263 has only `@_timed_tool("db_info")`
+> with no `@mcp.tool()` above it). The FastMCP runtime confirms 16 tools via
+> `mcp._tool_manager._tools`. All plan references corrected from 17 to 16;
+> `db_info` removed from the registry list.
 
 Lineage / dependency **facts**: `trace_column_lineage`, `find_table_usages`,
 `find_definition`, `get_downstream_dependencies`, `get_upstream_dependencies`,
 `get_backfill_order`, `diff_impact`, `search_sql_pattern`, `list_dialects_and_repos`,
-`db_info`, `get_hub_ranking`.
+`get_hub_ranking`.
 
 **Fact + embedded heuristic** (`risk: Judgement`): `get_change_scope`, `scope_change`.
 
@@ -192,7 +198,7 @@ frontmatter + prose body (tool table stubbed empty for now, filled in 2.1).
 
 ### Phase 2 — Tool table generated from the live registry
 
-**Step 2.1**: Add `TOOL_RETURN_MODELS` (all 17 tools → their return model), `list_registered_tools()`
+**Step 2.1**: Add `TOOL_RETURN_MODELS` (all 16 tools → their return model), `list_registered_tools()`
 (reads names from the imported `mcp` FastMCP instance), `_tool_is_heuristic(model)`
 (inspects model fields for a `Judgement`-typed field), and splice the generated table
 into `render_skill`.
@@ -220,9 +226,11 @@ exists at that exact path (no sqlcg frontmatter marker), warn and skip — mirro
   leaves exactly one file with identical content (idempotent). `install --dry-run --scope global`
   writes **nothing** and prints a note that the skill would be written.
 
-**Step 3.2**: Wire the `--scope` choice through any existing repo/path option so `project`
-resolves against the right repo root (default `Path.cwd()`), consistent with how
-`uninstall --repo` resolves the repo.
+**Step 3.2**: Add a `--repo` option to `install_cmd` so `project` scope resolves against
+the right repo root (default `Path.cwd()`), consistent with how `uninstall --repo`
+resolves the repo. **Note (plan-reviewer W1)**: `install.py` currently has NO `--repo`
+parameter — it must be added as a new `typer.Option`. The prior wording "any existing
+repo/path option" was incorrect; there is no such option on `install_cmd` today.
 - Files affected: `src/sqlcg/cli/commands/install.py`.
 - Acceptance: `install --scope project --repo <tmp>` writes `<tmp>/.claude/skills/sqlcg/SKILL.md`.
 
@@ -306,8 +314,11 @@ provisioned by `install`, and add a short note in the install command help about
   warns and skips on a foreign `SKILL.md`; uninstall rmtree's only the sqlcg subdir.
 - **Silent wrong-location write in CI** → non-TTY without `--scope` errors instead of guessing.
 - **FastMCP name extraction brittleness** → `list_registered_tools()` reads from the
-  imported `mcp` instance; if the FastMCP accessor API differs, fall back to the
-  `TOOL_RETURN_MODELS` keys (which the drift-guard test cross-checks against `@mcp.tool()` grep).
+  imported `mcp` instance via `mcp._tool_manager._tools` (a private dict attr confirmed
+  present in FastMCP's `ToolManager`; verified at implementation time). If the FastMCP
+  accessor API changes, fall back to the `TOOL_RETURN_MODELS` keys (the drift-guard test
+  cross-checks these against `@mcp.tool()` grep, so the fallback stays correct even if
+  the private attr is renamed in a FastMCP upgrade).
 
 ---
 
@@ -320,3 +331,13 @@ provisioned by `install`, and add a short note in the install command help about
 ### Blocking Questions
 - None. All three open questions (D1/D2/D3) are resolved with grounded defaults above; the
   user may override any of them, but planning is not blocked.
+
+### Plan-Reviewer Corrections (applied — not blocking)
+
+| ID | Severity | Issue | Resolution |
+|----|----------|-------|------------|
+| B1 | Blocker (resolved) | Plan claimed 17 tools; `db_info` is not `@mcp.tool()` decorated. Actual registry: 16 tools. | All "17" references corrected to 16; `db_info` removed from registry list and TOOL_RETURN_MODELS count. |
+| W1 | Warning (resolved) | Step 3.2 said "any existing repo/path option" — `install.py` has NO `--repo` option today. | Step 3.2 reworded to "Add a `--repo` option" (new parameter, not wire-through). |
+| N1 | Note | Line reference "idempotent check L45-48" was off by one. | Corrected to L44-47. |
+| N2 | Note | FastMCP private attr `_tool_manager._tools` not mentioned in risk entry. | Risk entry updated to name the attr and explain the fallback mechanism. |
+

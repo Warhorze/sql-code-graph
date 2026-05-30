@@ -1,6 +1,65 @@
 ## Current State
 
-CURRENT FEATURE: F1 — living-codebase resync (DEVELOPER complete — all 5 phases)
+ACTIVE AGENT: plan-reviewer — feature F2 (bundle-claude-skill)
+  status: READY FOR IMPLEMENTATION
+  plan: plan/bundle_claude_skill.md (reviewed, corrections applied)
+  branch: feat/sprint-10-anchor-tools
+  corrections applied:
+    B1 (blocker resolved): tool count corrected 17->16; db_info removed from registry
+      (db_info has no @mcp.tool() decorator — confirmed via grep + runtime list_tools)
+    W1 (warning resolved): Step 3.2 reworded — install.py has NO --repo option today;
+      developer must ADD it (not wire through an existing one)
+    N1: idempotent check line ref corrected L45-48 -> L44-47
+    N2: FastMCP _tool_manager._tools private attr named in risk section
+  failing tests committed:
+    tests/unit/test_F2_skill_render.py (8 tests: 1 FAILED, 7 SKIPPED pre-impl)
+    tests/unit/test_F2_install_skill.py (7 tests: 4 FAILED, 2 PASSED guards, 1 SKIPPED)
+    tests/unit/test_F2_uninstall_skill.py (3 tests: 2 FAILED, 1 PASSED guard)
+    tests/e2e/test_F2_skill_install_e2e.py (4 tests: 3 FAILED, 1 SKIPPED)
+    total: 8 FAILED + 3 PASSED (regression guards) + 14 SKIPPED (pre-impl) = confirmed red
+  NOTE: F2 not yet in ARCHITECTURE_REVIEW.md — flagged for architect-reviewer before merge
+
+Handoff — plan-reviewer (2026-05-30):
+  agent: plan-reviewer
+  plan: plan/bundle_claude_skill.md
+  status: READY FOR IMPLEMENTATION (corrections applied, failing tests committed)
+
+  Blockers found and resolved:
+    B1: Plan claimed 17 tools; verified grep + runtime (asyncio mcp.list_tools())
+      shows 16. db_info at L1263 has ONLY @_timed_tool("db_info"), no @mcp.tool().
+      Fixed: all "17" -> "16" throughout plan; db_info removed from registry list
+      and TOOL_RETURN_MODELS count corrected.
+
+  Warnings found and resolved:
+    W1: Step 3.2 said "any existing repo/path option" — install.py has NO --repo
+      parameter at all (only --dry-run). Fixed: Step 3.2 reworded to "Add a --repo
+      option to install_cmd".
+
+  Notes (no plan change for these):
+    N1: Idempotent check line ref was L45-48; actual is L44-47. Corrected.
+    N2: FastMCP private attr _tool_manager._tools verified and named in risk section.
+
+  Grounding verified against source:
+    - 16 tools confirmed at runtime: asyncio.run(mcp.list_tools()) returns 16
+    - db_info: only @_timed_tool("db_info") at L1263, no @mcp.tool() above it
+    - install.py: no --repo option exists (only --dry-run)
+    - uninstall.py: --repo exists at L22; _HOOK_SENTINELS L202; _step3 L208 all correct
+    - git.py: _HookSpec, _install_single_hook, _HOOKS — all correct
+    - models.py: Judgement L8, _check_invariants L38-46, all Judgement field placements correct
+    - install.py L13 (_SETTINGS_PATH), L17 (install_cmd), L70-72 (atomic write) all correct
+    - KuzuConfig L17 (db_path), from_env L24, __version__ L3, packages=src/sqlcg L89 all correct
+
+  Failing acceptance tests (8 FAILED before implementation):
+    tests/unit/test_F2_skill_render.py
+    tests/unit/test_F2_install_skill.py
+    tests/unit/test_F2_uninstall_skill.py
+    tests/e2e/test_F2_skill_install_e2e.py
+    Run: uv run pytest tests/unit/test_F2_skill_render.py tests/unit/test_F2_install_skill.py
+         tests/unit/test_F2_uninstall_skill.py tests/e2e/test_F2_skill_install_e2e.py -q
+    Result before impl: 8 FAILED, 3 PASSED (regression guards), 14 SKIPPED — confirmed red
+
+
+PREVIOUS FEATURE: F1 — living-codebase resync (DEVELOPER complete — all 5 phases)
   status: All phases implemented on branch feat/sprint-10-anchor-tools; ready for compliance check
   commit: 4317c77 (Phase 5); ecc1797 (Phase 4); a2664d7 (Phase 3); 3c312e9 (Phase 2); 0d372a3 (Phase 1)
   tests: 608 passed / 0 failed (excl. gitignored DWH e2e perf-budget which is pre-existing); pyright clean; ruff clean
