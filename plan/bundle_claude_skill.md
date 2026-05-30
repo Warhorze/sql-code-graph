@@ -89,7 +89,7 @@ Operational: `index_repo`, `execute_cypher`, `submit_feedback`.
   pick a default location, because picking wrong writes a team-shared file the user did
   not intend. This honours "the tool does not decide" in both interactive and scripted modes.
 - `project` → `<repo>/.claude/skills/sqlcg/SKILL.md` (repo defaults to `Path.cwd()`,
-  overridable via existing `--repo`-style option — see Step 3.1).
+  overridable via the new `--repo` option added in Step 3.2).
 - `global` → `~/.claude/skills/sqlcg/SKILL.md`.
 
 ### D3 — Shipping & versioning: **generated at install time; stamped with `__version__`** (chosen)
