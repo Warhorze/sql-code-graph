@@ -1,3 +1,13 @@
+## v1.0.1 (2026-05-30)
+
+### Fix
+
+- **indexer**: abort immediately on Ctrl-C instead of flushing a partial graph
+
+### Perf
+
+- **parser**: recover 3 once-per-statement lineage regressions from 4234e5d
+
 ## v1.0.0 (2026-05-30)
 
 ### Feat
