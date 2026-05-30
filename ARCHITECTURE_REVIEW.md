@@ -2733,3 +2733,38 @@ code makes this distinction explicit.
    approach is acceptable for infrequent timeouts. If T-04 measurement shows
    a significant fraction of files timing out (>1%), consider migrating to a
    subprocess with `multiprocessing.Process.kill()` to guarantee hard termination.
+
+---
+
+## 15. INFORMATION_SCHEMA feature removal (2026-05-29)
+
+**Decision**: removed the INFORMATION_SCHEMA-CSV feature end-to-end. It comprised
+two layers, both retired:
+
+1. **In-memory column-resolution sources** — [`SchemaResolver.add_information_schema()`](src/sqlcg/lineage/schema_resolver.py)
+   / `as_sources_dict()` / `mapping_schema()`, the `schema_sources` argument
+   threaded through [`base.py`](src/sqlcg/parsers/base.py) and both parsers, and
+   the per-edge `mapping_schema_tables` confidence scoring (1.0 schema-backed /
+   0.7 inferred). All edges are now uniformly inferred (confidence 0.7).
+2. **Graph-level authoritative schema** — the `sqlcg load-schema` CLI command,
+   the `--schema-from-info-schema` flag, `.sqlcg/schema.csv` auto-discovery, and
+   the "gold table" DDL-precedence path that suppressed DDL columns for
+   `information_schema`-backed tables.
+
+**Rationale**: profiling on the DWH corpus (N=100 sample, seed=42, 2026-05-28)
+measured **zero edge delta** between schema-loaded and no-schema runs (7241 vs
+7259 edges). Cross-file pass-2 CTAS resolution already dominated column lineage;
+CSV entries were registered but never consulted. The feature added a perf-sensitive
+surface (the O(N_files × N_schema) `expand()`/`sg_lineage` bloat the CLAUDE.md
+invariants existed to contain) for no measured coverage benefit.
+
+**Consequences**:
+- Schema now resolves purely from parsed DDL + cross-file CTAS bodies. Both
+  small-repo and large-repo flows use the same `sqlcg index <path>` command with
+  no schema export.
+- The two CLAUDE.md "Performance invariants" rows specific to schema_sources
+  (the `expand()`-excludes-schema and `mapping_schema_tables` confidence rows)
+  were retired; the surviving invariants (module-level imports, body_scope once,
+  pure-literal skip, scope-vs-sources, bulk upsert) are unaffected.
+- **Do not reintroduce** a schema-CSV ingestion path without a measured
+  lineage-coverage win to justify the perf surface.
