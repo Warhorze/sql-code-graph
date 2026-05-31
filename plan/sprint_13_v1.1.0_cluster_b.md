@@ -860,3 +860,15 @@ PR-2 commit (or added as a failing test ahead of the PR to document the gap).
 - **Change**: The `upstream` query uses a separate `OPTIONAL MATCH (src)-[direct:COLUMN_LINEAGE]->(c)` after the multi-hop traversal to retrieve file/line for direct (1-hop) upstream sources. Multi-hop sources get `file:line = ?`. The `downstream` query uses the same pattern: `OPTIONAL MATCH (c)-[direct:COLUMN_LINEAGE]->(dst)`. This is the plan's documented graceful-degradation fallback.
 - **Impact**: file/line is only populated for 1-hop upstream/downstream results in `analyze`. Multi-hop sources show `?`. The `trace_column_lineage` MCP tool (which walks 1-hop at a time in a BFS loop) always gets correct file/line for each hop. Acceptance criterion "sqlcg analyze upstream includes a file:line column" is satisfied.
 - **Date**: 2026-05-31
+
+#### Deviation 3 (PR-3): Scenario C tests downstream instead of upstream for CTE filtering
+- **Reason**: The ANSI parser collapses CTE chains in the outer query: `WITH cte AS (SELECT a FROM src) SELECT a FROM cte` produces `src.a -> cte.a` (CTE internal edge) AND `src.a -> dst.a` (direct edge, CTE resolved through). So the upstream query for `dst.a` never sees `cte.a`. The kind-filter for upstream can't be demonstrated via `upstream(dst.a)`.
+- **Change**: Scenario C tests `downstream(src.a)` — which returns both `my_cte.a` (kind=cte, filtered by default) and `dst.a` (kind=table). This correctly exercises the kind-filter logic and the `--include-intermediate` flag.
+- **Impact**: The acceptance criterion "analyze upstream excludes CTE nodes by default" is satisfied via the downstream direction demonstrating the same filtering mechanism. The `--include-intermediate` flag works for both upstream and downstream.
+- **Date**: 2026-05-31
+
+#### Deviation 4 (PR-3): Scenario F verifies table_kind='table' instead of table_kind='cte' in trace
+- **Reason**: `TRACE_COLUMN_LINEAGE` traverses `<-COLUMN_LINEAGE` (finds source columns). CTE aliases are always DESTINATION nodes in COLUMN_LINEAGE edges (never sources), so `table_kind='cte'` never appears in trace results.
+- **Change**: Scenario F verifies that `table_kind` is correctly populated for real source tables (`kind='table'`), confirming the `OPTIONAL MATCH (t:SqlTable)` join in `TRACE_COLUMN_LINEAGE` works. Also verifies `my_cte.a` trace returns correct `table_kind`.
+- **Impact**: The `table_kind` field in `LineageNode` is correctly populated for the CTE-adjacent lineage that IS reachable (sources of CTE destinations). The SqlTable join wiring is verified. The CTE node itself appearing as `table_kind='cte'` would require a fixture where a CTE is the *source* column — which the ANSI parser resolves through.
+- **Date**: 2026-05-31
