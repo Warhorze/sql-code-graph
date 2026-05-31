@@ -1,3 +1,42 @@
+## Current State — developer: v1.1.0 PR-D reindex op on server + --notify (#28)
+
+ACTIVE AGENT: developer — sprint-12 PR-D: reindex through running server
+  plan: plan/sprint_12_v1.1.0.md (PR-D ticket)
+  feature plan: plan/v1.1.0_live_graph_freshness.md
+  branch: fix/v1.0.2-bugfix
+  issues: #28 (silent stale graph)
+  status: COMPLETE — PR #36 (existing, updated with PR-D commits)
+  commit: b54153f
+  PR: https://github.com/Warhorze/sql-code-graph/pull/36
+
+Handoff:
+  agent: developer (PR-D complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  files changed:
+    - src/sqlcg/server/server.py (replace reindex stub with real op: to_thread.run_sync, reindex_lock, resync_changed)
+    - src/sqlcg/cli/commands/reindex.py (add --notify flag + socket-routing block + R3 fallback)
+    - src/sqlcg/cli/commands/git.py (update hooks: --notify + stderr cue; R9: sentinel unchanged)
+    - tests/e2e/test_mcp_lifecycle.py (update stub test to missing-fields error test)
+    - tests/integration/test_reindex_via_server.py (NEW — 6 integration tests: Scenarios A/C/D/E)
+  test results: 824 passed, 6 skipped, 3 xfailed (full suite)
+    + 6 new PR-D tests all pass
+    + e2e lifecycle tests: 7 passed (incl. updated stub test)
+    + 1 pre-existing failure: test_mcp_stdio_smoke (exists before this branch)
+  pyright: 0 errors
+  ruff: all checks passed
+  wiring verified:
+    - R1: _to_thread.run_sync(_do_reindex) in server.py
+    - R2: reindex_lock = anyio.Lock() created once in _run_with_control, passed to _control_socket_task
+    - R3: ConnectionRefusedError|FileNotFoundError caught in reindex.py --notify fallback
+    - R8: teardown order unchanged (os._exit path in _stop_watcher, lock cancelled before shutdown)
+    - R9: hook sentinel "# sqlcg post-checkout hook" unchanged (idempotency preserved)
+    - resync_changed: exactly one call site in server.py (not reimplemented)
+    - --notify flag definition and socket-routing block in reindex.py
+    - --notify and stderr cue in git.py hooks
+    - zero TODOs in server.py, reindex.py, git.py
+
+---
+
 ## Current State — developer: v1.1.0 PR-C Unix-socket control channel + mcp status/stop/restart (#29)
 
 ACTIVE AGENT: developer — sprint-12 PR-C: control socket + lifecycle commands
@@ -5,7 +44,7 @@ ACTIVE AGENT: developer — sprint-12 PR-C: control socket + lifecycle commands
   feature plan: plan/v1.1.0_live_graph_freshness.md
   branch: fix/v1.0.2-bugfix
   issues: #29 (MCP lifecycle + reindex through server)
-  status: IN PROGRESS
+  status: COMPLETE (PR-C verified green; PR-D built on top)
 
 ---
 
