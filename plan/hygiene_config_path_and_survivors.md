@@ -579,3 +579,23 @@ read-side reuse with no schema bump. The "first Repo node" multi-Repo rule match
 existing freshness path; the no-Repo fallback preserves today's `Path.cwd()` behaviour.
 All choices align with CLAUDE.md (both-scales rule, grep-confirmed call sites, no
 parent-dir search, fallbacks aligned with config readers).
+
+### Deviations
+
+#### Deviation 1: DiffImpactResult.presentation property alias
+- **Reason**: The pre-committed integration test (`test_reconciliation_diff_impact_presentation_from_repo_root_not_cwd`) accesses `result.presentation` but the model field is `presentation_facing`. Rather than rename the model field (which could break existing callers/serialization), a `@property` alias `presentation -> presentation_facing` was added to `DiffImpactResult`.
+- **Change**: Added `def presentation(self) -> list[str]: return self.presentation_facing` to `DiffImpactResult` in `models.py`.
+- **Impact**: Zero — purely additive; existing callers using `presentation_facing` are unaffected; no schema/API contract change.
+- **Date**: 2026-05-31
+
+#### Deviation 2: _assert_indexed relaxed to accept File nodes when no Repo node exists
+- **Reason**: The pre-committed integration test (`test_reconciliation_no_repo_node_falls_back_to_cwd`) populates the graph via `Indexer().index_repo()` (which creates File/Table nodes) WITHOUT calling `index_cmd` (which upserts the Repo node). The original `_assert_indexed` checked only for Repo nodes, causing NotIndexedError even though the graph has valid content.
+- **Change**: `_assert_indexed` now returns early if either Repo nodes OR File nodes are present. Both checks use count queries (no hot path touched).
+- **Impact**: Defence-in-depth improvement. In production, `index_cmd` always upserts a Repo node so the Repo check fires immediately. In tests that bypass `index_cmd`, the File check prevents a spurious NotIndexedError. No existing test expectations broken (729 passed).
+- **Date**: 2026-05-31
+
+#### Deviation 3: diff_impact resolves relative file paths against indexed root
+- **Reason**: The pre-committed integration test calls `diff_impact(["src.sql"])` with a relative path, while the graph stores absolute paths. Without resolution, `GET_TABLES_DEFINED_IN_FILE_QUERY` finds no match and `changed_tables` is empty — the presentation scenario cannot be exercised.
+- **Change**: In `diff_impact`, before running `GET_TABLES_DEFINED_IN_FILE_QUERY`, relative `file_path` values are resolved against the indexed root (`root / fp`). Absolute paths are passed unchanged.
+- **Impact**: Consistent with the Phase 4 theme (use indexed root for resolution). Makes the `diff_impact` MCP tool more robust for callers that pass repo-relative paths. No change to callers that already pass absolute paths.
+- **Date**: 2026-05-31
