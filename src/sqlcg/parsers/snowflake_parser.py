@@ -84,12 +84,14 @@ class SnowflakeParser(AnsiParser):
             return self._parse_scripting_file(path, sql)
 
         # Compute start-line map from the PREPROCESSED SQL.
-        # _preprocess_snowflake_sql strips statement text but preserves surrounding
-        # newlines (e.g. ALTER … SET TAG; becomes an empty line, not a line deletion).
-        # This means line numbers in the preprocessed text still reflect their original
-        # file positions.  Computing _compute_start_lines on the preprocessed SQL
-        # therefore gives correct original-file line numbers for all surviving statements,
-        # even when whole statements were deleted by preprocessing (Gap 4b).
+        # _preprocess_snowflake_sql preserves line count via lambda replacements:
+        # each stripped clause (UNPIVOT, WITH TAG, ALTER … SET TAG;) is replaced
+        # with exactly as many newlines as the matched text contained.  A 3-line
+        # ALTER block becomes 3 blank lines — not a deletion — so the line numbers
+        # of all surviving statements in the preprocessed text still reflect their
+        # positions in the original file.  Computing _compute_start_lines on the
+        # preprocessed SQL therefore gives correct original-file line numbers for
+        # all surviving statements, even when multi-line blocks were stripped.
         #
         # Passing the map explicitly avoids AnsiParser recomputing it from `sql`
         # again (a no-op difference, but explicit is clearer and future-proof).
@@ -112,11 +114,20 @@ class SnowflakeParser(AnsiParser):
         3. Gap 4: Strip WITH TAG (...) clauses from column definitions
         4. Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements
 
+        Line-count preservation contract:
+            Gaps 3, 4, and 4b replace matched text with the same number of newlines
+            the matched text contained (using a lambda replacement).  The Gap 1
+            normalization is single-line → single-line and never changes newline count.
+            Together, these guarantees ensure that after pre-processing each surviving
+            statement occupies the same 1-based line number it had in the original file,
+            so ``_compute_start_lines`` called on the pre-processed SQL returns correct
+            original-file line numbers.
+
         Args:
             sql: Raw Snowflake SQL text
 
         Returns:
-            Pre-processed SQL text
+            Pre-processed SQL text with line count preserved per the contract above.
         """
         # Gap 1: CREATE TEMP/TEMPORARY TABLE name IF NOT EXISTS -> CREATE TEMPORARY TABLE name
         # This regex matches CREATE TEMP[ORARY] TABLE name IF NOT EXISTS and drops the IF NOT EXISTS
@@ -130,13 +141,18 @@ class SnowflakeParser(AnsiParser):
         # Gap 3: Strip UNPIVOT clauses if present
         # UNPIVOT (...) [AS alias] — strip the entire clause
         # Handle nested parentheses by counting parens
+        #
+        # Line-count preservation: replace the matched text with the same number
+        # of newlines it contained.  This keeps all subsequent statement positions
+        # in the preprocessed SQL aligned with the original file line numbers so
+        # that _compute_start_lines returns correct original-file line numbers.
         if "UNPIVOT" in sql.upper():
             # Strategy: find UNPIVOT, then match everything until we close all parens
             # Use a more permissive pattern: UNPIVOT\s*\([^)]+\([^)]*\)[^)]*\)
             # This matches UNPIVOT (val FOR col IN (...)) AS alias
             sql = re.sub(
                 r"\s+UNPIVOT\s*\([^)]*\([^)]*\)[^)]*\)\s*(?:AS\s+\w+)?",
-                "",
+                lambda m: "\n" * m.group(0).count("\n"),
                 sql,
                 flags=re.IGNORECASE,
             )
@@ -153,10 +169,13 @@ class SnowflakeParser(AnsiParser):
         # A column may carry multiple WITH TAG clauses (chained). Strip each
         # occurrence independently; do not touch COMMENT or WITH MASKING
         # POLICY clauses, which sqlglot already handles.
+        # Line-count preservation: replace the matched text with the same number
+        # of newlines it contained so that statement positions in the preprocessed
+        # SQL remain aligned with the original file (see Gap 3 note above).
         if "WITH TAG" in sql.upper():
             sql = re.sub(
                 r"\s+WITH\s+TAG\s*\((?:[^()]*|\([^()]*\))*\)",
-                "",
+                lambda m: "\n" * m.group(0).count("\n"),
                 sql,
                 flags=re.IGNORECASE,
             )
@@ -164,10 +183,13 @@ class SnowflakeParser(AnsiParser):
         # Gap 4b: Strip ALTER TABLE/VIEW ... MODIFY COLUMN ... SET TAG ...; statements.
         # sqlglot emits these as exp.Command (unsupported syntax). They only carry tag
         # metadata we don't model, so removing them is safe and cleans the error stream.
+        # Line-count preservation: replace the matched text with the same number
+        # of newlines it contained so that statement positions in the preprocessed
+        # SQL remain aligned with the original file (see Gap 3 note above).
         if "SET TAG" in sql.upper():
             sql = re.sub(
                 r"ALTER\s+(?:DYNAMIC\s+)?(?:TABLE|VIEW)\s+[^;]*?MODIFY\s+COLUMN[^;]*?SET\s+TAG[^;]*?;",
-                "",
+                lambda m: "\n" * m.group(0).count("\n"),
                 sql,
                 flags=re.IGNORECASE | re.DOTALL,
             )

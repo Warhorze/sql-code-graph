@@ -89,9 +89,11 @@ class AnsiParser(SqlParser):
                 `ParsedFile.referenced_tables`.
             _precomputed_start_lines: optional list of 1-based start lines, one per
                 statement. When provided (e.g. by SnowflakeParser which computes the map
-                from the original pre-preprocessing SQL), this list is used directly and
-                ``_compute_start_lines`` is not called on the (possibly mutated) ``sql``
-                argument. When ``None``, ``_compute_start_lines(sql)`` is called here.
+                from the preprocessed SQL after ``_preprocess_snowflake_sql`` — which
+                preserves line count so preprocessed positions equal original-file
+                positions), this list is used directly and ``_compute_start_lines`` is
+                not called on the ``sql`` argument. When ``None``, ``_compute_start_lines
+                (sql)`` is called here.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -108,8 +110,10 @@ class AnsiParser(SqlParser):
 
         # Compute 1-based start lines once per file, before the statement loop.
         # When _precomputed_start_lines is provided (Snowflake non-scripting path),
-        # the caller has already computed the map from the original pre-preprocessing
-        # SQL to avoid line-shift / index-desync caused by ALTER ... SET TAG; deletion.
+        # the caller has already computed the map from the preprocessed SQL.
+        # _preprocess_snowflake_sql preserves line count (lambda replacements emit
+        # the same number of newlines as the matched text), so preprocessed line
+        # positions equal original-file positions — no line-shift desync.
         start_lines: list[int] = (
             _precomputed_start_lines
             if _precomputed_start_lines is not None

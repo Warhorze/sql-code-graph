@@ -301,6 +301,170 @@ def test_scenario_f_snowflake_preprocessing_preserves_start_lines(db, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Scenario F2 — Multi-line ALTER … SET TAG; does not shift subsequent start_line
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_f2_multiline_alter_set_tag_preserves_subsequent_start_line():
+    """Multi-line ALTER … SET TAG; deletion must NOT shift subsequent statements' start_line.
+
+    The fixture:
+      Line 1: CREATE TABLE src (a INT);
+      Lines 2-4: ALTER TABLE … MODIFY COLUMN … SET TAG … (3 lines, including body)
+                 (deleted by Gap 4b preprocessing)
+      Line 5: INSERT INTO dst SELECT a AS x FROM src;
+
+    Before the fix: the three interior newlines of the ALTER block were consumed
+    by the regex substitution → the preprocessed SQL had the INSERT at line 2 →
+    start_line was persisted as 2 instead of 5.
+
+    After the fix: the replacement preserves newline count → INSERT appears at
+    line 5 in the preprocessed SQL → start_line is correctly persisted as 5.
+    """
+    sql_lines = [
+        "CREATE TABLE src (a INT);",  # line 1
+        "ALTER TABLE src",  # line 2
+        "  MODIFY COLUMN a",  # line 3
+        "  SET TAG GOVERNANCE.pii = 'true';",  # line 4
+        "INSERT INTO dst SELECT a AS x FROM src;",  # line 5
+    ]
+    fixture_sql = "\n".join(sql_lines) + "\n"
+
+    from sqlcg.lineage.schema_resolver import SchemaResolver
+
+    resolver = SchemaResolver()
+    parser = SnowflakeParser(resolver)
+    parsed = parser.parse_file(None, fixture_sql)  # type: ignore[arg-type]
+
+    insert_stmts = [s for s in parsed.statements if s.kind == "INSERT"]
+    assert insert_stmts, (
+        "Expected at least one INSERT statement in parsed output. "
+        f"Parsed kinds: {[s.kind for s in parsed.statements]}"
+    )
+    insert_line = insert_stmts[0].start_line
+    assert insert_line == 5, (
+        f"INSERT must report start_line=5 (original file line 5). "
+        f"Got start_line={insert_line}. "
+        "If start_line=2, the multi-line ALTER block newlines were dropped during "
+        "preprocessing (Gap 4b line-count-preservation bug)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scenario F3 — Multi-line UNPIVOT does not shift subsequent start_line
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_f3_multiline_unpivot_preserves_subsequent_start_line():
+    """Multi-line UNPIVOT clause deletion must NOT shift subsequent statements' start_line.
+
+    The fixture:
+      Line 1: CREATE TABLE dst AS
+      Line 2: SELECT a, b FROM src
+      Lines 3-6: UNPIVOT (val FOR col IN (   -- 4 lines, including interior newlines
+                   x, y
+                 )) AS unpiv
+      Line 7-8: ;   (end of CREATE)
+      ... wait, we need a simpler multi-statement fixture.
+
+    Simpler approach: the UNPIVOT block spans lines 3-5 inside a SELECT statement,
+    followed by a second statement at line 7.
+
+    Fixture:
+      Line 1: CREATE TABLE src (x INT, y INT);
+      Lines 2-6: CREATE TABLE dst AS SELECT a FROM src
+                   UNPIVOT (val FOR col IN (
+                     x,
+                     y
+                   )) AS unpiv;
+      Line 7: INSERT INTO final_out SELECT a FROM dst;
+
+    After UNPIVOT strip (which spans lines 3-6 in the CREATE): the subsequent
+    INSERT must still report start_line=7.
+    """
+    sql_lines = [
+        "CREATE TABLE src (x INT, y INT);",  # line 1
+        "CREATE TABLE dst AS SELECT a FROM src",  # line 2
+        "  UNPIVOT (val FOR col IN (",  # line 3
+        "    x,",  # line 4
+        "    y",  # line 5
+        "  )) AS unpiv;",  # line 6
+        "INSERT INTO final_out SELECT a FROM dst;",  # line 7
+    ]
+    fixture_sql = "\n".join(sql_lines) + "\n"
+
+    from sqlcg.lineage.schema_resolver import SchemaResolver
+
+    resolver = SchemaResolver()
+    parser = SnowflakeParser(resolver)
+    parsed = parser.parse_file(None, fixture_sql)  # type: ignore[arg-type]
+
+    insert_stmts = [s for s in parsed.statements if s.kind == "INSERT"]
+    assert insert_stmts, (
+        "Expected at least one INSERT statement after UNPIVOT strip. "
+        f"Parsed kinds: {[s.kind for s in parsed.statements]}"
+    )
+    insert_line = insert_stmts[0].start_line
+    assert insert_line == 7, (
+        f"INSERT must report start_line=7 (original file line 7). "
+        f"Got start_line={insert_line}. "
+        "If start_line < 7, the multi-line UNPIVOT block newlines were dropped "
+        "during preprocessing (Gap 3 line-count-preservation bug)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scenario F4 — Multi-line WITH TAG does not shift subsequent start_line
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_f4_multiline_with_tag_preserves_subsequent_start_line():
+    """Multi-line WITH TAG clause deletion must NOT shift subsequent statements' start_line.
+
+    The fixture:
+      Line 1: CREATE OR REPLACE TABLE tgt (
+      Line 2:   col_a INT
+      Lines 3-6:   WITH TAG (
+                     GOVERNANCE.pii = 'true',
+                     GOVERNANCE.category = 'finance'
+                   )
+      Line 7: ) AS SELECT col_a FROM src;
+      Line 8: INSERT INTO final_out SELECT col_a FROM tgt;
+
+    After WITH TAG strip (lines 3-6): the INSERT must still report start_line=8.
+    """
+    sql_lines = [
+        "CREATE OR REPLACE TABLE tgt (col_a INT",  # line 1
+        "  WITH TAG (",  # line 2
+        "    GOVERNANCE.pii = 'true',",  # line 3
+        "    GOVERNANCE.category = 'finance'",  # line 4
+        "  )",  # line 5
+        ") AS SELECT col_a FROM src;",  # line 6
+        "INSERT INTO final_out SELECT col_a FROM tgt;",  # line 7
+    ]
+    fixture_sql = "\n".join(sql_lines) + "\n"
+
+    from sqlcg.lineage.schema_resolver import SchemaResolver
+
+    resolver = SchemaResolver()
+    parser = SnowflakeParser(resolver)
+    parsed = parser.parse_file(None, fixture_sql)  # type: ignore[arg-type]
+
+    insert_stmts = [s for s in parsed.statements if s.kind == "INSERT"]
+    assert insert_stmts, (
+        "Expected at least one INSERT statement after WITH TAG strip. "
+        f"Parsed kinds: {[s.kind for s in parsed.statements]}"
+    )
+    insert_line = insert_stmts[0].start_line
+    assert insert_line == 7, (
+        f"INSERT must report start_line=7 (original file line 7). "
+        f"Got start_line={insert_line}. "
+        "If start_line < 7, the multi-line WITH TAG block newlines were dropped "
+        "during preprocessing (Gap 4 line-count-preservation bug)."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scenario G — Snowflake scripting fallback emits start_line=0 → line=None
 # ---------------------------------------------------------------------------
 
