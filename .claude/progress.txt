@@ -1,4 +1,41 @@
-## Current State — developer: sprint_13 Cluster B PR-1 (#32 — Meaningful Confidence + reason)
+## Current State — developer: sprint_13 Cluster B PR-2 (#31 — Source Location)
+
+ACTIVE AGENT: developer — sprint_13 v1.1.0 Cluster B PR-2
+  plan: plan/sprint_13_v1.1.0_cluster_b.md (PR-2 ticket)
+  branch: feat/cluster-b-provenance
+  issues: #31 (source location: file/line/expression on lineage edges)
+  status: PR UPDATED (comment on #37) — ready for review
+  commit: cd0af1c
+  prior: PR-1 complete (0ced0d9)
+
+Handoff:
+  agent: developer (PR-2 complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  commit: cd0af1c
+  files changed:
+    - src/sqlcg/core/schema.py (SCHEMA_VERSION "4" → "5")
+    - src/sqlcg/core/schema.cypher (start_line INT64 on SqlQuery)
+    - src/sqlcg/parsers/base.py (QueryNode.start_line: int = 0)
+    - src/sqlcg/parsers/ansi_parser.py (_compute_start_lines staticmethod + wiring in parse_file)
+    - src/sqlcg/parsers/snowflake_parser.py (start_lines from preprocessed SQL via _precomputed_start_lines)
+    - src/sqlcg/indexer/indexer.py (start_line in query_rows dict)
+    - src/sqlcg/core/queries.cypher (TRACE_COLUMN_LINEAGE: OPTIONAL MATCH on SqlQuery)
+    - src/sqlcg/server/tools.py (both trace loops: file/line/expression; 0→None sentinel)
+    - src/sqlcg/cli/commands/analyze.py (upstream/downstream: file:line column)
+    - tests/integration/test_pr2_source_location.py (NEW — 10 tests: Scenarios A–G + guard)
+    - test mocks updated (schema version 4→5 in 8 test files)
+  test results: 671 passed, 4 skipped, 1 xfailed
+  pyright: 0 errors | ruff: all checks passed
+  deviations:
+    - D1: start_lines computed from preprocessed SQL (not original) — correct because
+      preprocessing preserves surrounding newlines, retaining original line positions.
+    - D2: analyze file:line uses OPTIONAL MATCH pattern (not r[-1]) — KuzuDB 0.11
+      RECURSIVE_REL limitation. 1-hop exact, multi-hop shows "?". trace tool unaffected.
+  PR: https://github.com/Warhorze/sql-code-graph/pull/37
+
+---
+
+## Prior State — developer: sprint_13 Cluster B PR-1 (#32 — Meaningful Confidence + reason)
 
 ACTIVE AGENT: developer — sprint_13 v1.1.0 Cluster B PR-1
   plan: plan/sprint_13_v1.1.0_cluster_b.md (PR-1 ticket)
