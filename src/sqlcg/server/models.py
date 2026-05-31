@@ -195,6 +195,12 @@ class DbInfoResult(BaseModel):
         default_factory=list,
         description="Health warnings. Empty means the graph is in a healthy state.",
     )
+    indexed_sha: str | None = Field(None, description="Git SHA of the last index run")
+    head_sha: str | None = Field(None, description="Current HEAD SHA of the indexed repo")
+    stale_by_commits: int | None = Field(
+        None, description="Commits HEAD is ahead of indexed_sha (0 = up to date)"
+    )
+    dirty: bool = Field(False, description="True if working tree has uncommitted changes")
 
 
 class DefinitionFile(BaseModel):

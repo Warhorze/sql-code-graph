@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
+from sqlcg.core.freshness import compute_freshness
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
@@ -1380,12 +1381,36 @@ def db_info() -> DbInfoResult:
                 "column lineage may be incomplete for those files."
             )
 
+    # Compute freshness from the stored SHA + first Repo node path
+    _freshness_kwargs: dict = {}
+    try:
+        _indexed_sha = db.get_indexed_sha()
+        _repo_rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        if _repo_rows and _indexed_sha is not None and _repo_rows[0].get("path"):
+            _root = Path(_repo_rows[0]["path"])
+            _f = compute_freshness(_root, _indexed_sha)
+            _freshness_kwargs = {
+                "indexed_sha": _f.indexed_sha,
+                "head_sha": _f.head_sha,
+                "stale_by_commits": _f.stale_by_commits,
+                "dirty": _f.dirty,
+            }
+        elif _indexed_sha is not None:
+            _freshness_kwargs = {"indexed_sha": str(_indexed_sha)}
+    except NotImplementedError:
+        # Neo4j backend raises NotImplementedError for get_indexed_sha — report null
+        pass
+    except Exception:
+        # Any unexpected error must not crash the db_info tool
+        pass
+
     return DbInfoResult(
         schema_version=schema_version,
         node_counts=node_counts,
         column_lineage_edges=column_lineage_edges,
         parse_quality=parse_quality,
         warnings=warnings,
+        **_freshness_kwargs,
     )
 
 
