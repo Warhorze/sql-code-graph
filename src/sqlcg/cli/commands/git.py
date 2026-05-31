@@ -38,9 +38,18 @@ _HOOKS: list[_HookSpec] = [
         script="""\
 #!/bin/sh
 # sqlcg post-merge hook — incremental resync after pull/merge
-# post-merge receives only $1 (squash flag), no old/new SHA; use stored-SHA delta
-sqlcg reindex "$(git rev-parse --show-toplevel)" --dialect auto --quiet --notify \\
-  || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+# git sets ORIG_HEAD to the pre-merge HEAD; pass it as --from so --notify can route
+# through a running server (same path as post-checkout). If ORIG_HEAD is unset (e.g.
+# first-ever merge / gc'd), fall back to the standalone stored-SHA delta (direct write).
+PREV=$(git rev-parse --verify --quiet ORIG_HEAD)
+TOP=$(git rev-parse --show-toplevel)
+if [ -n "$PREV" ]; then
+  sqlcg reindex --from "$PREV" --to HEAD "$TOP" --dialect auto --quiet --notify \\
+    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+else
+  sqlcg reindex "$TOP" --dialect auto --quiet --notify \\
+    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+fi
 """,
     ),
 ]
