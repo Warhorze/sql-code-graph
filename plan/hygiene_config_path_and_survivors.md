@@ -204,6 +204,10 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
   in use. Must NOT raise / must NOT change exit code.
 - Acceptance: indexing a dir without `.sqlcg.toml` prints the warning naming the path;
   with `.sqlcg.toml` present it does not; `--quiet` suppresses it in both cases.
+  **Tone constraint**: the warning is a **single** `console.print()` call (not multi-line),
+  yellow (not red), advisory in tone (confirms defaults are sane and indexing proceeds
+  normally) — it must not alarm a zero-config small-repo user who legitimately runs
+  without any `.sqlcg.toml`.
 
 **Step 1.3** — Mirror the warning in `reindex_cmd` (reindex also reads `get_dialect(path)`).
 - Files: [`reindex.py`](src/sqlcg/cli/commands/reindex.py)

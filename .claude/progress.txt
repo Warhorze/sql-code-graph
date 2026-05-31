@@ -1,4 +1,145 @@
-## Current State — developer: #35a PR-1 external downstream lineage injection
+## Handoff — plan-reviewer → developer (hygiene batch)  [commit 811eebb]
+
+PLAN: plan/hygiene_config_path_and_survivors.md
+BRANCH: feat/cluster-b-provenance
+STATUS: READY FOR IMPLEMENTATION (APPROVE-WITH-ONE-CHANGE)
+
+Review verdict: APPROVE-WITH-CHANGES — one small-repo concern flagged and fixed in plan.
+
+Items confirmed dropped (already done on branch):
+  #12  find case-sensitivity  — CONFIRMED DONE. find.py:20,43 lowercase; base.py:60-72,
+       102-114 store-side lowercase; test_find_cmd.py guards it. DROP.
+  #13  warnings to stdout     — CONFIRMED DONE. index.py:104-114 routes to log file /
+       --verbose → stderr; _CountingHandler + summary pointer at index.py:161-165. DROP.
+  #27b find table noise       — CONFIRMED DONE for find table (find.py:27-34 NoiseFilter).
+       Only find column remains (no --raw, no filter) — KEEP Phase 2.
+  #27d timeout as parse_cause — CONFIRMED DONE. error_classify.py:10,97-101 classifies
+       timeout; analyze failures --cause timeout works + e2e-tested. Only --help
+       discoverability remains — KEEP Phase 3 (doc-only).
+
+Config-path footgun — CONFIRMED REAL:
+  Index time: get_schema_aliases(path) indexer.py:137, get_external_consumers(path)
+    indexer.py:1177, get_presentation_prefixes(path) indexer.py:1181,
+    get_dialect(path) index.py:122, reindex.py:157 — all read from index path.
+  Query time: get_presentation_prefixes(Path.cwd()) tools.py:921,1640;
+    NoiseFilter.from_config(repo_root=None) → Path.cwd() noise_filter.py:152-153.
+  config.py has 7 readers, each guarded by `if config_file.exists(): ... else: return default`.
+  config_file_present() does NOT exist yet — correct, it's the new deliverable.
+  SCHEMA_VERSION = "6" (schema.py:6) — no bump needed.
+
+APPROVE-WITH-CHANGES: One issue found and must be fixed before implementation:
+  The warning fires UNCONDITIONALLY (non-quiet) whenever .sqlcg.toml is absent at
+  the index path. A 20-ETL user who legitimately has no config will see the warning
+  on every index run. This marginally violates the "zero friction for 20-ETL user"
+  rule if the warning is alarming. Fix: plan must make explicit the warning is a
+  SINGLE quiet-default line (not repeated, not red, not blocking) and must state
+  the warning wording confirms defaults are fine (not an error). The plan says
+  "informational" and "soft" — the developer must be instructed the message tone
+  must be advisory, one-line, yellow only (not red), mentioning defaults are sane.
+  Plan updated in-place (added explicit wording constraint to Step 1.2).
+
+  NOTE: after re-reading the plan, it already says "soft yellow" + "does not fail
+  the index" + "defaults are sane" in the rationale. The Step 1.2 acceptance
+  criterion just needs to lock in the one-line / non-alarming requirement explicitly
+  so the developer doesn't add a multi-line scary block. Updated Step 1.2 acceptance
+  criterion to include: "warning is a single console.print() call (not multi-line);
+  tone is advisory, not alarming."
+
+Hot-path check: PASS. git diff must NOT touch _extract_column_lineage or
+  _upsert_parsed_file. Plan's wiring checklist enforces this via git diff --stat.
+
+Reindex quiet flag: CONFIRMED. reindex.py:40 has --quiet/-q. Plan is correct.
+
+Failing tests committed:
+  tests/unit/test_hygiene_config_warning.py (commit 811eebb)
+  Run: uv run pytest tests/unit/test_hygiene_config_warning.py -q
+  Result before impl: 4 FAILED, 2 SKIPPED (config_file_present not yet defined),
+    2 PASSED (correct negative guards — pass vacuously before feature, become real
+    guards after warning lands)
+
+NEXT: developer implements Phase 1 → Phase 2 → Phase 3.
+
+## Handoff — architect-planner → developer (hygiene batch)  [commit ffb7716]
+
+PLAN: plan/hygiene_config_path_and_survivors.md  (committed, code-vs-plan verified)
+BRANCH: feat/cluster-b-provenance
+
+Triage result (3 of 4 nominated items already done on branch):
+  #12  find case-sensitivity  — DONE (ecf42c1; test_find_cmd.py). Close issue.
+  #13  warnings to stdout     — DONE (log-file default + --verbose + summary). Close issue.
+  #27b find-table noise       — DONE; only `find column` parity remains.
+  #27d timeout observability  — bucket + `analyze failures --cause timeout` work;
+                                only --help discoverability remains.
+  NEW config-path footgun     — REAL primary deliverable.
+
+Implementation (one PR, three phases):
+  P1 config-path warning: add config_file_present() to config.py; soft yellow warning
+     in index.py + reindex.py when no .sqlcg.toml at index path; --quiet suppresses;
+     never raise. (option a; NOT parent-dir search, NOT query-time reconcile.)
+  P2 find column: add --raw + NoiseFilter parity (filter on schema.table of c.id).
+  P3 analyze failures: enumerate _CAUSE_PRIORITY buckets in --help/docstring (doc-only).
+
+Hard constraints honoured: no SCHEMA_VERSION bump; no hot-path touched
+  (_extract_column_lineage / _upsert_parsed_file untouched — diff is 5 CLI/config files
+  + tests only); grep-confirmed call site required for config_file_present; tests assert
+  observable output (warning text + path, filtered rows, --help bucket list).
+
+NEXT: plan-reviewer gate, then developer implements P1→P3. Follow-up issue: option (b)
+  query-time path reconciliation (persist indexed root on Repo node).
+
+## Current State — architect-planner: hygiene batch (#12/#13/#27 survivors + config-path footgun)
+
+ACTIVE AGENT: architect-planner — planning hygiene/cleanup batch
+  plan: plan/hygiene_config_path_and_survivors.md
+  branch: feat/cluster-b-provenance
+  status: PLAN DRAFTED — code-vs-plan verified; 3 of 4 items already done on branch
+
+## Current State — developer: #35b PR-2 external downstream lineage injection (read-side)
+
+ACTIVE AGENT: developer — #35b PR-2 implementation COMPLETE
+  plan: plan/feature_35_external_downstream_injection.md
+  branch: feat/cluster-b-provenance
+  commit: e127a8a
+  status: PR UPDATED (#37) — ready for review
+
+  Files changed (PR-2):
+    - src/sqlcg/core/queries.cypher (add GET_TABLE_EXTERNAL_CONSUMERS, GET_TABLES_EXTERNAL_CONSUMERS_BATCH, COUNT_EXTERNAL_CONSUMERS)
+    - src/sqlcg/core/queries.py (register 3 new query constants)
+    - src/sqlcg/server/models.py (DiffImpactResult.external_consumers; PresentationCandidate.has_external_consumer)
+    - src/sqlcg/server/tools.py (get_downstream_dependencies + diff_impact + analyze_unused surfacing)
+    - src/sqlcg/cli/commands/analyze.py (downstream CLI: external consumer rows)
+    - src/sqlcg/server/skill.py (workflows doc updated)
+    - src/sqlcg/core/graph_db.py (remove GraphDB alias — Deviation D1 cleanup)
+    - tests/integration/test_T35_external_consumers.py (fix GraphDB → GraphBackend import)
+    - tests/unit/test_firstuser_findings.py (add batch-consumer mock responses)
+    - tests/unit/test_tools_hints.py (add batch-consumer mock response)
+    - plan/feature_35_external_downstream_injection.md (Deviation 2 documented)
+
+  Test results (full suite, excl. e2e):
+    814 passed, 4 skipped, 1 xfailed, 0 failed
+    - All 18 T35 tests green (T35-DOWN-1, T35-DIFF-1 ×2, T35-UNUSED-1 green)
+    - Perf invariants: test_perf_scaling_guard, test_T09_01_qualify_once, test_bulk_upsert_invariant — all green
+
+  Wiring verified:
+    - GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY: defined queries.py:46, imported tools.py:23, used at tools.py:958,1177,1650 (≥3 hits)
+    - DependencyNode(kind="external_consumer") constructed at tools.py:1184
+    - external_consumers= populated at tools.py:986; field on DiffImpactResult at models.py:333
+    - has_external_consumer= set at tools.py:1669; field on PresentationCandidate at models.py:424
+    - No GET_TABLE_EXTERNAL_CONSUMERS_QUERY in tools.py (no per-table loop in get_downstream_dependencies/diff_impact)
+    - skill.py mentions "external consumer" and "egress"
+
+  Alias resolution:
+    - GraphDB alias: REMOVED from graph_db.py; test fixed to import GraphBackend
+    - NODE_*/REL_* aliases in schema.py: KEPT — load-bearing in kuzu_backend.py (line 94),
+      neo4j_backend.py (index DDL creation), test_kuzu_backend.py (extensive use)
+
+  Deviations:
+    - Deviation 1: GraphDB alias (PR-1) resolved in PR-2 (alias removed, test fixed)
+    - Deviation 2: Two-query pattern for analyze_unused (Kuzu OPTIONAL MATCH scope limitation)
+
+  PR: https://github.com/Warhorze/sql-code-graph/pull/37
+
+## Prior State — developer: #35a PR-1 external downstream lineage injection
 
 ACTIVE AGENT: developer — #35a PR-1 implementation COMPLETE
   plan: plan/feature_35_external_downstream_injection.md
