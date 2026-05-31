@@ -77,6 +77,7 @@ async def _control_socket_task(
     db_path: "Path",
     backend_ref: "Callable[[], GraphBackend | None]",
     stop_event: "anyio.Event",
+    reindex_lock: "anyio.Lock",
     start_time: float,
 ) -> None:
     """Accept control connections on ``<db>.sock`` and dispatch ops.
@@ -87,11 +88,13 @@ async def _control_socket_task(
     - ``{"op": "stop"}`` → sends ``{"ok": true}`` then signals stop via
       *stop_event*.  The ``_run_with_control`` coroutine watches this event
       and closes stdin to trigger EOF in the MCP stdio loop.
-    - ``{"op": "reindex", ...}`` → error dict (implemented in PR-D).
+    - ``{"op": "reindex", "root", "from", "to", "dialect"}`` → runs
+      ``Indexer.resync_changed`` off the event-loop thread via
+      ``anyio.to_thread.run_sync``, serialised behind *reindex_lock* (R1, R2).
 
-    All backend reads happen on the event-loop thread via the shared singleton
-    (R2: single connection, no concurrent mutation in this PR).  The reindex op
-    (PR-D) serialises mutations behind an ``anyio.Lock``.
+    R2 (single connection): all backend mutations go through ``reindex_lock``
+    so concurrent notify calls never touch the single Kuzu connection
+    simultaneously.
 
     R8 teardown ordering: the caller must cancel this task BEFORE calling
     ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
@@ -104,6 +107,7 @@ async def _control_socket_task(
 
     import anyio
     import anyio.abc as _anyio_abc
+    import anyio.to_thread as _to_thread
 
     from sqlcg.core.config import get_db_path as _get_db_path
 
@@ -167,9 +171,34 @@ async def _control_socket_task(
                     return
 
                 elif op == "reindex":
-                    # PR-D implements the real reindex op. This stub returns an
-                    # explicit error dict — not a silent no-op, not a placeholder.
-                    resp = {"error": "reindex op not yet wired — upgrade to PR-D"}
+                    root = req.get("root")
+                    from_sha = req.get("from")
+                    to_sha = req.get("to")
+                    dialect = req.get("dialect")
+                    if not root or not from_sha or not to_sha:
+                        resp = {"error": "reindex op requires root, from, to"}
+                    else:
+                        from sqlcg.indexer.indexer import Indexer
+
+                        db = backend_ref()
+                        if db is None:
+                            resp = {"error": "backend not available"}
+                        else:
+                            indexer = Indexer()
+
+                            def _do_reindex() -> dict:
+                                return indexer.resync_changed(
+                                    _Path(root),
+                                    from_sha,
+                                    to_sha,
+                                    db,
+                                    dialect,
+                                )
+
+                            async with reindex_lock:
+                                # R1: run off event-loop thread; R2: lock serialises
+                                summary = await _to_thread.run_sync(_do_reindex)
+                            resp = {"ok": True, "summary": summary}
 
                 else:
                     resp = {"error": f"unknown op: {op!r}"}
@@ -259,12 +288,17 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
     ``stdio_server`` blocks on a pipe read (``anyio.to_thread.run_sync``
     with ``abandon_on_cancel=False``).  We cannot interrupt it without
     killing the process; ``_stop_watcher`` does cleanup first.
+
+    ``reindex_lock`` is created once here and passed into
+    ``_control_socket_task`` so concurrent notify calls are serialised
+    behind a single lock (R2).
     """
     import anyio
 
     import sqlcg.server.tools as _tools
 
     stop_event = anyio.Event()
+    reindex_lock = anyio.Lock()  # R2: serialise reindex ops (Kuzu not thread-safe)
 
     async with anyio.create_task_group() as tg:
         if sys.platform != "win32":
@@ -274,6 +308,7 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
                 db_path,
                 lambda: _tools._backend,
                 stop_event,
+                reindex_lock,
                 start_time,
             )
             # Watch stop_event; shuts down and calls os._exit(0).

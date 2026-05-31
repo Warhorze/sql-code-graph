@@ -27,7 +27,9 @@ _HOOKS: list[_HookSpec] = [
             "# $3 == 1 means branch checkout (not file checkout); skip file checkouts\n"
             '[ "$3" = "1" ] || exit 0\n'
             'sqlcg reindex --from "$1" --to "$2"'
-            ' "$(git rev-parse --show-toplevel)" --dialect auto --quiet || true\n'
+            ' "$(git rev-parse --show-toplevel)" --dialect auto --quiet --notify'
+            ' || echo "sqlcg: graph not updated (server busy/locked)'
+            " -- run 'sqlcg mcp status'\" >&2\n"
         ),
     ),
     _HookSpec(
@@ -37,7 +39,8 @@ _HOOKS: list[_HookSpec] = [
 #!/bin/sh
 # sqlcg post-merge hook — incremental resync after pull/merge
 # post-merge receives only $1 (squash flag), no old/new SHA; use stored-SHA delta
-sqlcg reindex "$(git rev-parse --show-toplevel)" --dialect auto --quiet || true
+sqlcg reindex "$(git rev-parse --show-toplevel)" --dialect auto --quiet --notify \\
+  || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
 """,
     ),
 ]

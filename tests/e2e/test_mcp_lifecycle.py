@@ -139,13 +139,14 @@ class TestMcpStatusLiveServer:
         resp = _send_op(sp, {"op": "status"})
         assert resp["db_path"] == str(db_path), f"Expected db_path={db_path}, got {resp['db_path']}"
 
-    def test_reindex_op_returns_error_dict(self, live_server):
-        """PR-C reindex stub returns explicit error dict, not a silent no-op."""
+    def test_reindex_op_missing_fields_returns_error(self, live_server):
+        """Reindex op without required fields returns an error dict immediately."""
         _, _, sp = live_server
-        resp = _send_op(sp, {"op": "reindex", "root": "/tmp", "from": "abc", "to": "def"})
-        assert "error" in resp, f"Expected error in reindex stub response, got: {resp}"
-        assert "PR-D" in resp["error"] or "not yet wired" in resp["error"], (
-            f"Error must reference PR-D upgrade path, got: {resp['error']}"
+        # Omit required 'to' field — server must return error without hanging
+        resp = _send_op(sp, {"op": "reindex", "root": "/tmp", "from": "abc"})
+        assert "error" in resp, f"Expected error for missing 'to' field, got: {resp}"
+        assert "requires root, from, to" in resp["error"], (
+            f"Error must mention required fields, got: {resp['error']}"
         )
 
     def test_unknown_op_returns_error(self, live_server):

@@ -43,6 +43,14 @@ def reindex_cmd(  # noqa: B008
         "--timeout-per-file",
         help="Per-file parse timeout in seconds",
     ),
+    notify: bool = typer.Option(  # noqa: B008
+        False,
+        "--notify",
+        help=(
+            "If a server is live on this DB, route the reindex through the server "
+            "(avoids lock contention). Falls back to direct write if no server is found."
+        ),
+    ),
 ) -> None:
     """Incrementally resync the graph after a git branch change or pull.
 
@@ -56,12 +64,66 @@ def reindex_cmd(  # noqa: B008
     Exits with an error if the database schema version does not match the current
     build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init.
     """
+    import json
+    import socket as _socket
+
     from sqlcg.core.config import get_backend, get_db_path, get_dialect
     from sqlcg.core.schema import SCHEMA_VERSION
     from sqlcg.indexer.indexer import Indexer
+    from sqlcg.server.control import sock_path
 
     # Resolve to absolute path so ignore-spec and git delta receive an absolute root
     path = path.resolve()
+
+    # --notify: if a server is live, route reindex through the socket (R3 fallback)
+    if notify:
+        sp = sock_path()
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                s.settimeout(30)  # reindex can take time on large repos
+                s.connect(str(sp))
+                # Resolve SHAs before sending — standalone mode reads from DB via socket
+                effective_from = from_sha
+                effective_to = to_sha or _get_head(path)
+                if effective_from is None:
+                    # Standalone mode: we cannot read stored SHA here without opening the
+                    # DB (which would conflict with the running server).  If no --from is
+                    # given with --notify, we send from="stored" as a sentinel and fall
+                    # back to direct write; the caller should pass --from explicitly.
+                    raise OSError(  # noqa: TRY301
+                        "--notify without --from requires direct DB access; falling through"
+                    )
+                payload = {
+                    "op": "reindex",
+                    "root": str(path),
+                    "from": effective_from,
+                    "to": effective_to,
+                    "dialect": dialect,
+                }
+                s.sendall(json.dumps(payload).encode() + b"\n")
+                data = s.recv(65536)
+            result = json.loads(data)
+            if "error" in result:
+                console.print(f"[red]Server reindex error: {result['error']}[/red]")
+                raise typer.Exit(1)
+            if not quiet:
+                srv_summary = result.get("summary", {})
+                console.print(
+                    f"[green]Resynced via server[/green] "
+                    f"+{srv_summary.get('added', 0)} added, "
+                    f"~{srv_summary.get('modified', 0)} modified, "
+                    f"-{srv_summary.get('deleted', 0)} deleted"
+                )
+            raise typer.Exit(0)
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            # R3: no live server (stale socket, socket absent, fallback condition) —
+            # fall through to the existing direct-write path unchanged
+            pass
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print(f"[red]--notify routing failed: {exc}[/red]")
+            raise typer.Exit(1) from exc
 
     # Resolve dialect
     if dialect == "auto":
