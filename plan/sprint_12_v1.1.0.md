@@ -1016,3 +1016,186 @@ It does not use `xfail` — it will fail if PR-D has not merged yet; that is cor
 - **Change**: `_stop_watcher` now calls `shutdown_backend()`, `cleanup_control_files()`, then `os._exit(0)` instead of closing stdin and cancelling the scope. R8 is satisfied in a slightly different way: the control socket task is still running when `shutdown_backend()` is called in `_stop_watcher`, but `cleanup_control_files()` removes the `.sock` file before `os._exit(0)`, so no new connections can arrive after cleanup begins. The `main()` finally block is bypassed by `os._exit`.
 - **Impact**: The exit path for `mcp stop` is `os._exit(0)` (hard exit, no finally blocks other than `_stop_watcher`'s explicit cleanup). Normal EOF-on-stdin exit still goes through `main()`'s finally block. This is the standard pattern for daemon stop-on-request. Tests assert exit code 0, socket file removal, and PID file removal — all pass.
 - **Date**: 2026-05-31
+
+---
+
+### PR-E — post-merge hook routes through the server (Cluster A live-verification fix)
+
+**Source**: live verification of Cluster A (#28) against the real `../dwh` repo, 2026-05-31
+**Effort**: XS (hook-text-only change in the hook generator)
+**Depends on**: PR-D (the `--notify` server-routing path it relies on)
+**Blocks**: NONE
+**Branch**: `fix/v1.0.2-bugfix`
+
+#### Finding (verified live)
+
+`sqlcg reindex` is *always* incremental. With `--from/--to` it diffs those SHAs; without
+them it reads the last-indexed SHA from the DB and diffs against HEAD; only with no stored
+SHA does it do a full index ([`reindex.py`](src/sqlcg/cli/commands/reindex.py) docstring +
+mode block L151-197).
+
+`--notify` only routes through the running server when `--from` is supplied. In standalone
+mode (`--notify`, no `--from`) it cannot read the stored SHA without opening the locked DB,
+so it deliberately raises
+`OSError("--notify without --from requires direct DB access; falling through")`
+([`reindex.py`](src/sqlcg/cli/commands/reindex.py) L88-95) and falls through to the direct
+write → hits the single-writer lock → the hook prints the stderr cue but **the graph is not
+updated**.
+
+Net effect verified live: **post-checkout** works (git hands it `$1`/`$2` → routes through
+server → `Resynced via server`, exit 0). **post-merge** calls `reindex … --notify` with
+**no `--from/--to`** ([`git.py`](src/sqlcg/cli/commands/git.py) L42), so after a `git pull`
+while the MCP server is live the graph is not updated (visible warning, not silent — but
+still not applied). The server op itself already requires both SHAs
+([`server.py`](src/sqlcg/server/server.py) L178: `if not root or not from_sha or not to_sha`).
+
+#### Root cause
+
+The post-merge hook does not pass the SHAs that git already exposes in its environment.
+post-checkout routes correctly *only because git gives it `$1`/`$2`*. post-merge gets no
+positional SHAs, but git **does** set `ORIG_HEAD` to the pre-merge HEAD, and the post-merge
+hook runs with `HEAD` already at the merge result. The implementation already anticipates
+this — the standalone-notify branch comment says "the caller should pass --from explicitly."
+
+#### The fix (hook-text only — no server/control/reindex-logic change)
+
+Change the generated **post-merge** script in `_HOOKS`
+([`git.py`](src/sqlcg/cli/commands/git.py) L35-45) so it passes the SHAs explicitly from
+git's environment and routes through the server exactly like post-checkout, with a guard
+for the case where `ORIG_HEAD` is unset.
+
+**Exact recommended hook text** (post-merge `script`):
+
+```sh
+#!/bin/sh
+# sqlcg post-merge hook — incremental resync after pull/merge
+# git sets ORIG_HEAD to the pre-merge HEAD; pass it as --from so --notify can route
+# through a running server (same path as post-checkout). If ORIG_HEAD is unset (e.g.
+# first-ever merge / gc'd), fall back to the standalone stored-SHA delta (direct write).
+PREV=$(git rev-parse --verify --quiet ORIG_HEAD)
+TOP=$(git rev-parse --show-toplevel)
+if [ -n "$PREV" ]; then
+  sqlcg reindex --from "$PREV" --to HEAD "$TOP" --dialect auto --quiet --notify \
+    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+else
+  sqlcg reindex "$TOP" --dialect auto --quiet --notify \
+    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+fi
+```
+
+Notes on the text:
+- `git rev-parse --verify --quiet ORIG_HEAD` prints the SHA on success and **nothing**
+  (empty, exit 1) when ORIG_HEAD is unset — the `|| true` semantics of `$(...)` in
+  `PREV=$(...)` mean an unset ORIG_HEAD yields an empty `PREV`, not a hook abort. The
+  `[ -n "$PREV" ]` test then selects the fallback branch.
+- `--to HEAD` (not `--to "$2"`) because post-merge has no `$2`; HEAD is already the merge
+  result when the hook fires.
+- The else branch is the **current** post-merge behaviour verbatim (standalone `--notify`
+  → falls through to stored-SHA direct write). It is the documented fallback, not new code.
+- The sentinel comment `# sqlcg post-merge hook` is **unchanged** → `install-hooks`
+  idempotency (R9) is preserved; users who re-run `install-hooks` with the old hook present
+  get the skip-silently path, and the script body is updated only on a fresh install or
+  when the user manually appends it.
+
+#### Verdicts on the reasoning items
+
+1. **ORIG_HEAD correctness/availability — RESOLVED, guard required.**
+   Verified empirically (temp clones, this machine, git 2.x): ORIG_HEAD is set to the
+   pre-merge HEAD for every case the hook fires on —
+   fast-forward pull (`ORIG_HEAD`=pre-pull HEAD), true divergent merge (`ORIG_HEAD`=pre-merge
+   local HEAD), `pull --rebase` (`ORIG_HEAD`=pre-rebase tip; `ORIG_HEAD..HEAD` correctly spans
+   the rebased range as "files that differ now"), and squash merge (`$1==1`: ORIG_HEAD set at
+   merge time, persists through the squash commit). It is **unset on a fresh clone that has
+   never merged** (`git rev-parse ORIG_HEAD` → fatal). **Verdict: a guard is mandatory** —
+   without it the hook would send an empty `--from` to the server, which the server op rejects
+   (`"reindex op requires root, from, to"`), surfacing as a server error exit 1 + the stderr
+   cue and no update. The `--verify --quiet` + `[ -n "$PREV" ]` guard routes the unset case
+   to the standalone stored-SHA fallback (today's behaviour) instead.
+
+2. **Delta-boundary correctness (stale-before-pull) — ACCEPTABLE, documented, no change.**
+   `ORIG_HEAD..HEAD` assumes the graph was current at `ORIG_HEAD`. If the stored indexed SHA
+   is *older* than `ORIG_HEAD`, this delta misses `stored_sha..ORIG_HEAD`. **Verdict: accept
+   it.** This is the **identical** boundary post-checkout already has (it diffs `$1..$2`,
+   ignoring stored SHA), so PR-E does not introduce a new correctness class — it makes
+   post-merge consistent with post-checkout. Closing the gap would require the server op to
+   read the stored SHA and compute `min(stored, ORIG_HEAD)..HEAD`, which is a server-logic
+   change (out of scope for a hook-text fix) and is exactly the "freshness is detectable"
+   safety net PR-A already ships: `sqlcg db info` / `mcp status` report `stale_by_commits`, so
+   a drifted graph is observable and a manual `sqlcg reindex` (standalone stored-SHA path)
+   recovers it. Recommendation: do **not** expand scope; document the boundary in the hook
+   comment is optional, the plan record here suffices.
+
+3. **No-server case — CORRECT, acceptable.**
+   With `--from ORIG_HEAD` and no live server, `--notify` catches
+   `ConnectionRefusedError`/`FileNotFoundError` and falls through to the **direct** path,
+   which now takes the explicit-SHA branch and diffs `ORIG_HEAD..HEAD` instead of
+   `stored_sha..HEAD`. **Verdict: correct for a non-server pull** — same boundary as item 2,
+   and strictly better than today (today's no-`--from` direct path uses stored-SHA, which is
+   *wider* and can re-walk more, but is not more correct given the graph was current at the
+   prior indexed state). The explicit-SHA path is the same code the post-checkout hook already
+   exercises in no-server mode and is covered by existing PR-D Scenario C/D fallback tests. No
+   guard needed beyond item 1's ORIG_HEAD check.
+
+4. **Touch the standalone `--notify` codepath? — NO.**
+   The standalone `--notify` (no `--from`) → `OSError` → fall-through is **working as
+   designed**: it cannot open the locked DB to read the stored SHA, so direct-write fallback
+   is the only safe behaviour. PR-E makes the hook *avoid* that branch by supplying `--from`,
+   which is the smaller and correct change. **Verdict: hook-generation change only**
+   (`git.py` `_HOOKS` post-merge `script`). No change to `reindex.py`, `server.py`,
+   `control.py`, or any reindex logic. This is the minimal diff that fixes the finding.
+
+#### Files affected
+
+- [`src/sqlcg/cli/commands/git.py`](src/sqlcg/cli/commands/git.py) — replace the post-merge
+  `_HookSpec.script` string only. Sentinel unchanged. No other file changes.
+
+#### Wiring verification (run before opening PR)
+
+- `grep -n "ORIG_HEAD" src/sqlcg/cli/commands/git.py` — must hit (post-merge passes it).
+- `grep -n "rev-parse --verify --quiet ORIG_HEAD" src/sqlcg/cli/commands/git.py` — guard present.
+- `grep -n "# sqlcg post-merge hook" src/sqlcg/cli/commands/git.py` — sentinel string
+  unchanged (R9 idempotency).
+- `grep -rn "TODO" src/sqlcg/cli/commands/git.py` — zero results.
+- Confirm no edit to `reindex.py`/`server.py`/`control.py`:
+  `git diff --stat` for this PR must show only `git.py` (and the test file).
+
+#### Tests to add
+
+Add to the existing hook test module (the one that already asserts post-checkout/post-merge
+content — locate via `grep -rln "post-merge\|install-hooks\|_HOOKS" tests/`).
+
+- **Scenario A — observable hook content (unit)**: run `install-hooks` into a temp git repo;
+  read `.git/hooks/post-merge`; assert it contains `--from "$PREV"`, `--to HEAD`, `--notify`,
+  the `git rev-parse --verify --quiet ORIG_HEAD` guard, and the `[ -n "$PREV" ]` branch.
+  Assert the sentinel `# sqlcg post-merge hook` is present (idempotency).
+- **Scenario B — idempotency unchanged (unit)**: run `install-hooks` twice; assert the
+  post-merge file is written once and the second run is the silent-skip path (sentinel match).
+- **Scenario C — ORIG_HEAD guard selects fallback (behavioural, shell)**: in a temp repo with
+  ORIG_HEAD **unset**, execute the generated post-merge script with `sqlcg` stubbed by a shim
+  on PATH that records its argv; assert the shim was invoked **without** `--from` (fallback
+  branch taken, no broken empty-`--from` payload).
+- **Scenario D — ORIG_HEAD present routes with SHAs (behavioural, shell)**: temp repo with
+  ORIG_HEAD set to a real SHA; execute the script with the `sqlcg` shim; assert the shim was
+  invoked with `--from <ORIG_HEAD_sha> --to HEAD --notify`.
+- **Scenario E — live re-verification (e2e, the gate for this fix)**: build a temp origin +
+  clone, `install-hooks` in the clone, `index` it, start a real `sqlcg mcp start` on the
+  clone's DB; advance origin by one commit; run `git pull` in the clone (triggers post-merge);
+  assert (a) the graph now reflects the pulled commit via the server (`mcp status` /
+  `db info` `stale_by_commits == 0`), and (b) **no "Database is locked" error** appeared on
+  the pull's stderr. This is the exact live-verification failure PR-E fixes.
+
+#### Acceptance criteria
+
+- `[ ]` `git pull` (simulated in a temp clone) while the MCP server is live updates the graph
+  **via the server** with no lock error — Scenario E asserts `stale_by_commits == 0` post-pull
+  and no "Database is locked" on stderr.
+- `[ ]` Generated post-merge hook contains `git rev-parse --verify --quiet ORIG_HEAD`,
+  `--from "$PREV"`, `--to HEAD`, `--notify`, and the `[ -n "$PREV" ]` fallback branch
+  (Scenario A).
+- `[ ]` With ORIG_HEAD unset, the hook invokes `sqlcg reindex` **without** `--from` (standalone
+  fallback) and does not error (Scenario C).
+- `[ ]` `install-hooks` remains idempotent — sentinel `# sqlcg post-merge hook` unchanged;
+  second run skips silently (Scenario B, R9).
+- `[ ]` `git diff --stat` for the PR shows only `git.py` + the test file — no reindex/server
+  logic change (item 4).
+- `[ ]` `grep -rn "TODO" src/sqlcg/cli/commands/git.py` — zero results; no TODO in the happy path.
