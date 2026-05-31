@@ -4,11 +4,21 @@
 
 A low-risk cleanup batch on `feat/cluster-b-provenance`. Code-vs-plan verification
 against the real source (file:line evidence below) shows **three of the four nominated
-items are already fixed on this branch**. Only **one genuinely new gap** remains worth
-shipping — the silent config-path footgun (item 4) — plus **two small, optional polish
-items** (#27d timeout discoverability, #27b `find column` noise parity). The plan ships
-the footgun fix as the spine and folds the two polish items into the same PR because they
-share the same theme (index-time observability / NoiseFilter parity) and are each <15 LOC.
+items are already fixed on this branch**. The shippable work is the silent config-path
+footgun (item 4) — split into **two layers**: an index-time **warning** (Phase 1) and a
+query-time **MCP/CLI config-root reconciliation** (Phase 4, a user-approved scope
+expansion) — plus **two small polish items** (#27d timeout discoverability, #27b
+`find column` noise parity). All four phases share one theme — *the config the user
+wrote must be the config every code path actually reads* — and ship as **one PR**.
+
+**Phase 4 (reconciliation) is the substantive deliverable.** Today the CLI/indexer and
+the MCP server share the config *reader functions* in
+[`config.py`](src/sqlcg/core/config.py) but **not the resolved config _path_**: index
+time reads `.sqlcg.toml` from the indexed directory, query time reads from `Path.cwd()`.
+When the MCP server's working directory differs from the indexed root, MCP computes a
+**different** presentation split / noise filter than what was actually indexed — a silent
+disagreement, with no error. Phase 4 gives true parity: MCP resolves config from the
+**same directory the graph was indexed from**, recovered from the persisted `Repo` node.
 
 ## Code-vs-Plan Verification — what is real vs already-done
 
@@ -116,8 +126,14 @@ dialect/aliases/external_consumers, with **no error or warning**. Every config r
 swallows the miss via `if config_file.exists(): ... else: return default`
 ([`config.py`](src/sqlcg/core/config.py), 7 readers, each guarded by `config_file.exists()`).
 
-**Chosen fix (minimal, correct): option (a) — emit a visible warning at index time when
-no `.sqlcg.toml` is found at the index path.** Rationale:
+There are **two distinct symptoms** of the same root cause (config path is implicit, not
+shared), and this batch fixes **both**:
+
+**Symptom (a) — index time: config silently absent.** `sqlcg index ./sql` with
+`.sqlcg.toml` at the repo **root** (the real dwh layout: config at root, corpus under
+`ddl/` + `etl/` subdirs) silently ingests **zero** dialect/aliases/external_consumers,
+with no error. → **Fix = Phase 1: a soft, visible warning at index time** when no
+`.sqlcg.toml` is found at the index path.
 
 - Cheapest and dovetails with the #13 observability theme.
 - Does NOT silently search parent dirs (per the hard constraint — that hides the problem).
@@ -127,33 +143,50 @@ no `.sqlcg.toml` is found at the index path.** Rationale:
   legitimate (defaults are sane), so the warning must be **soft** — it states the
   searched path and that defaults are in use, it does not fail the index.
 
-**Explicitly NOT doing option (b)** (reconcile index-path-vs-cwd by threading the index
-path into query-time readers): the query side has no index-path context at call time and
-would require persisting the indexed root in the graph and plumbing it through tools — a
-larger, riskier change than this hygiene batch warrants. Documented as a follow-up below.
+**Symptom (b) — query time: MCP reads config from the wrong directory.** Even when the
+config IS found and ingested at index time, the MCP server later reads
+`get_presentation_prefixes(Path.cwd())` and `NoiseFilter.from_config()` (cwd fallback) —
+so when the server's working dir ≠ the indexed root, the presentation split and noise
+filter at query time **disagree silently** with what was indexed. → **Fix = Phase 4: MCP
+config-root reconciliation** (the user-approved scope expansion; design below). This was
+previously deferred as a follow-up; it is now in scope because the verified mechanism
+(read the indexed root from the persisted `Repo` node) makes it a small, read-side-only
+change with no schema bump and no hot-path touch.
 
 ## Scope
 
 ### In Scope
 
-- A soft, visible warning at `sqlcg index` (and `sqlcg reindex`) when no `.sqlcg.toml` is
-  found at the index path — naming the exact path searched, suppressed by `--quiet`.
+- **(Phase 1)** A soft, visible warning at `sqlcg index` (and `sqlcg reindex`) when no
+  `.sqlcg.toml` is found at the index path — naming the exact path searched, suppressed
+  by `--quiet`.
 - A reusable `config_file_present(path) -> bool` helper in `config.py` so the check uses
   the same `.sqlcg.toml` location as the readers (no hardcoded filename drift).
-- NoiseFilter parity for `find column` (add `--raw` + filter, matching `find table`).
-- Enumerate valid `--cause` buckets in `analyze failures` help text/docstring (doc-only).
+- **(Phase 2)** NoiseFilter parity for `find column` (add `--raw` + filter, matching
+  `find table`).
+- **(Phase 3)** Enumerate valid `--cause` buckets in `analyze failures` help text /
+  docstring (doc-only).
+- **(Phase 4 — MCP/CLI config-root reconciliation)** A `_indexed_root(db) -> Path | None`
+  helper in `tools.py` that reads the persisted `Repo` node path, and rewiring the
+  query-time presentation-prefix reads (and the MCP-side NoiseFilter) to resolve config
+  from that indexed root instead of `Path.cwd()` — so MCP and the CLI compute the
+  **same** presentation split / noise filter from the **same** `.sqlcg.toml`.
 
 ### Non-Goals
 
-- Reconciling index-path vs `Path.cwd()` at query time (option b) — follow-up.
 - Searching parent directories for `.sqlcg.toml` (forbidden — hides the footgun).
+- Threading the indexed root into the *index-time* readers (they already read the index
+  path correctly — only the query-time MCP readers used `Path.cwd()`).
+- Per-Repo config in multi-Repo graphs (the v1.1.0 rule is "first Repo node"; see
+  Phase 4 design point 2).
 - Any SCHEMA_VERSION bump (none of these items change stored form).
 - `find pattern` noise filtering (no qualified-name key to filter on).
 - Re-opening #12 / #13 — both verified done; tests already guard them.
 - Any change to `_extract_column_lineage` column loop or `_upsert_parsed_file` edge-row
   loop. **Confirmed:** the warning fires in the CLI command before/around `index_repo`,
-  and the `find column` filter is post-query in the CLI — no hot-path code is touched.
-  All performance invariants in CLAUDE.md remain intact.
+  the `find column` filter is post-query in the CLI, and the Phase 4 reconciliation is
+  purely query-time read-side (`tools.py` `analyze_unused` / `diff_impact`) — no hot-path
+  code is touched. All performance invariants in CLAUDE.md remain intact.
 
 ## Design
 
@@ -174,10 +207,104 @@ larger, riskier change than this hygiene batch warrants. Documented as a follow-
   valid buckets: `timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback,
   pure_ddl_skip` (sourced verbatim from `_CAUSE_PRIORITY`,
   [`error_classify.py:10-20`](src/sqlcg/indexer/error_classify.py)).
+- **(Phase 4)** `tools.py`: new helper `def _indexed_root(db: GraphBackend) -> Path | None`
+  that reads the persisted `Repo` node path and returns it as a `Path` (or `None` when no
+  `Repo` node exists). Both presentation-prefix call sites switch from
+  `get_presentation_prefixes(Path.cwd())` to `get_presentation_prefixes(_indexed_root(db) or Path.cwd())`.
+
+### Phase 4 — MCP/CLI config-root reconciliation (detailed design)
+
+**Verified mechanism (confirmed against source).** The graph persists a `Repo` node whose
+**primary key is the indexed root path**, stored absolute/resolved:
+[`schema.cypher:2-5`](src/sqlcg/core/schema.cypher) — `path STRING PRIMARY KEY`. `index_cmd`
+upserts it at index time. `tools.py` already runs `MATCH (r:Repo)` (the not-indexed guard,
+[`tools.py:182`](src/sqlcg/server/tools.py)) and `db_info` already reads `r.path` and feeds
+it to `compute_freshness`
+([`tools.py:1460-1467`](src/sqlcg/server/tools.py) —
+`MATCH (r:Repo) RETURN r.path AS path LIMIT 1` → `Path(_repo_rows[0]["path"])`). Phase 4
+factors that exact pattern into `_indexed_root` and reuses it for config resolution.
+
+**The disagreement, with file:line evidence.**
+
+| Side | Reads config from | Evidence |
+|------|-------------------|----------|
+| Index (CLI/indexer) | the **indexed directory** | `get_dialect(path)` [`index.py:122`](src/sqlcg/cli/commands/index.py) / [`reindex.py:157`](src/sqlcg/cli/commands/reindex.py); `get_schema_aliases(path)` [`indexer.py:137`](src/sqlcg/indexer/indexer.py); `get_external_consumers(path)` [`indexer.py:1177`](src/sqlcg/indexer/indexer.py); `get_presentation_prefixes(path)` [`indexer.py:1181`](src/sqlcg/indexer/indexer.py) |
+| Query (MCP) | **`Path.cwd()`** | `get_presentation_prefixes(Path.cwd())` at [`tools.py:921`](src/sqlcg/server/tools.py) (`diff_impact`) and [`tools.py:1640`](src/sqlcg/server/tools.py) (`analyze_unused`); `NoiseFilter.from_config()` → `repo_root=None` → `Path.cwd()` [`noise_filter.py:152-153`](src/sqlcg/server/noise_filter.py) |
+
+**Design point 1 — where to resolve the root + grep-confirmed call sites.** Add
+`_indexed_root(db)` near the existing `_assert_indexed` helper
+([`tools.py:173`](src/sqlcg/server/tools.py)). It runs the same query `db_info` already
+uses: `MATCH (r:Repo) RETURN r.path AS path LIMIT 1`. Call sites this batch wires:
+
+- `analyze_unused` — replace [`tools.py:1640`](src/sqlcg/server/tools.py)
+  `prefixes = get_presentation_prefixes(Path.cwd())` with
+  `prefixes = get_presentation_prefixes(_indexed_root(db) or Path.cwd())`.
+- `diff_impact` — replace [`tools.py:921`](src/sqlcg/server/tools.py) identically.
+
+Grep-confirmation before PR (the helper must be **called**, not just defined):
+`grep -n "_indexed_root" src/sqlcg/server/tools.py` must show the definition **and** both
+call sites; and `grep -n "get_presentation_prefixes(Path.cwd())" src/sqlcg/server/tools.py`
+must return **nothing**.
+
+**Design point 2 — multi-Repo selection rule.** A graph *can* hold more than one `Repo`
+node. For v1.1.0 the rule is **first Repo node wins** (`... LIMIT 1`), matching the
+already-shipped behaviour of `db_info`'s freshness computation
+([`tools.py:1464`](src/sqlcg/server/tools.py)) — this keeps `_indexed_root` consistent with
+the one existing `r.path` consumer rather than inventing a second, divergent selection
+rule. We deliberately do **not** attempt to match the Repo that owns the queried table:
+`analyze_unused` and `diff_impact` are graph-wide (no single owning table), so there is no
+unambiguous per-call Repo to select. Per-Repo config resolution in multi-Repo graphs is a
+documented non-goal; the dominant real-world case (and every tested case) is a
+single-Repo graph. Documented in the postmortem/limitations so a multi-Repo user is not
+surprised.
+
+**Design point 3 — no-Repo fallback (never crash).** If `MATCH (r:Repo)` returns no rows
+or a row with an empty/null `path`, `_indexed_root` returns `None`, and every call site
+falls back to today's `Path.cwd()` via `_indexed_root(db) or Path.cwd()`. This preserves
+the exact current behaviour on a graph with no Repo node (which should not occur
+post-index, since `analyze_unused`/`diff_impact` both call `_assert_indexed` first — but
+the fallback is defence-in-depth and is unit-asserted in scenario 3).
+
+**Design point 4 — scope of reconciliation (NoiseFilter decision).** This batch moves the
+**presentation-prefix** reads to the indexed root (the two call sites above). The
+MCP-side `NoiseFilter.from_config()` cwd fallback
+([`noise_filter.py:152-153`](src/sqlcg/server/noise_filter.py)) is reached from **six**
+`tools.py` call sites (`find_definition` 734, `get_change_scope` 793, `get_backfill_order`
+866, `diff_impact` 920, `analyze_unused` 1633, `get_hub_ranking` 1730).
+
+**Recommendation: move the NoiseFilter to the indexed root in the SAME batch, but only at
+the two call sites that already resolve `_indexed_root` for presentation prefixes**
+(`analyze_unused` 1633 and `diff_impact` 920). Justification:
+
+- Those two functions read presentation prefixes AND build a NoiseFilter; resolving each
+  from a *different* directory (prefixes from the Repo root, noise from cwd) would be an
+  internally inconsistent split inside one tool call — the worse of both worlds. Keeping
+  them aligned within the function is the coherent unit.
+- The remaining four NoiseFilter call sites (`find_definition`, `get_change_scope`,
+  `get_backfill_order`, `get_hub_ranking`) do **not** read presentation prefixes; moving
+  them is mechanical but broadens the diff and the test surface. They are a **documented
+  follow-on** (tracked below), so the batch stays coherent: *every tool that splits on
+  presentation is reconciled now; the noise-only tools follow*.
+- Concretely, at lines 920 and 1633 change `NoiseFilter.from_config()` to
+  `NoiseFilter.from_config(repo_root=_indexed_root(db) or Path.cwd())`. `from_config`
+  already accepts `repo_root` and falls back to cwd on `None`
+  ([`noise_filter.py:138-160`](src/sqlcg/server/noise_filter.py)), so no signature change
+  is needed — resolve `_indexed_root(db)` once at the top of each function and pass it to
+  both the prefix read and the NoiseFilter.
+
+**Design point 5 — no schema bump, no hot-path touch.** `Repo.path` is **already**
+persisted ([`schema.cypher:3`](src/sqlcg/core/schema.cypher)); Phase 4 is **read-side
+only**. `SCHEMA_VERSION` stays `"6"` ([`schema.py:6`](src/sqlcg/core/schema.py)) — no
+re-index implied. No change touches `_extract_column_lineage` or `_upsert_parsed_file`;
+the diff is confined to `tools.py` (helper + two functions). All CLAUDE.md performance
+invariants remain intact.
 
 ### Data Models
 
-None. No node/edge/schema changes. SCHEMA_VERSION stays `"6"`.
+None. No node/edge/schema changes. SCHEMA_VERSION stays `"6"`
+([`schema.py:6`](src/sqlcg/core/schema.py)). Phase 4 only **reads** the existing
+`Repo.path` primary key ([`schema.cypher:3`](src/sqlcg/core/schema.cypher)) — already
+persisted at index time; no new node, edge, or property.
 
 ### Dependencies
 
@@ -232,6 +359,44 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
   sentence to the docstring. Doc-only — no logic change.
 - Acceptance: `sqlcg analyze failures --help` lists `timeout` among the named buckets.
 
+### Phase 4: MCP/CLI config-root reconciliation
+
+**Step 4.1** — Add the `_indexed_root` helper to `tools.py`.
+- Files: [`tools.py`](src/sqlcg/server/tools.py)
+- Define `def _indexed_root(db: GraphBackend) -> Path | None:` next to `_assert_indexed`
+  ([`tools.py:173`](src/sqlcg/server/tools.py)). Body: run
+  `MATCH (r:Repo) RETURN r.path AS path LIMIT 1` (same query `db_info` uses at
+  [`tools.py:1464`](src/sqlcg/server/tools.py)); return `Path(rows[0]["path"])` when a
+  non-empty path is present, else `None`. Must not raise.
+- Acceptance (scenario 3 + 4): returns the persisted `Repo` path for an indexed graph;
+  returns `None` when no `Repo` node exists. **Asserted against the exact stored path.**
+
+**Step 4.2** — Rewire `analyze_unused` to resolve config from the indexed root.
+- Files: [`tools.py`](src/sqlcg/server/tools.py)
+- Resolve `root = _indexed_root(db) or Path.cwd()` once near the top of the `with` block
+  (after `_assert_indexed(db)`). Replace [`tools.py:1640`](src/sqlcg/server/tools.py)
+  `get_presentation_prefixes(Path.cwd())` with `get_presentation_prefixes(root)`, and
+  [`tools.py:1633`](src/sqlcg/server/tools.py) `NoiseFilter.from_config()` with
+  `NoiseFilter.from_config(repo_root=root)`.
+- Acceptance (scenario 1): with cwd on a config-less dir B and the graph indexed from dir
+  A carrying `schema_prefixes=["ia_"]`, an `ia_pres.*` orphan lands in
+  `presentation_facing`, not `candidates`.
+
+**Step 4.3** — Rewire `diff_impact` identically.
+- Files: [`tools.py`](src/sqlcg/server/tools.py)
+- Resolve `root = _indexed_root(db) or Path.cwd()` after `_assert_indexed(db)`. Replace
+  [`tools.py:921`](src/sqlcg/server/tools.py) `get_presentation_prefixes(Path.cwd())` with
+  `get_presentation_prefixes(root)`, and [`tools.py:920`](src/sqlcg/server/tools.py)
+  `NoiseFilter.from_config()` with `NoiseFilter.from_config(repo_root=root)`.
+- Acceptance (scenario 2): with cwd on config-less dir B, a changed `ia_pres.*` table in
+  the blast radius is flagged presentation-facing using dir A's prefixes.
+
+> **Coherence note:** Phases 4.2 and 4.3 reconcile **both** the presentation read **and**
+> the NoiseFilter at the two tools that split on presentation — so a single tool call
+> never resolves prefixes from one directory and noise from another. The four
+> NoiseFilter-only call sites (`find_definition` 734, `get_change_scope` 793,
+> `get_backfill_order` 866, `get_hub_ranking` 1730) are the documented follow-on (below).
+
 ## Wiring Checklist (grep-confirmed call sites required before PR)
 
 - [ ] `config_file_present` is **called** from `index.py` (and `reindex.py`), not just
@@ -240,10 +405,20 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
 - [ ] `find_column`'s new `--raw` is wired to the filter block (not a dead option) —
       `grep -n "raw" src/sqlcg/cli/commands/find.py` shows it gating the filter.
 - [ ] `analyze failures` help string contains every bucket name from `_CAUSE_PRIORITY`.
+- [ ] **(Phase 4)** `_indexed_root` is **called**, not just defined —
+      `grep -n "_indexed_root" src/sqlcg/server/tools.py` shows the definition **and** both
+      `analyze_unused`/`diff_impact` call sites.
+- [ ] **(Phase 4)** No `get_presentation_prefixes(Path.cwd())` remains —
+      `grep -n "get_presentation_prefixes(Path.cwd())" src/sqlcg/server/tools.py` returns
+      nothing. The two sites read `_indexed_root(db) or Path.cwd()`.
+- [ ] **(Phase 4)** The two reconciled `NoiseFilter.from_config()` sites (920, 1633) pass
+      `repo_root=` resolved from the same `root`, not the bare cwd default.
+- [ ] **(Phase 4)** No `SCHEMA_VERSION` bump — `schema.py:6` still `"6"`; no schema.cypher
+      change. `Repo.path` is read-only here.
 - [ ] Perf invariants untouched: `git diff` does NOT touch
       `_extract_column_lineage` or `_upsert_parsed_file` —
       `git diff --stat` should list only `config.py`, `index.py`, `reindex.py`,
-      `find.py`, `analyze.py`, and the new tests.
+      `find.py`, `analyze.py`, `tools.py` (Phase 4, read-side only), and the new tests.
 - [ ] Path/constant fallback: warning names `KuzuConfig`-independent `.sqlcg.toml` (the
       readers' filename), not a hardcoded duplicate of `log_path`/`db_path`.
 
@@ -263,7 +438,37 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
 - `tests/unit/test_find_cmd.py` (extend): `find column` drops a noise-table column by
   default and keeps it under `--raw`. Assert the rendered rows, not exit code alone.
 
-### Integration / e2e tests
+### Integration tests — Phase 4 reconciliation (the real "CLI and MCP share config" guard)
+
+Committed (red) at
+[`test_hygiene_config_root_reconciliation.py`](tests/integration/test_hygiene_config_root_reconciliation.py).
+Each test indexes a fixture from **dir A** (which carries `[sqlcg.presentation]`), wires
+the backend into `tools`, then `monkeypatch.chdir`s to a **different dir B** (no
+`.sqlcg.toml`) — the exact condition that exposes the cwd-vs-root disagreement — and
+asserts **observable tool output**:
+
+- `test_reconciliation_analyze_unused_split_from_repo_root_not_cwd` — with cwd on B, the
+  `ia_pres.*` orphan must be in `presentation_facing`, not `candidates`. (Today it lands
+  in `candidates` because cwd B has no config → prefixes `[]`. Confirmed red for this
+  exact reason.)
+- `test_reconciliation_diff_impact_presentation_from_repo_root_not_cwd` — with cwd on B,
+  the changed `ia_pres.*` table must be flagged in `diff_impact(...).presentation`.
+- `test_reconciliation_no_repo_node_falls_back_to_cwd` — no `Repo` node → `_indexed_root`
+  returns `None`, `analyze_unused` still runs via cwd fallback, never crashes
+  (skip-guarded until `_indexed_root` exists).
+- `test_reconciliation_indexed_root_returns_repo_path` — `_indexed_root(db)` equals the
+  exact persisted `Repo` path (skip-guarded).
+- `test_reconciliation_wiring_helper_defined_and_called` — `_indexed_root` defined **and**
+  called ≥2× in `tools.py`.
+- `test_reconciliation_wiring_presentation_no_longer_reads_cwd` — no
+  `get_presentation_prefixes(Path.cwd())` remains in `tools.py`.
+
+Current state: **4 failed, 2 skipped** (the 2 skips are guarded on `_indexed_root` not yet
+existing and become active assertions once the helper lands). The split assertion fails
+because `get_presentation_prefixes(Path.cwd())` reads config-less dir B — the genuine
+regression guard for index/query config parity.
+
+### Integration / e2e tests (other phases)
 
 - Reuse [`test_parse_diagnostics_cli.py`](tests/e2e/test_parse_diagnostics_cli.py) — no
   new behaviour for #27d, but add an assertion that `--help` output enumerates `timeout`
@@ -275,6 +480,13 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
   `test_bulk_upsert_invariant.py` — confirm none flip red (they will not; no hot path is
   touched).
 - `test_find_cmd.py` existing #12 cases stay green.
+- **(Phase 4)** [`test_T34_presentation_segregation.py`](tests/integration/test_T34_presentation_segregation.py)
+  must stay green — its `_index_fixture` indexes AND `chdir`s into the **same** dir, so
+  cwd == Repo root; `_indexed_root(db) or Path.cwd()` resolves to that same dir and the
+  T34 behaviour is byte-identical. In particular `test_T34_scenario_D_no_config_byte_identical`
+  (no config → small-repo path unchanged) stays green: with config absent the prefixes are
+  `[]` whether resolved from the Repo root or cwd, so the zero-config small-repo experience
+  is untouched (CLAUDE.md both-scales rule).
 
 ## Acceptance Criteria
 
@@ -287,25 +499,41 @@ None new. Uses existing `typer`, `rich.Console`, `NoiseFilter`, `config` helpers
 - [ ] `find column` filters noise by default and `--raw` disables it (observable rows).
 - [ ] `sqlcg analyze failures --help` lists all `_CAUSE_PRIORITY` buckets including
       `timeout`.
+- [ ] **(Phase 4)** With the MCP process cwd on a config-less directory B and the graph
+      indexed from dir A carrying `schema_prefixes=["ia_"]`, `analyze_unused` places an
+      `ia_pres.*` orphan in `presentation_facing` (not `candidates`) — the split resolves
+      from the Repo root, not cwd.
+- [ ] **(Phase 4)** `diff_impact` flags a changed `ia_pres.*` table presentation-facing
+      under the same cwd≠root condition.
+- [ ] **(Phase 4)** `_indexed_root(db)` returns the persisted `Repo` path; returns `None`
+      (and tools fall back to cwd, no crash) when no `Repo` node exists.
+- [ ] **(Phase 4)** `grep` shows no `get_presentation_prefixes(Path.cwd())` left in
+      `tools.py`; `_indexed_root` is defined and called at both sites.
+- [ ] **(Phase 4)** `SCHEMA_VERSION` unchanged (`"6"`); no `schema.cypher` change.
 - [ ] No new method without a grep-confirmed call site.
 - [ ] No `# TODO` in any happy path.
-- [ ] `git diff --stat` touches only the five source files + tests; no parser/indexer
+- [ ] `git diff --stat` touches only the source files (`config.py`, `index.py`,
+      `reindex.py`, `find.py`, `analyze.py`, `tools.py`) + tests; no parser/indexer
       hot-path file appears.
-- [ ] Full suite (excl. e2e) green, including the three perf-invariant tests.
+- [ ] Full suite (excl. e2e) green, including the three perf-invariant tests and T34.
 
 ## PR Grouping Decision
 
-**One PR.** Justification:
+**One PR, four phases.** Justification:
 
-- All three kept items are low-risk, independent, and small (<15 LOC each of behaviour).
-- They share one theme: **index-time observability + NoiseFilter parity** — the same
-  reviewer mental model.
-- The footgun warning (Phase 1) is the only item with real user impact; Phases 2–3 are
-  trivial polish that would be wasteful to gate behind separate PRs.
-- No item depends on another, so review can proceed phase-by-phase but ship together.
+- All four phases share one theme: **the config the user wrote is the config every code
+  path reads** — index-time observability (Phase 1), NoiseFilter parity (Phase 2),
+  discoverability (Phase 3), and index/query config-root parity (Phase 4). One reviewer
+  mental model.
+- Phase 4 is the substantive deliverable (real user-facing correctness: MCP no longer
+  silently disagrees with the indexed config). Phases 1–3 are the low-risk hygiene around
+  the same footgun.
+- No phase depends on another's code, so review can proceed phase-by-phase but ship
+  together. Phase 4 is **read-side only** (`tools.py`), no schema bump, no hot-path touch
+  — it stays within the one-PR risk envelope.
 
-Suggested PR title: `fix: surface missing .sqlcg.toml at index time + find-column noise
-parity + failures cause discoverability (#27)`.
+Suggested PR title: `fix: reconcile MCP/CLI config root + surface missing .sqlcg.toml at
+index time + find-column noise parity + failures cause discoverability (#27)`.
 
 **Items dropped as already-done (flag for the user):**
 - **#12** — fixed in `ecf42c1`, tested in `test_find_cmd.py`. Close the issue.
@@ -321,19 +549,33 @@ parity + failures cause discoverability (#27)`.
 |------|-----------|------------|
 | Warning becomes noise for users who legitimately run without config | Low | It is a one-line soft notice, `--quiet`-suppressible, and only fires when no config is found at the index path — which is exactly when the silent zero-ingest bug bites. |
 | `find column` filter changes default output of an existing command | Low | Matches the established `--raw` opt-out convention already used by `find table` and all `analyze` subcommands; documented. |
-| Someone reads option (b) as in-scope and threads index path through query tools | Low | Explicit non-goal; recorded as follow-up below. |
 | Reindex has no `quiet` flag to gate on | Low | Verify in `reindex.py`; if absent, emit unconditionally (still soft, no exit-code change). |
+| **(Phase 4)** Multi-Repo graph picks the wrong Repo's config | Low | v1.1.0 rule is "first Repo node" — identical to the already-shipped freshness path ([`tools.py:1464`](src/sqlcg/server/tools.py)), so no new divergent behaviour. Per-Repo config is a documented non-goal; single-Repo is the dominant case. |
+| **(Phase 4)** Prefix resolved from Repo root but noise still from cwd (internal split) | Low | Both reconciled call sites (`analyze_unused`, `diff_impact`) resolve `root` once and pass it to **both** `get_presentation_prefixes` and `NoiseFilter.from_config(repo_root=root)`. Wiring checklist enforces it. |
+| **(Phase 4)** Graph with no Repo node crashes a query tool | Low | `_indexed_root` returns `None`; `_indexed_root(db) or Path.cwd()` falls back to today's behaviour. Scenario-3 test asserts no crash. |
+| **(Phase 4)** Small-repo zero-config user sees changed behaviour | Low | With no config, prefixes are `[]` whether resolved from Repo root or cwd; T34 scenario D guards byte-identical small-repo output. |
 
 ## Follow-up (not this batch)
 
-- **Option (b) reconciliation**: persist the indexed root in the graph (e.g. on the Repo
-  node, already written at [`index.py:194-201`](src/sqlcg/cli/commands/index.py)) and have
-  query-time `get_presentation_prefixes` / `NoiseFilter.from_config` read config from that
-  stored root instead of `Path.cwd()`. Larger change; needs its own plan and a
-  decision on multi-repo graphs. Track as a new issue.
+- **NoiseFilter-only MCP call sites**: the four `tools.py` `NoiseFilter.from_config()`
+  sites that do **not** read presentation prefixes — `find_definition`
+  ([`tools.py:734`](src/sqlcg/server/tools.py)), `get_change_scope`
+  ([`tools.py:793`](src/sqlcg/server/tools.py)), `get_backfill_order`
+  ([`tools.py:866`](src/sqlcg/server/tools.py)), `get_hub_ranking`
+  ([`tools.py:1730`](src/sqlcg/server/tools.py)) — still resolve noise from `Path.cwd()`.
+  Moving them to `_indexed_root(db) or Path.cwd()` is mechanical and could fold into a
+  later batch; deferred only to keep this PR's test surface tight. Track as a new issue.
+- **Per-Repo config in multi-Repo graphs**: if/when multi-Repo graphs become common,
+  resolve config per the Repo that owns the queried table instead of "first Repo node".
+  Needs its own design (which Repo owns a graph-wide `analyze_unused`?).
 
 ## Blocking Questions
 
-None. All four items are clearly defined, all design choices (query-time fold for #12,
-option (a) for the footgun) are already aligned with documented decisions
-(ARCHITECTURE_REVIEW §2.6 C2 normalization; CLAUDE.md "no silent parent-dir search").
+None. All four phases are clearly defined. Phase 4's design choices are anchored in
+verified source: the `Repo` node already persists the indexed root as its primary key
+([`schema.cypher:2-5`](src/sqlcg/core/schema.cypher)) and `db_info` already reads it for
+freshness ([`tools.py:1460-1467`](src/sqlcg/server/tools.py)), so reconciliation is a
+read-side reuse with no schema bump. The "first Repo node" multi-Repo rule matches the
+existing freshness path; the no-Repo fallback preserves today's `Path.cwd()` behaviour.
+All choices align with CLAUDE.md (both-scales rule, grep-confirmed call sites, no
+parent-dir search, fallbacks aligned with config readers).

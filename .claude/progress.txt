@@ -1,3 +1,51 @@
+## Handoff — architect-planner → developer (hygiene batch + Phase 4 reconciliation)
+
+PLAN: plan/hygiene_config_path_and_survivors.md  (amended; now 4 phases, ONE PR)
+BRANCH: feat/cluster-b-provenance
+AGENT: architect-planner   FEATURE: hygiene_config_path_and_survivors (Phase 4 added)
+
+NEW PHASE 4 — MCP/CLI config-root reconciliation (user-approved scope expansion):
+  Root cause: CLI/indexer reads .sqlcg.toml from the indexed dir; MCP reads from
+  Path.cwd(). When the MCP working dir != indexed root, MCP computes a DIFFERENT
+  presentation split / noise filter than what was indexed — silent disagreement.
+
+  VERIFIED MECHANISM (against source):
+    - Repo node PK is the indexed root path, stored resolved: schema.cypher:2-5
+      (path STRING PRIMARY KEY). index_cmd upserts it.
+    - db_info ALREADY reads it: tools.py:1464 `MATCH (r:Repo) RETURN r.path AS path
+      LIMIT 1` → Path(...) → compute_freshness. Phase 4 reuses this exact pattern.
+
+  DESIGN (5 points, all in plan §"Phase 4 — detailed design"):
+    1. Helper `_indexed_root(db) -> Path | None` next to _assert_indexed (tools.py:173);
+       runs the same r.path query. Call sites: analyze_unused (tools.py:1640) and
+       diff_impact (tools.py:921). Both → get_presentation_prefixes(_indexed_root(db) or
+       Path.cwd()). grep must show def + 2 call sites; zero get_presentation_prefixes(
+       Path.cwd()) left.
+    2. Multi-Repo rule: FIRST Repo node wins (LIMIT 1) — matches existing freshness path
+       (tools.py:1464). Per-Repo config = documented non-goal.
+    3. No-Repo fallback: _indexed_root returns None → `or Path.cwd()` keeps today's
+       behaviour. Never crash. Scenario-3 test asserts this.
+    4. NoiseFilter decision: reconcile NoiseFilter.from_config(repo_root=root) ONLY at the
+       two presentation-splitting sites (920 diff_impact, 1633 analyze_unused) so a single
+       tool call never splits prefixes-from-root vs noise-from-cwd. The 4 noise-only sites
+       (find_definition 734, get_change_scope 793, get_backfill_order 866, get_hub_ranking
+       1730) = documented follow-on.
+    5. NO SCHEMA_VERSION bump (Repo.path already persisted; read-side only). NO hot-path
+       touch (_extract_column_lineage / _upsert_parsed_file untouched). Diff confined to
+       tools.py.
+
+  FAILING TESTS COMMITTED (red): tests/integration/test_hygiene_config_root_reconciliation.py
+    Pattern: index from dir A (has [sqlcg.presentation]) → chdir to dir B (no config) →
+    assert split STILL correct (resolved from Repo root, not cwd).
+    State: 4 FAILED, 2 SKIPPED (skips guarded on _indexed_root; become real once it lands).
+    Confirmed red for the RIGHT reason: analyze_unused puts ia_pres.dashboard_feed in
+    candidates (wrong) because get_presentation_prefixes(Path.cwd()) reads config-less B.
+  T34 (test_T34_presentation_segregation.py) stays GREEN — it indexes+chdirs same dir, so
+    cwd == Repo root; scenario D (no config) guards byte-identical small-repo output.
+
+NEXT: developer implements Phase 1 → 2 → 3 → 4 (4 = Steps 4.1 helper, 4.2 analyze_unused,
+  4.3 diff_impact). Then say "finished" for plan-compliance check.
+
 ## Handoff — plan-reviewer → developer (hygiene batch)  [commit 811eebb]
 
 PLAN: plan/hygiene_config_path_and_survivors.md
