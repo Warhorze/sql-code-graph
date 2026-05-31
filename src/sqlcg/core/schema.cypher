@@ -115,3 +115,14 @@ CREATE NODE TABLE SchemaVersion (
     version STRING PRIMARY KEY,
     indexed_sha STRING
 );
+
+-- External consumer node: one per declared downstream consumer in .sqlcg.toml
+CREATE NODE TABLE ExternalConsumer (
+    name STRING PRIMARY KEY,
+    consumer_type STRING
+);
+
+-- Table -> ExternalConsumer: this table is consumed by an external system
+CREATE REL TABLE CONSUMED_BY (
+    FROM SqlTable TO ExternalConsumer
+);

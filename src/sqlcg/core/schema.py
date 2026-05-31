@@ -3,7 +3,7 @@
 from enum import StrEnum
 from importlib.resources import files
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 
 class NodeLabel(StrEnum):
@@ -13,6 +13,7 @@ class NodeLabel(StrEnum):
     COLUMN = "SqlColumn"
     QUERY = "SqlQuery"
     SCHEMA_VERSION = "SchemaVersion"
+    EXTERNAL_CONSUMER = "ExternalConsumer"
 
 
 class RelType(StrEnum):
@@ -27,6 +28,7 @@ class RelType(StrEnum):
     COLUMN_LINEAGE = "COLUMN_LINEAGE"
     DECLARES = "DECLARES"
     STAR_SOURCE = "STAR_SOURCE"
+    CONSUMED_BY = "CONSUMED_BY"
 
 
 # Backward-compatible aliases
@@ -36,6 +38,7 @@ NODE_TABLE = NodeLabel.TABLE
 NODE_COLUMN = NodeLabel.COLUMN
 NODE_QUERY = NodeLabel.QUERY
 NODE_SCHEMA_VERSION = NodeLabel.SCHEMA_VERSION
+NODE_EXTERNAL_CONSUMER = NodeLabel.EXTERNAL_CONSUMER
 
 REL_DEFINED_IN = RelType.DEFINED_IN
 REL_HAS_COLUMN = RelType.HAS_COLUMN
@@ -45,5 +48,6 @@ REL_DELETES_FROM = RelType.DELETES_FROM
 REL_UPDATES = RelType.UPDATES
 REL_COLUMN_LINEAGE = RelType.COLUMN_LINEAGE
 REL_DECLARES = RelType.DECLARES
+REL_CONSUMED_BY = RelType.CONSUMED_BY
 
 SCHEMA_DDL: str = files("sqlcg.core").joinpath("schema.cypher").read_text(encoding="utf-8")

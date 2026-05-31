@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from sqlcg.core.config import get_external_consumers, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.error_classify import _classify_error, dominant_cause
@@ -344,6 +345,9 @@ class Indexer:
         if profile:
             _t_star_end = time.perf_counter()
 
+        # Post-ingestion: ingest declared external downstream consumers from .sqlcg.toml
+        ingest_result = self._ingest_external_consumers(db, path)
+
         # Persist the HEAD SHA so `sqlcg reindex` (no SHAs) can compute the delta.
         # Silent on failure — non-git repos still index cleanly.
         try:
@@ -401,6 +405,9 @@ class Indexer:
             "quality": nonlocal_counts["quality"],
             "error_summary": error_summary,
             "batch_size": batch_size,
+            "external_consumers": ingest_result["consumers"],
+            "external_consumer_edges": ingest_result["edges"],
+            "external_consumer_warnings": ingest_result["warnings"],
         }
 
         if profile:
@@ -1156,3 +1163,73 @@ class Indexer:
 
         # Return the number of new edges created
         return max(0, after_count - before_count)
+
+    def _ingest_external_consumers(self, db: GraphBackend, path: Path) -> dict:
+        """Ingest declared external downstream consumers from .sqlcg.toml.
+
+        Runs ONCE per index_repo call, after _expand_star_sources and before
+        set_indexed_sha. Uses upsert_nodes_bulk/upsert_edges_bulk exclusively
+        (never upsert_node/upsert_edge per-row — CLAUDE.md perf invariant).
+
+        Returns:
+            Dict with keys: consumers (int), edges (int), warnings (list[str])
+        """
+        specs = get_external_consumers(path)
+        if not specs:
+            return {"consumers": 0, "edges": 0, "warnings": []}
+
+        presentation_prefixes = get_presentation_prefixes(path)
+
+        # Gather all target table qualifieds across all specs for a single existence check
+        all_targets: list[str] = []
+        for spec in specs:
+            all_targets.extend(spec.consumes)
+
+        # Single UNWIND round-trip to check which targets exist as SqlTable nodes
+        if all_targets:
+            existing_rows = db.run_read(
+                "UNWIND $names AS n MATCH (t:SqlTable {qualified: n}) RETURN n AS qualified",
+                {"names": all_targets},
+            )
+            existing_tables: set[str] = {row["qualified"] for row in existing_rows}
+        else:
+            existing_tables = set()
+
+        warnings: list[str] = []
+        consumer_rows: list[dict] = []
+        edge_rows: list[dict] = []
+
+        for spec in specs:
+            consumer_rows.append({"name": spec.name, "consumer_type": spec.consumer_type})
+            for target in spec.consumes:
+                if target not in existing_tables:
+                    warnings.append(
+                        f"Warning: external consumer '{spec.name}' "
+                        f"references unknown table '{target}'"
+                    )
+                    continue
+                # Check if this target is presentation-facing
+                if presentation_prefixes and not any(
+                    target.startswith(p) for p in presentation_prefixes
+                ):
+                    warnings.append(
+                        f"Warning: external consumer '{spec.name}' "
+                        f"references non-presentation table '{target}'"
+                    )
+                edge_rows.append({"src_key": target, "dst_key": spec.name})
+
+        # Bulk upsert nodes, then edges — never per-row
+        db.upsert_nodes_bulk(NodeLabel.EXTERNAL_CONSUMER, consumer_rows)
+        if edge_rows:
+            db.upsert_edges_bulk(
+                NodeLabel.TABLE,
+                NodeLabel.EXTERNAL_CONSUMER,
+                RelType.CONSUMED_BY,
+                edge_rows,
+            )
+
+        return {
+            "consumers": len(consumer_rows),
+            "edges": len(edge_rows),
+            "warnings": warnings,
+        }

@@ -266,6 +266,71 @@ def get_presentation_prefixes(path: Path) -> list[str]:
     return []
 
 
+class ExternalConsumerSpec(BaseModel):
+    """Specification for a single external downstream consumer declared in .sqlcg.toml."""
+
+    name: str
+    consumer_type: str
+    consumes: list[str]
+
+
+def get_external_consumers(path: Path) -> list[ExternalConsumerSpec]:
+    """Get external downstream consumer declarations from .sqlcg.toml.
+
+    Reads [[sqlcg.external_consumers]] array-of-tables from .sqlcg.toml. Each
+    table must have ``name`` and ``consumes`` (non-empty list). Rows without a
+    ``name`` or with an empty ``consumes`` list are silently skipped. The
+    ``kind`` field is stored as ``consumer_type`` (lowercased). **Defaults to an
+    empty list** when the section is absent — when unset, the ingestion pass is a
+    no-op (correct generic behaviour for any user). No hardcoded fallback::
+
+        [[sqlcg.external_consumers]]
+        name = "Tableau: Sales Dashboard"
+        kind = "tableau"
+        consumes = ["ia_sales.fct_orders"]
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of ExternalConsumerSpec objects. Defaults to an empty list.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("external_consumers", [])
+            if not isinstance(raw, list):
+                return []
+            specs: list[ExternalConsumerSpec] = []
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name", "")
+                if not name or not isinstance(name, str):
+                    continue
+                consumes_raw = entry.get("consumes", [])
+                if not isinstance(consumes_raw, list) or not consumes_raw:
+                    continue
+                consumes = [c.lower() for c in consumes_raw if isinstance(c, str)]
+                if not consumes:
+                    continue
+                kind = entry.get("kind", "")
+                consumer_type = kind.lower() if isinstance(kind, str) else ""
+                specs.append(
+                    ExternalConsumerSpec(
+                        name=name,
+                        consumer_type=consumer_type,
+                        consumes=consumes,
+                    )
+                )
+            return specs
+        except Exception:
+            pass
+    return []
+
+
 def get_backend() -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 

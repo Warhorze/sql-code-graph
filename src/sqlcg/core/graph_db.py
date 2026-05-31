@@ -204,6 +204,8 @@ class GraphBackend(ABC):
                 return "path"
             case NodeLabel.TABLE:
                 return "qualified"
+            case NodeLabel.EXTERNAL_CONSUMER:
+                return "name"
             case _:
                 return "id"
 
@@ -242,3 +244,7 @@ class GraphBackend(ABC):
             yield self
         except Exception:
             raise
+
+
+# Alias for test compatibility — the class is GraphBackend; GraphDB is an alias.
+GraphDB = GraphBackend

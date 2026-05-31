@@ -228,7 +228,7 @@ def test_scenario_d_schema_version_mismatch_exits(tmp_path):
         assert stored == "4"
         assert stored != SCHEMA_VERSION, "SCHEMA_VERSION must differ from '4' after the PR-2 bump"
         # Confirm the version gate would fire (matches the check in index.py)
-        assert SCHEMA_VERSION == "5", f"Expected SCHEMA_VERSION='5', got {SCHEMA_VERSION!r}"
+        assert SCHEMA_VERSION == "6", f"Expected SCHEMA_VERSION='6', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------
