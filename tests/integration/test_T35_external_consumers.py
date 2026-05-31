@@ -182,10 +182,10 @@ def test_T35_pk_field_for_external_consumer_is_name():
     if not _SCHEMA_AVAILABLE:
         pytest.skip("NodeLabel.EXTERNAL_CONSUMER not yet implemented (#35 PR-1)")
 
-    from sqlcg.core.graph_db import GraphDB
+    from sqlcg.core.graph_db import GraphBackend
     from sqlcg.core.schema import NodeLabel
 
-    pk = GraphDB._pk_field(NodeLabel.EXTERNAL_CONSUMER)
+    pk = GraphBackend._pk_field(NodeLabel.EXTERNAL_CONSUMER)
     assert pk == "name", (
         f"_pk_field(EXTERNAL_CONSUMER) must return 'name'; got {pk!r}. "
         "Missing explicit case in graph_db.py — default 'id' targets a non-existent column."

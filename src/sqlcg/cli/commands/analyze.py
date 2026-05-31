@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sqlcg.core.config import get_backend
+from sqlcg.core.queries import GET_TABLE_EXTERNAL_CONSUMERS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
 
 if TYPE_CHECKING:
@@ -138,6 +139,30 @@ def downstream(  # noqa: B008
             nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
             results = _filter_column_results(results, nf)
         _print_table(_add_file_line_col(results), ["id", "file:line"])
+
+        # Append external consumer rows for terminal tables (scalar query, one per terminal).
+        # Resolve terminal tables from the column results; fall back to the root column's table.
+        terminal_tables: set[str] = set()
+        for r in results:
+            tbl = _col_id_to_table(r["id"])
+            if tbl:
+                terminal_tables.add(tbl)
+        # Also check the root column's table (in case no downstream columns were found).
+        root_parts = ref.rsplit(".", 1)
+        if len(root_parts) == 2:
+            terminal_tables.add(root_parts[0])
+        consumer_rows: list[dict] = []
+        for tbl in sorted(terminal_tables):
+            rows_ec = backend.run_read(
+                GET_TABLE_EXTERNAL_CONSUMERS_QUERY,
+                {"table_qualified": tbl},
+            )
+            for ec in rows_ec:
+                consumer_rows.append(
+                    {"id": f"[external] {ec['name']} ({ec['consumer_type']})", "file:line": ""}
+                )
+        if consumer_rows:
+            _print_table(consumer_rows, ["id", "file:line"])
 
 
 @app.command("impact")

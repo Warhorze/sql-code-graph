@@ -351,8 +351,9 @@ def test_S4_2_downstream_empty_hint_contains_terminal_output():
     with patch("sqlcg.server.tools._open_backend") as mock_backend_ctx:
         mock_db = MagicMock()
         mock_db.run_read.side_effect = [
-            [{"n": 1}],
-            [],
+            [{"n": 1}],  # _assert_indexed
+            [],  # downstream BFS query — no column nodes
+            [],  # batch consumer query — no external consumers
         ]
         mock_backend_ctx.return_value.__enter__.return_value = mock_db
 
@@ -383,7 +384,7 @@ def test_S4_2_downstream_hint_differs_from_upstream_hint():
 
     with patch("sqlcg.server.tools._open_backend") as m:
         mock_db = MagicMock()
-        mock_db.run_read.side_effect = [[{"n": 1}], []]
+        mock_db.run_read.side_effect = [[{"n": 1}], [], []]  # indexed, bfs, batch-consumer
         m.return_value.__enter__.return_value = mock_db
         downstream = get_downstream_dependencies("ba.t.col")
 

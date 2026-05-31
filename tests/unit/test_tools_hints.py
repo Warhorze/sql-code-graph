@@ -104,7 +104,8 @@ class TestGetDownstreamDependenciesHint:
             # Mock empty downstream results
             mock_db.run_read.side_effect = [
                 [{"n": 1}],  # _assert_indexed
-                [],  # downstream query returns empty
+                [],  # downstream BFS query returns empty
+                [],  # batch consumer query — no external consumers
             ]
 
             result = get_downstream_dependencies("orders.amount")

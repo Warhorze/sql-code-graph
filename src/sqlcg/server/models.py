@@ -330,6 +330,13 @@ class DiffImpactResult(BaseModel):
         default_factory=list,
         description="Affected tables in topological rebuild order across the union blast radius.",
     )
+    external_consumers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Declared external consumers attached to any table in the blast radius "
+            "(via CONSUMED_BY edges). Empty when no consumers are configured."
+        ),
+    )
     noise_excluded: list[str] = Field(
         default_factory=list, description="Affected tables excluded as backup/noise."
     )
@@ -413,6 +420,14 @@ class PresentationCandidate(BaseModel):
     reason: str = Field(
         default="leaf in a declared egress layer; expected to have no in-corpus consumer",
         description="Why this table is segregated from dead_code rather than flagged.",
+    )
+    has_external_consumer: bool = Field(
+        default=False,
+        description=(
+            "FACT: True when at least one declared external consumer is attached "
+            "to this table via a CONSUMED_BY edge. Distinguishes a provable egress "
+            "point from a candidate orphan in the egress layer."
+        ),
     )
 
 

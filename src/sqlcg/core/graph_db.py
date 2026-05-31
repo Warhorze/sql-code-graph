@@ -244,7 +244,3 @@ class GraphBackend(ABC):
             yield self
         except Exception:
             raise
-
-
-# Alias for test compatibility — the class is GraphBackend; GraphDB is an alias.
-GraphDB = GraphBackend

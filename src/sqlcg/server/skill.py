@@ -54,8 +54,9 @@ _WORKFLOWS = """\
 
 - **Change a table**: `scope_change(t)` → read `authoritative_files`, follow `backfill_order`; treat `risk` as heuristic.
 - **Trace lineage**: `trace_column_lineage(schema.table.column)` (fact). Empty = unresolved at index time, not "no lineage" — check `hint`.
-- **Dead code**: `analyze_unused()` → `candidates` (`dead_code`, heuristic, confidence 0.5) are orphans OUTSIDE the declared egress layer; `presentation_facing` are terminal/egress leaves (config `[sqlcg.presentation]`) expected to have no in-corpus consumer — do NOT suggest deleting those. Show `reason` before suggesting deletion of any candidate.
-- **CI impact**: `diff_impact(changed_files)` (fact); `presentation_facing` flags user-visible tables.
+- **Dead code**: `analyze_unused()` → `candidates` (`dead_code`, heuristic, confidence 0.5) are orphans OUTSIDE the declared egress layer; `presentation_facing` are terminal/egress leaves (config `[sqlcg.presentation]`) expected to have no in-corpus consumer — do NOT suggest deleting those. `has_external_consumer=True` on a `presentation_facing` entry means a declared external egress consumer (e.g. Tableau, reverse-ETL) is attached via `CONSUMED_BY` — it is a provable egress point. Show `reason` before suggesting deletion of any candidate.
+- **CI impact**: `diff_impact(changed_files)` (fact); `presentation_facing` flags user-visible tables; `external_consumers` lists any declared external egress consumers (e.g. Tableau, BI tools) attached to tables in the blast radius via `CONSUMED_BY` edges — injected at index time from `[[sqlcg.external_consumers]]` in `.sqlcg.toml`.
+- **Downstream egress**: `get_downstream_dependencies(col)` appends `DependencyNode(kind="external_consumer")` entries for any declared external consumers attached to terminal tables — these represent data leaving the modeled SQL corpus.
 - **Hub topology**: `get_hub_ranking(k)` (fact); high hub = high-risk change target, quantify via `scope_change`.
 """
 

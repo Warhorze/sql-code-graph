@@ -118,3 +118,15 @@ LIMIT $k
 UNWIND $tables AS tbl
 MATCH (t:SqlTable {qualified: tbl})<-[:SELECTS_FROM]-(q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
 RETURN DISTINCT f.path AS path
+
+-- GET_TABLE_EXTERNAL_CONSUMERS
+MATCH (t:SqlTable {qualified: $table_qualified})-[:CONSUMED_BY]->(e:ExternalConsumer)
+RETURN e.name AS name, e.consumer_type AS consumer_type
+
+-- GET_TABLES_EXTERNAL_CONSUMERS_BATCH
+UNWIND $table_qualifieds AS tq
+MATCH (t:SqlTable {qualified: tq})-[:CONSUMED_BY]->(e:ExternalConsumer)
+RETURN tq AS table_qualified, e.name AS name, e.consumer_type AS consumer_type
+
+-- COUNT_EXTERNAL_CONSUMERS
+MATCH ()-[r:CONSUMED_BY]->() RETURN count(r) AS n

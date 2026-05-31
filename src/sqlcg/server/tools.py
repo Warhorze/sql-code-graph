@@ -20,6 +20,7 @@ from sqlcg.core.queries import (
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
+    GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
@@ -949,6 +950,21 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
         presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]
         order, had_cycle = _kahn_topological_sort(affected_tables, db)
 
+        # Resolve external consumers for the blast radius in a single BATCH query (not per-table).
+        external_consumers: list[str] = []
+        all_blast_tables = list(set(changed_tables) | set(affected_tables))
+        if all_blast_tables:
+            consumer_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": all_blast_tables},
+            )
+            seen_consumers: set[str] = set()
+            for crow in consumer_rows:
+                cname = crow["name"]
+                if cname not in seen_consumers:
+                    seen_consumers.add(cname)
+                    external_consumers.append(cname)
+
         hint = None
         if not changed_tables:
             hint = (
@@ -967,6 +983,7 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             affected_tables=affected_tables,
             presentation_facing=presentation_facing,
             backfill_order=order,
+            external_consumers=external_consumers,
             noise_excluded=noise_excluded,
             truncated=truncated,
             hint=hint,
@@ -1144,9 +1161,35 @@ def get_downstream_dependencies(table_col: str, max_depth: int | None = None) ->
                 elif node_id not in visited and max_depth is not None and next_depth > max_depth:
                     truncated = True
 
+        # Append external consumer terminal nodes via a single BATCH query (not per-table loop).
+        # Collect all terminal tables from the column closure then issue one round-trip.
+        terminal_tables = list({n.table for n in nodes if n.table is not None})
+        # Also include the root column's table when there are no intermediate nodes
+        # (root may itself be terminal with a consumer but no further column hops).
+        root_table = table_id  # table_id was extracted above from table_col
+        if root_table not in terminal_tables:
+            terminal_tables.append(root_table)
+
+        if terminal_tables:
+            consumer_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": terminal_tables},
+            )
+            for crow in consumer_rows:
+                nodes.append(
+                    DependencyNode(
+                        name=crow["name"],
+                        kind="external_consumer",
+                        table=crow["table_qualified"],
+                    )
+                )
+
         # Populate hint if result is empty (Step 4.2)
+        # Only fire the "terminal output" hint when there are also no external consumers.
         hint = None
-        if not nodes:
+        column_nodes = [n for n in nodes if n.kind == "column"]
+        consumer_nodes = [n for n in nodes if n.kind == "external_consumer"]
+        if not column_nodes and not consumer_nodes:
             hint = (
                 "No downstream consumers found — this column may be a terminal output. "
                 "If you expected consumers, confirm the consuming files were indexed "
@@ -1596,16 +1639,33 @@ def analyze_unused() -> UnusedTablesResult:
 
         prefixes = get_presentation_prefixes(Path.cwd())
 
+        # Build a set of tables that have at least one CONSUMED_BY edge, using a single
+        # BATCH query over all unused tables (one round-trip, not one per table).
+        unused_table_names = [row["table_qualified"] for row in unused_rows]
+        consumed_tables: set[str] = set()
+        if unused_table_names:
+            batch_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": unused_table_names},
+            )
+            for crow in batch_rows:
+                consumed_tables.add(crow["table_qualified"])
+
         candidates: list[UnusedCandidate] = []
         presentation_facing: list[PresentationCandidate] = []
         for row in unused_rows:
             tq = row["table_qualified"]
             if noise_filter.is_noise(tq):
                 continue
+            has_consumer = tq in consumed_tables
             matched = _matched_presentation_prefix(tq, prefixes)
             if matched is not None:
                 presentation_facing.append(
-                    PresentationCandidate(table_qualified=tq, matched_prefix=matched)
+                    PresentationCandidate(
+                        table_qualified=tq,
+                        matched_prefix=matched,
+                        has_external_consumer=has_consumer,
+                    )
                 )
                 continue
             candidates.append(
