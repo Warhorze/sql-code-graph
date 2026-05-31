@@ -43,7 +43,10 @@ _BOUNDARY = """\
 **Heuristics**: interpretations carrying `confidence` (uncalibrated) + `reason`. \
 Never present as fact — surface `reason`/`confidence` and have the user validate. \
 Only `get_change_scope`/`scope_change` (`risk`) and `analyze_unused` \
-(`dead_code`, confidence 0.5) are heuristics; every other tool returns facts.
+(`dead_code`, confidence 0.5) are heuristics. `trace_column_lineage` returns \
+deterministic fact edges (`confidence=1.0`, `reason=None`) for plainly-parsed \
+SELECT statements; `confidence<1.0` with a non-null `reason` flags an inferred \
+edge — surface `reason` and treat with caution.
 """
 
 _WORKFLOWS = """\

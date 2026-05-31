@@ -497,7 +497,7 @@ class SqlParser(ABC):
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=0.7,
+                            confidence=1.0,
                         )
                     )
                 except Exception as exc:

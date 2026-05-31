@@ -487,6 +487,30 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         raise
 
 
+_REASON_MAP: dict[tuple[str | None, float | None], str] = {
+    ("STAR_EXPANSION", 0.8): "star-expansion: columns inferred from source table schema",
+    ("UNKNOWN", 0.5): "column not found in resolved schema",
+    (None, 0.3): "scripting-block fallback: column lineage approximate",
+    ("UNKNOWN", 0.0): "lineage extraction failed at index time",
+}
+
+
+def _reason_for(transform: str | None, confidence: float | None) -> str | None:
+    """Return a human-readable reason for an inferred lineage edge.
+
+    Returns None for fact edges (confidence >= 1.0 or confidence is None).
+    Returns a descriptive string for inferred edges (confidence < 1.0).
+
+    Note: confidence values from KuzuDB are stored as FLOAT (32-bit) and may
+    differ from the Python float by up to ~1e-7. We round to 1 decimal place
+    for the _REASON_MAP lookup to tolerate float32 storage imprecision.
+    """
+    if confidence is None or confidence >= 1.0:
+        return None
+    rounded = round(confidence, 1)
+    return _REASON_MAP.get((transform, rounded)) or f"inferred edge (confidence={confidence:.2f})"
+
+
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
 def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
@@ -562,6 +586,9 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 table=row.get("table_qualified"),
                                 file=None,
                                 confidence=row.get("confidence"),
+                                line=None,
+                                expression=None,
+                                reason=_reason_for(row.get("transform"), row.get("confidence")),
                             )
                         )
                     queue.append((node_id, depth + 1))
@@ -597,6 +624,9 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 table=row.get("table_qualified"),
                                 file=None,
                                 confidence=row.get("confidence"),
+                                line=None,
+                                expression=None,
+                                reason=_reason_for(row.get("transform"), row.get("confidence")),
                             )
                         )
                     if node_id not in bare_visited:

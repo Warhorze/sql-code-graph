@@ -1,10 +1,11 @@
-## Current State — architect-planner: Cluster B v1.1.0 provenance & trust (#31/#32/#33)
+## Current State — developer: sprint_13 Cluster B PR-1 (#32 — Meaningful Confidence + reason)
 
-ACTIVE AGENT: architect-planner — feature plan for Cluster B (lineage provenance & output trust)
-  plan: plan/v1.1.0_cluster_b_provenance_trust.md (NEW)
-  issues: #31 (source location on edges), #32 (meaningful confidence), #33 (CLI/MCP parity + node-kind)
-  status: planning — hands to sprint-planner next
-  prior: developer sprint-12 PR-F complete (commit 9c385c0)
+ACTIVE AGENT: developer — sprint_13 v1.1.0 Cluster B PR-1
+  plan: plan/sprint_13_v1.1.0_cluster_b.md (PR-1 ticket)
+  branch: feat/cluster-b-provenance
+  issues: #32 (meaningful confidence + reason field)
+  status: IN PROGRESS
+  prior: architect-planner plan complete (commit 80c75e7)
 
 ## Prior State — developer: PR-F live-verification fixes (#28)
 

@@ -56,6 +56,14 @@ class LineageNode(BaseModel):
     )
     file: str | None = Field(None, description="Source file path, if applicable")
     confidence: float | None = Field(None, description="Confidence score 0.0-1.0")
+    line: int | None = Field(None, description="1-based start line of the producing statement")
+    expression: str | None = Field(
+        None, description="SQL text of the producing statement (truncated)"
+    )
+    reason: str | None = Field(
+        None,
+        description="Set only when confidence < 1.0; why the edge is inferred",
+    )
 
 
 class LineageEdge(BaseModel):
