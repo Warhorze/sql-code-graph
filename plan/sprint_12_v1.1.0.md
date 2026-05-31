@@ -18,7 +18,7 @@ process that calls `index`/`reindex`/`db reset` fails with "Database is locked".
 hooks use `|| true`, so this failure is swallowed and the graph goes stale silently — the
 worst failure mode for a correctness tool.
 
-This sprint ships the full mitigation in four PRs:
+This sprint ships the full mitigation in five PRs (PR-E added after live verification):
 
 - **PR-A** (low risk): expose the existing persisted SHA as a human-readable freshness line
   in `db info` and the MCP `db_info` tool. Immediately answers #30 and makes staleness *detectable*.
@@ -28,6 +28,10 @@ This sprint ships the full mitigation in four PRs:
   The infrastructure that PR-D depends on.
 - **PR-D** (high): reindex op on the running server (`anyio.to_thread.run_sync`, serialised lock)
   + `reindex --notify` fallback + git-hook stderr cue. Closes #28.
+- **PR-E** (xs, follow-up): make the generated **post-merge** hook pass `--from ORIG_HEAD --to HEAD`
+  so a `git pull` routes through the running server like post-checkout does. Closes the
+  post-merge gap found in live verification (standalone `--notify` can't read the stored SHA
+  from the locked DB). Hook-generation change only. See the PR-E ticket below for full detail.
 
 ---
 
@@ -83,6 +87,7 @@ This sprint ships the full mitigation in four PRs:
 | PR-B | `index --include-working-tree` | `cli/commands/index.py` | XS | MED | INDEPENDENT | NONE |
 | PR-C | Unix-socket control channel + `mcp status`/`stop`/`restart` | `server/control.py` (new), `server/server.py`, `cli/commands/mcp.py` | L | HIGH | PR-A | PR-D |
 | PR-D | Reindex op on server + `reindex --notify` + git-hook cue | `server/control.py`, `server/server.py`, `cli/commands/reindex.py`, `cli/commands/git.py` | L | HIGH | PR-C | NONE |
+| PR-E | Post-merge hook routes through server (`--from ORIG_HEAD --to HEAD` + unset guard) | `cli/commands/git.py`, test | XS | HIGH | PR-D | NONE |
 
 ---
 
@@ -125,6 +130,10 @@ entire attention is on the socket plumbing, not split with the working-tree flag
    to avoid blocking)
 3. PR-C — control socket + lifecycle
 4. PR-D — reindex op + `--notify` + git-hook update
+5. PR-E — post-merge hook `--from ORIG_HEAD` routing (follow-up; needs PR-D's `--notify`
+   + hook generator in place). Surfaced by live verification against `../dwh` after PR-D
+   merged: post-checkout routed through the server but post-merge did not, because standalone
+   `--notify` cannot read the stored SHA from the locked DB. Hook-generation change only.
 
 ### Two-developer sequence
 
