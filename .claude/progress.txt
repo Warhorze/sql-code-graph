@@ -5,7 +5,27 @@ ACTIVE AGENT: developer — sprint-12 PR-B: index --include-working-tree + dirty
   feature plan: plan/v1.1.0_live_graph_freshness.md
   branch: fix/v1.0.2-bugfix
   issues: #30 (freshness/staleness signal)
-  status: IN PROGRESS — implementation complete, opening PR
+  status: COMPLETE — PR opened
+  commit: abcf41c
+  PR: https://github.com/Warhorze/sql-code-graph/pull/36
+
+Handoff:
+  agent: developer (PR-B complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  files changed:
+    - src/sqlcg/cli/commands/index.py (add --include-working-tree flag + dirty sentinel write)
+    - tests/unit/test_include_working_tree.py (NEW — 6 unit tests: scenarios A/B/C)
+  test results: 791 passed, 6 skipped, 3 xfailed
+    + 6 new PR-B tests all pass
+    + 1 pre-existing failure: test_mcp_stdio_smoke.py (exists before this branch)
+  pyright: 0 errors
+  ruff: all checks passed
+  deviations: none
+  wiring verified:
+    - grep confirmed include_working_tree in index.py at line 66 (definition) + line 152 (use)
+    - grep confirmed +dirty sentinel write at line 158 in index.py
+    - grep confirmed zero TODOs in index.py
+    - parsers/base.py untouched, bulk-upsert path untouched
 
 ---
 
