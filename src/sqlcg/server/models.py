@@ -394,12 +394,42 @@ class UnusedCandidate(BaseModel):
     )
 
 
+class PresentationCandidate(BaseModel):
+    """A terminal/egress table that has no in-corpus consumer BY DESIGN.
+
+    Surfaced separately from dead_code: its lack of within-corpus consumers is the
+    defining property of a declared presentation/egress layer, not evidence it is dead.
+    """
+
+    table_qualified: str = Field(..., description="Qualified table name (schema.table).")
+    within_corpus_references: int = Field(
+        default=0,
+        description="FACT: count of SELECTS_FROM consumers in the indexed corpus (always 0 here).",
+    )
+    matched_prefix: str = Field(
+        ...,
+        description="FACT: the configured [sqlcg.presentation] schema_prefix this table matched.",
+    )
+    reason: str = Field(
+        default="leaf in a declared egress layer; expected to have no in-corpus consumer",
+        description="Why this table is segregated from dead_code rather than flagged.",
+    )
+
+
 class UnusedTablesResult(BaseModel):
     """Result of analyze_unused — tables with no within-corpus consumers."""
 
     candidates: list[UnusedCandidate] = Field(
         default_factory=list,
         description="Tables with zero SELECTS_FROM consumers (noise-filtered).",
+    )
+    presentation_facing: list[PresentationCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Terminal/egress leaves matched by [sqlcg.presentation] prefixes; "
+            "expected to have no in-corpus consumer (NOT dead code). Empty when no "
+            "presentation prefix is configured."
+        ),
     )
     total_tables_scanned: int = Field(
         0, description="FACT: total SqlTable nodes in the graph at time of scan."

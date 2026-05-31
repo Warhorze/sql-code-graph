@@ -47,6 +47,7 @@ from sqlcg.server.models import (
     Judgement,
     LineageNode,
     LineageResult,
+    PresentationCandidate,
     ScopeChangeResult,
     SqlPatternMatch,
     SqlPatternResult,
@@ -1552,6 +1553,19 @@ def submit_feedback(
         return {"status": "skipped"}
 
 
+def _matched_presentation_prefix(table_qualified: str, prefixes: list[str]) -> str | None:
+    """Return the first configured presentation prefix the table matches, else None.
+
+    Prefixes are pre-lowercased by get_presentation_prefixes; compare lowercased so an
+    ``IA_ANALYTICS.foo`` table matches an ``ia_`` prefix.
+    """
+    tql = table_qualified.lower()
+    for p in prefixes:
+        if tql.startswith(p):
+            return p
+    return None
+
+
 @mcp.tool()
 @_timed_tool("analyze_unused")
 def analyze_unused() -> UnusedTablesResult:
@@ -1580,10 +1594,19 @@ def analyze_unused() -> UnusedTablesResult:
         total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
         total_tables_scanned = total_rows[0]["n"] if total_rows else 0
 
+        prefixes = get_presentation_prefixes(Path.cwd())
+
         candidates: list[UnusedCandidate] = []
+        presentation_facing: list[PresentationCandidate] = []
         for row in unused_rows:
             tq = row["table_qualified"]
             if noise_filter.is_noise(tq):
+                continue
+            matched = _matched_presentation_prefix(tq, prefixes)
+            if matched is not None:
+                presentation_facing.append(
+                    PresentationCandidate(table_qualified=tq, matched_prefix=matched)
+                )
                 continue
             candidates.append(
                 UnusedCandidate(
@@ -1602,14 +1625,21 @@ def analyze_unused() -> UnusedTablesResult:
             )
 
         hint = None
-        if not candidates:
+        if not candidates and not presentation_facing:
             hint = (
                 "No unused-table candidates found. All indexed tables have at least one "
                 "within-corpus consumer, or the graph is empty."
             )
+        elif not candidates and presentation_facing:
+            hint = (
+                f"No dead-code candidates outside the declared egress layer. "
+                f"{len(presentation_facing)} terminal/presentation leaf(s) are reported "
+                f"separately (expected to have no in-corpus consumer)."
+            )
 
         return UnusedTablesResult(
             candidates=candidates,
+            presentation_facing=presentation_facing,
             total_tables_scanned=total_tables_scanned,
             hint=hint,
         )

@@ -54,7 +54,7 @@ _WORKFLOWS = """\
 
 - **Change a table**: `scope_change(t)` → read `authoritative_files`, follow `backfill_order`; treat `risk` as heuristic.
 - **Trace lineage**: `trace_column_lineage(schema.table.column)` (fact). Empty = unresolved at index time, not "no lineage" — check `hint`.
-- **Dead code**: `analyze_unused()` → each `dead_code` is heuristic; table may be consumed externally (BI/API/COPY INTO). Show `reason` before suggesting deletion.
+- **Dead code**: `analyze_unused()` → `candidates` (`dead_code`, heuristic, confidence 0.5) are orphans OUTSIDE the declared egress layer; `presentation_facing` are terminal/egress leaves (config `[sqlcg.presentation]`) expected to have no in-corpus consumer — do NOT suggest deleting those. Show `reason` before suggesting deletion of any candidate.
 - **CI impact**: `diff_impact(changed_files)` (fact); `presentation_facing` flags user-visible tables.
 - **Hub topology**: `get_hub_ranking(k)` (fact); high hub = high-risk change target, quantify via `scope_change`.
 """
