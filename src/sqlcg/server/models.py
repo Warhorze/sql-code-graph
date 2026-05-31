@@ -64,6 +64,10 @@ class LineageNode(BaseModel):
         None,
         description="Set only when confidence < 1.0; why the edge is inferred",
     )
+    table_kind: str | None = Field(
+        None,
+        description="Structural role of the source table: 'table', 'cte', 'derived', or 'external'",
+    )
 
 
 class LineageEdge(BaseModel):

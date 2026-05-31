@@ -23,6 +23,9 @@ def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
+    include_intermediate: bool = typer.Option(  # noqa: B008
+        False, "--include-intermediate", help="Include CTE/derived intermediate nodes"
+    ),
 ) -> None:
     """Trace upstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -30,10 +33,19 @@ def upstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    kind_filter = (
+        ""
+        if include_intermediate
+        else "MATCH (t:SqlTable {qualified: src.table_qualified}) "
+        "WHERE t.kind IN ['table', 'external'] "
+    )
+
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
+            f"{kind_filter}"
             f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
             "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
             "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
@@ -44,6 +56,7 @@ def upstream(  # noqa: B008
             fallback_results = backend.run_read(
                 f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
                 f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
+                f"{kind_filter}"
                 f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
                 "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
                 "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
@@ -71,6 +84,9 @@ def downstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
     depth: int = typer.Option(5, "--depth", help="Maximum traversal depth"),  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
+    include_intermediate: bool = typer.Option(  # noqa: B008
+        False, "--include-intermediate", help="Include CTE/derived intermediate nodes"
+    ),
 ) -> None:
     """Trace downstream column lineage."""
     # Bounds check for depth to prevent performance DoS
@@ -78,10 +94,19 @@ def downstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    kind_filter = (
+        ""
+        if include_intermediate
+        else "MATCH (t:SqlTable {qualified: dst.table_qualified}) "
+        "WHERE t.kind IN ['table', 'external'] "
+    )
+
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+            f"{kind_filter}"
             f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
             "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
             "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
@@ -92,6 +117,7 @@ def downstream(  # noqa: B008
             fallback_results = backend.run_read(
                 f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
                 f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+                f"{kind_filter}"
                 f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
                 "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
                 "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
@@ -117,15 +143,21 @@ def downstream(  # noqa: B008
 @app.command("impact")
 def impact(  # noqa: B008
     table: str = typer.Argument(..., help="Table name to analyze"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Show all queries impacted by a table."""
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
             f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
-            "RETURN q.id AS id, q.kind AS kind LIMIT 100",
+            "RETURN DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target LIMIT 100",
             {"t": table},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()
+            results = [r for r in results if not nf.is_noise(r.get("target", ""))]
         _print_table(results, ["id", "kind"])
 
 
@@ -156,14 +188,20 @@ def failures(
 @app.command("unused")
 def unused(
     threshold: int = typer.Option(0, "--threshold", help="Minimum reference count threshold"),
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find tables with no query references."""
     with get_backend() as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
-            "RETURN t.qualified AS qualified LIMIT 100",
+            "RETURN DISTINCT t.qualified AS qualified LIMIT 100",
             {},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()
+            results = [r for r in results if not nf.is_noise(r["qualified"])]
         _print_table(results, ["qualified"])
 
 

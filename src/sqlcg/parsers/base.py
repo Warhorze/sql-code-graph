@@ -55,6 +55,7 @@ class TableRef:
     db: str | None = None
     name: str = ""
     alias: str | None = None
+    role: str = "table"
 
     def __post_init__(self) -> None:
         """Normalize identity components to lowercase.
@@ -958,8 +959,8 @@ class SqlParser(ABC):
                             cte_alias = cte.alias
                             if not cte_alias:
                                 continue
-                            # Treat the CTE as a synthetic destination table
-                            cte_dst_table = TableRef(name=cte_alias)
+                            # Treat the CTE as a synthetic destination table (role="cte")
+                            cte_dst_table = TableRef(name=cte_alias, role="cte")
                             # The CTE's body is its SELECT expression (or UNION ALL, etc.)
                             cte_body = cte.this
                             # Accept both Select and Union (UNION ALL / UNION DISTINCT)

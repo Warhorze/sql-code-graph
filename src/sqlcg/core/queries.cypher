@@ -13,20 +13,17 @@ DETACH DELETE t
 -- DELETE_FILE
 MATCH (f:File {path: $path}) DETACH DELETE f
 
--- STALE_VIEWS
-MATCH (f:File {path: $path})<-[:DEFINED_IN]-(t:SqlTable)
-<-[:SELECTS_FROM]-(q:SqlQuery)-[:DECLARES]->(v:SqlTable {kind: 'VIEW'})
-RETURN DISTINCT v.qualified AS view_name
-
 -- INDEX_REPO_FILES
 MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path
 
 -- TRACE_COLUMN_LINEAGE
 MATCH (dst:SqlColumn {id: $id})<-[r:COLUMN_LINEAGE]-(src:SqlColumn)
 OPTIONAL MATCH (q:SqlQuery {id: r.query_id})
+OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified})
 RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified,
        r.transform AS transform, r.confidence AS confidence,
-       q.file_path AS file, q.start_line AS line, q.sql AS expression
+       q.file_path AS file, q.start_line AS line, q.sql AS expression,
+       t.kind AS table_kind
 
 -- FIND_TABLE_USAGES
 MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)
@@ -39,6 +36,12 @@ RETURN dst.id AS id, dst.col_name AS col_name, dst.table_qualified AS table_qual
 
 -- GET_UPSTREAM_DEPENDENCIES
 MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
+
+-- GET_UPSTREAM_DEPENDENCIES_FILTERED
+MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
+MATCH (t:SqlTable {qualified: src.table_qualified})
+WHERE t.kind IN ['table', 'external']
 RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
 
 -- SEARCH_SQL_PATTERN

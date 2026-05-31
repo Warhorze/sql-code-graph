@@ -589,6 +589,7 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 line=row.get("line") or None,
                                 expression=row.get("expression"),
                                 reason=_reason_for(row.get("transform"), row.get("confidence")),
+                                table_kind=row.get("table_kind"),
                             )
                         )
                     queue.append((node_id, depth + 1))
@@ -627,6 +628,7 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 line=row.get("line") or None,
                                 expression=row.get("expression"),
                                 reason=_reason_for(row.get("transform"), row.get("confidence")),
+                                table_kind=row.get("table_kind"),
                             )
                         )
                     if node_id not in bare_visited:

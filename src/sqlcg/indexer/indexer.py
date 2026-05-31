@@ -7,7 +7,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 from sqlcg.core.graph_db import GraphBackend
-from sqlcg.core.queries import STALE_VIEWS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.error_classify import _classify_error, dominant_cause
 from sqlcg.indexer.pool import HardKillPool
@@ -767,15 +766,19 @@ class Indexer:
         return summary
 
     def reindex_file(self, file_path: str, db: GraphBackend, dialect: str | None) -> None:
-        """Re-index a single file and its dependent views.
+        """Re-index a single file.
+
+        Re-indexes only the changed file. The stale-view cascade that was here
+        previously was a no-op (the dead query matched kind='VIEW' which is never
+        written). It has been removed in PR-3 (#33). Full re-index
+        (db reset && sqlcg index) is the migration path for VIEW dependency
+        tracking, deferred to v1.2.
 
         Args:
             file_path: Path to the file to re-index
             db: GraphBackend instance
             dialect: SQL dialect (None for ANSI)
         """
-        stale_views = db.run_read(STALE_VIEWS_QUERY, {"path": file_path})
-
         with db.transaction():
             db.delete_nodes_for_file(file_path)
             schema_resolver = SchemaResolver(dialect=dialect)
@@ -785,11 +788,7 @@ class Indexer:
 
             self._upsert_parsed_file(parsed, db)
 
-        for row in stale_views:
-            self._reindex_view_definition(row["view_name"], db, dialect)
-
-        # Re-run star expansion after re-indexing and all stale views are processed
-        # Call this outside the transaction
+        # Re-run star expansion after re-indexing
         self._expand_star_sources(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
@@ -930,7 +929,7 @@ class Indexer:
                     "name": table.name,
                     "catalog": table.catalog or "",
                     "db": table.db or "",
-                    "kind": "TABLE",
+                    "kind": "table",
                     "defined_in_file": parsed.path_str,
                 }
             )
@@ -989,24 +988,35 @@ class Indexer:
             )
             query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
 
-            # Source table edges
+            # Source table edges — apply structural role from TableRef.role.
+            # Real source tables have role="table"; CTE aliases have role="cte".
+            # Exclude <output> synthetic sinks (fallback dst when stmt.target is None).
             for src_table in stmt.sources:
+                if src_table.full_id == "<output>":
+                    continue
                 table_rows.append(
                     {
                         "qualified": src_table.full_id,
                         "name": src_table.name,
                         "catalog": src_table.catalog or "",
                         "db": src_table.db or "",
-                        "kind": "TABLE",
+                        "kind": src_table.role,
                         "defined_in_file": "",
                     }
                 )
                 selects_from_edges.append({"src_key": query_id, "dst_key": src_table.full_id})
 
-            # Column lineage edges
+            # Column lineage edges.
+            # CTE destination tables (role="cte") are not in stmt.sources so they are not
+            # emitted by the source-table loop above.  Collect them here from edge.dst so
+            # that each CTE alias gets a SqlTable node with kind="cte" in the graph.
+            # Also exclude <output> synthetic sinks from both table_rows and column_rows.
             for edge in stmt.column_lineage:
                 src_id = edge.src.full_id
                 dst_id = edge.dst.full_id
+                # Exclude <output> sink — it is a synthetic fallback, not a real table
+                if edge.dst.table.full_id == "<output>":
+                    continue
                 column_rows.append(
                     {
                         "id": src_id,
@@ -1027,6 +1037,18 @@ class Indexer:
                         "table_name": edge.dst.table.name,
                     }
                 )
+                # Emit CTE destination table nodes so they appear as SqlTable with kind="cte"
+                if edge.dst.table.role == "cte":
+                    table_rows.append(
+                        {
+                            "qualified": edge.dst.table.full_id,
+                            "name": edge.dst.table.name,
+                            "catalog": edge.dst.table.catalog or "",
+                            "db": edge.dst.table.db or "",
+                            "kind": "cte",
+                            "defined_in_file": "",
+                        }
+                    )
                 column_lineage_edges.append(
                     {
                         "src_key": src_id,
@@ -1038,7 +1060,7 @@ class Indexer:
                 )
                 counts["edges"] += 1
 
-            # STAR_SOURCE edges for graph-backend expansion
+            # STAR_SOURCE edges for graph-backend expansion — real source tables, keep kind="table"
             for star in stmt.star_sources:
                 table_rows.append(
                     {
@@ -1046,7 +1068,7 @@ class Indexer:
                         "name": star.source.name,
                         "catalog": star.source.catalog or "",
                         "db": star.source.db or "",
-                        "kind": "TABLE",
+                        "kind": "table",
                         "defined_in_file": "",
                     }
                 )
@@ -1070,7 +1092,7 @@ class Indexer:
                         "name": stmt.target.name,
                         "catalog": stmt.target.catalog or "",
                         "db": stmt.target.db or "",
-                        "kind": "TABLE",
+                        "kind": "table",
                         "defined_in_file": "",
                     }
                 )
@@ -1134,22 +1156,3 @@ class Indexer:
 
         # Return the number of new edges created
         return max(0, after_count - before_count)
-
-    def _reindex_view_definition(
-        self, view_name: str, db: GraphBackend, dialect: str | None
-    ) -> None:
-        """Re-index the file that defines a view.
-
-        Args:
-            view_name: Qualified view name
-            db: GraphBackend instance
-            dialect: SQL dialect
-        """
-        query = (
-            f"MATCH (t:{NodeLabel.TABLE} {{qualified: $name}})"
-            f"-[:{RelType.DEFINED_IN}]->(f:{NodeLabel.FILE}) "
-            "RETURN f.path AS path"
-        )
-        result = db.run_read(query, {"name": view_name})
-        for row in result:
-            self.reindex_file(row["path"], db, dialect)
