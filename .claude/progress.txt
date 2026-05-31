@@ -1,3 +1,34 @@
+## Current State — architect-planner: feature_F2_bundle_claude_skill
+
+ACTIVE AGENT: architect-planner
+FEATURE: F2 — bundle a Claude skill in install (last v1.1.0 feature)
+BRANCH: feat/cluster-b-provenance
+PLAN: plan/feature_F2_bundle_claude_skill.md
+STATUS: PLAN COMMITTED — idle, available for developer Q&A + compliance check
+
+KEY FINDING: F2 is ALREADY IMPLEMENTED, WIRED, AND TESTED on this branch.
+  - server/skill.py (render_skill/render_body/list_registered_tools/_tool_is_heuristic/TOOL_RETURN_MODELS)
+  - cli/commands/install.py (--scope/--repo, _resolve_scope, _provision_skill)
+  - cli/commands/uninstall.py (_step4_remove_skill + _SKILL_DIR_TARGETS)
+  - cli/commands/mcp.py (mcp best-practices -> render_body)
+  - tests: F2 unit (22 passed, 1 skipped gate) + e2e test_F2_skill_install_e2e.py
+  - ARCHITECTURE_REVIEW.md §16.2 records F2 + the locked install-location decision
+
+THE PLAN IS A CODE-VS-PLAN VERIFICATION + ONE-GAP-CLOSE:
+  - GAP (Phase A, the only code change): the shipped skill prose teaches #32
+    confidence/reason and #34/#35 presentation/external_consumer, but does NOT teach
+    the #31 file/line/expression provenance OR the #33 table_kind distinction on a
+    LineageNode. Fix = extend _BOUNDARY/_WORKFLOWS prose in skill.py (prose-only,
+    no logic/no new method). Add a render-output assertion test.
+  - Everything else verified shipped/green; SCHEMA_VERSION stays "6" (no graph impact).
+
+RELEASE-GATE CONFIRMATION (single item for sleeping user):
+  - --scope TTY-prompt default is currently `project` (recommended, repo-scoped,
+    zero-config for 20-ETL user). Confirm `project` vs `global`. One-line change.
+    The "lost locked decision" is NOT lost — it is in ARCHITECTURE_REVIEW.md §16.2.
+
+NEXT: hand to developer for Phase A prose edit + test, then plan-compliance check.
+
 ## Current State — developer: hygiene_config_path_and_survivors (all 4 phases)
 
 ACTIVE AGENT: developer
