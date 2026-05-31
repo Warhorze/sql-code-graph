@@ -1,4 +1,74 @@
-## Current State — developer: #34 analyze_unused presentation segregation
+## Current State — developer: #35a PR-1 external downstream lineage injection
+
+ACTIVE AGENT: developer — #35a PR-1 implementation COMPLETE
+  plan: plan/feature_35_external_downstream_injection.md
+  branch: feat/cluster-b-provenance
+  commit: ca8d950
+  status: PR UPDATED (#37) — ready for review
+
+  Files changed:
+    - src/sqlcg/core/schema.py (SCHEMA_VERSION "5"→"6"; EXTERNAL_CONSUMER + CONSUMED_BY enums + aliases)
+    - src/sqlcg/core/schema.cypher (ExternalConsumer node table + CONSUMED_BY rel table)
+    - src/sqlcg/core/graph_db.py (case NodeLabel.EXTERNAL_CONSUMER: return "name" in _pk_field; GraphDB alias)
+    - src/sqlcg/core/config.py (ExternalConsumerSpec model + get_external_consumers function)
+    - src/sqlcg/indexer/indexer.py (_ingest_external_consumers method + call site + result dict keys)
+    - tests/unit/test_star_schema_unit.py (version assertion "5"→"6")
+    - tests/unit/test_index_flags.py (mock get_schema_version "5"→"6")
+    - tests/unit/test_index_cmd.py (mock get_schema_version "5"→"6")
+    - tests/unit/test_freshness_helper.py (mock get_schema_version "5"→"6")
+    - tests/unit/test_include_working_tree.py (mock get_schema_version "5"→"6")
+    - tests/unit/test_pr07_observability.py (MagicMock schema version "5"→"6")
+    - tests/integration/test_pr2_source_location.py (SCHEMA_VERSION assertion "5"→"6")
+    - tests/integration/test_parse_diagnostics.py (schema version assertion "5"→"6")
+    - tests/integration/test_freshness_mcp.py (mock get_schema_version "5"→"6")
+
+  Test results (full suite, excl. e2e):
+    809 passed, 6 skipped, 1 xfailed, 3 failed (PR-2 tests only — expected)
+    - tests/unit/test_T35_config_external_consumers.py: 7 passed (T35-CFG-* all green)
+    - tests/integration/test_T35_external_consumers.py: 19 passed, 2 skipped, 3 failed (PR-2)
+    - T35-PERF: PASSED (bulk-only upsert verified)
+    - Perf invariants: test_perf_scaling_guard (4), test_T09_01_qualify_once (2),
+      test_bulk_upsert_invariant (1) — all 7 green
+
+  Wiring verified:
+    - _ingest_external_consumers: def (indexer.py:1167) + call (indexer.py:349) ✓
+    - get_external_consumers: defined config.py:277, called indexer.py:1177 ✓
+    - NodeLabel.EXTERNAL_CONSUMER + RelType.CONSUMED_BY in upsert calls ✓
+    - _pk_field EXTERNAL_CONSUMER case before default "id" in graph_db.py:207 ✓
+    - SCHEMA_VERSION = "6" at schema.py:6 (single definition) ✓
+    - upsert_nodes_bulk / upsert_edges_bulk only — zero singular calls ✓
+    - Zero new ops in _extract_column_lineage / _upsert_parsed_file / _flush_batch ✓
+
+  Deviations: None — all plan steps implemented as specified.
+    - GraphDB alias added to graph_db.py for test compatibility (test imports GraphDB,
+      production class is GraphBackend; alias is a non-functional name binding)
+
+  PR: https://github.com/Warhorze/sql-code-graph/pull/37
+
+## Prior State — plan-reviewer: #35 external downstream lineage injection
+
+ACTIVE AGENT: plan-reviewer — #35 feature plan reviewed
+  plan: plan/feature_35_external_downstream_injection.md
+  branch: feat/cluster-b-provenance
+  status: READY FOR IMPLEMENTATION
+  verdict: APPROVE-WITH-CHANGES (2 warnings corrected in-place, open question resolved)
+
+  Warnings corrected:
+    W1: Per-terminal GET_TABLE_EXTERNAL_CONSUMERS queries in Steps 2.2/2.3 replaced with
+        single GET_TABLES_EXTERNAL_CONSUMERS_BATCH UNWIND query for get_downstream_dependencies
+        and diff_impact. Prevents O(N_terminals) round-trips.
+    W2: PR-2 wiring checklist query name updated to BATCH variant + no-per-table-loop grep guard.
+
+  Open question resolved:
+    Non-presentation attachment: CONFIRMED attach+warn. Developer instruction recorded in plan.
+
+  Failing tests committed:
+    tests/unit/test_T35_config_external_consumers.py (T35-CFG-*)
+    tests/integration/test_T35_external_consumers.py (T35-IDX/DOWN/DIFF/UNUSED/PERF/schema)
+    State: 1 FAIL (schema_version_is_6), 24 SKIP — correct pre-implementation state.
+    Commits: fdb2f82 (plan), bf16cc7 (tests)
+
+## Prior State — developer: #34 analyze_unused presentation segregation
 
 ACTIVE AGENT: developer — #34 implementation
   plan: plan/feature_34_unused_presentation_segregation.md

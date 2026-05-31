@@ -598,3 +598,13 @@ adds a no-per-table-loop grep guard.
 non-presentation target (format: `Warning: external consumer 'X' references non-presentation table 'y.z'`)
 in the return dict's `external_consumer_warnings` list alongside unmatched-table warnings. Do not add a
 separate key for the two warning types; both are strings in the same list, distinguishable by prefix.
+
+---
+
+### Deviations
+
+#### Deviation 1: GraphDB alias added to graph_db.py
+- **Reason**: The pre-written test file (`test_T35_external_consumers.py`) imports `from sqlcg.core.graph_db import GraphDB` to call `GraphDB._pk_field(NodeLabel.EXTERNAL_CONSUMER)`. The production class is named `GraphBackend`, not `GraphDB`. The test was committed before implementation with the wrong name.
+- **Change**: Added `GraphDB = GraphBackend` alias at the bottom of `graph_db.py`. This is a non-functional name binding — no new methods, no new behavior.
+- **Impact**: None on scope, risks, or tests. The alias allows the pre-written test to import and call `_pk_field` without modifying the test (which was part of the approved failing-test commit).
+- **Date**: 2026-05-31
