@@ -603,8 +603,15 @@ separate key for the two warning types; both are strings in the same list, disti
 
 ### Deviations
 
-#### Deviation 1: GraphDB alias added to graph_db.py
-- **Reason**: The pre-written test file (`test_T35_external_consumers.py`) imports `from sqlcg.core.graph_db import GraphDB` to call `GraphDB._pk_field(NodeLabel.EXTERNAL_CONSUMER)`. The production class is named `GraphBackend`, not `GraphDB`. The test was committed before implementation with the wrong name.
-- **Change**: Added `GraphDB = GraphBackend` alias at the bottom of `graph_db.py`. This is a non-functional name binding — no new methods, no new behavior.
-- **Impact**: None on scope, risks, or tests. The alias allows the pre-written test to import and call `_pk_field` without modifying the test (which was part of the approved failing-test commit).
+#### Deviation 1: GraphDB alias added then removed
+- **Reason (PR-1)**: The pre-written test file (`test_T35_external_consumers.py`) imports `from sqlcg.core.graph_db import GraphDB` to call `GraphDB._pk_field(NodeLabel.EXTERNAL_CONSUMER)`. The production class is named `GraphBackend`, not `GraphDB`. The test was committed before implementation with the wrong name.
+- **Change (PR-1)**: Added `GraphDB = GraphBackend` alias at the bottom of `graph_db.py`. This is a non-functional name binding — no new methods, no new behavior.
+- **Resolution (PR-2)**: Per the CLAUDE.md no-backward-compat policy, the alias was removed in PR-2 and the test fixed to import `GraphBackend` directly.
+- **Impact**: None on scope, risks, or tests.
+- **Date**: 2026-05-31
+
+#### Deviation 2: Two-query pattern for analyze_unused consumer flag
+- **Reason**: The plan specified extending `ANALYZE_UNUSED_TABLES` with `OPTIONAL MATCH (t)-[c:CONSUMED_BY]->() ... count(c)`. This Cypher form triggers a KuzuDB binder error ("Variable t is not in scope") when `MATCH ... WHERE NOT (t)<-[:SELECTS_FROM]-()` precedes an `OPTIONAL MATCH` referencing the same variable — a KuzuDB scoping limitation verified on the installed version.
+- **Change**: `analyze_unused` uses the original `ANALYZE_UNUSED_TABLES` query unchanged, then issues one `GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY` call over the full unused-table list. Semantically equivalent to the plan's single-query approach.
+- **Impact**: Still a single bounded round-trip per `analyze_unused` call. The `ANALYZE_UNUSED_TABLES` query is unchanged (no schema migration risk). No test changes needed beyond what was already planned.
 - **Date**: 2026-05-31
