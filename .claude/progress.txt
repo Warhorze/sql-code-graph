@@ -4,7 +4,39 @@ ACTIVE AGENT: developer — sprint-12 PR-F: three live-verification defects
   plan: plan/sprint_12_v1.1.0.md (PR-F ticket + structured sections)
   branch: fix/v1.0.2-bugfix
   issues: #28 (Cluster A live-verification of PR-E against ../dwh)
-  status: IN PROGRESS
+  status: COMPLETE — committed 9c385c0 on fix/v1.0.2-bugfix
+
+Handoff:
+  agent: developer (PR-F complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  commit: 9c385c0
+  files changed:
+    - src/sqlcg/cli/commands/reindex.py (Bug1: TimeoutError clause + _NOTIFY_SOCKET_TIMEOUT_S=300; Bug2: _resolve_ref + _get_head delegation; resolve from/to in both paths)
+    - src/sqlcg/cli/commands/git.py (Bug3: _resolve_sqlcg_bin + {sqlcg_bin} template substitution; sentinels unchanged)
+    - tests/integration/test_reindex_via_server.py (PR-F Scenarios F1-A, F1-B, F2-C, F2-D)
+    - tests/unit/test_git_hooks.py (PR-F Scenarios F3-E, F3-F, F3-G; updated C/D shim tests)
+    - tests/e2e/test_git_hook_install.py (updated Scenarios C/D with _resolve_sqlcg_bin patch)
+  test results: 837 passed, 6 skipped, 3 xfailed (full suite minus benchmarks)
+    + 13 integration tests (PR-D+PR-F scenarios all pass)
+    + 21 unit hook tests all pass
+    + 8 e2e hook tests all pass
+  pyright: 0 errors
+  ruff: all checks passed
+  wiring verified:
+    - _NOTIFY_SOCKET_TIMEOUT_S=300 defined at reindex.py:25, used at :89
+    - TimeoutError clause at reindex.py:127 (before OSError clause at :143)
+    - _resolve_ref defined at :244, called at :103, :104, :181, :182
+    - _get_head delegates to _resolve_ref at :276
+    - shutil.which + sys.argv + sqlcg_bin in git.py:74, :79, :99
+    - sentinels "# sqlcg post-checkout hook" / "# sqlcg post-merge hook" unchanged in git.py:31, :45
+    - zero TODOs in reindex.py and git.py
+    - git diff --stat: only reindex.py, git.py, 3 test files (no parsers/indexer)
+  Scenario H: deferred — live ../dwh verification requires real DWH environment;
+    the subprocess boundary makes monkeypatching _NOTIFY_SOCKET_TIMEOUT_S across
+    process boundaries impractical without env-var plumbing not in the plan.
+    The in-process test (F1-A) covers the same invariant (TimeoutError → exit 0,
+    resync NOT called) with a monkeypatched 1s timeout.
+  deviations: none
 
 ---
 
