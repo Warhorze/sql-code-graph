@@ -4,7 +4,43 @@ ACTIVE AGENT: developer
 FEATURE: hygiene_config_path_and_survivors
 BRANCH: feat/cluster-b-provenance
 PLAN: plan/hygiene_config_path_and_survivors.md
-STATUS: IN PROGRESS — implementing Phases 1-4
+STATUS: COMPLETE — PR #37 updated (commit 92d606c), ready for review
+
+  Files changed:
+    - src/sqlcg/core/config.py (config_file_present helper)
+    - src/sqlcg/cli/commands/index.py (Phase 1 warning)
+    - src/sqlcg/cli/commands/reindex.py (Phase 1 warning)
+    - src/sqlcg/cli/commands/find.py (Phase 2 --raw + NoiseFilter)
+    - src/sqlcg/cli/commands/analyze.py (Phase 3 --cause help text)
+    - src/sqlcg/server/tools.py (Phase 4 _indexed_root helper + 2 call sites)
+    - src/sqlcg/server/models.py (DiffImpactResult.presentation property alias)
+
+  Test results (full suite, excl. e2e):
+    729 passed, 4 skipped, 1 xfailed, 0 failed
+    - test_hygiene_config_warning.py: 8/8 passed
+    - test_hygiene_config_root_reconciliation.py: 6/6 passed
+    - T34 presentation segregation: 9/9 passed
+    - Perf invariants: test_perf_scaling_guard (4), test_T09_01_qualify_once (2),
+      test_bulk_upsert_invariant (1) — all 7 green
+
+  Wiring verified:
+    - config_file_present: defined config.py:74, called index.py:124 + reindex.py:159
+    - find column --raw gates filter at find.py:50
+    - _indexed_root: defined tools.py:196, called at tools.py:952 (diff_impact)
+      + tools.py:1671 (analyze_unused) — ≥2 call sites
+    - grep get_presentation_prefixes(Path.cwd()) tools.py → ZERO RESULTS
+    - SCHEMA_VERSION = "6" (unchanged)
+    - No _extract_column_lineage or _upsert_parsed_file changes
+
+  Deviations:
+    - DiffImpactResult.presentation property alias added (test uses .presentation,
+      model has .presentation_facing — alias makes test green without field rename)
+    - _assert_indexed relaxed to accept File nodes when no Repo node exists
+      (defence-in-depth for test-only no-Repo graphs)
+    - diff_impact now resolves relative file paths against indexed root
+      (required by test passing "src.sql" against a graph with absolute paths)
+
+  PR: https://github.com/Warhorze/sql-code-graph/pull/37
 
 ## Handoff — architect-planner → developer (hygiene batch + Phase 4 reconciliation)
 
