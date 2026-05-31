@@ -1,4 +1,33 @@
-## Current State — plan-reviewer: #34 analyze_unused presentation segregation
+## Current State — developer: #34 analyze_unused presentation segregation
+
+ACTIVE AGENT: developer — #34 implementation
+  plan: plan/feature_34_unused_presentation_segregation.md
+  branch: feat/cluster-b-provenance
+  commit: 4698496
+  status: PR UPDATED (PR #37) — ready for review
+
+  Files changed:
+    - src/sqlcg/server/models.py (PresentationCandidate model + presentation_facing field on UnusedTablesResult)
+    - src/sqlcg/server/tools.py (_matched_presentation_prefix helper + prefix branch in analyze_unused loop + updated hint logic + PresentationCandidate import)
+    - src/sqlcg/server/skill.py (_WORKFLOWS analyze_unused line updated to mention presentation_facing)
+
+  Test results:
+    - tests/integration/test_T34_presentation_segregation.py: 9 passed (all scenarios A-E + wiring checks)
+    - Full suite (excl. e2e): 789 passed, 4 skipped, 1 xfailed
+    - pyright: 0 errors | ruff: all checks passed | pre-commit hooks: passed
+
+  Wiring verified:
+    - _matched_presentation_prefix: definition + call (>=2 hits in tools.py) ✓
+    - PresentationCandidate(: 1 constructor hit in tools.py ✓
+    - presentation_facing=: 2 hits in tools.py (diff_impact + analyze_unused) ✓
+    - SCHEMA_VERSION = "5" unchanged ✓
+    - _WORKFLOWS analyze_unused line contains presentation_facing ✓
+
+  Deviations: None — all 4 phases implemented as planned.
+
+  PR: https://github.com/Warhorze/sql-code-graph/pull/37
+
+## Prior State — plan-reviewer: #34 analyze_unused presentation segregation
 
 ACTIVE AGENT: plan-reviewer — #34 feature plan gate
   plan: plan/feature_34_unused_presentation_segregation.md
