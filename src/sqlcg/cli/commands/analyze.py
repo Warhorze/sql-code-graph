@@ -189,11 +189,19 @@ def impact(  # noqa: B008
 @app.command("failures")
 def failures(
     cause: str | None = typer.Option(  # noqa: B008
-        None, "--cause", help="Filter by E-code bucket (e.g. E5, timeout)"
+        None,
+        "--cause",
+        help=(
+            "Filter by E-code bucket. Valid values: "
+            "timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip"
+        ),
     ),
     limit: int = typer.Option(100, "--limit", help="Maximum rows to return"),  # noqa: B008
 ) -> None:
     """List files that failed to parse, with their dominant cause (E-code bucket).
+
+    Valid --cause buckets (from highest to lowest severity):
+    timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip.
 
     Requires a graph indexed with sqlcg >= v3 (schema version 3). Re-index
     with 'sqlcg db reset && sqlcg index <path>' if the graph was built with

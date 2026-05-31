@@ -171,19 +171,51 @@ def _open_backend():
 
 
 def _assert_indexed(db: GraphBackend) -> None:
-    """Check that the graph has indexed repos.
+    """Check that the graph has indexed content (repos or files).
+
+    Accepts a graph with Repo nodes (normal post-index_cmd state) OR with File
+    nodes but no Repo (e.g. a graph populated directly via Indexer without the CLI
+    wrapper). Returns without error when either is present.
 
     Args:
         db: GraphBackend instance
 
     Raises:
-        NotIndexedError: If no repos have been indexed
+        NotIndexedError: If no repos or files have been indexed
     """
     rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
-    if not rows or rows[0]["n"] == 0:
-        raise NotIndexedError(
-            "No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first."
-        )
+    if rows and rows[0]["n"] > 0:
+        return
+    # Fallback: accept a graph with File nodes but no Repo (test-only or partial state).
+    file_rows = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})
+    if file_rows and file_rows[0]["n"] > 0:
+        return
+    raise NotIndexedError("No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first.")
+
+
+def _indexed_root(db: GraphBackend) -> Path | None:
+    """Return the indexed root path stored on the first Repo node, or None.
+
+    Reads the persisted ``Repo.path`` primary key (set at index time by ``index_cmd``).
+    Uses the same query pattern as ``db_info``'s freshness computation.  Returns ``None``
+    when no Repo node exists or the path field is empty — callers fall back to
+    ``Path.cwd()`` via ``_indexed_root(db) or Path.cwd()``.
+
+    Multi-Repo: first Repo node wins (LIMIT 1), matching the existing freshness path.
+
+    Args:
+        db: GraphBackend instance
+
+    Returns:
+        Absolute Path of the indexed root, or None if unavailable.
+    """
+    try:
+        rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        if rows and rows[0].get("path"):
+            return Path(rows[0]["path"])
+    except Exception:
+        pass
+    return None
 
 
 def _bare_ref(ref: str) -> str:
@@ -917,13 +949,19 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
     """
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
-        prefixes = get_presentation_prefixes(Path.cwd())
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
+        prefixes = get_presentation_prefixes(root)
 
         changed_tables: list[str] = []
         seen_changed: set[str] = set()
         for file_path in changed_files:
-            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": file_path})
+            # Resolve relative paths against the indexed root so callers can pass
+            # relative names from the repo root (e.g. "etl/my_file.sql").
+            fp = Path(file_path)
+            if not fp.is_absolute():
+                fp = root / fp
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(fp)})
             for row in rows:
                 tq = row["table_qualified"]
                 if tq not in seen_changed:
@@ -1630,14 +1668,15 @@ def analyze_unused() -> UnusedTablesResult:
     """
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         # Single aggregation — no Python per-row graph traversal.
         unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
         total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
         total_tables_scanned = total_rows[0]["n"] if total_rows else 0
 
-        prefixes = get_presentation_prefixes(Path.cwd())
+        prefixes = get_presentation_prefixes(root)
 
         # Build a set of tables that have at least one CONSUMED_BY edge, using a single
         # BATCH query over all unused tables (one round-trip, not one per table).

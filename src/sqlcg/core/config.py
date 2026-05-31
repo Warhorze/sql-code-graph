@@ -71,6 +71,21 @@ def get_db_path() -> Path:
     return KuzuConfig.from_env().db_path
 
 
+def config_file_present(path: Path) -> bool:
+    """Return True when a .sqlcg.toml file exists at the given directory.
+
+    Single source of truth for the config filename so callers never hard-code
+    ".sqlcg.toml" independently.
+
+    Args:
+        path: Directory to check for .sqlcg.toml
+
+    Returns:
+        True if path/.sqlcg.toml exists, False otherwise.
+    """
+    return (Path(path) / ".sqlcg.toml").exists()
+
+
 def get_dialect(path: Path) -> str:
     """Get the SQL dialect from .sqlcg.toml or fall back to snowflake.
 

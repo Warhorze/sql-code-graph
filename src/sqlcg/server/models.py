@@ -345,6 +345,11 @@ class DiffImpactResult(BaseModel):
         None, description="Diagnostic hint when result is empty or approximate."
     )
 
+    @property
+    def presentation(self) -> list[str]:
+        """Alias for presentation_facing (backward-compatible accessor)."""
+        return self.presentation_facing
+
 
 class ScopeChangeResult(BaseModel):
     """Result of scope_change — single-call synthesis of everything an LLM needs

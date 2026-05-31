@@ -1,3 +1,11 @@
+## Current State — developer: hygiene_config_path_and_survivors (all 4 phases)
+
+ACTIVE AGENT: developer
+FEATURE: hygiene_config_path_and_survivors
+BRANCH: feat/cluster-b-provenance
+PLAN: plan/hygiene_config_path_and_survivors.md
+STATUS: IN PROGRESS — implementing Phases 1-4
+
 ## Handoff — architect-planner → developer (hygiene batch + Phase 4 reconciliation)
 
 PLAN: plan/hygiene_config_path_and_survivors.md  (amended; now 4 phases, ONE PR)

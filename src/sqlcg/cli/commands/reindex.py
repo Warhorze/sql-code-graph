@@ -73,7 +73,7 @@ def reindex_cmd(  # noqa: B008
     import json
     import socket as _socket
 
-    from sqlcg.core.config import get_backend, get_db_path, get_dialect
+    from sqlcg.core.config import config_file_present, get_backend, get_db_path, get_dialect
     from sqlcg.core.schema import SCHEMA_VERSION
     from sqlcg.indexer.indexer import Indexer
     from sqlcg.server.control import sock_path
@@ -155,6 +155,13 @@ def reindex_cmd(  # noqa: B008
     # Resolve dialect
     if dialect == "auto":
         dialect = get_dialect(path)
+
+    if not quiet and not config_file_present(path):
+        console.print(
+            f"[yellow]No .sqlcg.toml found at {path}/.sqlcg.toml — "
+            "using defaults (snowflake dialect, no aliases/prefixes). "
+            "Create .sqlcg.toml in the index directory to customise.[/yellow]"
+        )
 
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)

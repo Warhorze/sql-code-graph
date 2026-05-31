@@ -38,6 +38,7 @@ def find_table(  # noqa: B008
 @app.command("column")
 def find_column(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference (table.column)"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find a column by table.column reference."""
     ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
@@ -46,6 +47,12 @@ def find_column(  # noqa: B008
             f"MATCH (c:{NodeLabel.COLUMN}) WHERE c.id CONTAINS $ref RETURN c.id AS id LIMIT 50",
             {"ref": ref},
         )
+        if not raw:
+            from sqlcg.server.noise_filter import NoiseFilter
+
+            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+            # Filter on the schema.table portion of each column id (schema.table.column)
+            results = [r for r in results if not nf.is_noise(r["id"].rsplit(".", 1)[0])]
         _print_table(results, ["id"])
 
 
