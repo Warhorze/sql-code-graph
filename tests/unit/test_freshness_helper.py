@@ -278,7 +278,7 @@ class TestCliEmptyDb:
             mock_backend = MagicMock()
             mock_backend.__enter__.return_value = mock_backend
             mock_backend.__exit__.return_value = None
-            mock_backend.get_schema_version.return_value = "4"
+            mock_backend.get_schema_version.return_value = "5"
             # Empty DB: no indexed SHA, no Repo nodes
             mock_backend.get_indexed_sha.return_value = None
 

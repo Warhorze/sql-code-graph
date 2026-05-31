@@ -207,6 +207,7 @@ class QueryNode:
         confidence: Overall confidence score for this query's lineage
         parsing_mode: How the query was parsed (e.g., "sqlglot", "fallback", "scripting")
         defined_body: For CTAS statements, the exp.Select or exp.Subquery body being created
+        start_line: 1-based start line of statement in file; 0 = unknown (scripting-path sentinel)
     """
 
     file: Path
@@ -223,6 +224,7 @@ class QueryNode:
     star_sources: list[StarSource] = field(default_factory=list)
     defined_columns: list[str] = field(default_factory=list)
     defined_body: Any | None = None
+    start_line: int = 0  # 1-based start line of statement in file; 0 = unknown
 
 
 @dataclass

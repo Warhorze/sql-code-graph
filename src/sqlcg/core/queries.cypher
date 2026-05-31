@@ -23,7 +23,10 @@ MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path
 
 -- TRACE_COLUMN_LINEAGE
 MATCH (dst:SqlColumn {id: $id})<-[r:COLUMN_LINEAGE]-(src:SqlColumn)
-RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified, r.transform AS transform, r.confidence AS confidence
+OPTIONAL MATCH (q:SqlQuery {id: r.query_id})
+RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified,
+       r.transform AS transform, r.confidence AS confidence,
+       q.file_path AS file, q.start_line AS line, q.sql AS expression
 
 -- FIND_TABLE_USAGES
 MATCH (t:SqlTable {name: $name})<-[:SELECTS_FROM]-(q:SqlQuery)

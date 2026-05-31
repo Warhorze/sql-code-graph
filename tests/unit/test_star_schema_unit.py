@@ -20,12 +20,12 @@ def test_rel_type_star_source_enum_value():
     assert RelType.STAR_SOURCE == "STAR_SOURCE"
 
 
-def test_schema_version_is_four():
-    """SCHEMA_VERSION must be '4' after the living-codebase-resync schema change."""
+def test_schema_version_is_five():
+    """SCHEMA_VERSION must be '5' after the PR-2 source-location schema change."""
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "4", (
-        f"Expected SCHEMA_VERSION='4', got {SCHEMA_VERSION!r}. "
+    assert SCHEMA_VERSION == "5", (
+        f"Expected SCHEMA_VERSION='5', got {SCHEMA_VERSION!r}. "
         "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py."
     )
 
@@ -132,7 +132,7 @@ def test_star_metrics_in_info_output():
         mock_backend = MagicMock()
         mock_backend.__enter__.return_value = mock_backend
         mock_backend.__exit__.return_value = None
-        mock_backend.get_schema_version.return_value = "4"
+        mock_backend.get_schema_version.return_value = "5"
 
         def run_read_side_effect(query, _params):
             if "STAR_SOURCE" in query and "COLUMN_LINEAGE" not in query:

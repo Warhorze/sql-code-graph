@@ -584,10 +584,10 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 name=row.get("col_name", ""),
                                 kind="column",
                                 table=row.get("table_qualified"),
-                                file=None,
+                                file=row.get("file"),
                                 confidence=row.get("confidence"),
-                                line=None,
-                                expression=None,
+                                line=row.get("line") or None,
+                                expression=row.get("expression"),
                                 reason=_reason_for(row.get("transform"), row.get("confidence")),
                             )
                         )
@@ -622,10 +622,10 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 name=row.get("col_name", ""),
                                 kind="column",
                                 table=row.get("table_qualified"),
-                                file=None,
+                                file=row.get("file"),
                                 confidence=row.get("confidence"),
-                                line=None,
-                                expression=None,
+                                line=row.get("line") or None,
+                                expression=row.get("expression"),
                                 reason=_reason_for(row.get("transform"), row.get("confidence")),
                             )
                         )

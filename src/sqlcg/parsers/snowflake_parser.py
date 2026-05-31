@@ -79,10 +79,28 @@ class SnowflakeParser(AnsiParser):
         # Check for scripting blocks
         if self._has_scripting_block(sql):
             logger.debug("Snowflake scripting block detected in %s, using DML extraction", path)
+            # Scripting path uses regex DML extraction; original line positions are lost.
+            # QueryNode.start_line defaults to 0 (unknown sentinel) for these nodes.
             return self._parse_scripting_file(path, sql)
 
-        # Otherwise use standard ANSI parsing with Snowflake dialect
-        return AnsiParser.parse_file(self, path, sql, dependency_filter=dependency_filter)  # type: ignore
+        # Compute start-line map from the PREPROCESSED SQL.
+        # _preprocess_snowflake_sql strips statement text but preserves surrounding
+        # newlines (e.g. ALTER … SET TAG; becomes an empty line, not a line deletion).
+        # This means line numbers in the preprocessed text still reflect their original
+        # file positions.  Computing _compute_start_lines on the preprocessed SQL
+        # therefore gives correct original-file line numbers for all surviving statements,
+        # even when whole statements were deleted by preprocessing (Gap 4b).
+        #
+        # Passing the map explicitly avoids AnsiParser recomputing it from `sql`
+        # again (a no-op difference, but explicit is clearer and future-proof).
+        preprocessed_start_lines = AnsiParser._compute_start_lines(sql)  # type: ignore[attr-defined]
+        return AnsiParser.parse_file(  # type: ignore[call-arg]
+            self,  # type: ignore[arg-type]
+            path,
+            sql,
+            dependency_filter=dependency_filter,  # type: ignore[call-arg]
+            _precomputed_start_lines=preprocessed_start_lines,  # type: ignore[call-arg]
+        )
 
     @staticmethod
     def _preprocess_snowflake_sql(sql: str) -> str:

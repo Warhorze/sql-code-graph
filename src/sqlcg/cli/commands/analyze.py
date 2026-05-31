@@ -32,17 +32,21 @@ def upstream(  # noqa: B008
 
     with get_backend() as backend:
         results = backend.run_read(
-            f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $ref}})"
-            f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src) "
-            "RETURN src.id AS id LIMIT 100",
+            f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+            f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
+            f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
+            "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+            "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
             {"ref": ref},
         )
         if not results and len(ref.split(".")) >= 3:
             bare = _bare_ref(ref)
             fallback_results = backend.run_read(
-                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
-                f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src) "
-                "RETURN src.id AS id LIMIT 100",
+                f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
+                f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
+                "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+                "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
                 {"bare": bare},
             )
             if fallback_results:
@@ -59,7 +63,7 @@ def upstream(  # noqa: B008
 
             nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
             results = _filter_column_results(results, nf)
-        _print_table(results, ["id"])
+        _print_table(_add_file_line_col(results), ["id", "file:line"])
 
 
 @app.command("downstream")
@@ -76,17 +80,21 @@ def downstream(  # noqa: B008
 
     with get_backend() as backend:
         results = backend.run_read(
-            f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $ref}})"
-            f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst) "
-            "RETURN dst.id AS id LIMIT 100",
+            f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+            f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+            f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
+            "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+            "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
             {"ref": ref},
         )
         if not results and len(ref.split(".")) >= 3:
             bare = _bare_ref(ref)
             fallback_results = backend.run_read(
-                f"MATCH p=(c:{NodeLabel.COLUMN} {{id: $bare}})"
-                f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst) "
-                "RETURN dst.id AS id LIMIT 100",
+                f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
+                f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+                f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
+                "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+                "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
                 {"bare": bare},
             )
             if fallback_results:
@@ -103,7 +111,7 @@ def downstream(  # noqa: B008
 
             nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
             results = _filter_column_results(results, nf)
-        _print_table(results, ["id"])
+        _print_table(_add_file_line_col(results), ["id", "file:line"])
 
 
 @app.command("impact")
@@ -194,6 +202,25 @@ def _filter_column_results(
 ) -> list[dict]:
     """Filter column-ID result rows by NoiseFilter, dropping rows whose table is noise."""
     return [r for r in results if not nf.is_noise(_col_id_to_table(r["id"]))]
+
+
+def _add_file_line_col(rows: list[dict]) -> list[dict]:
+    """Add a 'file:line' composite column from 'file' and 'line' fields.
+
+    Formats as 'path/to/file.sql:N' when both are present, or '?' when either
+    is absent (multi-hop upstream where file/line is not available).
+    """
+    result = []
+    for row in rows:
+        new_row = dict(row)
+        file = row.get("file")
+        line = row.get("line")
+        if file and line:
+            new_row["file:line"] = f"{file}:{line}"
+        else:
+            new_row["file:line"] = "?"
+        result.append(new_row)
+    return result
 
 
 def _print_table(rows: list[dict], columns: list[str]) -> None:

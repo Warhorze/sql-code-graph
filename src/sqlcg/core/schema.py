@@ -3,7 +3,7 @@
 from enum import StrEnum
 from importlib.resources import files
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 class NodeLabel(StrEnum):

@@ -44,7 +44,8 @@ CREATE NODE TABLE SqlQuery (
     target_table STRING,
     parse_failed BOOLEAN,
     confidence FLOAT,
-    parsing_mode STRING
+    parsing_mode STRING,
+    start_line INT64
 );
 
 -- File -> Repo: file belongs to this repository

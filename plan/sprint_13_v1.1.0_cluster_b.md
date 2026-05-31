@@ -846,3 +846,17 @@ PR-2 commit (or added as a failing test ahead of the PR to document the gap).
 | `TableRef.role` field addition breaks serialization / pickling in subprocess isolation path | LOW | `QueryNode` and `ParsedFile` are pickled via `multiprocessing.Process` spawn context (`indexer.py:816`). Adding a defaulted field to a `@dataclass` does not break pickle. Confirm with the `test_bulk_upsert_invariant.py` run. |
 | `STALE_VIEWS` drop changes `reindex_file` observable behaviour | LOW | The cascade was already a no-op (zero rows returned). Removing dead code cannot break working behaviour. Confirm with existing `reindex_file` integration tests. |
 | `analyze upstream` query extension (file/line join via `r[-1].query_id`) fails on multi-hop paths where intermediate edges use different `query_id` values | MED | The join targets the **last** edge in the path (`r[-1]`). For multi-hop traversal, `r` is a list of edges; KuzuDB variable-length match returns the full path's edge list. Validate in Scenario B integration test. If the multi-hop join is unsupported, degrade gracefully: only expose `file:line` on single-hop upstream (emit empty for multi-hop). |
+
+### Deviations
+
+#### Deviation 1: Snowflake start_line computed from preprocessed SQL (not original)
+- **Reason**: The plan recommended computing `_compute_start_lines` on the original SQL (before `_preprocess_snowflake_sql`) to avoid desync. However, testing revealed that `_preprocess_snowflake_sql` removes the ALTER statement's *text* but preserves surrounding newlines, leaving empty lines in their place. This means the preprocessed SQL retains the original line positions for surviving statements. Computing start_lines from the PREPROCESSED SQL gives correct original-file line numbers (confirmed with `_compute_start_lines` on a 3-statement fixture with Gap 4b deletion).
+- **Change**: In `SnowflakeParser.parse_file`, `_compute_start_lines` is called on the SQL *after* `_preprocess_snowflake_sql` (not before). The result is passed as `_precomputed_start_lines` to `AnsiParser.parse_file` to avoid recomputation.
+- **Impact**: No scope change. Scenario F integration test confirms correct behavior (INSERT at original line 3, not post-preprocess line 2).
+- **Date**: 2026-05-31
+
+#### Deviation 2: `analyze upstream/downstream` file:line uses separate OPTIONAL MATCH (not r[-1])
+- **Reason**: KuzuDB 0.11.3 does not support `r[-1].query_id` on a variable-length path edge list (type is RECURSIVE_REL, not a LIST). Tested with `r[-1]`, `properties(r[-1], ...)` — both fail with binder exceptions.
+- **Change**: The `upstream` query uses a separate `OPTIONAL MATCH (src)-[direct:COLUMN_LINEAGE]->(c)` after the multi-hop traversal to retrieve file/line for direct (1-hop) upstream sources. Multi-hop sources get `file:line = ?`. The `downstream` query uses the same pattern: `OPTIONAL MATCH (c)-[direct:COLUMN_LINEAGE]->(dst)`. This is the plan's documented graceful-degradation fallback.
+- **Impact**: file/line is only populated for 1-hop upstream/downstream results in `analyze`. Multi-hop sources show `?`. The `trace_column_lineage` MCP tool (which walks 1-hop at a time in a BFS loop) always gets correct file/line for each hop. Acceptance criterion "sqlcg analyze upstream includes a file:line column" is satisfied.
+- **Date**: 2026-05-31

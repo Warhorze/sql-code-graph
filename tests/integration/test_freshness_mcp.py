@@ -189,7 +189,7 @@ class TestDbInfoNeo4jGuard:
     def test_neo4j_guard_returns_null_sha(self):
         """db_info returns indexed_sha=None and does not raise for Neo4j backend."""
         mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "4"
+        mock_backend.get_schema_version.return_value = "5"
         mock_backend.get_indexed_sha.side_effect = NotImplementedError("Not implemented for Neo4j")
 
         def run_read_side_effect(query: str, _params: dict):

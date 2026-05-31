@@ -984,6 +984,7 @@ class Indexer:
                     "parse_failed": stmt.parse_failed,
                     "confidence": stmt.confidence,
                     "parsing_mode": stmt.parsing_mode,
+                    "start_line": stmt.start_line,
                 }
             )
             query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
