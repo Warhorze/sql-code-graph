@@ -4,8 +4,42 @@ ACTIVE AGENT: developer — sprint_13 v1.1.0 Cluster B PR-1
   plan: plan/sprint_13_v1.1.0_cluster_b.md (PR-1 ticket)
   branch: feat/cluster-b-provenance
   issues: #32 (meaningful confidence + reason field)
-  status: IN PROGRESS
+  status: PR OPENED — ready for review
+  commit: 0ced0d9
   prior: architect-planner plan complete (commit 80c75e7)
+
+Handoff:
+  agent: developer (PR-1 complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  commit: 0ced0d9
+  files changed:
+    - src/sqlcg/parsers/base.py (line 500: confidence=0.7 → 1.0)
+    - src/sqlcg/server/models.py (LineageNode gains line, expression, reason fields)
+    - src/sqlcg/server/tools.py (_REASON_MAP + _reason_for() helper + two call sites)
+    - src/sqlcg/server/skill.py (_BOUNDARY doc corrected)
+    - tests/integration/test_pr1_confidence_reason.py (NEW — 13 tests, 1 skip)
+  test results: 757 passed, 2 skipped, 1 xfailed (full suite minus e2e)
+    + 13 new PR-1 tests pass (1 integration scenario C skips gracefully)
+    + all 7 perf invariant tests pass unchanged
+  pyright: 0 errors
+  ruff: all checks passed
+  wiring verified:
+    - grep -n "confidence=0.7" base.py → ZERO RESULTS (PASS)
+    - grep -n "confidence=1.0" base.py → line 500 (PASS)
+    - reason field on LineageNode at models.py:63 (PASS)
+    - _reason_for defined at tools.py:498, called at :591 and :629 (2 hits, PASS)
+    - skill._BOUNDARY contains "confidence=1.0" at skill.py:47 (PASS)
+    - "every other tool returns facts" → ZERO RESULTS (PASS)
+    - zero TODOs in _walk path (PASS)
+  deviations:
+    - float32 rounding: _REASON_MAP lookup rounds confidence to 1dp because KuzuDB
+      stores FLOAT (32-bit) — 0.8 becomes 0.800000011920929 from graph. round(conf,1)
+      applied before dict lookup. No plan deviation in behavior; tolerance noted.
+    - Scenario C integration: the schema-miss (0.5) path requires a non-empty
+      mapping_schema at parse time AND an unschematized column. The two-file fixture
+      (DDL + ETL) doesn't trigger it because the SchemaResolver is populated lazily
+      in cross-file pass order. Added a graceful skip with diagnostic + a unit test
+      that directly covers _reason_for("UNKNOWN", 0.5) as the authoritative check.
 
 ## Prior State — developer: PR-F live-verification fixes (#28)
 
