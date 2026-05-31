@@ -234,6 +234,11 @@ New blocks in [`queries.cypher`](../src/sqlcg/core/queries.cypher):
 MATCH (t:SqlTable {qualified: $table_qualified})-[:CONSUMED_BY]->(e:ExternalConsumer)
 RETURN e.name AS name, e.consumer_type AS consumer_type
 
+-- GET_TABLES_EXTERNAL_CONSUMERS_BATCH  (preferred for get_downstream_dependencies / diff_impact)
+UNWIND $table_qualifieds AS tq
+MATCH (t:SqlTable {qualified: tq})-[:CONSUMED_BY]->(e:ExternalConsumer)
+RETURN tq AS table_qualified, e.name AS name, e.consumer_type AS consumer_type
+
 -- COUNT_EXTERNAL_CONSUMERS
 MATCH ()-[r:CONSUMED_BY]->() RETURN count(r) AS n
 
@@ -247,9 +252,12 @@ ORDER BY t.qualified
 
 `get_downstream_dependencies` (table or column root): after the existing `COLUMN_LINEAGE` closure
 completes, roll the terminal columns up to their tables (reuse `_rollup_to_tables`, present at
-`tools.py`), then for each terminal table run `GET_TABLE_EXTERNAL_CONSUMERS` and append a
-`DependencyNode(name=consumer.name, kind="external_consumer", table=terminal_table)` for each. This is a
-bounded append (number of terminal tables × consumers), outside the 50k column-traversal loop.
+`tools.py`). **Issue one single `GET_TABLES_EXTERNAL_CONSUMERS_BATCH` query over all terminal tables
+at once** (passing `table_qualifieds=list_of_terminals` via `UNWIND`) rather than one
+`GET_TABLE_EXTERNAL_CONSUMERS` call per terminal table — the latter is O(N_terminals) round-trips and
+would regress if a blast radius has many terminal tables. Append a
+`DependencyNode(name=consumer.name, kind="external_consumer", table=terminal_table)` for each result
+row. This is a single bounded round-trip outside the 50k column-traversal loop.
 
 `diff_impact` gains `external_consumers: list[str]` — the union of consumer names attached to any
 `affected_tables` entry.
@@ -348,19 +356,25 @@ egress (provable egress point) from one without (candidate orphan even in the eg
   parses the new blocks (existing `_load` covers it).
 
 **Step 2.2 — Surface in `get_downstream_dependencies`.**
-- Files: [`tools.py`](../src/sqlcg/server/tools.py) `get_downstream_dependencies`.
-- After the column closure (line ~1146), roll terminal columns to tables, run
-  `GET_TABLE_EXTERNAL_CONSUMERS_QUERY` per terminal table, append
-  `DependencyNode(name=..., kind="external_consumer", table=...)`. Adjust the empty-result hint
-  (line 1150) so it is only shown when there are also no external consumers.
+- Files: [`queries.cypher`](../src/sqlcg/core/queries.cypher) (add `GET_TABLES_EXTERNAL_CONSUMERS_BATCH`),
+  [`queries.py`](../src/sqlcg/core/queries.py) (`GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY`),
+  [`tools.py`](../src/sqlcg/server/tools.py) `get_downstream_dependencies`.
+- After the column closure (line ~1146), roll terminal columns to tables via `_rollup_to_tables`,
+  then issue **one** `GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY` call with
+  `table_qualifieds=list(terminal_tables)`. Do NOT call `GET_TABLE_EXTERNAL_CONSUMERS_QUERY` once
+  per terminal — that is O(N_terminals) round-trips. Append
+  `DependencyNode(name=..., kind="external_consumer", table=...)` for each result row.
+  Adjust the empty-result hint (line 1150) so it only fires when there are also no external consumers.
 - Acceptance: tracing downstream from a column whose table has a `CONSUMED_BY` edge returns a node with
-  `kind="external_consumer"` and the consumer name; tracing a column with no consumer is byte-identical
-  to today.
+  `kind="external_consumer"` and the consumer name in a single-query append; tracing a column with
+  no consumer is byte-identical to today.
 
 **Step 2.3 — Surface in `diff_impact`.**
 - Files: [`models.py`](../src/sqlcg/server/models.py) (`DiffImpactResult.external_consumers:
-  list[str]`), [`tools.py`](../src/sqlcg/server/tools.py) `diff_impact` (union consumer names over
-  `affected_tables`; line ~964 result construction).
+  list[str] = Field(default_factory=list, description=...)`),
+  [`tools.py`](../src/sqlcg/server/tools.py) `diff_impact` (issue one
+  `GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY` over `affected_tables` at line ~964;
+  collect consumer names into a deduplicated list; do NOT call a per-table query in a loop).
 - Acceptance: `diff_impact` over a changed file whose downstream blast radius reaches a consumed table
   lists that consumer in `external_consumers`; empty when no consumers exist.
 
@@ -402,11 +416,13 @@ PR-1:
       (`git diff` shows zero changes to those method bodies).
 
 PR-2:
-- [ ] `GET_TABLE_EXTERNAL_CONSUMERS_QUERY` defined in `queries.py` AND used in `tools.py`/`analyze.py`:
-      `grep -rn "GET_TABLE_EXTERNAL_CONSUMERS_QUERY" src/` ≥ 3 hits.
+- [ ] `GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY` defined in `queries.py` AND used in `tools.py`/`analyze.py`:
+      `grep -rn "GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY" src/` ≥ 3 hits.
 - [ ] `DependencyNode(... kind="external_consumer"` constructed in `get_downstream_dependencies`.
 - [ ] `external_consumers=` populated in `diff_impact` result; field exists on `DiffImpactResult`.
 - [ ] `has_external_consumer=` populated in `analyze_unused`; field exists on `PresentationCandidate`.
+- [ ] No per-table loop calls `GET_TABLE_EXTERNAL_CONSUMERS_QUERY` in `get_downstream_dependencies`
+      or `diff_impact` — verify with `git diff` that only the `BATCH` variant appears in those methods.
 - [ ] skill string contains "external consumer" or "egress".
 
 ---
@@ -497,6 +513,88 @@ PR-2:
 
 ### Blocking Questions
 
-None blocking. One sub-decision (Decision 1: allow non-presentation attachment with a warning) is
-flagged for the plan-reviewer to confirm or override; the recommended default (attach + warn) is
-implementable as planned and does not block PR-1.
+None blocking.
+
+---
+
+## Plan-Reviewer Verdict
+
+**APPROVE-WITH-CHANGES** — plan committed at cabcafb is sound; two warnings corrected in-place above.
+
+### Review findings
+
+#### Verified claims (all confirmed against source)
+
+- `_pk_field` at `graph_db.py:192` is a `@staticmethod`, `match` statement, default `case _ → "id"`.
+  **The `ExternalConsumer → "name"` case is not present today** — Step 1.3 is the only place that fixes
+  this. The plan correctly identifies this as the highest silent-failure risk and pins it to `graph_db.py`
+  (not `kuzu_backend.py`). Wiring checklist grep correctly targets the right file.
+
+- `SCHEMA_VERSION = "5"` at `schema.py:6`. All three gate sites (`index.py:186`, `reindex.py:167`,
+  `watch.py:36`) compare the imported constant — no code change needed at gate sites after the bump.
+
+- `upsert_nodes_bulk` / `upsert_edges_bulk` are the exclusively used bulk path in `_upsert_parsed_file`.
+  The ingestion pass slot (after `_expand_star_sources` at `indexer.py:342`, before `set_indexed_sha`
+  at line ~347) is clean — zero profiling or hot-path code between them.
+
+- `get_presentation_prefixes` at `config.py:238` is the canonical template for `get_external_consumers`:
+  `tomllib.load`, `try/except pass`, `default []`, lowercase values. Plan mirrors it correctly.
+
+- `_rollup_to_tables` exists at `tools.py:277` and is already imported and tested — safe to reuse in PR-2.
+
+- `DependencyNode` (`models.py:120`) has `kind: str` as a free string — no model change needed to emit
+  `kind="external_consumer"`.
+
+- `DiffImpactResult` (`models.py:311`) has no `external_consumers` field today — Step 2.3 adds it.
+  `PresentationCandidate` (`models.py:397`) has no `has_external_consumer` field today — Step 2.4 adds it.
+
+- `trace_column_lineage` is upstream-only (traverses `COLUMN_LINEAGE` backward) and handles no table-level
+  egress hops. It is correctly OUT of scope for both PRs — no change needed.
+
+#### Warnings corrected in-place
+
+**W1 (PR-2 round-trips)**: Steps 2.2 and 2.3 originally said "for each terminal table run
+`GET_TABLE_EXTERNAL_CONSUMERS`" — this is O(N_terminals) round-trips. Replaced with a single
+`GET_TABLES_EXTERNAL_CONSUMERS_BATCH` (`UNWIND $table_qualifieds`) query for both
+`get_downstream_dependencies` and `diff_impact`. The single-target query `GET_TABLE_EXTERNAL_CONSUMERS`
+is kept for `analyze downstream` CLI (Step 2.5) where it runs on one resolved terminal at a time. Wiring
+checklist updated to gate on the BATCH variant, not the scalar one. This is consistent with the UNWIND
+pattern already used in `_ingest_external_consumers` for existence-checking.
+
+**W2 (PR-2 wiring checklist query name)**: Checklist item referenced `GET_TABLE_EXTERNAL_CONSUMERS_QUERY`
+for `tools.py` usage — now correctly references `GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY` and
+adds a no-per-table-loop grep guard.
+
+#### Notes (no change needed)
+
+- The plan correctly excludes `trace_column_lineage` from scope (it is upstream-only and has no table-level
+  egress extension path). The plan summary mention of it as a "downstream terminal" is slightly misleading
+  phrasing but refers to `get_downstream_dependencies`, not `trace_column_lineage` — acceptable.
+- The `ANALYZE_UNUSED_TABLES` Cypher extension uses `OPTIONAL MATCH ... count(c)` correctly — tables with
+  zero CONSUMED_BY edges still appear in the result with `external_consumer_count=0`. No change needed.
+
+### Resolution of the open sub-decision
+
+> Should external consumers be allowed to attach to NON-presentation tables?
+
+**CONFIRMED: attach + warn is correct. No enforcement.** Reasoning:
+
+1. **Coupling avoidance**: enforcing presentation-only attachment would require a non-empty
+   `[sqlcg.presentation]` to use `[[sqlcg.external_consumers]]` at all. A user declaring consumers on
+   non-prefixed tables (e.g. a small repo without the presentation concept) would get a hard failure, which
+   contradicts the "20-ETL user just works" promise.
+
+2. **Correctness of lineage**: if a user declares that an external consumer reads `ba.staging_table`, that
+   is a factual lineage statement — refusing to persist it hides information. The warning correctly flags
+   the architectural anomaly without discarding the data.
+
+3. **Reversibility**: if a future user adds presentation prefixes, the non-presentation warning disappears
+   on re-index. Nothing needs to be cleaned up.
+
+4. **Precedent**: the ignored-tables and schema-aliases config readers also apply warnings for
+   mismatches without hard failure.
+
+**Developer instruction**: implement exactly as specified in Step 1.5. Emit a warning line per
+non-presentation target (format: `Warning: external consumer 'X' references non-presentation table 'y.z'`)
+in the return dict's `external_consumer_warnings` list alongside unmatched-table warnings. Do not add a
+separate key for the two warning types; both are strings in the same list, distinguishable by prefix.
