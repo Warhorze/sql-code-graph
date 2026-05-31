@@ -18,6 +18,12 @@ from rich.console import Console
 
 console = Console()
 
+# Client-side socket timeout for the --notify control-socket path.
+# A real DWH server-side resync_changed measured ~89 s (41 changed files + closure);
+# 300 s covers that with headroom while keeping the wait bounded on a wedged server.
+# This is a CLI transport bound, NOT a KuzuConfig/indexer constant.
+_NOTIFY_SOCKET_TIMEOUT_S = 300
+
 
 def reindex_cmd(  # noqa: B008
     path: Path = typer.Argument(..., help="Repository root directory to resync"),  # noqa: B008
@@ -80,11 +86,10 @@ def reindex_cmd(  # noqa: B008
         sp = sock_path()
         try:
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
-                s.settimeout(30)  # reindex can take time on large repos
+                s.settimeout(_NOTIFY_SOCKET_TIMEOUT_S)
                 s.connect(str(sp))
                 # Resolve SHAs before sending — standalone mode reads from DB via socket
                 effective_from = from_sha
-                effective_to = to_sha or _get_head(path)
                 if effective_from is None:
                     # Standalone mode: we cannot read stored SHA here without opening the
                     # DB (which would conflict with the running server).  If no --from is
@@ -93,6 +98,10 @@ def reindex_cmd(  # noqa: B008
                     raise OSError(  # noqa: TRY301
                         "--notify without --from requires direct DB access; falling through"
                     )
+                # Resolve symbolic refs (HEAD, branch names) to concrete 40-char SHAs
+                # before sending — prevents literal "HEAD" from being stored in the graph.
+                effective_from = _resolve_ref(path, effective_from)
+                effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)
                 payload = {
                     "op": "reindex",
                     "root": str(path),
@@ -115,9 +124,27 @@ def reindex_cmd(  # noqa: B008
                     f"-{srv_summary.get('deleted', 0)} deleted"
                 )
             raise typer.Exit(0)
+        except TimeoutError:
+            # Bug 1 fix: server is alive and working (accepted the connection, holds the
+            # lock, will finish and persist).  Do NOT fall through to the direct-write
+            # path — that would hit the held lock and produce a false "Database is locked"
+            # error.  Exit 0 so the git hook stays non-fatal; the server will complete.
+            # (socket.timeout is an alias of TimeoutError, a subclass of OSError — this
+            # clause must be listed before the broad OSError clause below.)
+            import sys
+
+            print(
+                f"Server is still applying the reindex (timed out waiting after "
+                f"{_NOTIFY_SOCKET_TIMEOUT_S}s); the graph will update when it finishes "
+                f"— check 'sqlcg mcp status'.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(0) from None
         except (FileNotFoundError, ConnectionRefusedError, OSError):
             # R3: no live server (stale socket, socket absent, fallback condition) —
-            # fall through to the existing direct-write path unchanged
+            # fall through to the existing direct-write path unchanged.
+            # NOTE: socket.timeout / TimeoutError is an OSError subclass, so the
+            # dedicated timeout clause above must be listed first (already is).
             pass
         except typer.Exit:
             raise
@@ -150,15 +177,17 @@ def reindex_cmd(  # noqa: B008
 
         # ---- Determine mode -------------------------------------------------------
         if from_sha is not None:
-            # Explicit-SHA mode
-            effective_to = to_sha or _get_head(path)
+            # Explicit-SHA mode — resolve symbolic refs to concrete SHAs before storing
+            effective_from = _resolve_ref(path, from_sha)
+            effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)
             if not quiet:
                 console.print(
-                    f"Resyncing [cyan]{path}[/cyan] [dim]{from_sha[:8]}..{effective_to[:8]}[/dim]"
+                    f"Resyncing [cyan]{path}[/cyan] "
+                    f"[dim]{effective_from[:8]}..{effective_to[:8]}[/dim]"
                 )
             summary = indexer.resync_changed(
                 path,
-                from_sha,
+                effective_from,
                 effective_to,
                 backend,
                 dialect,
@@ -212,24 +241,36 @@ def reindex_cmd(  # noqa: B008
                 )
 
 
-def _get_head(root: Path) -> str:
-    """Return the current HEAD SHA for the git repo at root.
+def _resolve_ref(root: Path, ref: str) -> str:
+    """Resolve a git ref (HEAD, branch, tag, or concrete SHA) to a 40-char SHA.
 
-    Raises typer.Exit(1) if git is unavailable or root is not a git repo.
+    A concrete SHA resolves to itself (idempotent), so callers may pass either a
+    symbolic ref or a SHA without branching.
+
+    Raises typer.Exit(1) if git is unavailable or the ref cannot be resolved.
     """
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", ref],
             cwd=str(root),
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             console.print(
-                f"[red]Could not determine HEAD SHA in {root}: {result.stderr.strip()}[/red]"
+                f"[red]Could not resolve ref '{ref}' in {root}: {result.stderr.strip()}[/red]"
             )
             raise typer.Exit(1)
         return result.stdout.strip()
     except FileNotFoundError:
-        console.print("[red]git is not available — cannot determine HEAD SHA[/red]")
+        console.print("[red]git is not available — cannot resolve ref[/red]")
         raise typer.Exit(1) from None
+
+
+def _get_head(root: Path) -> str:
+    """Return the current HEAD SHA for the git repo at root.
+
+    Delegates to _resolve_ref so there is one git-rev-parse code path.
+    Raises typer.Exit(1) if git is unavailable or root is not a git repo.
+    """
+    return _resolve_ref(root, "HEAD")

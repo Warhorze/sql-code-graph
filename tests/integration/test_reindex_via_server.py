@@ -1,14 +1,22 @@
-"""Integration tests for PR-D: reindex op on the MCP control socket (#28).
+"""Integration tests for PR-D + PR-F: reindex op on the MCP control socket (#28).
 
 Critical invariant guard (Scenario A) asserts that the server-side reindex
 op delegates to ``Indexer.resync_changed`` — not a reimplemented walk.  This
 guard inherits the bulk-upsert perf invariant from CLAUDE.md.
 
-Scenarios:
+Scenarios (PR-D):
     A — reindex op calls resync_changed (invariant guard)
     C — fallback on no server: --notify with no server falls through to direct write
     D — fallback on stale socket: ConnectionRefusedError caught, direct write runs
     E — server error surfaces as non-zero exit (missing required fields)
+
+Scenarios (PR-F):
+    F1-A — socket timeout does NOT fall through: exit 0, "still applying" stderr,
+            resync_changed was NOT invoked in-process, no "Database is locked"
+    F1-B — genuine no-server still falls through to direct write (re-asserted)
+    F2-C — symbolic --to HEAD is resolved to 40-char SHA before store (server path)
+    F2-Cdir — symbolic --to HEAD resolved in direct-write path too
+    F2-D — _resolve_ref unit: idempotent on full SHA, bogus ref raises typer.Exit
 """
 
 import json
@@ -501,3 +509,325 @@ class TestNotifyServerErrorSurfaces:
             f"stdout: {result.stdout!r} stderr: {result.stderr!r}"
         )
         assert "deliberate test error" in result.stdout or "deliberate test error" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario F1-A — timeout does NOT fall through; exits 0, "still applying" stderr
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyTimeoutDoesNotFallThrough:
+    """PR-F Bug 1 fix: a socket timeout exits 0 with a 'still applying' message and
+    does NOT enter the direct-write path (which would hit the held DB lock).
+
+    Uses a mock socket server that accepts the connection then sleeps (never replies),
+    combined with a monkeypatched _NOTIFY_SOCKET_TIMEOUT_S = 1 s so the test
+    completes quickly without waiting 300 s.
+    """
+
+    def test_timeout_in_process_exits_zero_no_direct_write(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Scenario F1-A: timeout exits 0, 'still applying' in stderr, resync NOT called.
+
+        Asserts:
+        - exit code is 0 (hook stays non-fatal)
+        - stderr contains 'still applying' and 'mcp status'
+        - Indexer.resync_changed was NOT invoked (direct-write path never entered)
+        - 'Database is locked' is NOT in stderr
+        """
+        import io
+        import sys as _sys
+
+        import anyio
+        import anyio.to_thread as _to_thread
+        import typer
+
+        import sqlcg.cli.commands.reindex as _reindex_mod
+        from sqlcg.indexer.indexer import Indexer
+        from sqlcg.server.control import cleanup_control_files, sock_path
+
+        db_path = tmp_path / "test_f1a.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+        # Lower the timeout so the test completes in ~1 s
+        monkeypatch.setattr(_reindex_mod, "_NOTIFY_SOCKET_TIMEOUT_S", 1)
+
+        sp = sock_path(db_path)
+
+        (git_repo / "f1a.sql").write_text("-- f1a\n")
+        old_sha = _commit_all(git_repo, "f1a-base")
+        (git_repo / "f1a_new.sql").write_text("-- f1a new\n")
+        new_sha = _commit_all(git_repo, "f1a-new")
+
+        server_ready: list[bool] = []
+
+        async def _slow_handle(stream) -> None:  # type: ignore[no-untyped-def]
+            """Accept the connection, read the payload, then sleep — never reply."""
+            async with stream:
+                await stream.receive(4096)
+                # Sleep longer than the patched 1 s timeout — simulates a slow reindex
+                await anyio.sleep(10)
+
+        async def _slow_server() -> None:
+            listener = await anyio.create_unix_listener(str(sp))
+            sp.chmod(0o600)
+            server_ready.append(True)
+            async with listener:
+                await listener.serve(_slow_handle)
+
+        resync_call_log: list = []
+        original_resync = Indexer.resync_changed
+
+        def spy_resync(self_inner, *args, **kwargs):  # type: ignore[no-untyped-def]
+            resync_call_log.append((args, kwargs))
+            return original_resync(self_inner, *args, **kwargs)
+
+        captured_stderr: list[str] = []
+        exit_codes: list[int] = []
+
+        async def _run_test() -> None:
+            from sqlcg.cli.commands.reindex import reindex_cmd
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_slow_server)
+                while not server_ready:
+                    await anyio.sleep(0.05)
+
+                def _invoke_reindex() -> None:
+                    buf = io.StringIO()
+                    old_stderr = _sys.stderr
+                    _sys.stderr = buf
+                    try:
+                        with patch.object(Indexer, "resync_changed", spy_resync):
+                            try:
+                                reindex_cmd(
+                                    path=git_repo,
+                                    from_sha=old_sha,
+                                    to_sha=new_sha,
+                                    dialect="ansi",
+                                    quiet=True,
+                                    batch_size=50,
+                                    timeout_per_file=5,
+                                    notify=True,
+                                )
+                            except SystemExit as exc:
+                                exit_codes.append(int(exc.code or 0))
+                            except typer.Exit as exc:
+                                exit_codes.append(int(exc.exit_code))
+                    finally:
+                        _sys.stderr = old_stderr
+                        captured_stderr.append(buf.getvalue())
+
+                await _to_thread.run_sync(_invoke_reindex)
+                tg.cancel_scope.cancel()
+
+        try:
+            anyio.run(_run_test)
+        finally:
+            cleanup_control_files(db_path)
+
+        # Indexer.resync_changed must NOT have been called (direct-write path not entered)
+        assert len(resync_call_log) == 0, (
+            f"resync_changed must not be called on timeout. Call log: {resync_call_log}"
+        )
+
+        # Exit code must be 0
+        assert exit_codes and exit_codes[-1] == 0, (
+            f"Expected exit 0 on timeout, got: {exit_codes}. stderr: {captured_stderr}"
+        )
+
+        # stderr must contain the 'still applying' cue and 'mcp status'
+        all_stderr = "".join(captured_stderr)
+        assert "still applying" in all_stderr, (
+            f"Expected 'still applying' in stderr. Got: {all_stderr!r}"
+        )
+        assert "mcp status" in all_stderr, (
+            f"Expected 'mcp status' reference in stderr. Got: {all_stderr!r}"
+        )
+
+        # 'Database is locked' must NOT appear (direct-write path not entered)
+        assert "Database is locked" not in all_stderr, (
+            f"'Database is locked' must not appear on timeout. stderr: {all_stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario F1-B — genuine no-server still falls through to direct write
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyGenuineNoServerFallthrough:
+    """PR-F Bug 1: re-assert that genuine no-server still falls through.
+
+    This is a re-assertion of the existing Scenario C/D behaviour after the Bug 1
+    fix — ensures the timeout-only clause does not break the no-server fallback.
+    """
+
+    def test_no_server_still_falls_through_and_updates_graph(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Scenario F1-B: no server → direct write → graph updated (exit 0)."""
+        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.indexer.indexer import Indexer
+
+        db_path = tmp_path / "test_f1b.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+
+        (git_repo / "f1b_orders.sql").write_text(
+            "CREATE TABLE F1B_ORDERS (order_id INT, total NUMERIC);\n"
+        )
+        sha_a = _commit_all(git_repo, "f1b-add-orders")
+
+        backend = KuzuBackend(str(db_path))
+        backend.init_schema()
+        indexer = Indexer()
+        indexer.index_repo(git_repo, "ansi", backend)
+        backend.set_indexed_sha(sha_a)
+        backend.close()
+
+        (git_repo / "f1b_items.sql").write_text(
+            "CREATE TABLE F1B_ITEMS (item_id INT, sku VARCHAR);\n"
+        )
+        sha_b = _commit_all(git_repo, "f1b-add-items")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sqlcg",
+                "reindex",
+                str(git_repo),
+                "--from",
+                sha_a,
+                "--to",
+                sha_b,
+                "--dialect",
+                "ansi",
+                "--notify",
+            ],
+            env={**os.environ, "SQLCG_DB_PATH": str(db_path)},
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, f"no-server fallthrough must exit 0. stderr: {result.stderr}"
+        assert "Database is locked" not in result.stderr
+        assert "Database is locked" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario F2-C — symbolic --to HEAD is resolved to 40-char SHA
+# ---------------------------------------------------------------------------
+
+
+class TestSymbolicRefResolution:
+    """PR-F Bug 2: --to HEAD must store the concrete SHA, not the string 'HEAD'."""
+
+    def test_symbolic_to_head_resolved_in_direct_write_path(
+        self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Scenario F2-C (direct-write): --to HEAD stores 40-char SHA, not 'HEAD'.
+
+        The direct-write path is the choke point for both the --notify (client resolves
+        before sending, server stores what the client sent) and the non-notify path.
+        Asserting the stored SHA == git rev-parse HEAD verifies _resolve_ref fires.
+        """
+        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.indexer.indexer import Indexer
+
+        db_path = tmp_path / "test_f2c.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+
+        (git_repo / "f2c_base.sql").write_text("CREATE TABLE F2C_BASE (id INT);\n")
+        old_sha = _commit_all(git_repo, "f2c-base")
+        (git_repo / "f2c_new.sql").write_text("CREATE TABLE F2C_NEW (val INT);\n")
+        new_sha = _commit_all(git_repo, "f2c-new")  # this becomes HEAD
+
+        backend = KuzuBackend(str(db_path))
+        backend.init_schema()
+        indexer = Indexer()
+        indexer.index_repo(git_repo, "ansi", backend)
+        backend.set_indexed_sha(old_sha)
+        backend.close()
+
+        # Direct write with --to HEAD (the symbolic ref the bug would store literally)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sqlcg",
+                "reindex",
+                str(git_repo),
+                "--from",
+                old_sha,
+                "--to",
+                "HEAD",
+                "--dialect",
+                "ansi",
+            ],
+            env={**os.environ, "SQLCG_DB_PATH": str(db_path)},
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"reindex failed: {result.stderr}"
+
+        check = KuzuBackend(str(db_path))
+        check.init_schema()
+        stored_sha = check.get_indexed_sha()
+        check.close()
+
+        assert stored_sha is not None
+        assert stored_sha != "HEAD", f"Stored SHA must not be literal 'HEAD'. Got: {stored_sha!r}"
+        assert stored_sha == new_sha, (
+            f"Stored SHA must equal git rev-parse HEAD ({new_sha}). Got: {stored_sha!r}"
+        )
+        assert len(stored_sha) == 40, (
+            f"Stored SHA must be a 40-char concrete SHA. Got: {stored_sha!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario F2-D — _resolve_ref unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRefUnit:
+    """Scenario F2-D: _resolve_ref unit tests."""
+
+    def test_resolve_head_returns_full_sha(self, git_repo: Path):
+        """_resolve_ref(root, 'HEAD') returns the 40-char HEAD SHA."""
+        from sqlcg.cli.commands.reindex import _resolve_ref
+
+        sha = _resolve_ref(git_repo, "HEAD")
+        assert len(sha) == 40, f"Expected 40-char SHA, got: {sha!r}"
+        assert all(c in "0123456789abcdef" for c in sha), f"Not a hex SHA: {sha!r}"
+
+    def test_resolve_full_sha_is_idempotent(self, git_repo: Path):
+        """_resolve_ref is idempotent: resolving a full SHA returns the same SHA."""
+        from sqlcg.cli.commands.reindex import _resolve_ref
+
+        head_sha = _resolve_ref(git_repo, "HEAD")
+        resolved_again = _resolve_ref(git_repo, head_sha)
+        assert resolved_again == head_sha, (
+            f"Resolving a full SHA must be idempotent. "
+            f"head={head_sha!r} re-resolved={resolved_again!r}"
+        )
+
+    def test_resolve_head_matches_get_head(self, git_repo: Path):
+        """_resolve_ref(root, 'HEAD') == _get_head(root) (delegation verified)."""
+        from sqlcg.cli.commands.reindex import _get_head, _resolve_ref
+
+        assert _resolve_ref(git_repo, "HEAD") == _get_head(git_repo)
+
+    def test_resolve_bogus_ref_raises_exit(self, git_repo: Path):
+        """_resolve_ref raises typer.Exit(1) for a bogus ref."""
+        import typer
+
+        from sqlcg.cli.commands.reindex import _resolve_ref
+
+        with pytest.raises((typer.Exit, SystemExit)) as exc_info:
+            _resolve_ref(git_repo, "refs/heads/this-branch-does-not-exist-f2d-test")
+        # Must be exit code 1
+        exc = exc_info.value
+        code = exc.exit_code if isinstance(exc, typer.Exit) else exc.args[0]
+        assert int(code) == 1, f"Expected exit code 1, got: {code}"

@@ -1,10 +1,10 @@
-## Current State — architect-planner: PR-F plan (Cluster A live-verification fixes, #28)
+## Current State — developer: PR-F live-verification fixes (#28)
 
-ACTIVE AGENT: architect-planner — sprint-12 PR-F: three live-verification defects
+ACTIVE AGENT: developer — sprint-12 PR-F: three live-verification defects
   plan: plan/sprint_12_v1.1.0.md (PR-F ticket + structured sections)
   branch: fix/v1.0.2-bugfix
   issues: #28 (Cluster A live-verification of PR-E against ../dwh)
-  status: PLANNING
+  status: IN PROGRESS
 
 ---
 

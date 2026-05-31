@@ -114,3 +114,181 @@ def test_idempotency_no_duplicate_hook_lines(temp_git_repo):
     # All three installs should report success/idempotency
     hook_lines = content.count("sqlcg reindex")
     assert hook_lines == 1, f"Expected 1 sqlcg reindex line, found {hook_lines}"
+
+
+# ---------------------------------------------------------------------------
+# PR-E: post-merge hook ORIG_HEAD routing tests (#28)
+# ---------------------------------------------------------------------------
+
+
+def test_post_merge_hook_content_orig_head_guard(temp_git_repo):
+    """Scenario A: generated post-merge hook contains ORIG_HEAD guard and correct flags."""
+    hook_path = temp_git_repo / ".git" / "hooks" / "post-merge"
+
+    result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    assert result.exit_code == 0
+    assert hook_path.exists()
+
+    content = hook_path.read_text()
+
+    # Sentinel present (R9 idempotency relies on this exact string)
+    assert "# sqlcg post-merge hook" in content
+
+    # ORIG_HEAD guard
+    assert "git rev-parse --verify --quiet ORIG_HEAD" in content
+    assert '[ -n "$PREV" ]' in content
+
+    # Positive branch: routes through server with explicit SHAs
+    assert '--from "$PREV"' in content
+    assert "--to HEAD" in content
+    assert "--notify" in content
+
+    # Fallback branch: no --from (standalone stored-SHA path)
+    # The else branch must contain a reindex call without --from
+    else_idx = content.index("else")
+    fallback_section = content[else_idx:]
+    assert "sqlcg reindex" in fallback_section
+
+
+def test_post_merge_hook_idempotent(temp_git_repo):
+    """Scenario B: install-hooks is idempotent — second run skips silently."""
+    hook_path = temp_git_repo / ".git" / "hooks" / "post-merge"
+
+    # First install
+    result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    assert result.exit_code == 0
+    content_after_first = hook_path.read_text()
+
+    # Second install — must not change file content
+    result2 = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    assert result2.exit_code == 0
+    content_after_second = hook_path.read_text()
+
+    assert content_after_first == content_after_second
+    assert content_after_second.count("# sqlcg post-merge hook") == 1
+
+
+def test_post_merge_hook_orig_head_unset_invokes_without_from(temp_git_repo):
+    """Scenario C: with ORIG_HEAD unset, hook invokes sqlcg reindex without --from."""
+    import sqlcg.cli.commands.git as _git_mod
+
+    hook_path = temp_git_repo / ".git" / "hooks" / "post-merge"
+
+    # Create a sqlcg shim BEFORE installing hooks — patch _resolve_sqlcg_bin to
+    # return the shim path so the hook embeds the absolute shim path.
+    shim_dir = temp_git_repo / ".shim"
+    shim_dir.mkdir()
+    argv_file = shim_dir / "sqlcg_argv.txt"
+    shim_path = shim_dir / "sqlcg"
+    shim_path.write_text(f'#!/bin/sh\necho "$@" >> {argv_file}\nexit 0\n')
+    shim_path.chmod(0o755)
+
+    original_resolve = _git_mod._resolve_sqlcg_bin
+    _git_mod._resolve_sqlcg_bin = lambda: str(shim_path)
+    try:
+        runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    finally:
+        _git_mod._resolve_sqlcg_bin = original_resolve
+
+    assert hook_path.exists()
+
+    env = os.environ.copy()
+    # Ensure ORIG_HEAD is not set
+    env.pop("ORIG_HEAD", None)
+
+    result = subprocess.run(
+        ["sh", str(hook_path)],
+        cwd=str(temp_git_repo),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    # Hook must not abort with a non-zero exit from the guard itself
+    # (the shim exits 0, so the hook exits 0)
+    assert result.returncode == 0
+
+    # The shim must have been called (argv file exists)
+    assert argv_file.exists(), "sqlcg shim was never invoked"
+    argv_recorded = argv_file.read_text().strip()
+
+    # Fallback branch: must NOT contain --from
+    assert "--from" not in argv_recorded, (
+        f"Fallback branch must not pass --from; got: {argv_recorded!r}"
+    )
+    # Must contain reindex
+    assert "reindex" in argv_recorded
+
+
+def test_post_merge_hook_orig_head_set_routes_with_shas(temp_git_repo):
+    """Scenario D: with ORIG_HEAD set, hook invokes sqlcg reindex with --from and --to HEAD."""
+    import sqlcg.cli.commands.git as _git_mod
+
+    hook_path = temp_git_repo / ".git" / "hooks" / "post-merge"
+
+    # Need at least one commit so git rev-parse HEAD works
+    dummy_file = temp_git_repo / "README.md"
+    dummy_file.write_text("init\n")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=str(temp_git_repo),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=str(temp_git_repo),
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "t@t.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "t@t.com",
+        },
+    )
+
+    shim_dir = temp_git_repo / ".shim"
+    shim_dir.mkdir()
+    argv_file = shim_dir / "sqlcg_argv.txt"
+    shim_path = shim_dir / "sqlcg"
+    shim_path.write_text(f'#!/bin/sh\necho "$@" >> {argv_file}\nexit 0\n')
+    shim_path.chmod(0o755)
+
+    # Patch _resolve_sqlcg_bin before installing hooks (same as Scenario C)
+    original_resolve = _git_mod._resolve_sqlcg_bin
+    _git_mod._resolve_sqlcg_bin = lambda: str(shim_path)
+    try:
+        runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    finally:
+        _git_mod._resolve_sqlcg_bin = original_resolve
+
+    assert hook_path.exists()
+
+    prev_sha = "abc1234def5678901234567890abcdef12345678"
+
+    env = os.environ.copy()
+
+    # Simulate ORIG_HEAD by writing the ref file git normally sets
+    orig_head_file = temp_git_repo / ".git" / "ORIG_HEAD"
+    orig_head_file.write_text(prev_sha + "\n")
+
+    result = subprocess.run(
+        ["sh", str(hook_path)],
+        cwd=str(temp_git_repo),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert argv_file.exists(), "sqlcg shim was never invoked"
+    argv_recorded = argv_file.read_text().strip()
+
+    # Positive branch: must contain --from <prev_sha> and --to HEAD
+    assert f"--from {prev_sha}" in argv_recorded, (
+        f"Expected --from {prev_sha} in argv; got: {argv_recorded!r}"
+    )
+    assert "--to HEAD" in argv_recorded, f"Expected --to HEAD in argv; got: {argv_recorded!r}"
+    assert "--notify" in argv_recorded
