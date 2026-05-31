@@ -1,4 +1,19 @@
-## Current State — developer: sprint_13 Cluster B PR-3 (#33 — CLI/MCP Parity + Node-Kind Tagging)
+## Current State — architect-planner: #34 analyze_unused presentation segregation
+
+ACTIVE AGENT: architect-planner — v1.1.0 next feature (#34)
+  task: re-triage #27, decide #34-vs-#35 one-vs-two, plan the first feature
+  branch: feat/cluster-b-provenance
+  decision: TWO features. #34 first (read-side refinement of analyze_unused, no schema bump),
+            #35 follow-on (new node + CONSUMED_BY edge + manifest loader + SCHEMA_VERSION "5"->"6").
+  #27 re-triage: (a) bck globs ALREADY FIXED (config.py:147 `*_bck_*`), (c) CTE-alias leak ALREADY
+            FIXED by PR-3 (base.py:963 role="cte"; indexer emits kind; <output> excluded),
+            (e) dedup ALREADY FIXED (DISTINCT + de-dup in analyze.py). SURVIVING: (b) partial — CLI
+            NoiseFilter parity done for upstream/downstream/impact/unused by PR-3, but `find`
+            command still unfiltered; (d) timeout observability NOT done.
+  output: plan/feature_34_unused_presentation_segregation.md
+  status: PLAN COMMITTED — idle for developer Q&A + compliance check
+
+## Prior State — developer: sprint_13 Cluster B PR-3 (#33 — CLI/MCP Parity + Node-Kind Tagging)
 
 ACTIVE AGENT: developer — sprint_13 v1.1.0 Cluster B PR-3
   plan: plan/sprint_13_v1.1.0_cluster_b.md (PR-3 ticket)
