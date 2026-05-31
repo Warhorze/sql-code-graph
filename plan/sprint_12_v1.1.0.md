@@ -18,7 +18,7 @@ process that calls `index`/`reindex`/`db reset` fails with "Database is locked".
 hooks use `|| true`, so this failure is swallowed and the graph goes stale silently — the
 worst failure mode for a correctness tool.
 
-This sprint ships the full mitigation in five PRs (PR-E added after live verification):
+This sprint ships the full mitigation in six PRs (PR-E and PR-F added after live verification):
 
 - **PR-A** (low risk): expose the existing persisted SHA as a human-readable freshness line
   in `db info` and the MCP `db_info` tool. Immediately answers #30 and makes staleness *detectable*.
@@ -32,6 +32,13 @@ This sprint ships the full mitigation in five PRs (PR-E added after live verific
   so a `git pull` routes through the running server like post-checkout does. Closes the
   post-merge gap found in live verification (standalone `--notify` can't read the stored SHA
   from the locked DB). Hook-generation change only. See the PR-E ticket below for full detail.
+- **PR-F** (s, follow-up): fix three defects found by LIVE verification of PR-E against `../dwh`:
+  (1) the `--notify` client socket timeout (30s) is shorter than a real DWH `resync_changed`
+  (~89s), so the client times out and falls through to the direct-write path **while the server
+  still holds the lock**, producing a false "Database is locked" on a `git pull` that the server
+  in fact completed. (2) `--to HEAD` is stored literally as the string `"HEAD"` instead of a
+  resolved 40-char SHA. (3) generated hooks call bare `sqlcg` from `$PATH`, so a stale installed
+  binary errors with `No such option: --notify`. See the PR-F ticket below for full detail.
 
 ---
 
@@ -88,6 +95,7 @@ This sprint ships the full mitigation in five PRs (PR-E added after live verific
 | PR-C | Unix-socket control channel + `mcp status`/`stop`/`restart` | `server/control.py` (new), `server/server.py`, `cli/commands/mcp.py` | L | HIGH | PR-A | PR-D |
 | PR-D | Reindex op on server + `reindex --notify` + git-hook cue | `server/control.py`, `server/server.py`, `cli/commands/reindex.py`, `cli/commands/git.py` | L | HIGH | PR-C | NONE |
 | PR-E | Post-merge hook routes through server (`--from ORIG_HEAD --to HEAD` + unset guard) | `cli/commands/git.py`, test | XS | HIGH | PR-D | NONE |
+| PR-F | Live-verification fixes: socket-timeout/no-fall-through-on-timeout, symbolic-ref resolution for `--to`, hook binary path | `cli/commands/reindex.py`, `cli/commands/git.py`, tests | S | HIGH | PR-E | NONE |
 
 ---
 
@@ -134,6 +142,14 @@ entire attention is on the socket plumbing, not split with the working-tree flag
    + hook generator in place). Surfaced by live verification against `../dwh` after PR-D
    merged: post-checkout routed through the server but post-merge did not, because standalone
    `--notify` cannot read the stored SHA from the locked DB. Hook-generation change only.
+6. PR-F — three defects found by LIVE verification of PR-E against `../dwh` (follow-up; needs
+   PR-E's server-routing post-merge hook in place to reproduce all three). (1) the `--notify`
+   client socket timeout (30s) is shorter than a real DWH `resync_changed` (~89s), so the
+   client times out and falls through to the direct-write path **while the server still holds
+   the lock**, producing a false "Database is locked" on a `git pull` the server in fact
+   completed. (2) `--to HEAD` is stored literally as the string `"HEAD"`. (3) generated hooks
+   call bare `sqlcg` from `$PATH`, so a stale installed binary errors with
+   `No such option: --notify`. See the PR-F ticket below for the recommendations and full detail.
 
 ### Two-developer sequence
 
@@ -1208,3 +1224,303 @@ content — locate via `grep -rln "post-merge\|install-hooks\|_HOOKS" tests/`).
 - `[ ]` `git diff --stat` for the PR shows only `git.py` + the test file — no reindex/server
   logic change (item 4).
 - `[ ]` `grep -rn "TODO" src/sqlcg/cli/commands/git.py` — zero results; no TODO in the happy path.
+
+---
+
+### PR-F — Live-verification fixes (Cluster A, #28): socket timeout, symbolic-ref `--to`, hook binary path
+
+**Source**: LIVE verification of PR-E against the real `../dwh` repo, 2026-05-31
+**Effort**: S
+**Depends on**: PR-E (its server-routing post-merge hook is what surfaced all three)
+**Blocks**: NONE
+**Branch**: `fix/v1.0.2-bugfix`
+
+Three defects were observed running an actual `git pull` on a `../dwh` clone with the MCP
+server live. Each is independent; all three land in this one PR. **No parser/indexer change —
+perf invariants untouched. PR-D's `resync_changed` reuse stays intact.**
+
+---
+
+#### Bug 1 (BLOCKER) — client socket timeout shorter than a real reindex; fall-through on timeout produces a false lock error
+
+**Observed**: [`reindex.py`](src/sqlcg/cli/commands/reindex.py) L83 sets `s.settimeout(30)`
+on the control-socket client. A real DWH server-side `resync_changed` (41 changed files +
+closure) took **~89s**. The client timed out at 30s; the `OSError` was caught by the R3
+fallback (L118) and fell through to the **direct-write path**, which then hit the
+still-held server lock and printed `RuntimeError: Database is locked …` plus the hook's
+stderr cue — so a `git pull` reports failure even though the server **did** complete the
+reindex ~60s later.
+
+**Recommendation: Option (a) — synchronous with a long timeout, AND do NOT fall through to
+direct write on a socket *timeout*.** Rationale:
+
+- **Correctness over UX, minimal change.** The server already serialises every reindex behind
+  `reindex_lock` ([`server.py`](src/sqlcg/server/server.py) L198), runs it off the event loop
+  via `anyio.to_thread.run_sync` (L200), and keeps serving tool calls meanwhile. A waiting
+  client is the simplest correct model. Option (b) (async ack + background apply) introduces
+  transient staleness between ack and completion and requires the server to track and report
+  a queued/in-flight reindex in `mcp status` — a much larger change for a follow-up bugfix
+  PR on a release branch. Defer (b) to v1.2 if pull-blocking UX becomes a complaint;
+  record that as a backlog note, not work in PR-F.
+- **The fall-through on timeout is the actual root cause of the false error.** A *timeout*
+  means the server is **alive and working** (it accepted the connection, it is holding the
+  lock, it will finish and persist). Falling through to direct write in that state is
+  guaranteed to hit the lock and emit a false "Database is locked". A *connection failure*
+  (`ConnectionRefusedError` / `FileNotFoundError` — stale or absent socket) means there is
+  **no live server**, so direct write is the correct and safe fallback. PR-F must split these:
+
+  - On `socket.timeout` (raised by `settimeout` expiry — note Python's `socket.timeout` is an
+    alias of `TimeoutError`, a subclass of `OSError`): do **NOT** fall through. Print a clear
+    message that the server is still applying the reindex and that freshness is verifiable via
+    `sqlcg mcp status`, and **exit 0** (the hook must stay non-fatal to the pull, and the server
+    will complete the write — treating this as failure is what produced the false cue). The
+    `socket.timeout` `except` clause must be ordered **before** the broad `(FileNotFoundError,
+    ConnectionRefusedError, OSError)` clause so it is not swallowed by it.
+  - On `ConnectionRefusedError` / `FileNotFoundError` (genuine no-server): fall through to the
+    direct-write path unchanged (today's R3 behaviour).
+
+- **Raise the timeout regardless**, so the common case (medium repos) completes synchronously
+  and reports the real summary rather than the "still applying" message. Set the client
+  `settimeout` to **300** seconds to comfortably cover the ~89s DWH case with headroom. Do not
+  remove the timeout entirely — an unbounded client wait on a wedged server is worse than a
+  bounded one that exits 0 with a "check status" cue. 300s is a CLI-client transport bound and
+  is **not** a `KuzuConfig`/indexer constant (the indexer's own per-file timeout is unrelated
+  and lives at `Indexer.resync_changed(timeout_per_file=5)`); define it as a module-level
+  named constant in `reindex.py` (e.g. `_NOTIFY_SOCKET_TIMEOUT_S = 300`) with a comment citing
+  the ~89s DWH measurement, so the number is not a bare magic literal.
+
+**Concretely** (in the `--notify` block of [`reindex.py`](src/sqlcg/cli/commands/reindex.py)):
+
+1. Replace `s.settimeout(30)` with `s.settimeout(_NOTIFY_SOCKET_TIMEOUT_S)`.
+2. Add a dedicated `except _socket.timeout:` (equivalently `except TimeoutError:`) clause
+   **before** the `except (FileNotFoundError, ConnectionRefusedError, OSError):` clause. In it:
+   print (stderr) e.g. `Server is still applying the reindex (timed out waiting after 300s); the
+   graph will update when it finishes — check 'sqlcg mcp status'.` and `raise typer.Exit(0)`.
+   Do **not** `pass` (that is what falls through).
+3. Leave the `(FileNotFoundError, ConnectionRefusedError, OSError)` clause as the
+   genuine-no-server fall-through. Because `socket.timeout`/`TimeoutError` is an `OSError`
+   subclass, the timeout clause must be listed first or Python will match the broad clause.
+
+**Note** the standalone `--notify` (no `--from`) path at L88-95 raises a plain `OSError`
+(not a timeout) to deliberately fall through — that must remain caught by the no-server
+clause, so the timeout clause must specifically catch `socket.timeout`/`TimeoutError`, never
+bare `OSError`.
+
+---
+
+#### Bug 2 — `--to HEAD` stored literally as the string `"HEAD"`
+
+**Observed**: [`reindex.py`](src/sqlcg/cli/commands/reindex.py) L87 `effective_to = to_sha or
+_get_head(path)`. The PR-E post-merge hook passes `--to HEAD`, so `to_sha == "HEAD"` is
+truthy and the literal string `"HEAD"` is sent to the server and persisted via
+`set_indexed_sha("HEAD")` instead of a resolved 40-char SHA. It works coincidentally for
+`stale_by_commits` (git re-resolves `HEAD`) but is wrong and misbehaves on branch switches.
+
+**Fix location: resolve symbolic refs in `reindex.py` before sending/storing (robust).**
+Not the hook. Rationale: resolving in `reindex.py` handles **any** symbolic ref (`HEAD`,
+branch names, tags) from any caller, not just the one hook string; it keeps the hook text
+simple and is the single choke point through which both the socket payload and the
+direct-write path flow. The hook alternative (`--to "$(git rev-parse HEAD)"`) only fixes the
+one hook and leaves the literal-ref bug latent for any other caller.
+
+**Concretely**:
+
+1. Add a small resolver in `reindex.py` (reuse the existing `_get_head` pattern, which already
+   runs `git rev-parse HEAD` and handles git-missing / non-repo via `typer.Exit(1)`):
+
+   ```python
+   def _resolve_ref(root: Path, ref: str) -> str:
+       """Resolve a git ref (HEAD, branch, tag, or SHA) to a concrete 40-char SHA.
+
+       Raises typer.Exit(1) if git is unavailable or the ref cannot be resolved.
+       """
+       # subprocess git rev-parse <ref> in cwd=root; mirror _get_head's error handling.
+   ```
+
+   (Implementation mirrors `_get_head` exactly but takes an arbitrary `ref` arg. Prefer
+   refactoring `_get_head` to `return _resolve_ref(root, "HEAD")` so there is one
+   git-rev-parse code path, not two.)
+
+2. In the `--notify` block, resolve `effective_to` through `_resolve_ref` **before** building
+   the payload: `effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)`.
+   Apply the same resolution in the explicit-SHA direct-write branch (L154) so a non-`--notify`
+   call also stores a concrete SHA. A bare 40-char SHA passed as `--to` resolves to itself
+   (idempotent), so this is safe for the existing `--from "$PREV"` resolved-SHA callers too.
+
+3. `--from` already passes a resolved SHA (the post-merge hook uses
+   `PREV=$(git rev-parse --verify --quiet ORIG_HEAD)`), so only `--to` / symbolic refs need
+   this. Resolving `from_sha` through `_resolve_ref` as well is harmless and makes the two
+   sides symmetric; do so for robustness but it is not the load-bearing fix.
+
+**Acceptance value to pin** (cross-module constant alignment): after a server-routed pull,
+`backend.get_indexed_sha()` must equal the 40-char output of `git rev-parse HEAD` in the
+repo — never the literal `"HEAD"`. `set_indexed_sha` is called server-side inside
+`resync_changed` ([`indexer.py`](src/sqlcg/indexer/indexer.py) L519) with the `new_sha`
+argument the server received as `to` — so resolving on the **client** before sending is what
+guarantees the stored value is concrete.
+
+---
+
+#### Bug 3 — installed-binary version skew (bare `sqlcg` in generated hooks)
+
+**Observed**: generated hooks call bare `sqlcg` from `$PATH`
+([`git.py`](src/sqlcg/cli/commands/git.py) L29-30, L47, L50). The system-installed `sqlcg`
+(`~/.local/bin`) predated `--notify`, so the hook errored `No such option: --notify`. After
+1.1.0 ships, anyone who has not reinstalled gets silently no-op hooks.
+
+**Split: part code (PR-F), part release-notes.**
+
+**Code (PR-F) — embed the resolved absolute path of the installing binary into the hook.**
+Recommendation: at `install-hooks` time, resolve the `sqlcg` binary that is doing the
+installation and write its **absolute path** into the generated hook scripts instead of bare
+`sqlcg`. Resolution order:
+
+1. `shutil.which("sqlcg")` — the binary on the installer's `$PATH` (the one the user means).
+2. Fallback to `sys.argv[0]` resolved via `Path(...).resolve()` only if it ends in `sqlcg`
+   / is executable, for the `python -m`-style invocation.
+3. If neither yields a usable absolute path, fall back to bare `sqlcg` (current behaviour) so
+   `install-hooks` never hard-fails — and print a one-line warning that the hook will rely on
+   `$PATH`.
+
+Weighing robustness vs. portability: the absolute path is **strictly more correct** for the
+common case (a single installed/venv `sqlcg`) because it pins the exact binary that owns
+`--notify`, eliminating the silent-skew failure. The portability downside (hook breaks if the
+venv is moved/deleted) is real but (a) detectable — the hook would fail loudly with
+"no such file", not silently no-op, which is strictly better than today's `No such option`
+confusion, and (b) the documented recovery is a one-line `sqlcg git install-hooks` re-run,
+which rewrites the path. The hook scripts are generated per-repo and re-runnable, so a moved
+venv is a re-install, not a corruption. Net: embed the absolute path.
+
+Implementation: the `_HOOKS` scripts currently hardcode the literal `sqlcg`. Change
+`_install_single_hook` (or the `_HOOKS` construction) to substitute a resolved
+`sqlcg_bin` string into the script bodies at install time (e.g. format the command prefix
+from a resolved path). The sentinel comments must stay byte-for-byte unchanged so **R9
+idempotency is preserved** — only the command line changes, not the sentinel. Confirm
+`grep -n "# sqlcg post-checkout hook\|# sqlcg post-merge hook"` still matches verbatim.
+
+**Release-notes (NOT code) — reinstall instruction + version note.** Independent of the path
+embedding, the 1.1.0 release notes must state: users who installed `sqlcg` before 1.1.0 must
+`uv tool upgrade` / reinstall the CLI **and** re-run `sqlcg git install-hooks` in each repo so
+the hooks point at the `--notify`-capable binary. This is a deployment/communication action,
+not code, and belongs in the release changelog (e.g. `plan/measurements/` changelog or the
+GitHub release body), not in PR-F's diff. PR-F's code change reduces but does not eliminate
+the need for this note (a fresh install still needs `install-hooks` re-run to pick up the new
+absolute-path hook text).
+
+---
+
+#### Files affected
+
+- [`src/sqlcg/cli/commands/reindex.py`](src/sqlcg/cli/commands/reindex.py) — Bug 1
+  (`_NOTIFY_SOCKET_TIMEOUT_S` constant, `s.settimeout(...)`, dedicated `socket.timeout`/
+  `TimeoutError` except clause ordered before the no-server clause, exit 0 + "still applying"
+  message); Bug 2 (`_resolve_ref` helper, resolve `--to`/`--from` before send + in direct-write
+  branch; refactor `_get_head` to delegate to `_resolve_ref`).
+- [`src/sqlcg/cli/commands/git.py`](src/sqlcg/cli/commands/git.py) — Bug 3 (resolve the
+  installing `sqlcg` binary via `shutil.which`/`sys.argv[0]`, substitute its absolute path
+  into the generated hook command lines; sentinels unchanged).
+- Tests: extend the existing reindex/notify test module and the hook test module
+  (`tests/unit/test_git_hooks.py`); add a live re-verification e2e.
+
+#### Wiring verification (run before opening PR)
+
+- `grep -n "_NOTIFY_SOCKET_TIMEOUT_S\|settimeout" src/sqlcg/cli/commands/reindex.py` — constant
+  defined and used; no bare `30` literal remains on the socket.
+- `grep -n "socket.timeout\|TimeoutError" src/sqlcg/cli/commands/reindex.py` — the dedicated
+  timeout clause is present and (by reading) ordered before the `(FileNotFoundError,
+  ConnectionRefusedError, OSError)` clause.
+- `grep -n "_resolve_ref" src/sqlcg/cli/commands/reindex.py` — defined and called for `--to`
+  (and `--from`) before the socket payload is built and in the direct-write branch;
+  `_get_head` delegates to it.
+- `grep -n "shutil.which\|sys.argv\|sqlcg_bin" src/sqlcg/cli/commands/git.py` — binary
+  resolution present; the hook command lines use the resolved path variable.
+- `grep -n "# sqlcg post-checkout hook\|# sqlcg post-merge hook" src/sqlcg/cli/commands/git.py`
+  — both sentinels unchanged (R9 idempotency).
+- `grep -rn "TODO" src/sqlcg/cli/commands/reindex.py src/sqlcg/cli/commands/git.py` — zero
+  results; no TODO in any happy path.
+- No parser/indexer files touched: `git diff --stat` must NOT list anything under
+  `src/sqlcg/parsers/` or `src/sqlcg/indexer/` (perf invariants untouched).
+
+#### Tests to add (assert observable behavior, not "no exception")
+
+- **Bug 1 — Scenario A (timeout does NOT fall through)**: stub the control socket with a
+  server that accepts the connection and then sleeps past the (temporarily lowered, via
+  monkeypatched `_NOTIFY_SOCKET_TIMEOUT_S`) timeout without replying. Call
+  `sqlcg reindex --from <sha> --to <sha> --notify <root>`. Assert: exit code **0**, stderr
+  contains the "still applying" / "mcp status" message, and the **direct-write path was NOT
+  entered** (assert no "Database is locked" on stderr and `set_indexed_sha` was not called
+  client-side — e.g. spy `Indexer.resync_changed` and assert it was **not** invoked in-process).
+- **Bug 1 — Scenario B (genuine no-server still falls through)**: no socket / stale socket;
+  `sqlcg reindex --from <sha> --to <sha> --notify` falls through to direct write and updates
+  the graph (existing PR-D Scenario C/D behaviour, re-asserted post-change).
+- **Bug 2 — Scenario C (symbolic `--to` resolved before store)**: temp git repo, server live;
+  `sqlcg reindex --from <prev_sha> --to HEAD --notify`; after completion assert
+  `backend.get_indexed_sha()` equals the 40-char `git rev-parse HEAD` output and is **not**
+  the literal `"HEAD"`. Add a direct-write variant (no server) asserting the same.
+- **Bug 2 — Scenario D (`_resolve_ref` unit)**: `_resolve_ref(root, "HEAD")` ==
+  `_resolve_ref(root, <full_sha>)` == the full SHA (idempotent on a concrete SHA); a bogus ref
+  raises `typer.Exit`.
+- **Bug 3 — Scenario E (absolute path embedded, observable)**: monkeypatch `shutil.which`
+  to return `/opt/venv/bin/sqlcg`; run `install-hooks` into a temp repo; read
+  `.git/hooks/post-merge` and `post-checkout`; assert the command lines start with
+  `/opt/venv/bin/sqlcg reindex` (absolute) and **not** bare `sqlcg reindex`; assert the
+  sentinels `# sqlcg post-merge hook` / `# sqlcg post-checkout hook` are present.
+- **Bug 3 — Scenario F (idempotency unchanged)**: run `install-hooks` twice; second run is the
+  silent-skip path (sentinel match); file written once.
+- **Bug 3 — Scenario G (no `sqlcg` on PATH → bare fallback + warning)**: monkeypatch
+  `shutil.which` to return `None` and make `sys.argv[0]` non-usable; run `install-hooks`;
+  assert the hook falls back to bare `sqlcg` and a one-line warning is printed (no hard fail).
+- **LIVE re-verification — Scenario H (the gate for this PR)**: build a temp origin + clone;
+  `sqlcg git install-hooks` in the clone; `sqlcg index` it; start a real `sqlcg mcp start` on
+  the clone's DB; advance origin by a commit large enough that `resync_changed` takes
+  > a deliberately-lowered client timeout (monkeypatch `_NOTIFY_SOCKET_TIMEOUT_S` low, or use a
+  fixture with enough changed files); run `git pull` in the clone (fires post-merge → server
+  route). Assert: (a) **no "Database is locked"** on the pull's stderr, (b) after the server
+  finishes, `sqlcg db info` / `mcp status` reports `stale_by_commits == 0`, and (c) the stored
+  `indexed_sha` is the concrete 40-char `git rev-parse HEAD`, not `"HEAD"`.
+
+#### Acceptance criteria
+
+- `[ ]` A LIVE `git pull` on a `../dwh`-style clone with the MCP server running does **NOT**
+  print "Database is locked" — Scenario H asserts clean stderr and (after server completion)
+  `stale_by_commits == 0`. (This is the binding acceptance from the finding.)
+- `[ ]` On a client socket **timeout**, `reindex --notify` exits **0**, prints the "still
+  applying / check `mcp status`" cue, and does **NOT** fall through to direct write
+  (Scenario A) — verified by spying that in-process `resync_changed` was not called.
+- `[ ]` On a genuine no-server (stale/absent socket), `reindex --notify` still falls through to
+  direct write and updates the graph (Scenario B).
+- `[ ]` After a server-routed pull with `--to HEAD`, `backend.get_indexed_sha()` equals
+  `git rev-parse HEAD` (40-char), never the literal `"HEAD"` (Scenario C/H).
+- `[ ]` `_resolve_ref` resolves `HEAD`/branch/tag/SHA to a concrete SHA and is idempotent on a
+  full SHA; `_get_head` delegates to it (Scenario D).
+- `[ ]` `install-hooks` embeds the resolved absolute `sqlcg` path into both generated hooks
+  when `shutil.which("sqlcg")` succeeds (Scenario E); falls back to bare `sqlcg` + warning when
+  no binary is resolvable (Scenario G); sentinels unchanged so idempotency holds (Scenario F).
+- `[ ]` `grep -n "socket.timeout\|TimeoutError" src/sqlcg/cli/commands/reindex.py` — dedicated
+  timeout clause present and ordered before the no-server `OSError` clause.
+- `[ ]` `git diff --stat` lists only `reindex.py`, `git.py`, and test files — no
+  `parsers/`/`indexer/` change (perf invariants untouched; `resync_changed` reuse intact).
+- `[ ]` `grep -rn "TODO" src/sqlcg/cli/commands/reindex.py src/sqlcg/cli/commands/git.py` —
+  zero results; no TODO in any happy path.
+- `[ ]` Release-notes action recorded separately (not in PR-F diff): pre-1.1.0 installs must
+  reinstall the CLI and re-run `sqlcg git install-hooks`.
+
+#### Release-notes item (NOT part of the PR-F diff)
+
+Add to the 1.1.0 release changelog / GitHub release body:
+
+> **Upgrade note**: if you installed `sqlcg` before 1.1.0, upgrade the CLI
+> (`uv tool upgrade sqlcg` or reinstall) **and** re-run `sqlcg git install-hooks` in each
+> repo. Pre-1.1.0 hooks call a `sqlcg` that lacks `--notify`; the 1.1.0 `install-hooks` writes
+> hooks that pin the absolute path of the installed binary, so re-running it after upgrade is
+> required to pick up the fix.
+
+---
+
+### PR-F note — wait-model decision record
+
+Option (b) (async ack + background apply + `mcp status` queued/in-flight reporting) was
+**considered and deferred to v1.2**. It gives better `git pull` latency on large repos but
+adds transient ack-to-completion staleness and server state-tracking. PR-F ships option (a)
+(synchronous, 300s client bound, no fall-through on timeout) as the smaller correct fix for
+the release branch. Revisit (b) only if pull-blocking latency becomes a reported pain point.

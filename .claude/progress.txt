@@ -1,3 +1,46 @@
+## Current State — architect-planner: PR-F plan (Cluster A live-verification fixes, #28)
+
+ACTIVE AGENT: architect-planner — sprint-12 PR-F: three live-verification defects
+  plan: plan/sprint_12_v1.1.0.md (PR-F ticket + structured sections)
+  branch: fix/v1.0.2-bugfix
+  issues: #28 (Cluster A live-verification of PR-E against ../dwh)
+  status: PLANNING
+
+---
+
+## Prior State — developer: v1.1.0 PR-E post-merge hook server routing (#28)
+
+ACTIVE AGENT: developer — sprint-12 PR-E: post-merge ORIG_HEAD fix
+  plan: plan/sprint_12_v1.1.0.md (PR-E ticket)
+  branch: fix/v1.0.2-bugfix
+  issues: #28 (Cluster A live-verification finding)
+  status: COMPLETE — committed 6171e01 on fix/v1.0.2-bugfix
+  commit: 6171e01
+
+Handoff:
+  agent: developer (PR-E complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  files changed:
+    - src/sqlcg/cli/commands/git.py (replace post-merge script with ORIG_HEAD guard)
+    - tests/unit/test_git_hooks.py (replace old standalone test, add Scenario C+D)
+  test results: 829 passed, 6 skipped, 3 xfailed (full suite, pre-existing DWH e2e failure only)
+    + test_post_merge_contains_orig_head_guard (Scenario A — content check)
+    + test_post_merge_orig_head_unset_invokes_fallback (Scenario C — shell exec, no --from)
+    + test_post_merge_orig_head_present_routes_with_shas (Scenario D — shell exec, --from sha --to HEAD --notify)
+    + test_install_hooks_idempotent_post_merge (Scenario B — unchanged, still passes)
+  pyright: 0 errors
+  ruff: all checks passed
+  wiring verified:
+    - ORIG_HEAD hit: git.py line 44
+    - rev-parse --verify --quiet ORIG_HEAD: git.py line 44
+    - sentinel "# sqlcg post-merge hook": git.py line 37 (unchanged, R9 idempotency)
+    - zero TODOs in git.py
+    - git diff --stat: only git.py + test_git_hooks.py (2 files)
+  deviations: none — git.py was already partially updated in PR-D (--notify + stderr cue);
+    PR-E adds the ORIG_HEAD guard body (the unimplemented part)
+
+---
+
 ## Current State — developer: v1.1.0 PR-D reindex op on server + --notify (#28)
 
 ACTIVE AGENT: developer — sprint-12 PR-D: reindex through running server
