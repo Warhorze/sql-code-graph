@@ -1,3 +1,14 @@
+## Current State — developer: v1.1.0 PR-C Unix-socket control channel + mcp status/stop/restart (#29)
+
+ACTIVE AGENT: developer — sprint-12 PR-C: control socket + lifecycle commands
+  plan: plan/sprint_12_v1.1.0.md (PR-C ticket)
+  feature plan: plan/v1.1.0_live_graph_freshness.md
+  branch: fix/v1.0.2-bugfix
+  issues: #29 (MCP lifecycle + reindex through server)
+  status: IN PROGRESS
+
+---
+
 ## Current State — developer: v1.1.0 PR-B index --include-working-tree (#30)
 
 ACTIVE AGENT: developer — sprint-12 PR-B: index --include-working-tree + dirty sentinel

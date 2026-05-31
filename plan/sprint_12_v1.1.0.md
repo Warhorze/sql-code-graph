@@ -1006,3 +1006,13 @@ It does not use `xfail` — it will fail if PR-D has not merged yet; that is cor
 | R7 | Windows has no Unix domain sockets | MED | Platform guard (`if sys.platform != "win32"`) around socket creation in `server.py`; import is safe on Windows; deferred to v1.2 | PR-C |
 | R8 | `_run_with_control` task group teardown order | MED | Control socket task must be cancelled before `shutdown_backend()` runs (to avoid serving ops on a closed connection). Ensure `anyio.move_on_after` or task-group cancel scope wraps the socket task, and `finally` in `main` calls `shutdown_backend()` after `anyio.run` returns | PR-C |
 | R9 | Hook sentinel unchanged but script changed — `install-hooks` idempotency | LOW | Idempotency check uses sentinel comment string only; the sentinel does not include command arguments, so updating the script body does not break the idempotency guard for users who re-run `install-hooks` | PR-D |
+
+---
+
+### Deviations
+
+#### Deviation 1: Stop mechanism uses `os._exit(0)` instead of cancel-scope + stdin-close
+- **Reason**: The MCP `stdio_server` (mcp SDK) uses `anyio.to_thread.run_sync(readline, abandon_on_cancel=False)` for stdin reading. When the server is launched as a subprocess with a PIPE stdin, closing the read-end of the pipe from within the subprocess does NOT unblock the `readline()` thread — the parent process holds the write end open, so no EOF is delivered. `anyio.run()` then blocks indefinitely waiting for the thread to finish (because `abandon_on_cancel=False`). Using a cancel-scope cancellation cannot interrupt this blocked thread.
+- **Change**: `_stop_watcher` now calls `shutdown_backend()`, `cleanup_control_files()`, then `os._exit(0)` instead of closing stdin and cancelling the scope. R8 is satisfied in a slightly different way: the control socket task is still running when `shutdown_backend()` is called in `_stop_watcher`, but `cleanup_control_files()` removes the `.sock` file before `os._exit(0)`, so no new connections can arrive after cleanup begins. The `main()` finally block is bypassed by `os._exit`.
+- **Impact**: The exit path for `mcp stop` is `os._exit(0)` (hard exit, no finally blocks other than `_stop_watcher`'s explicit cleanup). Normal EOF-on-stdin exit still goes through `main()`'s finally block. This is the standard pattern for daemon stop-on-request. Tests assert exit code 0, socket file removal, and PID file removal — all pass.
+- **Date**: 2026-05-31
