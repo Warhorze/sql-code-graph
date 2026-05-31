@@ -2827,3 +2827,124 @@ removes the skill, mirroring the F1 sentinel teardown.
   persists the prerequisite `indexed_sha`.
 - `max_closure_depth=3` is a reasoned default, not yet calibrated against real
   DWH chain depth — revisit if a deep chain is observed under-resolving.
+
+---
+
+## 17. v1.1.0 — Live Graph Freshness & Daemon Reindex (Cluster A)
+
+Review date: 2026-05-31 · Reviewer: architect-reviewer · Branch:
+`fix/v1.0.2-bugfix` · Verdict: **APPROVED-WITH-FOLLOWUPS**
+
+Resolves the §16.3 deferred staleness FACT and closes the silent-stale-graph
+class of failure. Plan: [`v1.1.0_live_graph_freshness.md`](plan/v1.1.0_live_graph_freshness.md);
+sprint breakdown: [`sprint_12_v1.1.0.md`](plan/sprint_12_v1.1.0.md). GitHub
+issues [#28], [#29], [#30]. Four PRs (21ecd2e, abcf41c, e3bead4/add000d/f02b279,
+b54153f), all merged on the branch.
+
+### 17.1 Freshness model (#30)
+
+A new backend-free helper [`core/freshness.py`](src/sqlcg/core/freshness.py)
+computes a `Freshness(indexed_sha, head_sha, stale_by_commits, dirty, branch)`
+from a repo root + the stored SHA. All git calls funnel through one private
+`_git(root, *args)` that returns `None` on any failure — **never raises**
+(matches the defensive pattern in `git_delta.py`/`watcher.py`). `stale_by_commits`
+is `git rev-list --count <indexed>..<head>`; an indexed SHA unknown to git
+(rebased/shallow, or the `+dirty` sentinel) yields `None` ("distance unknown"),
+never a false `0`. The helper does not import the backend — the caller passes
+`indexed_sha` in — so it unit-tests against a real temp git repo with no Kuzu.
+
+Surfaced in three places, all reusing the single helper:
+- `sqlcg db info` prints `render_freshness_line` (silent on empty/non-git DB).
+- MCP `db_info` tool extends `DbInfoResult` with the four optional fields;
+  Neo4j's `NotImplementedError` on `get_indexed_sha()` is guarded → reports
+  `indexed_sha: null` without crashing.
+- `mcp status` JSON (see 17.3).
+
+`index --include-working-tree` (#30, PR-B) folds uncommitted changes and
+overwrites the stored SHA with a `"<head>+dirty"` sentinel via a fresh backend
+context. The sentinel is intentionally **not** a valid SHA, so freshness reports
+"commit distance unknown, working tree dirty" — accurate rather than guessed.
+Default committed-only behaviour is unchanged.
+
+### 17.2 Daemon control-channel architecture (#29)
+
+The MCP server is a single process running one `anyio` event loop holding the
+KuzuDB write lock for its whole lifetime (no lock lease — verified no safe Kuzu
+API exists; a reader/writer split was explicitly rejected). v1.1 adds a
+**Unix-domain-socket control channel** on that same event loop, not a second
+process. Control-file paths derive from `get_db_path()` (`KuzuConfig`-owned),
+never hardcoded `~/.sqlcg`, so two servers on two DBs do not collide:
+`graph.db` → `graph.db.sock` + `graph.db.pid` (both `0o600`). See
+[`server/control.py`](src/sqlcg/server/control.py) (paths + pid record +
+`is_pid_alive` + cleanup) and `_control_socket_task` in
+[`server/server.py`](src/sqlcg/server/server.py).
+
+Protocol (newline-delimited JSON, one request → one response):
+- `status` → `{running, pid, db_path, indexed_sha, head_sha, stale_by_commits,
+  connected_clients, uptime}`. `connected_clients` is best-effort `1` (stdio
+  transport = one client by design; documented approximation, not a gate).
+- `stop` → replies `{"ok": true}`, sets `stop_event` (see 17.5).
+- `reindex {root, from, to, dialect}` → see 17.4.
+
+CLI side (`mcp status`/`stop`/`restart` in
+[`cli/commands/mcp.py`](src/sqlcg/cli/commands/mcp.py)) connect-and-probe the
+socket. R3 stale-socket handling: on `ConnectionRefusedError`/`FileNotFoundError`,
+fall through to the PID-file probe (`is_pid_alive`) — `running:true,
+degraded:"socket unavailable"` if the PID lives, `{"running": false}` otherwise.
+The socket task is guarded behind `sys.platform != "win32"`; Windows keeps the
+direct-write + staleness-cue path (IPC deferred to v1.2).
+
+### 17.3 Daemon-writer reindex (#28 — the real fix)
+
+The silent-stale-graph failure (a second process opening the locked DB,
+swallowed by the hook's `|| true`) is fixed by routing the delta **through the
+process that already holds the lock**. The `reindex` socket op calls
+`Indexer.resync_changed(root, from, to, db, dialect)` **unchanged** (positional
+match verified against [`indexer.py`](src/sqlcg/indexer/indexer.py) line 428),
+run via `anyio.to_thread.run_sync` (R1: off the event-loop thread so tool calls
+are not blocked) behind a single `anyio.Lock` (`reindex_lock`, R2: the Kuzu
+connection is not thread-safe — see finding 3.3; concurrent notifies serialise).
+`reindex --notify` ([`reindex.py`](src/sqlcg/cli/commands/reindex.py)) probes the
+socket and on any connect failure falls through to the existing direct-write path
+unchanged (R3). The git hooks ([`git.py`](src/sqlcg/cli/commands/git.py)) now pass
+`--notify` and emit a one-line **stderr cue** on failure while staying non-fatal
+to the checkout — killing the "silent" mode. Idempotency sentinels unchanged (R9).
+
+**Perf invariants intact (verified):** neither `parsers/base.py` nor
+`indexer.py` changed anywhere in Cluster A (`git diff --stat 21ecd2e~1 dcba863`
+on both paths is empty). The reindex op reuses `resync_changed`, so the
+bulk-upsert and once-per-statement-scope invariants are inherited; an integration
+test (`test_reindex_via_server.py` Scenario A) pins that `resync_changed` is
+called exactly once. DWH regression gate **PASSED**: 175s (≤240s budget),
+45,652 edges (≥44,939 baseline — no coverage regression).
+
+### 17.4 Deviation: `os._exit(0)` on stop (accepted for v1.1)
+
+The MCP `stdio_server` runs stdin `readline` in a thread via
+`anyio.to_thread.run_sync` with `abandon_on_cancel=False`. When stdin is a
+parent-held pipe, that blocking read **cannot be interrupted** from inside the
+subprocess (the parent holds the write end open), so a clean cancel-scope
+unwind cannot drain the thread. The `stop` path therefore does explicit cleanup
+**first** — `shutdown_backend()` then `cleanup_control_files()` in `_stop_watcher`
+([`server.py`](src/sqlcg/server/server.py) ~L218-255) — and then calls
+`os._exit(0)`. R8 (backend shutdown + socket removal before exit) holds because
+the teardown runs ahead of the hard exit, not in `main()`'s `finally` (which
+`os._exit` skips). This is **documented honestly, not faked, and contains no
+TODO in a happy path** (commit f02b279). Acceptable for v1.1.
+
+`restart` is `stop` + client-respawn guidance, **not** a true re-parent: the
+editor owns the stdio process lifecycle and v1.1 has no launcher to re-spawn it
+(R5). Also documented, not faked.
+
+### 17.5 Tracked for v1.2
+
+- **True graceful stop / true `restart`** — needs a launcher model that owns the
+  stdio process so the blocking-pipe-read can be unblocked and `os._exit(0)`
+  retired in favour of clean unwind (R5 + 17.4).
+- **Windows IPC** (named pipes) for lifecycle + notify-reindex (R7).
+- **Per-file / SQL-only dirty tracking** — v1.1 reports whole-tree dirty only.
+- **Socket auth token** for multi-user machines (R6: socket is `0o600`,
+  owner-only, but any same-uid local process can send `stop`/`reindex`).
+- **Freshness on every tool result by default** — v1.1 ships it gated/off to
+  protect hot-path latency; default-on pending an overhead measurement.
+- **`connected_clients` fidelity** — best-effort `1` today; no real counter.
