@@ -1,12 +1,49 @@
+## Current State — developer: v1.1.0 PR-B index --include-working-tree (#30)
+
+ACTIVE AGENT: developer — sprint-12 PR-B: index --include-working-tree + dirty sentinel
+  plan: plan/sprint_12_v1.1.0.md (PR-B ticket)
+  feature plan: plan/v1.1.0_live_graph_freshness.md
+  branch: fix/v1.0.2-bugfix
+  issues: #30 (freshness/staleness signal)
+  status: IN PROGRESS — implementation complete, opening PR
+
+---
+
 ## Current State — developer: v1.1.0 PR-A freshness helper (#30)
 
 ACTIVE AGENT: developer — sprint-12 PR-A: freshness helper + db info + db_info tool
   plan: plan/sprint_12_v1.1.0.md (PR-A ticket)
   feature plan: plan/v1.1.0_live_graph_freshness.md
-  branch: fix/v1.0.2-bugfix (committing to existing branch per user instruction)
+  branch: fix/v1.0.2-bugfix
   issues: #30 (freshness/staleness signal)
-  status: IN PROGRESS
-  started: 2026-05-31
+  status: COMPLETE
+  commit: 21ecd2e
+
+Handoff:
+  agent: developer (PR-A complete, ready for architect-planner compliance check)
+  status: IMPLEMENTATION COMPLETE
+  files changed:
+    - src/sqlcg/core/freshness.py (NEW — Freshness dataclass, compute_freshness, render_freshness_line, _git)
+    - src/sqlcg/cli/commands/db.py (wire get_indexed_sha + compute_freshness + render_freshness_line)
+    - src/sqlcg/server/models.py (add indexed_sha, head_sha, stale_by_commits, dirty to DbInfoResult)
+    - src/sqlcg/server/tools.py (wire compute_freshness into db_info; handle NotImplementedError)
+    - tests/unit/test_freshness_helper.py (NEW — 18 unit tests: scenarios A/B/C/D/G)
+    - tests/integration/test_freshness_mcp.py (NEW — 5 integration tests: scenarios E/F)
+  test results: 776 passed, 6 skipped, 1 xfailed (excl. gitignored DWH e2e)
+    + 23 new PR-A tests all pass
+    + 1 pre-existing failure: test_mcp_stdio_smoke.py::test_mcp_start_handshake_on_stdout (exists before this branch)
+  pyright: 0 errors
+  ruff: all checks passed
+  deviations: none
+  wiring verified:
+    - grep confirmed compute_freshness in db.py (import + call site)
+    - grep confirmed get_indexed_sha in db.py
+    - grep confirmed render_freshness_line in db.py
+    - grep confirmed compute_freshness in tools.py (import + call site)
+    - grep confirmed get_indexed_sha in tools.py
+    - grep confirmed indexed_sha, head_sha, stale_by_commits, dirty in models.py
+    - grep confirmed zero TODOs in freshness.py
+    - grep confirmed _git not called directly from db.py or tools.py
 
 ---
 

@@ -63,6 +63,14 @@ def index_cmd(  # noqa: B008
     profile: bool = typer.Option(  # noqa: B008
         False, "--profile/--no-profile", help="Emit per-stage timing after indexing"
     ),
+    include_working_tree: bool = typer.Option(  # noqa: B008
+        False,
+        "--include-working-tree",
+        help=(
+            "Index the working tree including uncommitted changes. "
+            "Marks freshness as 'indexed with working-tree changes'."
+        ),
+    ),
 ) -> None:
     """Index SQL files in a directory.
 
@@ -136,6 +144,19 @@ def index_cmd(  # noqa: B008
         sqlcg_log.removeHandler(_warn_handler)
         sqlcg_log.removeHandler(_counter)
         _warn_handler.close()
+
+    # --include-working-tree: if the working tree is dirty, overwrite the stored SHA
+    # with a "<head>+dirty" sentinel so 'db info' can distinguish clean-HEAD index
+    # from working-tree-inclusive index.  The backend was closed inside _run_index,
+    # so we open a fresh context here for the single sentinel write.
+    if include_working_tree:
+        from sqlcg.core.freshness import _git
+
+        dirty_out = _git(path, "status", "--porcelain")
+        if dirty_out:  # non-empty string → working tree is dirty
+            head = _git(path, "rev-parse", "HEAD") or "unknown"
+            with get_backend() as _b2:
+                _b2.set_indexed_sha(f"{head}+dirty")
 
     if not verbose and not quiet and _counter.count > 0 and _warn_log_path is not None:
         console.print(
