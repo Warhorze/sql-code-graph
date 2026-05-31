@@ -318,8 +318,15 @@ presentation-facing table as dead.
     (config `[sqlcg.presentation]`) expected to have no in-corpus consumer — do NOT suggest deleting
     those. Show `reason` before suggesting deletion of any candidate.
   ```
-- Acceptance: `skill._BOUNDARY`/relevant skill string mentions `presentation_facing` and no longer
-  implies every consumer-less table is `dead_code`.
+- Acceptance: The **`_WORKFLOWS` string** (the specific string that contains the
+  `analyze_unused()` workflow bullet at line 57) must contain `presentation_facing` on the
+  `analyze_unused` line after this change. The `_BOUNDARY` string at lines 39-50 describes
+  the heuristic contract (`dead_code, confidence 0.5`) and does **not** need updating — it
+  remains accurate (the `dead_code` field is still a heuristic; `presentation_facing` entries
+  have no `Judgement` field and are facts, not heuristics). Acceptance is confirmed by:
+  `grep -A1 analyze_unused src/sqlcg/server/skill.py | grep -c presentation_facing`
+  returning ≥1 (the `_WORKFLOWS` line contains `presentation_facing`). The failing test
+  `test_T34_skill_workflows_mentions_presentation_facing` encodes this check precisely.
 
 ---
 

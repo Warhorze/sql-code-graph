@@ -1,4 +1,59 @@
-## Current State — architect-planner: #34 analyze_unused presentation segregation
+## Current State — plan-reviewer: #34 analyze_unused presentation segregation
+
+ACTIVE AGENT: plan-reviewer — #34 feature plan gate
+  plan: plan/feature_34_unused_presentation_segregation.md
+  branch: feat/cluster-b-provenance
+  status: READY FOR IMPLEMENTATION (1 warning found and fixed, failing tests committed)
+
+  Issues found and resolved:
+    WARNING-1 (Step 4.1 acceptance criterion ambiguous): The criterion said
+      "skill._BOUNDARY/relevant skill string mentions presentation_facing" but the only
+      proposed edit is to _WORKFLOWS (line 57). _BOUNDARY is a separate string (lines 39-50)
+      that does NOT need updating. The criterion text was ambiguous: a developer reading it
+      could incorrectly target _BOUNDARY. Fixed: Step 4.1 acceptance criterion now explicitly
+      names _WORKFLOWS, explains _BOUNDARY does NOT need changing (its heuristic contract
+      remains accurate — PresentationCandidate has no Judgement field), and provides a
+      grep-confirm command. The failing test test_T34_skill_workflows_mentions_presentation_facing
+      encodes the check precisely (it verifies the analyze_unused line specifically, not just
+      any line containing "presentation_facing" — the diff_impact line already contained it).
+
+  Grounding verified:
+    - get_presentation_prefixes: config.py:261 reads [sqlcg.presentation].schema_prefixes,
+      lowercases, returns [] default. No KuzuConfig/fallback path — reads .sqlcg.toml directly.
+    - get_presentation_prefixes imported in tools.py:10 (confirmed). No new import needed.
+    - ANALYZE_UNUSED_TABLES_QUERY: queries.cypher:102-106 returns only table_qualified, no
+      Python-inaccessible fields. Query unchanged — bucketing is purely post-query Python. CONFIRMED.
+    - SCHEMA_VERSION stays "5" at schema.py:6. CONFIRMED.
+    - UnusedTablesResult: models.py:397-411 has candidates/total_tables_scanned/hint only.
+      presentation_facing field is additive with default_factory=list. CONFIRMED.
+    - analyze_unused loop at tools.py:1574-1615: single db.run_read + Python loop over result
+      set. The startswith-any per row is O(rows x prefixes), not in any parser/indexer hot path.
+      No hot path invariants touched. CONFIRMED.
+    - hint branch: tools.py:1604-1609 fires on "not candidates" only — confirmed Step 3.1
+      must update this to account for the new bucket. CONFIRMED.
+    - Existing regression guards test_analyze_unused_fact_heuristic_separation (line 405) and
+      test_analyze_unused_backup_excluded (line 437): no [sqlcg.presentation] config in either;
+      they stay green with the default-off path. CONFIRMED.
+    - diff_impact case-sensitivity latent bug at tools.py:948: confirmed t.startswith(p) without
+      lowercasing. Plan flags it correctly in Open Question 2 as an existing diff_impact bug to
+      report to architect-reviewer separately — not fixed here. CONFIRMED OK.
+    - Scenario E noise test: ia_pres.feed_bck → table name "feed_bck" → fnmatch("feed_bck",
+      "*_bck") is True in NoiseFilter.is_noise (noise_filter.py:79-81). Noise wins. CONFIRMED.
+    - skill.py line 57 (_WORKFLOWS): the Dead code bullet; _BOUNDARY at lines 39-50 is a
+      separate string. Plan now correctly scopes the edit to _WORKFLOWS only. CONFIRMED.
+
+  Handoff:
+    agent: developer
+    status: READY FOR IMPLEMENTATION
+    plan: plan/feature_34_unused_presentation_segregation.md (corrected Step 4.1 criterion)
+    failing tests: tests/integration/test_T34_presentation_segregation.py
+      - test_T34_wiring_helper_defined_and_called: FAILED (helper not yet defined)
+      - test_T34_skill_workflows_mentions_presentation_facing: FAILED (analyze_unused line not updated)
+      - 7 other tests: SKIPPED (PresentationCandidate import guard — model not yet defined)
+    run: uv run pytest tests/integration/test_T34_presentation_segregation.py --no-header -q
+    result before impl: 2 FAILED, 7 SKIPPED — confirmed red
+
+## Prior State — architect-planner: #34 analyze_unused presentation segregation
 
 ACTIVE AGENT: architect-planner — v1.1.0 next feature (#34)
   task: re-triage #27, decide #34-vs-#35 one-vs-two, plan the first feature
