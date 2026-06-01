@@ -46,7 +46,7 @@ def upstream(  # noqa: B008
         "WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
     )
 
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
@@ -110,7 +110,7 @@ def downstream(  # noqa: B008
         "WITH c, dst, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
     )
 
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
@@ -178,7 +178,7 @@ def impact(  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Show all queries impacted by a table."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
             f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
@@ -214,7 +214,7 @@ def failures(
     with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
     an earlier version.
     """
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         cypher = (
             f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
             "AND ($cause IS NULL OR f.parse_cause = $cause) "
@@ -231,7 +231,7 @@ def unused(
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find tables with no query references."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
             "RETURN DISTINCT t.qualified AS qualified LIMIT 100",

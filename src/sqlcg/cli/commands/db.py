@@ -75,7 +75,7 @@ def db_reset(  # noqa: B008
 @app.command("info")
 def db_info() -> None:
     """Show database stats."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         version = backend.get_schema_version() or "unknown"
         console.print(f"Schema version: {version}")
 
@@ -167,7 +167,7 @@ def db_info() -> None:
 @app.command("list-repos")
 def list_repos() -> None:
     """List all indexed repositories."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         result = backend.run_read("MATCH (r:Repo) RETURN r.path AS path, r.name AS name", {})
 
         if not result:

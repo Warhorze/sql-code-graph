@@ -123,7 +123,7 @@ def gain_cmd(
         # Section F: parse quality from graph
         parse_quality: dict[str, int] | None = None
         try:
-            with get_backend() as backend:
+            with get_backend(read_only=True) as backend:
                 mode_rows = backend.run_read(
                     "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
                     " COUNT(q) AS cnt ORDER BY cnt DESC",
