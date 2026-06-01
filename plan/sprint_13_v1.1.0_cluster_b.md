@@ -872,3 +872,130 @@ PR-2 commit (or added as a failing test ahead of the PR to document the gap).
 - **Change**: Scenario F verifies that `table_kind` is correctly populated for real source tables (`kind='table'`), confirming the `OPTIONAL MATCH (t:SqlTable)` join in `TRACE_COLUMN_LINEAGE` works. Also verifies `my_cte.a` trace returns correct `table_kind`.
 - **Impact**: The `table_kind` field in `LineageNode` is correctly populated for the CTE-adjacent lineage that IS reachable (sources of CTE destinations). The SqlTable join wiring is verified. The CTE node itself appearing as `table_kind='cte'` would require a fixture where a CTE is the *source* column — which the ANSI parser resolves through.
 - **Date**: 2026-05-31
+
+
+● architect-planner(Architect verification of fix)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● The DWH corpus only surfaced 7 .sql files, but memory says it's ~1,340 files — the find likely missed the real layout. Let me
+  inspect the corpus structure before timing anything (a perf gate on 7 files would be meaningless).
+
+● Bash(echo "=== top-level of dwh ==="; ls -la /home/ignwrad/Projects/dwh/ 2>/dev/null
+      echo "=== sql file count (all) ==="; find /home/ignwrad/Projects/dwh/ -iname '*.…)
+  ⎿  === top-level of dwh ===
+     .claude/
+     .git/
+     … +64 lines (ctrl+o to expand)
+
+● The wc -l of "7" is an rtk artifact — the extension tally confirms 1,453 .sql files, squarely in the large-repo target range. Good
+  corpus for the gate. The dwh repo has its own .sqlcg.toml + .sqlcgignore.
+
+  To time the new parser code without disturbing my working tree, I'll run the index from a git worktree on the branch. Let me check
+  the db workflow and set it up.
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      echo "=== db subcommands ==="; uv run sqlcg db --help 2>&1 | sed -n '1,40p'…)
+  ⎿  === db subcommands ===
+
+      Usage: sqlcg db [OPTIONS] COMMAND [ARGS]...
+     … +28 lines (ctrl+o to expand)
+  ⎿  Allowed by auto mode classifier
+
+● The dwh corpus is Snowflake dialect — so this perf run doubles as a real-world functional smoke test of exactly the PR-2
+  preprocessing/start_line changes. Let me find the DB-path config knob so I can use a clean, isolated DB for the measurement.
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      echo "=== KuzuConfig path defaults / env ==="; grep -rn "db_path\|DB_PATH\|SQLCG_DB\|getenv\|environ\|default.*db\|\.sq…)
+  ⎿  === KuzuConfig path defaults / env ===
+     17:    db_path: Path = Field(default_factory=lambda: Path.home() / ".sqlcg" / "graph.db")
+     23:        default_factory=lambda: Path.home() / ".sqlcg" / "index.log",
+     … +39 lines (ctrl+o to expand)
+
+● SQLCG_DB_PATH controls the DB location, dialect comes from the dwh .sqlcg.toml. Let me check .sqlcgignore, then run the timed index
+  from a worktree on the branch with a clean isolated DB. I'll allow it to run a bit past 240s so I capture the actual time (to
+  distinguish "241s" from "blown up") and compare against both the 4-min gate and the 210–256s baseline.
+
+● Bash(cat /home/ignwrad/Projects/dwh/.sqlcgignore
+      echo "=== existing worktrees ==="; git worktree list)
+  ⎿  # IA-DATAPRODUCTS: COMBI/AGG Dynamic Tables have 100+ columns × 10+ FULL OUTER JOINs.
+     # sqlglot lineage traversal is O(columns × joins) per file; all source tables are
+     # absent from schema (E5), so zero lineage edges are produced anyway.
+     … +7 lines (ctrl+o to expand)
+
+● The main working dir is already on feat/cluster-b-provenance (the dev agents checked it out here), so I can run the gate directly
+  against the branch code. .sqlcgignore excludes IA-DATAPRODUCTS (113 files) → effective corpus ~1,340 files, matching the baseline.
+  Launching the timed index in the background with a clean isolated DB.
+
+● Bash(cd /home/ignwrad/Projects/sql-code-graph
+      rm -rf /tmp/sqlcg-perf && mkdir -p /tmp/sqlcg-perf…)
+  ⎿  Running in the background (↓ to manage)
+  ⎿  Allowed by auto mode classifier
+
+● Both parallel verifications are now in flight:
+
+  - #2 Architect review (background agent) — auditing the diff against the plan/architecture, with special focus on the Snowflake
+  newline-preservation claim (UNPIVOT/WITH TAG strips, not just the ALTER case) and the test-count reconciliation.
+  - #3 Perf gate (background) — timed full index of the ~1,340-file Snowflake corpus against the branch code, clean isolated DB, 4-min
+  target (allowing run-past to 360s so I capture the real number vs. the 210–256s baseline).
+
+  The perf run is also a free functional smoke test of PR-2's Snowflake parsing, since the corpus is Snowflake dialect. I'll report
+  both results when they land, then move to #4 (live issue verification) and #5 (backlog triage). Standing by.
+
+✻ Cooked for 3m 21s
+
+● Background command "Timed full index of dwh corpus on branch" completed (exit code 0)
+
+  Read 1 file (ctrl+o to expand)
+
+● Perf gate: PASS. 1,340 files indexed in 139 seconds — comfortably under the 4-minute hard limit, and if anything faster than the
+  210–256s baseline (consistent with the ~167s figure in memory; machine variance). No regression, so no parser-history bisect needed.
+  The graph is healthy: 1,840 tables, 39,034 edges, 823 files with column lineage (only 2 timeouts, both pre-existing large IA
+  files). The Snowflake corpus indexed cleanly on the branch code, which is a good functional signal for PR-2.
+
+● Task #3 closed. Now waiting on #2 (architect review), which is still running — that gates #4 (live verification). I've kept the
+  freshly-indexed v5 graph at /tmp/sqlcg-perf/graph.db so I can run live analyze/MCP checks against real data the moment the architect
+  reports back.
+
+  Current state:
+  - ✅ #1 PRs implemented (PR #37)
+  - ⏳ #2 Architect review — running
+  - ✅ #3 Perf gate — 139s, pass
+  - ⛔ #4 Live verification — waiting on #2
+  - ⛔ #5 Backlog triage — waiting on #4
+
+  Standing by for the architect agent.
+
+✻ Cogitated for 32s
+
+● Agent "Architect verification of fix" completed · 6m 32s
+
+● The architect verification is back, and it caught a genuine blocking defect — exactly the Snowflake edge case I flagged. The
+  developer's PR-2 deviation (computing line map from preprocessed SQL) holds only for single-line tag clauses; multi-line ALTER…SET
+  TAG, UNPIVOT, and WITH TAG clauses collapse to one blank line, shifting every subsequent statement's start_line by N. Scenario F
+  only tested the single-line variant, so it passed despite the bug. The architect also corrected my branch-base worry (the branch is
+  a full descendant of fix/v1.0.2-bugfix — no missed work) and confirmed everything else (#32, #33, perf invariants, STALE_VIEWS) is
+  genuinely fixed.
+
+  Other verdicts: #32 ✅ genuinely fixed, #33 ✅ genuinely fixed, perf invariants intact, STALE_VIEWS cleanly removed.
+
+  This needs a fix iteration before live verification. Recording the verification result and dispatching the developer to fix the
+  blocking defect.
+
+● developer(Fix Snowflake start_line shift)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● The fix developer is running on task #6 (background) — converting the three Snowflake strip regexes to newline-count-preserving
+  replacements, fixing the docstring, and adding multi-line regression tests (verified fail-before/pass-after). I'm deferring the
+  757→671 test-count reconciliation to that agent's final full-suite report rather than running pytest concurrently and racing its
+  file edits (it's editing snowflake_parser.py/ansi_parser.py/the PR-2 test file).
+
+  Status:
+  - ✅ #1 PRs implemented
+  - ✅ #2 Architect review — done, 1 blocking defect found
+  - ✅ #3 Perf gate — 139s, pass
+  - ⏳ #6 Snowflake multi-line fix — running
+  - ⛔ #4 Live verification — now waiting on #6
+  - ⛔ #5 Backlog triage — waiting on #4
+
+  Once #6 lands green, I'll run the live verification (#4) against a freshly re-indexed graph — including a real Snowflake file with a
+  multi-line SET TAG to confirm the line numbers are now correct in actual analyze/MCP output, not just unit tests. Standing by.
