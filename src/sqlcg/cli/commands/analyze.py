@@ -19,6 +19,29 @@ app = typer.Typer(help="Lineage analysis")
 console = Console()
 
 
+def _kind_filter(source_alias: str, include_intermediate: bool) -> str:
+    """Build the Half-B (#38) kind filter for the lineage traversal query.
+
+    When ``include_intermediate`` is False, the filter uses ``OPTIONAL MATCH`` plus
+    ``t.kind IS NULL OR t.kind IN ['table', 'external']`` so a source whose SqlTable
+    node is ABSENT (a CTE-body source on a graph indexed before the #39 fix, or not yet
+    re-indexed) is KEPT rather than silently dropped.  Reverting this to an inner
+    ``MATCH (t:SqlTable {...}) ... WHERE t.kind IN [...]`` is the #38 regression:
+    node-less physical sources vanish from results.
+
+    ``source_alias`` is ``src`` for upstream and ``dst`` for downstream — it names both
+    the node whose table is looked up and the variable carried through the WITH clause.
+    This is the single production source of the filter string; the #40 recall guard
+    imports it so reverting Half B here turns the guard red.
+    """
+    if include_intermediate:
+        return ""
+    return (
+        f"OPTIONAL MATCH (t:SqlTable {{qualified: {source_alias}.table_qualified}}) "
+        f"WITH c, {source_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    )
+
+
 @app.command("upstream")
 def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
@@ -39,12 +62,7 @@ def upstream(  # noqa: B008
     # re-indexed after #39 fix) is KEPT rather than silently dropped.  WHERE t.kind IS NULL OR
     # t.kind IN [...] means: keep when node absent (NULL) OR when kind is a physical source.
     # CTE aliases (kind='cte') and derived tables (kind='derived') are filtered out.
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) "
-        "WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
-    )
+    kind_filter = _kind_filter("src", include_intermediate)
 
     with get_backend(read_only=True) as backend:
         results = backend.run_read(
@@ -103,12 +121,7 @@ def downstream(  # noqa: B008
     # Half B (#38): OPTIONAL MATCH keeps sources whose SqlTable node is absent (NULL) or is a
     # physical kind.  WITH c, dst, t carries the three variables in scope at this interpolation
     # point; direct and q are bound later in the query.
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "OPTIONAL MATCH (t:SqlTable {qualified: dst.table_qualified}) "
-        "WITH c, dst, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
-    )
+    kind_filter = _kind_filter("dst", include_intermediate)
 
     with get_backend(read_only=True) as backend:
         results = backend.run_read(

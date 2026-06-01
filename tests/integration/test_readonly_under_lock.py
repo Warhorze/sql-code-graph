@@ -391,3 +391,20 @@ def test_db_reset_does_not_open_readonly_backend() -> None:
     assert "get_backend(read_only=True)" not in source, (
         "db_reset must not call get_backend(read_only=True)"
     )
+
+
+def test_gain_cmd_opens_readonly_backend() -> None:
+    """gain (Section F parse-quality read) must open get_backend(read_only=True).
+
+    gain_cmd's backend call is inside a conditional (only reached when the metrics DB
+    exists), so it is pinned by source inspection rather than the parametrized invoke
+    test above.  Reverting the flag at gain.py's read site reds this.
+    """
+    import inspect
+
+    from sqlcg.cli.commands import gain as gain_module
+
+    source = inspect.getsource(gain_module.gain_cmd)
+    assert "get_backend(read_only=True)" in source, (
+        "gain_cmd must open its parse-quality read with get_backend(read_only=True)"
+    )

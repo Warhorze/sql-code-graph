@@ -9,11 +9,17 @@ Fixtures:
   - union_all_branch: a UNION ALL CTE to catch branch-miss bugs.
 
 Guard asymmetry (from plan §tests for Cluster 1):
-  - This guard (surface-recall) is the HALF-B sentinel: reverting Half B (restoring
-    the inner-join filter) makes it red because physical sources are dropped by the
-    MATCH...WHERE kind IN [...] when the SqlTable node is missing.
+  - The HALF-B sentinel is ``test_half_b_keeps_node_less_physical_source`` below: it
+    builds the true #38 "no-reindex" scenario (a source column whose SqlTable node is
+    ABSENT) and runs the REAL production filter imported from analyze._kind_filter, so
+    reverting Half B (inner-join filter) drops the node-less source and reds the test.
+    The node-present fixtures alone cannot sentinel Half B: with the SqlTable node there
+    (via Half A) both the inner-join and the OPTIONAL-MATCH filter return the source.
   - Guard 2 (graph-completeness invariant, test_cte_source_node_invariant.py) is the
     HALF-A sentinel: reverting Half A (dropping src-table emission) makes it red.
+  - The filtered-query helper imports analyze._kind_filter rather than mirroring the
+    string, so the guards exercise production code (the #40 lesson: a hardcoded mirror
+    cannot catch a regression in the real query).
 
 Observable-output contract: every assertion checks returned id sets or
 table_kind field values, not "no exception raised".
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import pytest
 
+from sqlcg.cli.commands.analyze import _kind_filter
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import GET_UPSTREAM_DEPENDENCIES_QUERY, TRACE_COLUMN_LINEAGE_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
@@ -77,11 +84,12 @@ SELECT val FROM unioned;
 
 
 def _upstream_filtered_query(depth: int = 5) -> str:
-    """Build the exact upstream query analyze.py constructs with kind_filter ON."""
-    kind_filter = (
-        "OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) "
-        "WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
-    )
+    """Build the exact upstream query analyze.py constructs with kind_filter ON.
+
+    The filter clause is imported from production (``analyze._kind_filter``), not
+    mirrored here, so reverting Half B in analyze.py reds the tests that use it.
+    """
+    kind_filter = _kind_filter("src", include_intermediate=False)
     return (
         f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
         f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
@@ -100,10 +108,10 @@ def _upstream_filtered_query(depth: int = 5) -> str:
 def test_multi_hop_cte_cli_filtered_returns_physical_source(db, tmp_path):
     """CLI filtered upstream query returns the real physical source through 2 CTE hops.
 
-    Reverting Half B (restoring inner-join filter) makes this red because the
-    source SqlTable node is absent in an already-broken graph.
-    Reverting Half A (dropping src-table emission) makes this red via Guard 2, not here —
-    but the query would also fail to find kind='table' without the node.
+    This is the recall anchor (asserts the production filtered query, not raw edges).
+    It is NOT the Half-B sentinel: with Half A present the SqlTable node exists, so
+    both the inner-join and OPTIONAL-MATCH filters return the source.  The dedicated
+    Half-B sentinel is ``test_half_b_keeps_node_less_physical_source`` below.
     """
     (tmp_path / "fixture.sql").write_text(_MULTI_HOP_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
@@ -124,6 +132,49 @@ def test_multi_hop_cte_cli_filtered_returns_physical_source(db, tmp_path):
     assert not any("cte_a" in rid or "cte_b" in rid for rid in returned_ids), (
         f"CTE intermediates appeared in filtered upstream results: "
         f"{[rid for rid in returned_ids if 'cte_a' in rid or 'cte_b' in rid]}"
+    )
+
+
+def test_half_b_keeps_node_less_physical_source(db, tmp_path):
+    """HALF-B SENTINEL: the production filter keeps a source whose SqlTable node is absent.
+
+    This reproduces the #38 "no-reindex" scenario (Half B independence): a physical
+    source column whose SqlTable node does NOT exist — exactly the state of a graph
+    indexed before the #39 fix.  We index the fixture, then DELETE the staging.src_a
+    SqlTable node to recreate that broken state while leaving the COLUMN_LINEAGE edges
+    and the SqlColumn intact.
+
+    Half B (OPTIONAL MATCH + ``t.kind IS NULL OR ...``) KEEPS the node-less source.
+    Reverting Half B to an inner ``MATCH (t:SqlTable {...}) ... WHERE t.kind IN [...]``
+    DROPS it — and because this test runs the real ``analyze._kind_filter`` via
+    ``_upstream_filtered_query``, that revert in production reds this test.
+    """
+    (tmp_path / "fixture.sql").write_text(_MULTI_HOP_SQL)
+    Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
+
+    # Precondition: Half A created the SqlTable node (non-vacuous — proves we exercise
+    # the node-removal path rather than asserting on an already-absent node).
+    before = db.run_read("MATCH (t:SqlTable {qualified: 'staging.src_a'}) RETURN count(t) AS n", {})
+    assert before[0]["n"] == 1, "Precondition failed: Half A did not emit staging.src_a node"
+
+    # Recreate the pre-#39 broken state: source column exists + edges exist, but the
+    # SqlTable node is gone.
+    db.run_write("MATCH (t:SqlTable {qualified: 'staging.src_a'}) DETACH DELETE t", {})
+    after = db.run_read("MATCH (t:SqlTable {qualified: 'staging.src_a'}) RETURN count(t) AS n", {})
+    assert after[0]["n"] == 0, "Node-less precondition not established"
+    # The source COLUMN must still exist (only the SqlTable node was removed).
+    col = db.run_read("MATCH (c:SqlColumn {id: 'staging.src_a.col_a'}) RETURN count(c) AS n", {})
+    assert col[0]["n"] == 1, "Source SqlColumn unexpectedly removed — fixture invalid"
+
+    rows = db.run_read(_upstream_filtered_query(), {"ref": "mart.dst.col_a"})
+    returned_ids = {r["id"] for r in rows}
+
+    assert "staging.src_a.col_a" in returned_ids, (
+        "Node-less physical source 'staging.src_a.col_a' was dropped by the filtered "
+        "upstream query.\n"
+        f"Returned ids: {sorted(returned_ids)}\n"
+        "Half B (OPTIONAL MATCH + 'kind IS NULL') was reverted to the inner-join filter "
+        "— a source whose SqlTable node is absent is silently dropped (regression #38)."
     )
 
 
