@@ -142,3 +142,77 @@ def test_index_with_batch_size_flag(tmp_path, monkeypatch):
     result_custom = runner.invoke(app, ["index", str(fixtures_path), "--batch-size", "7"])
     assert result_custom.exit_code == 0
     assert "Indexed" in result_custom.output
+
+
+def test_v1_1_1_F2_index_relative_path_git_walk_no_crash(tmp_path, monkeypatch):
+    """Regression test: `sqlcg index <relative-path>` must not raise ValueError.
+
+    Bug: walker.py:_git_sql_files joins root / f where root is the relative input.
+    ignore.py:is_ignored then does path.relative_to(root.resolve()) — path is
+    relative, root is absolute → ValueError.
+
+    This test MUST FAIL before F2 (walk_sql_files root.resolve() fix) is implemented.
+    The test covers the git-walk branch by init-ing a git repo + `git add`.
+    """
+    import subprocess
+
+    # Create a parent dir and a sub-repo
+    parent = tmp_path / "parent"
+    repo = parent / "repo"
+    repo.mkdir(parents=True)
+
+    (repo / "dim_customer.sql").write_text("CREATE TABLE dim_customer (id INT)")
+    # Init git and stage the file so git ls-files returns it
+    subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=False)
+    subprocess.run(
+        ["git", "add", "dim_customer.sql"], cwd=str(repo), capture_output=True, check=False
+    )
+
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+    runner.invoke(app, ["db", "init"])
+
+    # Run `sqlcg index ./repo` from the parent directory (relative path)
+    monkeypatch.chdir(parent)
+    result = runner.invoke(app, ["index", "./repo"])
+
+    assert result.exit_code == 0, (
+        f"sqlcg index <relative-path> crashed with exit_code={result.exit_code}.\n"
+        f"Output: {result.output}\n"
+        "Expected exit_code=0 after F2 fix (resolve root once in walk_sql_files)."
+    )
+    assert "ValueError" not in (result.output or ""), (
+        "ValueError appeared in output — the relative-path crash in ignore.py is not fixed."
+    )
+    # The indexed file's table should be queryable
+    find_result = runner.invoke(app, ["find", "table", "dim_customer"])
+    assert "dim_customer" in find_result.output.lower(), (
+        "dim_customer table not found after indexing via relative path"
+        " — index may have silently skipped the file."
+    )
+
+
+def test_v1_1_1_F2_index_relative_path_rglob_fallback_no_crash(tmp_path, monkeypatch):
+    """Regression test: `sqlcg index <relative-path>` with non-git dir (rglob fallback).
+
+    Sibling of the git-walk branch test above — confirms the rglob path is also safe
+    (it was already fixed in #24 but we keep it here to prevent regression).
+    """
+    parent = tmp_path / "parent"
+    non_git_repo = parent / "data"
+    non_git_repo.mkdir(parents=True)
+
+    (non_git_repo / "fact_orders.sql").write_text("CREATE TABLE fact_orders (id INT)")
+
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+    runner.invoke(app, ["db", "init"])
+
+    monkeypatch.chdir(parent)
+    result = runner.invoke(app, ["index", "./data"])
+
+    assert result.exit_code == 0, (
+        f"sqlcg index <relative-path> (rglob branch) crashed: exit={result.exit_code}\n"
+        f"Output: {result.output}"
+    )
+    assert "ValueError" not in (result.output or ""), "ValueError appeared in rglob-branch output."
