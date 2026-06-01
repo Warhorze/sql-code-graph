@@ -45,7 +45,7 @@ def reindex_cmd(  # noqa: B008
         help="Files per KuzuDB transaction (same default as index command)",
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        5,
+        10,
         "--timeout-per-file",
         help="Per-file parse timeout in seconds",
     ),

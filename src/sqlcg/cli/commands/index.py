@@ -29,7 +29,7 @@ def index_cmd(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        5, "--timeout-per-file", help="Timeout per file in seconds"
+        10, "--timeout-per-file", help="Timeout per file in seconds"
     ),
     buffer_pool_size: int = typer.Option(  # noqa: B008
         0,

@@ -191,7 +191,7 @@ class Indexer:
         dialect: str | None,
         db: GraphBackend,
         dbt_manifest: Path | None = None,
-        timeout_per_file: int = 5,
+        timeout_per_file: int = 10,
         use_git: bool = True,
         progress_callback: Callable[[int, int], None] | None = None,
         no_ddl: bool = False,
@@ -554,7 +554,7 @@ class Indexer:
         dialect: str | None,
         *,
         batch_size: int = 50,
-        timeout_per_file: int = 5,
+        timeout_per_file: int = 10,
         max_closure_depth: int = 3,
     ) -> dict:
         """Incrementally resync the graph after a git branch change or pull.
