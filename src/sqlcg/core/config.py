@@ -346,14 +346,30 @@ def get_external_consumers(path: Path) -> list[ExternalConsumerSpec]:
     return []
 
 
-def get_backend() -> "GraphBackend":
+def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
+
+    Args:
+        read_only: Open the database in read-only mode. For KuzuBackend this
+            enables multiple concurrent read-only opens (reader/reader
+            concurrency), but does NOT allow reads while a read-write writer
+            holds the exclusive process lock — that requires routing through the
+            live MCP server via ``read_client.run_read_routed`` (v1.2.0).
+            Ignored for Neo4jBackend (Neo4j has no single-writer process lock;
+            the flag is a no-op and the normal connection is opened).
 
     Returns:
         A GraphBackend instance (KuzuBackend by default, or Neo4jBackend)
 
     Raises:
         ValueError: If backend type is not recognized
+
+    Note:
+        CLI read commands (find, analyze, db info, gain) route through a live
+        MCP server via ``read_client.run_read_routed`` (v1.2.0) when a server
+        is live, falling back to ``get_backend(read_only=True)`` when no server
+        is present. The fallback path still contends for the process lock under
+        an active writer (Windows / no-server fallback only).
     """
     backend_type = os.getenv("SQLCG_BACKEND", "kuzu")
 
@@ -364,11 +380,13 @@ def get_backend() -> "GraphBackend":
         return KuzuBackend(
             str(kuzu_cfg.db_path),
             buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
+            read_only=read_only,
         )
     elif backend_type == "neo4j":
         from sqlcg.core.neo4j_backend import Neo4jBackend
 
         neo4j_cfg = Neo4jConfig.from_env()
+        # read_only is ignored for Neo4j — no single-writer process lock.
         return Neo4jBackend(neo4j_cfg.uri, neo4j_cfg.user, neo4j_cfg.password)
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")
