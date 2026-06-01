@@ -181,7 +181,7 @@ After indexing, `sqlcg db info` shows non-zero `STAR_EXPANSION lineage edges`, a
 | **Search & meta** | |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
 | `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
-| `db_info()` | Graph health, node counts, parse quality breakdown, warnings |
+| `db_info()` | Graph health, node counts, parse quality breakdown, warnings, freshness (indexed SHA vs HEAD) |
 | `execute_cypher(query)` | Raw Cypher query against the graph |
 | `submit_feedback(...)` | Report a false positive/negative to improve metrics |
 
@@ -189,6 +189,12 @@ After indexing, `sqlcg db info` shows non-zero `STAR_EXPANSION lineage edges`, a
 > reference — `schema.table.column` (e.g. `ba.orders.customer_id`), not a bare
 > `table.column`. Each returned node carries both `name` (the bare column) and
 > `table` (the owning `schema.table`), so results are navigable without a second lookup.
+
+> **Provenance fields**: lineage edges now carry `file`, `line`, and `expression`
+> (where the lineage was derived from), a `confidence` of `1.0` for plainly-parsed
+> facts (lower for inferred edges, with a `reason`), and a `table_kind`
+> (`table` / `cte` / `derived` / `external`) so CTE and derived aliases are
+> distinguishable from real tables.
 
 > **LLM agent tip**: call `db_info()` before lineage queries to check that
 > `SqlColumn > 0` and `warnings` is empty. If `parse_quality["scripting_block"]`
@@ -205,16 +211,21 @@ sqlcg db init                          # initialise graph database
 sqlcg index <path> --dialect snowflake # index SQL files (snowflake is the tested dialect)
 sqlcg index <path> --dialect auto      # read dialect from .sqlcg.toml
 sqlcg index <path> --profile           # index + print per-stage timing and slowest files
+sqlcg index <path> --include-working-tree  # also index uncommitted changes (marks graph dirty)
 sqlcg reindex <path> --from <sha> --to <sha>  # incremental resync of only changed files
 sqlcg analyze unused                   # tables with no query references
 sqlcg analyze upstream/downstream      # trace lineage from the CLI
 sqlcg find table/column/pattern        # search the graph
 sqlcg watch <path>                     # watch for file changes
+sqlcg db info                          # graph stats + freshness (indexed SHA vs HEAD)
 sqlcg git install-hooks                # install post-checkout + post-merge resync hooks
 sqlcg gain                             # show usage metrics
 sqlcg report                           # generate FP/error report
 sqlcg mcp best-practices               # print the fact/heuristic boundary for the MCP tools
 sqlcg mcp start                        # start MCP server manually
+sqlcg mcp status                       # server status JSON (via control socket)
+sqlcg mcp stop                         # stop the running MCP server gracefully
+sqlcg mcp restart                      # stop the server (client must respawn it)
 sqlcg version                          # show installed version
 ```
 
