@@ -1,5 +1,32 @@
 # Feature Plan: v1.1.3 — `SELECT *` over a `UNION ALL` of sibling CTEs (residual #38)
 
+> **plan-reviewer corrections — 2026-06-01**
+>
+> **B1 (BLOCKER)**: The 2-branch UNION ALL fixture in Step 2.1 does NOT reproduce the DWH
+> island. `qualify()` mutates the AST in-place: for a 2-branch UNION ALL, `qualify()`
+> expands `SELECT *` inside `cte_union` to explicit columns before the CTE-projection loop
+> runs. After expansion, `projection_source.expressions` is no longer `[Star]`, so the
+> star-skip (`base.py:988-994`) never fires and the loop iterates the explicit columns
+> successfully. The 2-branch fixture already works today — no fix is needed for it.
+>
+> The actual island occurs with **N-branch UNION ALL (N≥3)**, where `cte_body.this` is
+> itself a `Union` (not a `Select`). `Union.expressions` is always `[]` (empty), so
+> `projection_source.expressions = []` and the inner `for cte_col_expr` loop body never
+> executes. **Fix: change the fixture to a 3-branch UNION ALL** (adds a `cte_c` branch)
+> so the guard is red on current code for the right reason. Step 1.1 must also be
+> corrected to walk to the deepest left-branch Select (not just `cte_body.this`).
+>
+> **B2 (BLOCKER)**: Step 1.1 only handles the case where `projection_source.expressions`
+> is `[Star]` (2-branch, direct left Select). For N≥3 branches, `projection_source` is a
+> `Union` with `.expressions = []` — the plan's detection condition is never satisfied.
+> **Fix: traverse to the deepest left-branch Select** (`while isinstance(ps, exp.Union):
+> ps = ps.this`) before checking for the star. Only then check `ps.expressions == [Star]`.
+> The `cte_body_sql` serialization of the full union body is unaffected (still correct).
+>
+> **Branching note (non-blocking)**: this plan targets v1.1.3 but lives on
+> `feat/v1.1.2-bugfix`. Implementation must land on a fresh branch (`fix/v1.1.3-union-cte-star`
+> off `master` or after PR #41 merges), not extend PR #41.
+
 ## Summary
 
 Star-expand `SELECT *` projections inside a CTE whose body is a `UNION ALL` of
@@ -176,20 +203,30 @@ No new third-party dependencies. Uses existing sqlglot `lineage()` `sources=` pa
 
 ### Phase 1: Star-over-union-CTE resolution in the parser
 
-**Step 1.1**: In the CTE-projection loop, detect a union body whose left-branch
-projection is a star and derive the column-name list from the referenced sibling CTE.
+**Step 1.1**: In the CTE-projection loop, detect a union body whose **deepest
+left-branch** projection is a star and derive the column-name list from the referenced
+sibling CTE.
 - Files affected: [`src/sqlcg/parsers/base.py`](../src/sqlcg/parsers/base.py)
   (`_extract_column_lineage`, the `for cte in cte_expressions` block at ~946–1041).
-- Detail: when `isinstance(cte_body, exp.Union)` and `projection_source.expressions`
-  is a single `exp.Star` (or `<alias>.*`), collect the union body's referenced relation
-  names from its `exp.Table` nodes (left branch first), look the first one up in
+- Detail: when `isinstance(cte_body, exp.Union)`, walk to the **deepest left-branch
+  `exp.Select`** by traversing `ps = cte_body.this` until `isinstance(ps, exp.Select)`
+  (i.e. `while isinstance(ps, exp.Union): ps = ps.this`). This handles both 2-branch
+  (`cte_body.this` is a `Select`) and N-branch (`cte_body.this` is itself a `Union`
+  whose `.expressions` is always `[]`). Only when `ps.expressions` is a single `exp.Star`
+  (or `<alias>.*`) do we take the star-expansion path: collect the union body's referenced
+  relation names from its `exp.Table` nodes (left branch first), look the first one up in
   `combined_sources`, and use **that** CTE body's non-star projections to supply
   `cte_col_name`s. Fall back to the existing behaviour (skip) if the referenced relation
   is not a known sibling CTE in `combined_sources`.
+- **Why `cte_body.this` alone is insufficient**: for a 3-branch `A UNION ALL B UNION ALL C`,
+  sqlglot parses as `Union(this=Union(this=A, expression=B), expression=C)`. The outer
+  `Union.this` is another `Union`, whose `.expressions` = `[]` (empty). Checking
+  `projection_source.expressions == [Star]` never matches. Walking to the deepest
+  `Select` is O(N_branches) per CTE — once, before the per-column loop.
 - The branch-CTE column-list lookup and the union body's referenced-CTE set are computed
   **once per CTE**, before the per-column loop (perf invariant: no per-column re-parse).
-- Acceptance: for the synthetic fixture, `cte_insert`'s projected columns are enumerated
-  from the branch CTE's explicit column list.
+- Acceptance: for the synthetic 3-branch fixture, `cte_union`'s projected columns are
+  enumerated from the first referenced branch CTE's explicit column list.
 
 **Step 1.2**: Pass the filtered sibling-CTE bodies to the `sg_lineage` call so the star
 expands.
@@ -230,15 +267,23 @@ per-column `combined_sources` rebuild was introduced.
       SELECT k AS grp_key, SUM(amount) AS total_amt
         FROM staging.src_b GROUP BY k
   ),
+  cte_c AS (
+      SELECT k AS grp_key, SUM(amount) AS total_amt
+        FROM staging.src_c GROUP BY k
+  ),
   cte_union AS (
       SELECT * FROM cte_a
-      UNION ALL
-      SELECT * FROM cte_b
+      UNION ALL SELECT * FROM cte_b
+      UNION ALL SELECT * FROM cte_c
   )
   SELECT grp_key, total_amt FROM cte_union;
   ```
-  Two sibling CTEs with **identical explicit column lists**, unioned via `UNION ALL`,
-  star-selected by `cte_union`, then the outer SELECT names the columns.
+  **Three** sibling CTEs (not two) with **identical explicit column lists**, unioned via
+  `UNION ALL`. A 3-branch fixture is required because for N=2, `qualify()` mutates the AST
+  in-place and expands `SELECT *` to explicit columns before the CTE-projection loop runs,
+  masking the bug. For N=3, `cte_body.this` is a nested `Union` (not a `Select`), so
+  `projection_source.expressions = []` and the current loop body never executes — producing
+  zero incoming edges to `cte_union`. This is the shape that matches the DWH islands.
 - Acceptance: see Test Strategy + Acceptance Criteria.
 
 **Step 2.2**: Add a behavioural assertion to the perf scaling guard if a new
@@ -267,11 +312,14 @@ hot-path op is introduced (only if Step 1 adds a counted op).
 - **Integration test (primary guard)** — `test_union_cte_star_recall_guard.py`, real
   in-memory KuzuDB via `Indexer().index_repo`, asserting **observable graph output**
   (the #40 lesson — assert real edges/ids, never "no exception"):
-  1. `test_union_star_cte_gets_incoming_edges` — after indexing the fixture,
+  1. `test_union_star_cte_gets_incoming_edges` — after indexing the **3-branch** fixture,
      `MATCH (s)-[:COLUMN_LINEAGE]->(c:SqlColumn {id:'cte_union.total_amt'}) RETURN s.id`
-     returns a **non-empty** set including `staging.src_a.amount` and
-     `staging.src_b.amount`. **Goes red on current code** (island), green on the fix.
-     This is the central bug sentinel.
+     returns **a non-empty set** (any incoming edge). **Goes red on current code**: with
+     the 3-branch fixture, `cte_union.total_amt` has 0 incoming edges today (the island).
+     After the fix, incoming edges exist (from physical sources via `sources=` resolution).
+     This is the central bug sentinel. Note: the fix emits `staging.src_*.amount ->
+     cte_union.total_amt` directly (sqlglot collapses the CTE hop when `sources=` is
+     passed), so the upstream set includes physical sources, not just CTE intermediates.
   2. `test_union_star_cte_final_target_reaches_both_sources` — the end-to-end CLI-shaped
      traversal from `mart.union_star_dst.total_amt` upstream reaches both
      `staging.src_a.amount` and `staging.src_b.amount` (chain reconnected across the
@@ -322,11 +370,10 @@ exception with a successful resolution at equal call count).
 
 ## Acceptance Criteria
 
-- [ ] On the synthetic fixture, `cte_union.total_amt` has ≥1 incoming `COLUMN_LINEAGE`
-      edge, and its upstream set includes both `staging.src_a.amount` and
-      `staging.src_b.amount`.
-- [ ] `test_union_star_cte_gets_incoming_edges` is **red on `master`/pre-fix** and
-      **green after the fix** (verified by running it against the unmodified parser).
+- [ ] On the **3-branch** synthetic fixture, `cte_union.total_amt` has ≥1 incoming
+      `COLUMN_LINEAGE` edge (currently 0 — confirmed island with 3 branches).
+- [ ] `test_union_star_cte_gets_incoming_edges` is **red on `master`/pre-fix** (0 edges;
+      verified with the 3-branch fixture) and **green after the fix**.
 - [ ] End-to-end: upstream traversal from `mart.union_star_dst.total_amt` reaches both
       physical sources through the reconnected `cte_union` boundary.
 - [ ] The existing explicit-column union path is unchanged: `test_union_all_cte_*` in
@@ -349,6 +396,7 @@ exception with a successful resolution at equal call count).
 | Branch CTEs are not union-compatible / column counts differ | We take the first branch's referenced CTE column list (the existing union path already assumes left-branch column names at `base.py:970–973`). Mismatched branches degrade to the current behaviour (no edge), never to a wrong edge. |
 | Regressing the general CTE recall the v1.1.2 guards pin | The `sources=` argument is added **only** on the star-over-union path; the explicit-column path is byte-for-byte unchanged. `test_cte_recall_guard.py` + the new `test_explicit_column_union_still_traces` gate this. |
 | Perf regression in the hot loop | New work is once-per-CTE, O(N_refs); same `sg_lineage` call count. Gated by `test_perf_scaling_guard.py`. |
+| `qualify()` in-place mutation changes `cte_body_sql` for 2-branch fixtures | `qualify()` mutates the AST in-place; for 2-branch unions it expands `SELECT *` to explicit columns, so `cte_body_sql` (line 982) serializes the qualified SQL. This means the 2-branch case already works today (qualify rescues it). The fix targets the case where the star is NOT expanded: 3+ branches (`projection_source` is a Union with `.expressions = []`) or future edge cases where qualify doesn't expand. The guard MUST use a 3-branch fixture to exercise the true unrescued path. |
 
 ## PR Breakdown
 
@@ -363,8 +411,18 @@ migration path (CLAUDE.md "No backward compatibility").
 
 ## Blocking Questions
 
-None blocking. One non-blocking confirmation:
+**Corrected by plan-reviewer 2026-06-01** — two blockers found and fixed in-plan above.
+Original "None blocking" verdict was incorrect.
 
+**B1 (FIXED IN-PLAN)**: 2-branch fixture masked the bug. Changed to 3-branch in Step 2.1
+and Test Strategy. The 2-branch case already works today because `qualify()` expands the
+star in-place; the real island is the N≥3 branch case.
+
+**B2 (FIXED IN-PLAN)**: Step 1.1 only checked `projection_source.expressions == [Star]`
+but for N≥3 branches `projection_source` is a Union with `.expressions = []`. Fixed to
+walk to the deepest left-branch Select first.
+
+Non-blocking note:
 - ARCHITECTURE_REVIEW.md does not yet record this residual #38 disposition (the finding
   lives in [`findings_v1.1.2_dwh_eval.md`](findings_v1.1.2_dwh_eval.md), which states
   "keep #38 open, narrow scope to UNION-ALL-of-CTEs star"). This plan proceeds on that
