@@ -68,3 +68,6 @@ results_*.json
 
 # Local-only golden lineage ground truth — names private DWH columns
 tests/e2e/golden_lineage.yaml
+# Local-only scratch script for bootstrapping the golden set
+scratch_bootstrap_golden.py
+.claude/worktrees/

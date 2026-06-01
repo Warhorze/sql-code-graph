@@ -18,7 +18,7 @@ def find_table(  # noqa: B008
 ) -> None:
     """Find a table by name."""
     name = name.lower()  # graph keys are lowercased at index time (C2 normalization)
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE}) WHERE t.qualified CONTAINS $name "
             "RETURN t.qualified AS qualified, t.kind AS kind LIMIT 50",
@@ -42,7 +42,7 @@ def find_column(  # noqa: B008
 ) -> None:
     """Find a column by table.column reference."""
     ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN}) WHERE c.id CONTAINS $ref RETURN c.id AS id LIMIT 50",
             {"ref": ref},
@@ -61,7 +61,7 @@ def find_pattern(  # noqa: B008
     pattern: str = typer.Argument(..., help="SQL pattern to search for"),  # noqa: B008
 ) -> None:
     """Find queries containing a SQL pattern."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (q:{NodeLabel.QUERY}) WHERE q.sql CONTAINS $pattern "
             "RETURN q.id AS id, q.kind AS kind LIMIT 50",

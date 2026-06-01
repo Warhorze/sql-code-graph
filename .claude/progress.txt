@@ -1,3 +1,171 @@
+## Handoff — plan-reviewer: v1.1.3 union-cte-star  [2026-06-01]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: v1.1.3 — SELECT * over N-branch UNION ALL of sibling CTEs (residual #38)
+BRANCH: feat/v1.1.2-bugfix (plan corrected here; impl MUST branch fresh: fix/v1.1.3-union-cte-star)
+PLAN: plan/v1_1_3_union_cte_star.md (corrected in-place, committed separately)
+
+STATUS: APPROVE-WITH-CORRECTIONS. 2 blockers found and fixed in-plan. Failing tests committed.
+
+VERDICT: APPROVE-WITH-CORRECTIONS
+
+BLOCKERS FOUND AND FIXED IN-PLAN:
+  B1 (CRITICAL): 2-branch fixture masked the bug. qualify() mutates the AST in-place
+     and expands SELECT * inside 2-branch union CTEs before the CTE-projection loop runs.
+     The REAL island occurs with N≥3 branches: cte_body.this is a nested Union (not Select),
+     Union.expressions=[], inner loop body never executes. Fixed: fixture changed to
+     3-branch UNION ALL (added cte_c). Empirically confirmed: 3-branch cte_union.total_amt
+     has 0 incoming edges today; 2-branch already works.
+
+  B2 (CRITICAL): Step 1.1 detection condition wrong for N≥3 branches. Plan said
+     "when projection_source.expressions is a single Star" — but for 3-branch union,
+     projection_source = cte_body.this = nested Union, Union.expressions = [].
+     The condition never fires. Fixed: Step 1.1 now specifies traversal to deepest
+     left-branch Select (while isinstance(ps, exp.Union): ps = ps.this) before checking
+     for the star. Both 2-branch and N-branch handled uniformly.
+
+PERF INVARIANTS: Preservation argument is correct. The fix is once-per-CTE, O(N_refs).
+  No new exp.expand(), no per-column re-parse, no body_scope change, no qualify regression.
+  qualify() in-place mutation HELPS (2-branch already fixed by qualify); the new code path
+  only fires when qualify doesn't expand (N≥3 branches or qualify failure).
+  All gating guards (test_perf_scaling_guard, test_T09_01_qualify_once, test_bulk_upsert_invariant,
+  test_upsert_batch_invariant) confirmed green at baseline.
+
+GUARD EFFECTIVENESS: All 3 sentinel tests are truly red today:
+  - test_union_star_cte_gets_incoming_edges: FAIL (0 incoming edges to cte_union.total_amt)
+  - test_union_star_cte_incoming_edges_are_cte_projection: FAIL (0 edges)
+  - test_union_star_cte_mcp_upstream_returns_physical_sources: FAIL (island: MCP returns [])
+  Anti-regression (explicit-column union): PASS (stays green through and after fix)
+
+SCOPE DISCIPLINE: Fix correctly scoped. 2-branch explicit-column union already works;
+  existing test_cte_recall_guard.py guards unchanged. STAR_SOURCE / STAR_EXPANSION
+  correctly excluded. No schema source added.
+
+BRANCHING NOTE: plan/impl MUST land on fresh branch fix/v1.1.3-union-cte-star
+  off master (after PR #41 merges), not extending feat/v1.1.2-bugfix / PR #41.
+
+FAILING TESTS COMMITTED:
+  tests/integration/test_union_cte_star_recall_guard.py
+  Run: uv run pytest tests/integration/test_union_cte_star_recall_guard.py -q
+  Result before fix: 3 FAILED, 1 PASSED
+
+NEXT: developer implements fix (off master, after PR #41 merges).
+
+## Handoff — architect-planner: v1.1.3 union-cte-star  [2026-06-01]
+
+ACTIVE AGENT: architect-planner (idle, available for Q&A + plan-compliance on "finished")
+FEATURE: v1.1.3 — SELECT * over a UNION ALL of sibling CTEs (residual #38)
+BRANCH: feat/v1.1.2-bugfix (plan committed here; impl should branch fresh, e.g. fix/v1.1.3-union-cte-star)
+PLAN: plan/v1_1_3_union_cte_star.md  (committed)
+
+STATUS: PLAN COMPLETE — ready for plan-reviewer, then developer.
+
+ROOT CAUSE (confirmed against code + real file):
+  - CTE-projection loop base.py:946-1041. For a UNION CTE body it serializes the union
+    body in isolation (base.py:982 cte_body_sql) and calls sg_lineage with NO sources=
+    (base.py:1011-1015). The left-branch projection is a bare Star (base.py:988-994 skips it),
+    and even a concrete name fails: sg_lineage("col","SELECT * FROM cte_a UNION ALL ...")
+    raises "Cannot find column" because the sibling CTE names are undefined relations.
+    Exception swallowed at base.py:1035 → cte_insert.* become islands.
+  - Empirically (full pipeline, real file wtfe_kpi_voorraad_artikel_voorraadlocatie.sql):
+    cte_insert.ma_vrije_vrd has 0 incoming COLUMN_LINEAGE, while the branch CTE and the
+    final target both trace fine — the island is strictly the upstream side of cte_insert.
+  - NOTE: whole-statement qualify SUCCEEDS on the real file (body_scope built), so this is
+    NOT a qualify-failure / fallback issue — it is specific to the CTE-projection loop.
+
+FIX (planned, not implemented):
+  - In the CTE-projection loop, on a union body whose left branch is SELECT *: derive
+    column names from the referenced sibling CTE (looked up in combined_sources), and pass
+    a filtered map of ONLY the union body's referenced sibling CTE bodies as sources= to the
+    existing sg_lineage call. sqlglot then expands * per branch; edges emit as CTE_PROJECTION
+    confidence 1.0 (NOT STAR_SOURCE — a CTE has no target_table). Verified the sources= call
+    resolves both branches to their physical sources.
+
+PERF INVARIANTS: fix is once-per-CTE O(N_refs), same sg_lineage call count, no new exp.expand,
+  no body_scope change, no per-column re-parse. Gating guards all GREEN at baseline:
+  test_perf_scaling_guard, test_T09_01_qualify_once, test_cte_recall_guard (12 passed).
+  Developer MUST keep test_perf_scaling_guard / test_T09_01_qualify_once /
+  test_bulk_upsert_invariant / test_upsert_batch_invariant green.
+
+NEW GUARD TO ADD: tests/integration/test_union_cte_star_recall_guard.py — red on bug, green
+  on fix; asserts cte_union.total_amt gets incoming edges to staging.src_a/src_b.amount, plus
+  an explicit-column-union anti-regression test. Fixture is synthetic (no private corpus).
+
+VERSION: bump 1.1.2 -> 1.1.3 (pyproject.toml:7, src/sqlcg/__init__.py:3, uv.lock).
+ISSUE: re-scope #38 to this residual; architect-reviewer to add a line to ARCHITECTURE_REVIEW.md.
+
+NEXT STEPS: plan-reviewer gate -> developer implements single PR -> plan-compliance check.
+
+---
+
+## Handoff — developer: v1.1.2-bugfix  [2026-06-01]
+
+ACTIVE AGENT: developer
+FEATURE: v1.1.2-bugfix (issues #38, #39, #40, #28)
+BRANCH: feat/v1.1.2-bugfix
+PLAN: plan/v1_1_2_bugfix.md
+STATUS: IMPLEMENTATION COMPLETE — PR #41 updated with lock semantics correction, ready for plan-compliance check
+PR: https://github.com/Warhorze/sql-code-graph/pull/41
+
+COMMITS:
+  4ce0ded  fix(#38,#39,#40): CTE lineage recall — emit source SqlTable nodes, invert kind-filter, remove dead query
+  4a7d609  fix(#28): read-only connection for CLI read commands
+  7ef2b6c  test(#28): pin hook --notify visibility + write-path fallthrough
+  e966296  fix(#28): correct read-only lock semantics — cross-process tests + accurate docs
+
+FILES CHANGED:
+  PR1:
+    - src/sqlcg/indexer/indexer.py  (Half A: emit src-table SqlTable row in column_lineage loop)
+    - src/sqlcg/cli/commands/analyze.py  (Half B: OPTIONAL MATCH kind-filter for upstream+downstream)
+    - src/sqlcg/core/queries.cypher  (remove GET_UPSTREAM_DEPENDENCIES_FILTERED block)
+    - src/sqlcg/core/queries.py  (remove GET_UPSTREAM_DEPENDENCIES_FILTERED_QUERY binding)
+    - tests/unit/test_queries_loader.py  (remove loadability assertion for removed query)
+    - tests/integration/test_cte_recall_guard.py  (NEW: Guard 1 surface-recall)
+    - tests/integration/test_cte_source_node_invariant.py  (NEW: Guard 2 graph-completeness)
+    - pyproject.toml, src/sqlcg/__init__.py, uv.lock  (version bump 1.1.0 → 1.1.2)
+    - .gitignore  (scratch_bootstrap_golden.py gitignored)
+  PR2:
+    - src/sqlcg/core/config.py  (get_backend(read_only=False) + empty-DB degradation)
+    - src/sqlcg/cli/commands/analyze.py  (upstream/downstream/impact/failures/unused → read_only=True)
+    - src/sqlcg/cli/commands/find.py  (find_table/find_column/find_pattern → read_only=True)
+    - src/sqlcg/cli/commands/db.py  (db_info/list_repos → read_only=True; init/reset unchanged)
+    - src/sqlcg/cli/commands/gain.py  (Section F parse-quality read → read_only=True)
+    - tests/integration/test_readonly_under_lock.py  (NEW: 15 tests)
+  PR3:
+    - tests/unit/test_git_hooks_notify.py  (NEW: 12 hook content guards)
+
+TEST RESULTS (full suite incl. e2e — commit e966296):
+  968 passed, 7 skipped, 3 xfailed, 0 failed
+  - PR1 guards: 10 CTE recall/invariant/alias tests (test_cte_recall_guard + test_cte_source_node_invariant + test_cte_schema_alias_guard) — all green
+  - PR2: 16 readonly lock + wiring tests (incl. 2 new cross-process tests) — all green
+  - PR3: 12 hook content guards — all green
+  - Perf invariants: test_perf_scaling_guard (4), test_upsert_batch_invariant (4), test_bulk_upsert_invariant (1), test_T09_01_qualify_once (2) — all green
+  - pyright: 0 errors | ruff: all checks passed
+
+WIRING VERIFIED:
+  - get_backend(read_only=True): grep confirmed 10 read call sites (analyze×5, find×3, db×2, gain×1)
+  - get_backend() (default False): init, reset, server unchanged
+  - GET_UPSTREAM_DEPENDENCIES_FILTERED: grep confirms zero remaining references in src/ or tests/
+  - SqlTable row for edge.src.table: appended after <output> continue in _build_file_rows
+  - SCHEMA_VERSION = "6": unchanged (schema.py:6)
+
+DEVIATIONS (commit e966296 — lock semantics correction):
+  - Same-process vacuous test test_readonly_open_succeeds_while_writer_holds_lock deleted;
+    its docstring falsely claimed cross-process behavior. Replaced with two cross-process tests:
+    test_cross_process_reader_reader_concurrency (reader/reader concurrency — the real #28 benefit)
+    test_cross_process_writer_blocks_readonly_open (writer blocks all opens including read_only=True —
+      documents the known limitation; asserts "Database is locked" from the read_only open attempt).
+  - Docstrings corrected: config.py get_backend() and kuzu_backend.py KuzuBackend.__init__
+    now accurately state that read_only=True enables reader/reader concurrency but does NOT
+    allow reads while a read-write writer holds the exclusive lock.
+  - Plan #28 acceptance criterion re-scoped in plan/v1_1_2_bugfix.md §Deviations (Deviation 1).
+  - Earlier deviation (test_readwrite_open_fails_while_writer_holds_lock) was a prior attempt;
+    superseded by the cross-process approach in commit e966296.
+
+NEXT: architect-planner plan-compliance check.
+
+---
+
 ## Handoff — developer: v1.1.1 batch-upsert perf + bugfix batch  [2026-06-01]
 
 DATE: 2026-06-01
@@ -1684,3 +1852,9 @@ Handoff — plan-reviewer (2026-05-30):
   NOTE: No failing acceptance tests written in this focused re-gate (this was
     a verification-only pass per user instruction "Do not edit the plan").
     The plan is ready for developer implementation as-is.
+
+## Current State — architect-planner: v1.1.2 bug-fix release  [2026-06-01]
+AGENT: architect-planner
+FEATURE: v1.1.2 bug-fix release (issues #38, #39, #40, #28; #29 = dependency context)
+OUTPUT: plan/v1_1_2_bugfix.md
+STATUS: planning — ready for plan-reviewer on completion

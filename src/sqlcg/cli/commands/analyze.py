@@ -19,6 +19,29 @@ app = typer.Typer(help="Lineage analysis")
 console = Console()
 
 
+def _kind_filter(source_alias: str, include_intermediate: bool) -> str:
+    """Build the Half-B (#38) kind filter for the lineage traversal query.
+
+    When ``include_intermediate`` is False, the filter uses ``OPTIONAL MATCH`` plus
+    ``t.kind IS NULL OR t.kind IN ['table', 'external']`` so a source whose SqlTable
+    node is ABSENT (a CTE-body source on a graph indexed before the #39 fix, or not yet
+    re-indexed) is KEPT rather than silently dropped.  Reverting this to an inner
+    ``MATCH (t:SqlTable {...}) ... WHERE t.kind IN [...]`` is the #38 regression:
+    node-less physical sources vanish from results.
+
+    ``source_alias`` is ``src`` for upstream and ``dst`` for downstream — it names both
+    the node whose table is looked up and the variable carried through the WITH clause.
+    This is the single production source of the filter string; the #40 recall guard
+    imports it so reverting Half B here turns the guard red.
+    """
+    if include_intermediate:
+        return ""
+    return (
+        f"OPTIONAL MATCH (t:SqlTable {{qualified: {source_alias}.table_qualified}}) "
+        f"WITH c, {source_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    )
+
+
 @app.command("upstream")
 def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
@@ -34,15 +57,14 @@ def upstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "MATCH (t:SqlTable {qualified: src.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
-    )
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
+    # Half B (#38): use OPTIONAL MATCH so a missing SqlTable node (e.g. CTE-body source not yet
+    # re-indexed after #39 fix) is KEPT rather than silently dropped.  WHERE t.kind IS NULL OR
+    # t.kind IN [...] means: keep when node absent (NULL) OR when kind is a physical source.
+    # CTE aliases (kind='cte') and derived tables (kind='derived') are filtered out.
+    kind_filter = _kind_filter("src", include_intermediate)
 
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
@@ -95,15 +117,13 @@ def downstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "MATCH (t:SqlTable {qualified: dst.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
-    )
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
+    # Half B (#38): OPTIONAL MATCH keeps sources whose SqlTable node is absent (NULL) or is a
+    # physical kind.  WITH c, dst, t carries the three variables in scope at this interpolation
+    # point; direct and q are bound later in the query.
+    kind_filter = _kind_filter("dst", include_intermediate)
 
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
             f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
@@ -171,7 +191,7 @@ def impact(  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Show all queries impacted by a table."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
             f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
@@ -207,7 +227,7 @@ def failures(
     with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
     an earlier version.
     """
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         cypher = (
             f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
             "AND ($cause IS NULL OR f.parse_cause = $cause) "
@@ -224,7 +244,7 @@ def unused(
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find tables with no query references."""
-    with get_backend() as backend:
+    with get_backend(read_only=True) as backend:
         results = backend.run_read(
             f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
             "RETURN DISTINCT t.qualified AS qualified LIMIT 100",

@@ -346,8 +346,24 @@ def get_external_consumers(path: Path) -> list[ExternalConsumerSpec]:
     return []
 
 
-def get_backend() -> "GraphBackend":
+def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
+
+    Args:
+        read_only: Open in read-only mode.  When ``True``, the KùzuDB open
+            does not take an exclusive write lock, enabling *multiple concurrent
+            read-only opens* (reader/reader concurrency).  CLI read commands
+            pass ``True`` so they do not hold the exclusive write lock and
+            therefore do not block other concurrent readers or a pending reindex.
+            Note: this does NOT allow reads while a read-write writer already
+            holds the exclusive lock — KùzuDB's exclusive write lock is
+            process-level; a ``read_only=True`` open still fails with
+            "Database is locked" when a writer is active.  Reads during an
+            active writer remain a known limitation (future work: route reads
+            through the live MCP server).
+            Neo4j has no single-writer lock; this flag is a no-op there.
+            All writer call sites (index, reindex, db init/reset, server
+            init_backend) use the default ``False``.
 
     Returns:
         A GraphBackend instance (KuzuBackend by default, or Neo4jBackend)
@@ -361,14 +377,26 @@ def get_backend() -> "GraphBackend":
         from sqlcg.core.kuzu_backend import KuzuBackend
 
         kuzu_cfg = KuzuConfig.from_env()
-        return KuzuBackend(
-            str(kuzu_cfg.db_path),
-            buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
-        )
+        try:
+            return KuzuBackend(
+                str(kuzu_cfg.db_path),
+                buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
+                read_only=read_only,
+            )
+        except RuntimeError as exc:
+            if read_only and "READ ONLY" in str(exc):
+                # KùzuDB refuses to open a non-existent or empty DB in read-only
+                # mode ("Cannot create an empty database under READ ONLY mode").
+                # Surface the same empty-DB guidance the user sees from `db info`.
+                raise RuntimeError(
+                    "Database not initialised — run 'sqlcg db init' and 'sqlcg index <path>' first."
+                ) from exc
+            raise
     elif backend_type == "neo4j":
         from sqlcg.core.neo4j_backend import Neo4jBackend
 
         neo4j_cfg = Neo4jConfig.from_env()
+        # Neo4j has no single-writer lock; read_only is a no-op here.
         return Neo4jBackend(neo4j_cfg.uri, neo4j_cfg.user, neo4j_cfg.password)
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")

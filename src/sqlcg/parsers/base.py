@@ -967,10 +967,16 @@ class SqlParser(ABC):
                             if not isinstance(cte_body, (exp.Select, exp.Union)):
                                 continue
 
-                            # For Union bodies, use the left branch's projections.
+                            # For Union bodies, use the deepest left-branch Select's projections.
                             # Union.expressions is always empty; projections are on Union.this.
+                            # For N=2: cte_body.this is a Select — the while loop is a no-op.
+                            # For N≥3: cte_body.this is a nested Union (A UNION ALL B UNION ALL C
+                            # parses as Union(Union(A,B),C)), so we walk down to the deepest
+                            # left-branch Select (whose star qualify() already expanded in place).
                             if isinstance(cte_body, exp.Union):
                                 projection_source = cte_body.this
+                                while isinstance(projection_source, exp.Union):
+                                    projection_source = projection_source.this
                             else:
                                 projection_source = cte_body
 

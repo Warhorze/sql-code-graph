@@ -1,3 +1,37 @@
+## v1.1.3 (2026-06-01)
+
+> **Re-index recommended (no schema change).** `SCHEMA_VERSION` stays `6`, so no
+> forced migration — but the lineage fixes below only take effect on a fresh
+> `sqlcg index <path>`, which adds the previously-missing CTE-body source nodes and
+> union-CTE edges. Folds in the unreleased v1.1.1/v1.1.2 work — there is no separate
+> 1.1.1 or 1.1.2 release.
+
+### Fix
+
+- **#39**: emit a `SqlTable` node for source tables referenced only inside CTE bodies,
+  so `find table` and the graph-completeness invariant see CTE-body-only sources
+- **#38**: invert the `analyze upstream`/`downstream` kind-filter to `OPTIONAL MATCH …
+  WHERE t.kind IS NULL OR t.kind IN ['table','external']`, so default-flag queries
+  return real physical sources instead of dead-ending at the insert-CTE node
+- **#38**: trace `SELECT *` across a `UNION ALL` of sibling CTEs (N≥3 branches) — derive
+  the unioning CTE's columns from the deepest branch `SELECT`; the CTE hop is preserved
+  (`cte_union.col ← branch_cte.col`, `CTE_PROJECTION`) and physical sources stay reachable
+  via multi-hop traversal
+- **#28**: open CLI read commands (`analyze`, `find`, `db info`, `gain`) with a read-only
+  KùzuDB connection so concurrent readers coexist and reads don't take the exclusive write
+  lock; accurate lock-semantics docs (a read still blocks while a read-write writer holds the
+  process-level lock — documented as a known limitation)
+- **#28**: git hooks route `reindex --notify` through the live server's control socket and
+  print a visible stderr warning on failure instead of a silent `|| true`
+
+### Test / hardening
+
+- **#40**: replace the ineffective lineage regression guards with effective sentinels —
+  reverting either half of the #38/#39 fix now turns a guard red; the #38 filter is asserted
+  against the real production query path, not a mirrored string
+- **#28**: cross-process lock tests pin reader/reader concurrency and the writer-blocks-reader
+  limitation; hook `--notify` content and write-path fallthrough are regression-tested
+
 ## v1.1.0 (2026-06-01)
 
 > **⚠️ Upgrade note — re-index required.** The graph schema advanced from
