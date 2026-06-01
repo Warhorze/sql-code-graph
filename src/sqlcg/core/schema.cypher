@@ -44,7 +44,8 @@ CREATE NODE TABLE SqlQuery (
     target_table STRING,
     parse_failed BOOLEAN,
     confidence FLOAT,
-    parsing_mode STRING
+    parsing_mode STRING,
+    start_line INT64
 );
 
 -- File -> Repo: file belongs to this repository
@@ -113,4 +114,15 @@ CREATE REL TABLE STAR_SOURCE (
 CREATE NODE TABLE SchemaVersion (
     version STRING PRIMARY KEY,
     indexed_sha STRING
+);
+
+-- External consumer node: one per declared downstream consumer in .sqlcg.toml
+CREATE NODE TABLE ExternalConsumer (
+    name STRING PRIMARY KEY,
+    consumer_type STRING
+);
+
+-- Table -> ExternalConsumer: this table is consumed by an external system
+CREATE REL TABLE CONSUMED_BY (
+    FROM SqlTable TO ExternalConsumer
 );

@@ -89,17 +89,27 @@ def test_post_merge_contains_sentinel(temp_git_repo):
     assert "# sqlcg post-merge hook" in content
 
 
-def test_post_merge_contains_reindex_standalone(temp_git_repo):
-    """post-merge hook calls sqlcg reindex in standalone mode (no SHA args)."""
+def test_post_merge_contains_orig_head_guard(temp_git_repo):
+    """post-merge hook contains the ORIG_HEAD guard and routes through the server.
+
+    PR-E fix: post-merge now passes ORIG_HEAD as --from so --notify can route
+    through a running MCP server (same path as post-checkout). A fallback branch
+    for when ORIG_HEAD is unset (first-ever merge / gc'd) is also present.
+    """
     hook_path = temp_git_repo / ".git" / "hooks" / "post-merge"
 
     runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
 
     content = hook_path.read_text()
     assert "sqlcg reindex" in content
-    # post-merge does NOT pass --from/--to (standalone mode uses stored SHA)
-    assert "--from" not in content
-    assert "--to" not in content
+    # ORIG_HEAD guard — reads pre-merge HEAD via git rev-parse
+    assert "git rev-parse --verify --quiet ORIG_HEAD" in content
+    # If-branch: passes explicit SHAs to enable server routing
+    assert '--from "$PREV"' in content
+    assert "--to HEAD" in content
+    assert "--notify" in content
+    # Fallback branch: standalone reindex without --from when ORIG_HEAD is unset
+    assert '[ -n "$PREV" ]' in content
     assert "--dialect auto" in content
     assert "--quiet" in content
 
@@ -137,6 +147,155 @@ def test_install_hooks_idempotent_post_merge(temp_git_repo):
     assert content_first.count("# sqlcg post-merge hook") == 1
     assert content_second.count("# sqlcg post-merge hook") == 1
     assert content_first == content_second
+
+
+# ---------------------------------------------------------------------------
+# Scenario C/D — ORIG_HEAD guard behavioural tests (shell execution with shim)
+# ---------------------------------------------------------------------------
+
+
+def _write_sqlcg_shim(bin_dir: Path, argv_log: Path) -> None:
+    """Write a sqlcg shim that records its argv to argv_log and exits 0."""
+    shim = bin_dir / "sqlcg"
+    shim.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{argv_log}"\nexit 0\n')
+    shim.chmod(0o755)
+
+
+def _init_git_repo_for_shell(repo_path: Path) -> str:
+    """Initialize a real git repo; return the HEAD SHA."""
+    import subprocess
+
+    subprocess.run(["git", "init", str(repo_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    (repo_path / "f.sql").write_text("SELECT 1")
+    subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_post_merge_orig_head_unset_invokes_fallback(tmp_path):
+    """Scenario C: when ORIG_HEAD is unset, the hook invokes sqlcg without --from.
+
+    The fallback branch (else) must run and must NOT pass --from to sqlcg, so the
+    standalone stored-SHA delta path is taken (not an empty --from broken payload).
+    """
+    import os
+    import subprocess
+
+    import sqlcg.cli.commands.git as _git_mod
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo_for_shell(repo_path)
+
+    # Set up shim BEFORE installing hooks so _resolve_sqlcg_bin returns the shim path.
+    # This mirrors real usage: the shim is the "installed sqlcg" on PATH.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    _write_sqlcg_shim(bin_dir, argv_log)
+    shim_path = str(bin_dir / "sqlcg")
+
+    # Patch _resolve_sqlcg_bin so the hook embeds the shim path
+    original_resolve = _git_mod._resolve_sqlcg_bin
+    _git_mod._resolve_sqlcg_bin = lambda: shim_path
+    try:
+        runner.invoke(app, ["git", "install-hooks", "--repo", str(repo_path)])
+    finally:
+        _git_mod._resolve_sqlcg_bin = original_resolve
+
+    # Ensure ORIG_HEAD is unset (fresh repo after git init has no ORIG_HEAD)
+    hook_path = repo_path / ".git" / "hooks" / "post-merge"
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        ["sh", str(hook_path)],
+        cwd=str(repo_path),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, f"hook failed: {proc.stderr}"
+    argv_recorded = argv_log.read_text()
+    # Fallback branch: sqlcg must be called with 'reindex' but WITHOUT '--from'
+    assert "reindex" in argv_recorded
+    assert "--from" not in argv_recorded
+
+
+def test_post_merge_orig_head_present_routes_with_shas(tmp_path):
+    """Scenario D: when ORIG_HEAD is set, the hook passes --from ORIG_HEAD --to HEAD --notify.
+
+    The if-branch must run and must pass all three: --from <sha>, --to HEAD, --notify.
+    This verifies the fix routes through the running server (same path as post-checkout).
+    """
+    import os
+    import subprocess
+
+    import sqlcg.cli.commands.git as _git_mod
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    orig_sha = _init_git_repo_for_shell(repo_path)
+
+    # Simulate what git sets after a merge: write ORIG_HEAD to .git/ORIG_HEAD
+    (repo_path / ".git" / "ORIG_HEAD").write_text(orig_sha + "\n")
+
+    # Set up shim BEFORE installing hooks (same pattern as Scenario C above)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    _write_sqlcg_shim(bin_dir, argv_log)
+    shim_path = str(bin_dir / "sqlcg")
+
+    original_resolve = _git_mod._resolve_sqlcg_bin
+    _git_mod._resolve_sqlcg_bin = lambda: shim_path
+    try:
+        runner.invoke(app, ["git", "install-hooks", "--repo", str(repo_path)])
+    finally:
+        _git_mod._resolve_sqlcg_bin = original_resolve
+
+    hook_path = repo_path / ".git" / "hooks" / "post-merge"
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        ["sh", str(hook_path)],
+        cwd=str(repo_path),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, f"hook failed: {proc.stderr}"
+    argv_recorded = argv_log.read_text()
+    # If-branch: sqlcg must be called with explicit SHAs and --notify
+    assert "reindex" in argv_recorded
+    assert "--from" in argv_recorded
+    assert orig_sha in argv_recorded
+    assert "--to" in argv_recorded
+    assert "HEAD" in argv_recorded
+    assert "--notify" in argv_recorded
 
 
 # ---------------------------------------------------------------------------
@@ -277,3 +436,113 @@ def test_install_hooks_fails_outside_git_repo():
 
         assert result.exit_code != 0
         assert "not a git repository" in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario E — absolute path embedded in hooks when shutil.which succeeds
+# ---------------------------------------------------------------------------
+
+
+def test_install_hooks_embeds_absolute_binary_path(temp_git_repo, monkeypatch):
+    """Scenario E: when shutil.which returns an absolute path, hooks use it.
+
+    Asserts:
+    - post-checkout and post-merge command lines start with the resolved absolute path
+    - NOT bare 'sqlcg' (which would cause version skew if the installed binary differs)
+    - sentinel comments are present (R9 idempotency preserved)
+    """
+    import sqlcg.cli.commands.git as _git_mod
+
+    abs_bin = "/opt/venv/bin/sqlcg"
+    monkeypatch.setattr(_git_mod, "_resolve_sqlcg_bin", lambda: abs_bin)
+
+    result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    assert result.exit_code == 0
+
+    co_hook = temp_git_repo / ".git" / "hooks" / "post-checkout"
+    pm_hook = temp_git_repo / ".git" / "hooks" / "post-merge"
+    co_content = co_hook.read_text()
+    pm_content = pm_hook.read_text()
+
+    # Command lines must use the absolute path
+    assert f"{abs_bin} reindex" in co_content, (
+        f"post-checkout must use absolute path. Got:\n{co_content}"
+    )
+    assert f"{abs_bin} reindex" in pm_content, (
+        f"post-merge must use absolute path. Got:\n{pm_content}"
+    )
+
+    # Bare 'sqlcg reindex' (without the leading abs path prefix) must NOT appear
+    # as a standalone command (i.e. not preceded by a different path component)
+    assert "\nsqlcg reindex" not in co_content, "post-checkout must not use bare 'sqlcg reindex'"
+    assert "\nsqlcg reindex" not in pm_content, "post-merge must not use bare 'sqlcg reindex'"
+
+    # Sentinels must be unchanged (R9 idempotency)
+    assert "# sqlcg post-checkout hook" in co_content
+    assert "# sqlcg post-merge hook" in pm_content
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario F — idempotency still holds with absolute path
+# ---------------------------------------------------------------------------
+
+
+def test_install_hooks_idempotent_with_absolute_path(temp_git_repo, monkeypatch):
+    """Scenario F: second install-hooks run silently skips (sentinel already present).
+
+    The sentinel check is byte-for-byte, so idempotency is preserved regardless of
+    whether the command line uses an absolute path or bare sqlcg.
+    """
+    import sqlcg.cli.commands.git as _git_mod
+
+    abs_bin = "/opt/venv/bin/sqlcg"
+    monkeypatch.setattr(_git_mod, "_resolve_sqlcg_bin", lambda: abs_bin)
+
+    runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    co_content_first = (temp_git_repo / ".git" / "hooks" / "post-checkout").read_text()
+    pm_content_first = (temp_git_repo / ".git" / "hooks" / "post-merge").read_text()
+
+    runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+    co_content_second = (temp_git_repo / ".git" / "hooks" / "post-checkout").read_text()
+    pm_content_second = (temp_git_repo / ".git" / "hooks" / "post-merge").read_text()
+
+    assert co_content_first == co_content_second, "post-checkout must not change on second install"
+    assert pm_content_first == pm_content_second, "post-merge must not change on second install"
+
+
+# ---------------------------------------------------------------------------
+# PR-F Scenario G — no binary resolvable → bare fallback + warning, no hard fail
+# ---------------------------------------------------------------------------
+
+
+def test_install_hooks_bare_fallback_when_no_binary_resolvable(temp_git_repo, monkeypatch):
+    """Scenario G: when no sqlcg binary is resolvable, falls back to bare 'sqlcg' + warning.
+
+    Asserts:
+    - install-hooks does NOT hard-fail
+    - the generated hooks use bare 'sqlcg reindex'
+    - a one-line warning is printed to output
+    """
+    import sqlcg.cli.commands.git as _git_mod
+
+    # Make shutil.which return None (no sqlcg on PATH)
+    monkeypatch.setattr(_git_mod.shutil, "which", lambda name: None)
+    # Make sys.argv[0] non-usable (not named sqlcg, not executable)
+    monkeypatch.setattr(_git_mod.sys, "argv", ["/usr/bin/python3"])
+
+    result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+
+    # Must NOT hard-fail
+    assert result.exit_code == 0, f"install-hooks must not hard-fail. output: {result.output}"
+
+    co_content = (temp_git_repo / ".git" / "hooks" / "post-checkout").read_text()
+    pm_content = (temp_git_repo / ".git" / "hooks" / "post-merge").read_text()
+
+    # Must fall back to bare 'sqlcg'
+    assert "sqlcg reindex" in co_content
+    assert "sqlcg reindex" in pm_content
+
+    # Warning must be printed
+    assert "warning" in result.output.lower() or "warn" in result.output.lower(), (
+        f"Expected a warning when no binary resolvable. Output: {result.output!r}"
+    )

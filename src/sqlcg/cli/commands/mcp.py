@@ -71,3 +71,106 @@ def mcp_best_practices() -> None:
     from sqlcg.server.skill import render_body
 
     typer.echo(render_body())
+
+
+@app.command("status")
+def mcp_status() -> None:
+    """Print server status JSON (connects to control socket).
+
+    Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
+    stale_by_commits, connected_clients, uptime when a server is live.
+
+    When no server is found: {"running": false}.
+    When the PID file exists with a live process but the socket is unavailable:
+    {"running": true, "degraded": "socket unavailable", ...}.
+
+    R3 (stale socket): if the socket file exists but the server is not
+    responding (ConnectionRefusedError / FileNotFoundError), falls through
+    to the PID-file probe — never hangs or errors on a dead socket.
+    """
+    import socket as _socket
+
+    from sqlcg.server.control import is_pid_alive, read_pid, sock_path
+
+    sp = sock_path()
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(str(sp))
+            s.sendall(json.dumps({"op": "status"}).encode() + b"\n")
+            data = s.recv(4096)
+        console.print_json(data.decode())
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        # Socket unavailable — probe via PID file (R3: stale-socket fall-through)
+        rec = read_pid()
+        if rec and is_pid_alive(rec["pid"]):
+            console.print_json(
+                json.dumps(
+                    {
+                        "running": True,
+                        "degraded": "socket unavailable",
+                        "pid": rec["pid"],
+                        "db_path": rec["db_path"],
+                    }
+                )
+            )
+        else:
+            console.print_json(json.dumps({"running": False}))
+
+
+@app.command("stop")
+def mcp_stop() -> None:
+    """Stop the running MCP server gracefully.
+
+    Sends a ``stop`` op via the control socket; waits up to 5 s for the
+    socket file to disappear (confirming clean exit).  Falls back to SIGTERM
+    on the PID-file PID if the socket is unavailable.
+
+    R3 (stale socket): ``ConnectionRefusedError`` / ``FileNotFoundError`` are
+    caught — never hangs on a dead socket.
+    """
+    import socket as _socket
+    import time
+
+    from sqlcg.server.control import is_pid_alive, read_pid, sock_path
+
+    sp = sock_path()
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(str(sp))
+            s.sendall(json.dumps({"op": "stop"}).encode() + b"\n")
+            s.recv(128)
+        # Wait up to 5 s for the socket file to disappear (confirms clean exit)
+        for _ in range(10):
+            if not sp.exists():
+                break
+            time.sleep(0.5)
+        console.print("[green]Server stopped.[/green]")
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        # Socket unavailable — fall back to SIGTERM via PID file
+        import signal
+
+        rec = read_pid()
+        if rec and is_pid_alive(rec["pid"]):
+            os.kill(rec["pid"], signal.SIGTERM)
+            console.print(f"[yellow]Socket unavailable — sent SIGTERM to PID {rec['pid']}[/yellow]")
+        else:
+            console.print("[yellow]No server found to stop.[/yellow]")
+
+
+@app.command("restart")
+def mcp_restart() -> None:
+    """Stop the server. The client (editor) must respawn.
+
+    v1.1 cannot re-parent an editor-spawned stdio process.  This command
+    stops the current server and prints guidance for the user to restart
+    the MCP server via their editor's MCP configuration.
+
+    True auto-restart (re-parenting stdio) is deferred to v1.2.
+    """
+    mcp_stop()
+    console.print(
+        "[yellow]Server stopped. Please restart via your editor's MCP configuration.[/yellow]"
+    )
+    console.print("[dim]True auto-restart (re-parenting stdio) is deferred to v1.2.[/dim]")

@@ -56,6 +56,18 @@ class LineageNode(BaseModel):
     )
     file: str | None = Field(None, description="Source file path, if applicable")
     confidence: float | None = Field(None, description="Confidence score 0.0-1.0")
+    line: int | None = Field(None, description="1-based start line of the producing statement")
+    expression: str | None = Field(
+        None, description="SQL text of the producing statement (truncated)"
+    )
+    reason: str | None = Field(
+        None,
+        description="Set only when confidence < 1.0; why the edge is inferred",
+    )
+    table_kind: str | None = Field(
+        None,
+        description="Structural role of the source table: 'table', 'cte', 'derived', or 'external'",
+    )
 
 
 class LineageEdge(BaseModel):
@@ -195,6 +207,12 @@ class DbInfoResult(BaseModel):
         default_factory=list,
         description="Health warnings. Empty means the graph is in a healthy state.",
     )
+    indexed_sha: str | None = Field(None, description="Git SHA of the last index run")
+    head_sha: str | None = Field(None, description="Current HEAD SHA of the indexed repo")
+    stale_by_commits: int | None = Field(
+        None, description="Commits HEAD is ahead of indexed_sha (0 = up to date)"
+    )
+    dirty: bool = Field(False, description="True if working tree has uncommitted changes")
 
 
 class DefinitionFile(BaseModel):
@@ -312,6 +330,13 @@ class DiffImpactResult(BaseModel):
         default_factory=list,
         description="Affected tables in topological rebuild order across the union blast radius.",
     )
+    external_consumers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Declared external consumers attached to any table in the blast radius "
+            "(via CONSUMED_BY edges). Empty when no consumers are configured."
+        ),
+    )
     noise_excluded: list[str] = Field(
         default_factory=list, description="Affected tables excluded as backup/noise."
     )
@@ -319,6 +344,11 @@ class DiffImpactResult(BaseModel):
     hint: str | None = Field(
         None, description="Diagnostic hint when result is empty or approximate."
     )
+
+    @property
+    def presentation(self) -> list[str]:
+        """Alias for presentation_facing (backward-compatible accessor)."""
+        return self.presentation_facing
 
 
 class ScopeChangeResult(BaseModel):
@@ -376,12 +406,50 @@ class UnusedCandidate(BaseModel):
     )
 
 
+class PresentationCandidate(BaseModel):
+    """A terminal/egress table that has no in-corpus consumer BY DESIGN.
+
+    Surfaced separately from dead_code: its lack of within-corpus consumers is the
+    defining property of a declared presentation/egress layer, not evidence it is dead.
+    """
+
+    table_qualified: str = Field(..., description="Qualified table name (schema.table).")
+    within_corpus_references: int = Field(
+        default=0,
+        description="FACT: count of SELECTS_FROM consumers in the indexed corpus (always 0 here).",
+    )
+    matched_prefix: str = Field(
+        ...,
+        description="FACT: the configured [sqlcg.presentation] schema_prefix this table matched.",
+    )
+    reason: str = Field(
+        default="leaf in a declared egress layer; expected to have no in-corpus consumer",
+        description="Why this table is segregated from dead_code rather than flagged.",
+    )
+    has_external_consumer: bool = Field(
+        default=False,
+        description=(
+            "FACT: True when at least one declared external consumer is attached "
+            "to this table via a CONSUMED_BY edge. Distinguishes a provable egress "
+            "point from a candidate orphan in the egress layer."
+        ),
+    )
+
+
 class UnusedTablesResult(BaseModel):
     """Result of analyze_unused — tables with no within-corpus consumers."""
 
     candidates: list[UnusedCandidate] = Field(
         default_factory=list,
         description="Tables with zero SELECTS_FROM consumers (noise-filtered).",
+    )
+    presentation_facing: list[PresentationCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Terminal/egress leaves matched by [sqlcg.presentation] prefixes; "
+            "expected to have no in-corpus consumer (NOT dead code). Empty when no "
+            "presentation prefix is configured."
+        ),
     )
     total_tables_scanned: int = Field(
         0, description="FACT: total SqlTable nodes in the graph at time of scan."

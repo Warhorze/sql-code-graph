@@ -166,3 +166,48 @@ def test_F2_tool_return_models_covers_all_16_tools():
     assert len(registered) == 16, (
         f"list_registered_tools() must return 16 tools, got {len(registered)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase A: provenance (#31) and node-kind (#33) prose assertions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _SKILL_MODULE_AVAILABLE, reason="F2 Phase A not yet implemented")
+def test_F2_render_skill_teaches_provenance_fields():
+    """Phase A AC: rendered skill body mentions the #31 provenance fields file/line/expression.
+
+    LineageNode carries file, line, and expression so the LLM can cite the exact
+    source location of each lineage edge. The skill must teach this — asserting on
+    rendered output, not merely on structure.
+    """
+    output = render_skill("0.3.1")
+    for field in ("file", "line", "expression"):
+        assert field in output, (
+            f"render_skill output must mention the provenance field '{field}' "
+            f"(LineageNode.{field} from #31) so the LLM cites source locations. "
+            f"Field missing from rendered skill."
+        )
+
+
+@pytest.mark.skipif(not _SKILL_MODULE_AVAILABLE, reason="F2 Phase A not yet implemented")
+def test_F2_render_skill_teaches_table_kind_distinction():
+    """Phase A AC: rendered skill body teaches the #33 table_kind node-kind distinction.
+
+    LineageNode.table_kind distinguishes 'table' / 'cte' / 'derived' / 'external'.
+    The skill must teach the LLM to use table_kind to avoid presenting a CTE/derived
+    intermediate as the ultimate source table.
+    """
+    output = render_skill("0.3.1")
+    assert "table_kind" in output, (
+        "render_skill output must mention 'table_kind' (#33) so the LLM can distinguish "
+        "real tables from CTE/derived intermediates when interpreting lineage chains."
+    )
+    # At least one of the concrete kind values must appear to make the teaching actionable
+    kind_values = {"cte", "derived", "external"}
+    # Check in full output (not just word-split, to handle quoted/backtick forms)
+    present_in_text = [k for k in kind_values if k in output]
+    assert present_in_text, (
+        f"render_skill output must name at least one concrete table_kind value "
+        f"({kind_values}) so the LLM knows the enumeration. None found in rendered skill."
+    )

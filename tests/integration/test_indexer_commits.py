@@ -49,7 +49,14 @@ class TestPerFileCommitBoundary:
         )
 
     def test_single_file_failure_does_not_abort_corpus(self, tmp_path: Path):
-        """Guard: single file failure logs WARNING and continues."""
+        """Guard: single file build failure logs WARNING and continues.
+
+        After v1.1.1 (batch-flush refactor), failure isolation is at _build_file_rows
+        (pure, per-file, no db access). A bad file is excluded from the batch buffer;
+        the remaining files flush together. Patch target is _build_file_rows, not
+        _upsert_parsed_file (which is now the single-file wrapper used only by
+        reindex_file, not by _flush_batch).
+        """
         # Create 5 valid SQL files and prepare to fail one
         for i in range(5):
             sql_file = tmp_path / f"file_{i:02d}.sql"
@@ -58,19 +65,19 @@ class TestPerFileCommitBoundary:
         backend = KuzuBackend(":memory:")
         backend.init_schema()
 
-        # Mock _upsert_parsed_file to raise on 3rd call
+        # Mock _build_file_rows to raise on 3rd call
         indexer = Indexer()
         call_count = 0
-        original_upsert = indexer._upsert_parsed_file
+        original_build = indexer._build_file_rows
 
-        def failing_upsert(parsed, db):
+        def failing_build(parsed, defined_table_registry=None):
             nonlocal call_count
             call_count += 1
             if call_count == 3:
-                raise RuntimeError("Simulated upsert failure")
-            return original_upsert(parsed, db)
+                raise RuntimeError("Simulated build failure")
+            return original_build(parsed, defined_table_registry)
 
-        with patch.object(indexer, "_upsert_parsed_file", side_effect=failing_upsert):
+        with patch.object(indexer, "_build_file_rows", side_effect=failing_build):
             summary = indexer.index_repo(tmp_path, dialect=None, db=backend)
 
         # Verify failed file is counted in quality, not silent loss

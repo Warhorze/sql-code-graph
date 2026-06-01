@@ -73,6 +73,254 @@ async def _run_stdio_async_with_real_stdout() -> None:
         )
 
 
+async def _control_socket_task(
+    db_path: "Path",
+    backend_ref: "Callable[[], GraphBackend | None]",
+    stop_event: "anyio.Event",
+    reindex_lock: "anyio.Lock",
+    start_time: float,
+) -> None:
+    """Accept control connections on ``<db>.sock`` and dispatch ops.
+
+    Supported ops (newline-delimited JSON request → response):
+
+    - ``{"op": "status"}`` → running state, pid, db_path, freshness, uptime.
+    - ``{"op": "stop"}`` → sends ``{"ok": true}`` then signals stop via
+      *stop_event*.  The ``_run_with_control`` coroutine watches this event
+      and closes stdin to trigger EOF in the MCP stdio loop.
+    - ``{"op": "reindex", "root", "from", "to", "dialect"}`` → runs
+      ``Indexer.resync_changed`` off the event-loop thread via
+      ``anyio.to_thread.run_sync``, serialised behind *reindex_lock* (R1, R2).
+
+    R2 (single connection): all backend mutations go through ``reindex_lock``
+    so concurrent notify calls never touch the single Kuzu connection
+    simultaneously.
+
+    R8 teardown ordering: the caller must cancel this task BEFORE calling
+    ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
+    wrapping this task in ``_run_with_control`` — the scope is cancelled when
+    the stdio loop exits, before ``main`` calls ``shutdown_backend()``.
+    """
+    import json
+    import time
+    from pathlib import Path as _Path
+
+    import anyio
+    import anyio.abc as _anyio_abc
+    import anyio.to_thread as _to_thread
+
+    from sqlcg.core.config import get_db_path as _get_db_path
+
+    sp = sock_path(db_path)
+
+    listener = await anyio.create_unix_listener(str(sp))
+    sp.chmod(0o600)
+
+    async def _handle_connection(stream: _anyio_abc.SocketStream) -> None:
+        async with stream:
+            try:
+                raw = await stream.receive(4096)
+                req = json.loads(raw)
+                op = req.get("op")
+
+                if op == "status":
+                    from sqlcg.core.freshness import compute_freshness
+
+                    db = backend_ref()
+                    indexed_sha: str | None = None
+                    head_sha: str | None = None
+                    stale: int | None = None
+
+                    if db is not None:
+                        try:
+                            indexed_sha = db.get_indexed_sha()
+                        except Exception:
+                            indexed_sha = None
+
+                        if indexed_sha is not None:
+                            try:
+                                rows = db.run_read(
+                                    "MATCH (r:Repo) RETURN r.path AS path LIMIT 1",
+                                    {},
+                                )
+                                if rows:
+                                    f = compute_freshness(_Path(rows[0]["path"]), indexed_sha)
+                                    head_sha = f.head_sha
+                                    stale = f.stale_by_commits
+                            except Exception:
+                                pass
+
+                    resp: dict = {
+                        "running": True,
+                        "pid": os.getpid(),
+                        "db_path": str(db_path or _get_db_path()),
+                        "indexed_sha": indexed_sha,
+                        "head_sha": head_sha,
+                        "stale_by_commits": stale,
+                        "connected_clients": 1,  # stdio transport = 1 by design
+                        "uptime": time.time() - start_time,
+                    }
+
+                elif op == "stop":
+                    resp = {"ok": True}
+                    await stream.send(json.dumps(resp).encode() + b"\n")
+                    # Trigger graceful stop: close stdin (triggers EOF in MCP loop)
+                    # then cancel the task group.  Cleanup is still done in the
+                    # main() finally block via cleanup_control_files().
+                    stop_event.set()
+                    return
+
+                elif op == "reindex":
+                    root = req.get("root")
+                    from_sha = req.get("from")
+                    to_sha = req.get("to")
+                    dialect = req.get("dialect")
+                    if not root or not from_sha or not to_sha:
+                        resp = {"error": "reindex op requires root, from, to"}
+                    else:
+                        from sqlcg.indexer.indexer import Indexer
+
+                        db = backend_ref()
+                        if db is None:
+                            resp = {"error": "backend not available"}
+                        else:
+                            indexer = Indexer()
+
+                            def _do_reindex() -> dict:
+                                return indexer.resync_changed(
+                                    _Path(root),
+                                    from_sha,
+                                    to_sha,
+                                    db,
+                                    dialect,
+                                )
+
+                            async with reindex_lock:
+                                # R1: run off event-loop thread; R2: lock serialises
+                                summary = await _to_thread.run_sync(_do_reindex)
+                            resp = {"ok": True, "summary": summary}
+
+                else:
+                    resp = {"error": f"unknown op: {op!r}"}
+
+                await stream.send(json.dumps(resp).encode() + b"\n")
+
+            except Exception as exc:
+                try:
+                    await stream.send(json.dumps({"error": str(exc)}).encode() + b"\n")
+                except Exception:
+                    pass
+
+    async with listener:
+        await listener.serve(_handle_connection)
+
+
+async def _stop_watcher(
+    stop_event: "anyio.Event",
+    db_path: "Path",
+) -> None:
+    """Wait for stop_event then perform graceful shutdown.
+
+    When the control socket ``stop`` op fires ``stop_event``, this task:
+    1. Shuts down the backend (flush pending writes).
+    2. Removes the control files (.sock, .pid).
+    3. Calls ``os._exit(0)`` to terminate the process immediately.
+
+    We use ``os._exit(0)`` rather than a cancel-scope approach because the
+    MCP ``stdio_server`` runs stdin readline in a thread via
+    ``anyio.to_thread.run_sync`` with ``abandon_on_cancel=False`` (the
+    default).  When stdin is a pipe, the read-end cannot be closed from within
+    the subprocess to interrupt the blocking readline — the parent holds the
+    write end open.  ``os._exit`` bypasses the thread-drain wait entirely and
+    exits the process without calling ``atexit`` handlers or running
+    ``finally`` blocks in other tasks.
+
+    R8 ordering: backend is shut down HERE (before os._exit), not in main().
+    The ``finally`` block in ``main()`` will also try to shutdown/cleanup but
+    ``os._exit`` prevents it from running — so we do it explicitly here.
+    """
+    import sqlcg.server.tools as _tools
+    from sqlcg.server.control import cleanup_control_files
+
+    await stop_event.wait()
+    # Graceful teardown before hard exit
+    try:
+        _tools.shutdown_backend()
+    except Exception:
+        pass
+    try:
+        cleanup_control_files(db_path)
+    except Exception:
+        pass
+    os._exit(0)
+
+
+async def _sigterm_watcher(
+    stop_event: "anyio.Event",
+) -> None:
+    """Watch for SIGTERM and trigger the same graceful stop as the socket stop op.
+
+    Fires ``stop_event`` which causes ``_stop_watcher`` to shut down cleanly.
+    Not started on Windows (no Unix signals).
+    """
+    import signal
+
+    import anyio
+
+    with anyio.open_signal_receiver(signal.SIGTERM) as signals:
+        async for _sig in signals:
+            stop_event.set()
+            return
+
+
+async def _run_with_control(db_path: "Path", start_time: float) -> None:
+    """Run the stdio MCP loop and the control-socket task in a shared TaskGroup.
+
+    Stop mechanism (R8 teardown ordering):
+    - Control socket ``stop`` op → ``stop_event.set()`` → ``_stop_watcher``
+      shuts down backend + removes control files + calls ``os._exit(0)``.
+    - External SIGTERM → ``_sigterm_watcher`` → same path via ``stop_event``.
+    - Normal EOF on stdin (editor closes connection) → stdio loop returns →
+      ``tg.cancel_scope.cancel()`` → tasks cancelled → ``main()`` finally
+      block does cleanup.
+
+    ``os._exit(0)`` is used for the stop-op path because the MCP
+    ``stdio_server`` blocks on a pipe read (``anyio.to_thread.run_sync``
+    with ``abandon_on_cancel=False``).  We cannot interrupt it without
+    killing the process; ``_stop_watcher`` does cleanup first.
+
+    ``reindex_lock`` is created once here and passed into
+    ``_control_socket_task`` so concurrent notify calls are serialised
+    behind a single lock (R2).
+    """
+    import anyio
+
+    import sqlcg.server.tools as _tools
+
+    stop_event = anyio.Event()
+    reindex_lock = anyio.Lock()  # R2: serialise reindex ops (Kuzu not thread-safe)
+
+    async with anyio.create_task_group() as tg:
+        if sys.platform != "win32":
+            # Spawn control socket alongside the stdio loop.
+            tg.start_soon(
+                _control_socket_task,
+                db_path,
+                lambda: _tools._backend,
+                stop_event,
+                reindex_lock,
+                start_time,
+            )
+            # Watch stop_event; shuts down and calls os._exit(0).
+            tg.start_soon(_stop_watcher, stop_event, db_path)
+            # Watch for SIGTERM; fires stop_event for same clean path.
+            tg.start_soon(_sigterm_watcher, stop_event)
+
+        # stdio loop — when it returns (EOF/error), cancel remaining tasks.
+        await _run_stdio_async_with_real_stdout()
+        tg.cancel_scope.cancel()
+
+
 def main(db_path: str | None = None) -> None:
     """Start the MCP server.
 
@@ -80,7 +328,13 @@ def main(db_path: str | None = None) -> None:
         db_path: Path to KùzuDB database. If None, uses SQLCG_DB_PATH env var
                 or ~/.sqlcg/graph.db (via get_db_path in tools module).
     """
+    import time
+    from pathlib import Path
+
     import anyio
+
+    from sqlcg.core.config import get_db_path
+    from sqlcg.server.control import cleanup_control_files, write_pid
 
     # Must be first — redirects sys.stdout → sys.stderr so stray prints don't
     # corrupt fd 1. _real_stdout_buffer was already captured at module top.
@@ -94,7 +348,35 @@ def main(db_path: str | None = None) -> None:
     # Initialize the backend singleton used by all tools
     sqlcg.server.tools.init_backend(db_path)
 
+    _start_time = time.time()
+    _db_path_obj = Path(db_path) if db_path else get_db_path()
+
+    # Write PID file so CLI clients can discover and probe the server.
+    write_pid(_db_path_obj)
+
     try:
-        anyio.run(_run_stdio_async_with_real_stdout)
+        anyio.run(_run_with_control, _db_path_obj, _start_time)
     finally:
+        # R8: control-socket task is cancelled inside _run_with_control before
+        # this finally block runs, so no stop/reindex op can arrive on a closed
+        # connection.
         sqlcg.server.tools.shutdown_backend()
+        cleanup_control_files(_db_path_obj)
+
+
+# ---------------------------------------------------------------------------
+# Late imports pulled up to module scope for _control_socket_task
+# ---------------------------------------------------------------------------
+# These are referenced in the type annotations in _control_socket_task.
+# We use TYPE_CHECKING guard to keep them from executing at import time.
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    import anyio
+
+    from sqlcg.core.graph_db import GraphBackend
+
+from sqlcg.server.control import sock_path  # noqa: E402  (used in _control_socket_task)

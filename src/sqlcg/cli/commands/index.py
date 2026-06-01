@@ -14,7 +14,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from sqlcg.core.config import KuzuConfig, get_backend, get_db_path, get_dialect
+from sqlcg.core.config import KuzuConfig, config_file_present, get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
@@ -29,7 +29,7 @@ def index_cmd(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        5, "--timeout-per-file", help="Timeout per file in seconds"
+        10, "--timeout-per-file", help="Timeout per file in seconds"
     ),
     buffer_pool_size: int = typer.Option(  # noqa: B008
         0,
@@ -62,6 +62,14 @@ def index_cmd(  # noqa: B008
     ),
     profile: bool = typer.Option(  # noqa: B008
         False, "--profile/--no-profile", help="Emit per-stage timing after indexing"
+    ),
+    include_working_tree: bool = typer.Option(  # noqa: B008
+        False,
+        "--include-working-tree",
+        help=(
+            "Index the working tree including uncommitted changes. "
+            "Marks freshness as 'indexed with working-tree changes'."
+        ),
     ),
 ) -> None:
     """Index SQL files in a directory.
@@ -113,6 +121,13 @@ def index_cmd(  # noqa: B008
     if dialect == "auto":
         dialect = get_dialect(path)
 
+    if not quiet and not config_file_present(path):
+        console.print(
+            f"[yellow]No .sqlcg.toml found at {path}/.sqlcg.toml — "
+            "using defaults (snowflake dialect, no aliases/prefixes). "
+            "Create .sqlcg.toml in the index directory to customise.[/yellow]"
+        )
+
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +151,19 @@ def index_cmd(  # noqa: B008
         sqlcg_log.removeHandler(_warn_handler)
         sqlcg_log.removeHandler(_counter)
         _warn_handler.close()
+
+    # --include-working-tree: if the working tree is dirty, overwrite the stored SHA
+    # with a "<head>+dirty" sentinel so 'db info' can distinguish clean-HEAD index
+    # from working-tree-inclusive index.  The backend was closed inside _run_index,
+    # so we open a fresh context here for the single sentinel write.
+    if include_working_tree:
+        from sqlcg.core.freshness import _git
+
+        dirty_out = _git(path, "status", "--porcelain")
+        if dirty_out:  # non-empty string → working tree is dirty
+            head = _git(path, "rev-parse", "HEAD") or "unknown"
+            with get_backend() as _b2:
+                _b2.set_indexed_sha(f"{head}+dirty")
 
     if not verbose and not quiet and _counter.count > 0 and _warn_log_path is not None:
         console.print(

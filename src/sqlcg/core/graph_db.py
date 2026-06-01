@@ -204,6 +204,8 @@ class GraphBackend(ABC):
                 return "path"
             case NodeLabel.TABLE:
                 return "qualified"
+            case NodeLabel.EXTERNAL_CONSUMER:
+                return "name"
             case _:
                 return "id"
 

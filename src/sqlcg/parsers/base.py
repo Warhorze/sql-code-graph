@@ -55,6 +55,7 @@ class TableRef:
     db: str | None = None
     name: str = ""
     alias: str | None = None
+    role: str = "table"
 
     def __post_init__(self) -> None:
         """Normalize identity components to lowercase.
@@ -207,6 +208,7 @@ class QueryNode:
         confidence: Overall confidence score for this query's lineage
         parsing_mode: How the query was parsed (e.g., "sqlglot", "fallback", "scripting")
         defined_body: For CTAS statements, the exp.Select or exp.Subquery body being created
+        start_line: 1-based start line of statement in file; 0 = unknown (scripting-path sentinel)
     """
 
     file: Path
@@ -223,6 +225,7 @@ class QueryNode:
     star_sources: list[StarSource] = field(default_factory=list)
     defined_columns: list[str] = field(default_factory=list)
     defined_body: Any | None = None
+    start_line: int = 0  # 1-based start line of statement in file; 0 = unknown
 
 
 @dataclass
@@ -497,7 +500,7 @@ class SqlParser(ABC):
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
-                            confidence=0.7,
+                            confidence=1.0,
                         )
                     )
                 except Exception as exc:
@@ -956,8 +959,8 @@ class SqlParser(ABC):
                             cte_alias = cte.alias
                             if not cte_alias:
                                 continue
-                            # Treat the CTE as a synthetic destination table
-                            cte_dst_table = TableRef(name=cte_alias)
+                            # Treat the CTE as a synthetic destination table (role="cte")
+                            cte_dst_table = TableRef(name=cte_alias, role="cte")
                             # The CTE's body is its SELECT expression (or UNION ALL, etc.)
                             cte_body = cte.this
                             # Accept both Select and Union (UNION ALL / UNION DISTINCT)

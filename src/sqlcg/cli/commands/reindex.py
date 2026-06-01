@@ -18,6 +18,12 @@ from rich.console import Console
 
 console = Console()
 
+# Client-side socket timeout for the --notify control-socket path.
+# A real DWH server-side resync_changed measured ~89 s (41 changed files + closure);
+# 300 s covers that with headroom while keeping the wait bounded on a wedged server.
+# This is a CLI transport bound, NOT a KuzuConfig/indexer constant.
+_NOTIFY_SOCKET_TIMEOUT_S = 300
+
 
 def reindex_cmd(  # noqa: B008
     path: Path = typer.Argument(..., help="Repository root directory to resync"),  # noqa: B008
@@ -39,9 +45,17 @@ def reindex_cmd(  # noqa: B008
         help="Files per KuzuDB transaction (same default as index command)",
     ),
     timeout_per_file: int = typer.Option(  # noqa: B008
-        5,
+        10,
         "--timeout-per-file",
         help="Per-file parse timeout in seconds",
+    ),
+    notify: bool = typer.Option(  # noqa: B008
+        False,
+        "--notify",
+        help=(
+            "If a server is live on this DB, route the reindex through the server "
+            "(avoids lock contention). Falls back to direct write if no server is found."
+        ),
     ),
 ) -> None:
     """Incrementally resync the graph after a git branch change or pull.
@@ -56,16 +70,98 @@ def reindex_cmd(  # noqa: B008
     Exits with an error if the database schema version does not match the current
     build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init.
     """
-    from sqlcg.core.config import get_backend, get_db_path, get_dialect
+    import json
+    import socket as _socket
+
+    from sqlcg.core.config import config_file_present, get_backend, get_db_path, get_dialect
     from sqlcg.core.schema import SCHEMA_VERSION
     from sqlcg.indexer.indexer import Indexer
+    from sqlcg.server.control import sock_path
 
     # Resolve to absolute path so ignore-spec and git delta receive an absolute root
     path = path.resolve()
 
+    # --notify: if a server is live, route reindex through the socket (R3 fallback)
+    if notify:
+        sp = sock_path()
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                s.settimeout(_NOTIFY_SOCKET_TIMEOUT_S)
+                s.connect(str(sp))
+                # Resolve SHAs before sending — standalone mode reads from DB via socket
+                effective_from = from_sha
+                if effective_from is None:
+                    # Standalone mode: we cannot read stored SHA here without opening the
+                    # DB (which would conflict with the running server).  If no --from is
+                    # given with --notify, we send from="stored" as a sentinel and fall
+                    # back to direct write; the caller should pass --from explicitly.
+                    raise OSError(  # noqa: TRY301
+                        "--notify without --from requires direct DB access; falling through"
+                    )
+                # Resolve symbolic refs (HEAD, branch names) to concrete 40-char SHAs
+                # before sending — prevents literal "HEAD" from being stored in the graph.
+                effective_from = _resolve_ref(path, effective_from)
+                effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)
+                payload = {
+                    "op": "reindex",
+                    "root": str(path),
+                    "from": effective_from,
+                    "to": effective_to,
+                    "dialect": dialect,
+                }
+                s.sendall(json.dumps(payload).encode() + b"\n")
+                data = s.recv(65536)
+            result = json.loads(data)
+            if "error" in result:
+                console.print(f"[red]Server reindex error: {result['error']}[/red]")
+                raise typer.Exit(1)
+            if not quiet:
+                srv_summary = result.get("summary", {})
+                console.print(
+                    f"[green]Resynced via server[/green] "
+                    f"+{srv_summary.get('added', 0)} added, "
+                    f"~{srv_summary.get('modified', 0)} modified, "
+                    f"-{srv_summary.get('deleted', 0)} deleted"
+                )
+            raise typer.Exit(0)
+        except TimeoutError:
+            # Bug 1 fix: server is alive and working (accepted the connection, holds the
+            # lock, will finish and persist).  Do NOT fall through to the direct-write
+            # path — that would hit the held lock and produce a false "Database is locked"
+            # error.  Exit 0 so the git hook stays non-fatal; the server will complete.
+            # (socket.timeout is an alias of TimeoutError, a subclass of OSError — this
+            # clause must be listed before the broad OSError clause below.)
+            import sys
+
+            print(
+                f"Server is still applying the reindex (timed out waiting after "
+                f"{_NOTIFY_SOCKET_TIMEOUT_S}s); the graph will update when it finishes "
+                f"— check 'sqlcg mcp status'.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(0) from None
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            # R3: no live server (stale socket, socket absent, fallback condition) —
+            # fall through to the existing direct-write path unchanged.
+            # NOTE: socket.timeout / TimeoutError is an OSError subclass, so the
+            # dedicated timeout clause above must be listed first (already is).
+            pass
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print(f"[red]--notify routing failed: {exc}[/red]")
+            raise typer.Exit(1) from exc
+
     # Resolve dialect
     if dialect == "auto":
         dialect = get_dialect(path)
+
+    if not quiet and not config_file_present(path):
+        console.print(
+            f"[yellow]No .sqlcg.toml found at {path}/.sqlcg.toml — "
+            "using defaults (snowflake dialect, no aliases/prefixes). "
+            "Create .sqlcg.toml in the index directory to customise.[/yellow]"
+        )
 
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,15 +184,17 @@ def reindex_cmd(  # noqa: B008
 
         # ---- Determine mode -------------------------------------------------------
         if from_sha is not None:
-            # Explicit-SHA mode
-            effective_to = to_sha or _get_head(path)
+            # Explicit-SHA mode — resolve symbolic refs to concrete SHAs before storing
+            effective_from = _resolve_ref(path, from_sha)
+            effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)
             if not quiet:
                 console.print(
-                    f"Resyncing [cyan]{path}[/cyan] [dim]{from_sha[:8]}..{effective_to[:8]}[/dim]"
+                    f"Resyncing [cyan]{path}[/cyan] "
+                    f"[dim]{effective_from[:8]}..{effective_to[:8]}[/dim]"
                 )
             summary = indexer.resync_changed(
                 path,
-                from_sha,
+                effective_from,
                 effective_to,
                 backend,
                 dialect,
@@ -150,24 +248,36 @@ def reindex_cmd(  # noqa: B008
                 )
 
 
-def _get_head(root: Path) -> str:
-    """Return the current HEAD SHA for the git repo at root.
+def _resolve_ref(root: Path, ref: str) -> str:
+    """Resolve a git ref (HEAD, branch, tag, or concrete SHA) to a 40-char SHA.
 
-    Raises typer.Exit(1) if git is unavailable or root is not a git repo.
+    A concrete SHA resolves to itself (idempotent), so callers may pass either a
+    symbolic ref or a SHA without branching.
+
+    Raises typer.Exit(1) if git is unavailable or the ref cannot be resolved.
     """
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", ref],
             cwd=str(root),
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             console.print(
-                f"[red]Could not determine HEAD SHA in {root}: {result.stderr.strip()}[/red]"
+                f"[red]Could not resolve ref '{ref}' in {root}: {result.stderr.strip()}[/red]"
             )
             raise typer.Exit(1)
         return result.stdout.strip()
     except FileNotFoundError:
-        console.print("[red]git is not available — cannot determine HEAD SHA[/red]")
+        console.print("[red]git is not available — cannot resolve ref[/red]")
         raise typer.Exit(1) from None
+
+
+def _get_head(root: Path) -> str:
+    """Return the current HEAD SHA for the git repo at root.
+
+    Delegates to _resolve_ref so there is one git-rev-parse code path.
+    Raises typer.Exit(1) if git is unavailable or root is not a git repo.
+    """
+    return _resolve_ref(root, "HEAD")

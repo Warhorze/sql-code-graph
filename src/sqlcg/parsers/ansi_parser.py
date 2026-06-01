@@ -37,11 +37,44 @@ class AnsiParser(SqlParser):
         """
         super().__init__(schema_resolver, schema_aliases=schema_aliases)
 
+    @staticmethod
+    def _compute_start_lines(sql: str) -> list[int]:
+        """Compute 1-based start line for each semicolon-delimited statement.
+
+        Uses the sqlglot tokenizer. Groups tokens by SEMICOLON boundaries and
+        returns the .line of the first token in each group. O(tokens), called
+        once per file before the statement loop.
+
+        Args:
+            sql: SQL text to tokenize
+
+        Returns:
+            List of 1-based line numbers, one per statement. May be shorter
+            than the parsed statement count if the trailing statement lacks a
+            semicolon — callers should guard with ``if stmt_index < len(lines)``.
+        """
+        from sqlglot.tokens import Tokenizer, TokenType  # type: ignore[attr-defined]
+
+        tokens = Tokenizer().tokenize(sql)
+        lines: list[int] = []
+        group_start: int | None = None
+        for tok in tokens:
+            if group_start is None and tok.token_type != TokenType.SEMICOLON:
+                group_start = tok.line
+            elif tok.token_type == TokenType.SEMICOLON:
+                if group_start is not None:
+                    lines.append(group_start)
+                group_start = None
+        if group_start is not None:  # last statement with no trailing semicolon
+            lines.append(group_start)
+        return lines
+
     def parse_file(
         self,
         path: Path,
         sql: str,
         dependency_filter: set[str] | None = None,
+        _precomputed_start_lines: list[int] | None = None,
     ) -> ParsedFile:
         """Parse SQL file and extract table/column lineage.
 
@@ -54,6 +87,13 @@ class AnsiParser(SqlParser):
                 `None` to disable filtering; pass-2 callers
                 (`CrossFileAggregator.resolve_pass2`) compute this from the pass-1
                 `ParsedFile.referenced_tables`.
+            _precomputed_start_lines: optional list of 1-based start lines, one per
+                statement. When provided (e.g. by SnowflakeParser which computes the map
+                from the preprocessed SQL after ``_preprocess_snowflake_sql`` — which
+                preserves line count so preprocessed positions equal original-file
+                positions), this list is used directly and ``_compute_start_lines`` is
+                not called on the ``sql`` argument. When ``None``, ``_compute_start_lines
+                (sql)`` is called here.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -67,6 +107,18 @@ class AnsiParser(SqlParser):
             logger.debug("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
             return out
+
+        # Compute 1-based start lines once per file, before the statement loop.
+        # When _precomputed_start_lines is provided (Snowflake non-scripting path),
+        # the caller has already computed the map from the preprocessed SQL.
+        # _preprocess_snowflake_sql preserves line count (lambda replacements emit
+        # the same number of newlines as the matched text), so preprocessed line
+        # positions equal original-file positions — no line-shift desync.
+        start_lines: list[int] = (
+            _precomputed_start_lines
+            if _precomputed_start_lines is not None
+            else self._compute_start_lines(sql)
+        )
 
         # Check for pure-DDL files (still parse table definitions but skip lineage)
         is_pure_ddl = self._is_pure_ddl_file(statements)
@@ -127,6 +179,10 @@ class AnsiParser(SqlParser):
                     scope=scope,
                     skip_column_lineage=is_pure_ddl,
                     schema_dict=schema_dict,
+                )
+                # Assign 1-based start line from the pre-computed map (0 if out of range)
+                query_node.start_line = (
+                    start_lines[stmt_index] if stmt_index < len(start_lines) else 0
                 )
                 out.statements.append(query_node)
 

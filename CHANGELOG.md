@@ -1,3 +1,56 @@
+## v1.1.0 (2026-06-01)
+
+> **⚠️ Upgrade note — re-index required.** The graph schema advanced from
+> `SCHEMA_VERSION` 4 to 6 (added `start_line` on `SqlQuery`, repurposed
+> `SqlTable.kind`, added the `ExternalConsumer` node + `CONSUMED_BY` edge). There
+> is no in-place migration — re-run `sqlcg index <path>` to rebuild the graph. If
+> you run the MCP server, restart it (`sqlcg mcp restart`) after re-indexing.
+
+### Feat
+
+- **#28/#29/#30**: live-graph freshness & daemon reindex — Unix-socket control channel,
+  `mcp status/stop/restart`, reindex through the running server, post-merge hook routing
+  via `ORIG_HEAD`, `index --include-working-tree` + dirty sentinel, and a freshness signal
+  (indexed SHA vs HEAD) surfaced in `db info` / the `db_info` MCP tool
+- **#31**: source location — `file`/`line`/`expression` on lineage edges (`start_line` on `SqlQuery`)
+- **#32**: meaningful confidence — `1.0` for plainly-parsed facts, with a `reason` on inferred edges
+- **#33**: CLI/MCP output parity + node-kind tagging (`table` / `cte` / `derived` / `external`)
+- **#34**: `analyze_unused` segregates presentation/terminal tables from dead code
+- **#35**: external downstream lineage injection — `ExternalConsumer` node + `CONSUMED_BY` edge
+- **hygiene**: config-path footgun warning, find/analyze noise-filter parity, cause discoverability,
+  and MCP config-root reconciliation
+- **skill**: bundled Claude skill teaches the new provenance + node-kind fields (F2)
+- **indexer**: batch-scoped upsert — bulk writes once per batch instead of per file
+  (~13,400 → ~270 backend round-trips on the 1,340-file DWH corpus; upsert 169s → 52s)
+
+### Fix
+
+- **#31**: preserve newline count in Snowflake preprocessing (multi-line `start_line` bug)
+- **#28**: socket timeout fix, symbolic-ref `--to` resolution, hook binary path
+- **index**: resolve walker root once so relative paths yield absolute paths (sibling of #24)
+- **analyze_unused**: external-consumer warning clarifies the edge is created anyway;
+  debug log on the no-Repo File-node fallback
+
+### Perf
+
+- **indexer**: raise default per-file parse timeout 5s→10s
+
+## v1.0.2 (2026-05-30)
+
+### Fix
+
+- **parser**: restore COALESCE/func lineage + CTE-chain hops broken by eb19f29 (#25)
+- **observability**: make pool-path timeouts visible + route warnings to log file (#13/#27d PR-07)
+- **analyze**: query-time bare-name fallback for unqualified INSERT targets (#26 PR-06)
+- **analyze**: wire NoiseFilter into CLI + add *_bck_* glob (#27a/b PR-08)
+- **install**: restore uvx cold-cache message dropped in #23 rewrite
+- **parser**: preserve skip markers for INSERT-column-list expressions (#25 regression)
+- **parser**: INSERT positional mapping overrides SELECT alias attribution (#25)
+- **install**: write via claude mcp add + ~/.claude.json fallback, remove settings.json (#23)
+- **server**: capture fd 1 before _configure_mcp_logging to fix stdio transport (#22)
+- **find**: lowercase name/ref before graph query to match C2 normalization (#12)
+- **reindex**: resolve root to absolute before ignore matching (#24)
+
 ## v1.0.1 (2026-05-30)
 
 ### Fix

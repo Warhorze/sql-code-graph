@@ -2,11 +2,13 @@
 
 import os
 import shutil
+from pathlib import Path
 
 import typer
 from rich.console import Console
 
 from sqlcg.core.config import get_backend, get_db_path
+from sqlcg.core.freshness import compute_freshness, render_freshness_line
 from sqlcg.core.schema import NodeLabel
 from sqlcg.utils.logging import getLogger
 
@@ -76,6 +78,21 @@ def db_info() -> None:
     with get_backend() as backend:
         version = backend.get_schema_version() or "unknown"
         console.print(f"Schema version: {version}")
+
+        # Freshness block — only shown when the DB has been indexed from a git repo
+        try:
+            indexed_sha = backend.get_indexed_sha()
+            repo_rows = backend.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+            if repo_rows and indexed_sha is not None and repo_rows[0].get("path"):
+                repo_root = Path(repo_rows[0]["path"])
+                f = compute_freshness(repo_root, indexed_sha)
+                console.print(render_freshness_line(f))
+        except NotImplementedError:
+            # Neo4j backend raises NotImplementedError for get_indexed_sha — skip silently
+            pass
+        except Exception as e:
+            # Any unexpected error in the freshness block must not crash db info
+            logger.debug(f"Freshness check skipped: {e}")
 
         # Show node counts for all labels
         for label in NodeLabel:

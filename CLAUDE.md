@@ -108,9 +108,11 @@ Any refactor that touches [`base.py`](src/sqlcg/parsers/base.py) or [`indexer.py
 | **`body_scope` is built once per statement BEFORE the column loop** (with a schema-free qualify retry on failure), never lazily inside it | `_extract_column_lineage` | Building it inside the loop re-ran expand+qualify+build_scope for *every* column whenever qualify failed (the failure path). Regressed in `4234e5d` |
 | In the INSERT column-list aliasing path, **`body.copy()` + strip-WITH happen once** before the loop; only the single projection is swapped per column | `_extract_column_lineage` INSERT block | A full-body deepcopy per column is O(cols × body_size). Regressed in `4234e5d` |
 | **`_upsert_parsed_file` uses `upsert_nodes_bulk`/`upsert_edges_bulk`** (Phase A→B→C), never `upsert_node`/`upsert_edge` per row | `indexer.py` `_upsert_parsed_file` | Measured: bulk=181s vs per-node=1020s+ on 1,340-file DWH (~10 execute() calls per file vs ~14,500 total). Commit `4234e5d` accidentally regressed this by rewriting the method during C2 normalization. |
+| **`_flush_row_batch` accumulates rows across all files in a batch and calls each `upsert_*_bulk` once per batch** (not once per file) | `indexer.py` `_flush_batch`/`_upsert_file_batch` → `_flush_row_batch` | Measured: per-file flush = ~13,400 `execute()` on 1,340-file DWH (10/file); per-batch flush = ~270 (10/batch). v1.1.1. Guard: [`test_upsert_batch_invariant.py`](tests/unit/test_upsert_batch_invariant.py) |
 
-Tests covering these invariants live in [`test_T09_01_qualify_once.py`](tests/unit/test_T09_01_qualify_once.py)
-and [`test_bulk_upsert_invariant.py`](tests/unit/test_bulk_upsert_invariant.py) (each pins
+Tests covering these invariants live in [`test_T09_01_qualify_once.py`](tests/unit/test_T09_01_qualify_once.py),
+[`test_bulk_upsert_invariant.py`](tests/unit/test_bulk_upsert_invariant.py), and
+[`test_upsert_batch_invariant.py`](tests/unit/test_upsert_batch_invariant.py) (each pins
 one *named* regression). If any fail after a refactor, the invariant was broken — do not mark
 the test as pre-existing and move on.
 

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
+from sqlcg.core.freshness import compute_freshness
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
@@ -19,6 +20,7 @@ from sqlcg.core.queries import (
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
+    GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
@@ -46,6 +48,7 @@ from sqlcg.server.models import (
     Judgement,
     LineageNode,
     LineageResult,
+    PresentationCandidate,
     ScopeChangeResult,
     SqlPatternMatch,
     SqlPatternResult,
@@ -168,19 +171,55 @@ def _open_backend():
 
 
 def _assert_indexed(db: GraphBackend) -> None:
-    """Check that the graph has indexed repos.
+    """Check that the graph has indexed content (repos or files).
+
+    Accepts a graph with Repo nodes (normal post-index_cmd state) OR with File
+    nodes but no Repo (e.g. a graph populated directly via Indexer without the CLI
+    wrapper). Returns without error when either is present.
 
     Args:
         db: GraphBackend instance
 
     Raises:
-        NotIndexedError: If no repos have been indexed
+        NotIndexedError: If no repos or files have been indexed
     """
     rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
-    if not rows or rows[0]["n"] == 0:
-        raise NotIndexedError(
-            "No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first."
+    if rows and rows[0]["n"] > 0:
+        return
+    # Fallback: accept a graph with File nodes but no Repo (test-only or partial state).
+    file_rows = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})
+    if file_rows and file_rows[0]["n"] > 0:
+        logger.debug(
+            "File nodes present but no Repo node — accepting as test-only/partial graph; "
+            "a production graph should always have a Repo node"
         )
+        return
+    raise NotIndexedError("No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first.")
+
+
+def _indexed_root(db: GraphBackend) -> Path | None:
+    """Return the indexed root path stored on the first Repo node, or None.
+
+    Reads the persisted ``Repo.path`` primary key (set at index time by ``index_cmd``).
+    Uses the same query pattern as ``db_info``'s freshness computation.  Returns ``None``
+    when no Repo node exists or the path field is empty — callers fall back to
+    ``Path.cwd()`` via ``_indexed_root(db) or Path.cwd()``.
+
+    Multi-Repo: first Repo node wins (LIMIT 1), matching the existing freshness path.
+
+    Args:
+        db: GraphBackend instance
+
+    Returns:
+        Absolute Path of the indexed root, or None if unavailable.
+    """
+    try:
+        rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        if rows and rows[0].get("path"):
+            return Path(rows[0]["path"])
+    except Exception:
+        pass
+    return None
 
 
 def _bare_ref(ref: str) -> str:
@@ -486,6 +525,30 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         raise
 
 
+_REASON_MAP: dict[tuple[str | None, float | None], str] = {
+    ("STAR_EXPANSION", 0.8): "star-expansion: columns inferred from source table schema",
+    ("UNKNOWN", 0.5): "column not found in resolved schema",
+    (None, 0.3): "scripting-block fallback: column lineage approximate",
+    ("UNKNOWN", 0.0): "lineage extraction failed at index time",
+}
+
+
+def _reason_for(transform: str | None, confidence: float | None) -> str | None:
+    """Return a human-readable reason for an inferred lineage edge.
+
+    Returns None for fact edges (confidence >= 1.0 or confidence is None).
+    Returns a descriptive string for inferred edges (confidence < 1.0).
+
+    Note: confidence values from KuzuDB are stored as FLOAT (32-bit) and may
+    differ from the Python float by up to ~1e-7. We round to 1 decimal place
+    for the _REASON_MAP lookup to tolerate float32 storage imprecision.
+    """
+    if confidence is None or confidence >= 1.0:
+        return None
+    rounded = round(confidence, 1)
+    return _REASON_MAP.get((transform, rounded)) or f"inferred edge (confidence={confidence:.2f})"
+
+
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
 def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
@@ -559,8 +622,12 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 name=row.get("col_name", ""),
                                 kind="column",
                                 table=row.get("table_qualified"),
-                                file=None,
+                                file=row.get("file"),
                                 confidence=row.get("confidence"),
+                                line=row.get("line") or None,
+                                expression=row.get("expression"),
+                                reason=_reason_for(row.get("transform"), row.get("confidence")),
+                                table_kind=row.get("table_kind"),
                             )
                         )
                     queue.append((node_id, depth + 1))
@@ -594,8 +661,12 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                                 name=row.get("col_name", ""),
                                 kind="column",
                                 table=row.get("table_qualified"),
-                                file=None,
+                                file=row.get("file"),
                                 confidence=row.get("confidence"),
+                                line=row.get("line") or None,
+                                expression=row.get("expression"),
+                                reason=_reason_for(row.get("transform"), row.get("confidence")),
+                                table_kind=row.get("table_kind"),
                             )
                         )
                     if node_id not in bare_visited:
@@ -882,13 +953,19 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
     """
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
-        prefixes = get_presentation_prefixes(Path.cwd())
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
+        prefixes = get_presentation_prefixes(root)
 
         changed_tables: list[str] = []
         seen_changed: set[str] = set()
         for file_path in changed_files:
-            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": file_path})
+            # Resolve relative paths against the indexed root so callers can pass
+            # relative names from the repo root (e.g. "etl/my_file.sql").
+            fp = Path(file_path)
+            if not fp.is_absolute():
+                fp = root / fp
+            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(fp)})
             for row in rows:
                 tq = row["table_qualified"]
                 if tq not in seen_changed:
@@ -915,6 +992,21 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
         presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]
         order, had_cycle = _kahn_topological_sort(affected_tables, db)
 
+        # Resolve external consumers for the blast radius in a single BATCH query (not per-table).
+        external_consumers: list[str] = []
+        all_blast_tables = list(set(changed_tables) | set(affected_tables))
+        if all_blast_tables:
+            consumer_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": all_blast_tables},
+            )
+            seen_consumers: set[str] = set()
+            for crow in consumer_rows:
+                cname = crow["name"]
+                if cname not in seen_consumers:
+                    seen_consumers.add(cname)
+                    external_consumers.append(cname)
+
         hint = None
         if not changed_tables:
             hint = (
@@ -933,6 +1025,7 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             affected_tables=affected_tables,
             presentation_facing=presentation_facing,
             backfill_order=order,
+            external_consumers=external_consumers,
             noise_excluded=noise_excluded,
             truncated=truncated,
             hint=hint,
@@ -1110,9 +1203,35 @@ def get_downstream_dependencies(table_col: str, max_depth: int | None = None) ->
                 elif node_id not in visited and max_depth is not None and next_depth > max_depth:
                     truncated = True
 
+        # Append external consumer terminal nodes via a single BATCH query (not per-table loop).
+        # Collect all terminal tables from the column closure then issue one round-trip.
+        terminal_tables = list({n.table for n in nodes if n.table is not None})
+        # Also include the root column's table when there are no intermediate nodes
+        # (root may itself be terminal with a consumer but no further column hops).
+        root_table = table_id  # table_id was extracted above from table_col
+        if root_table not in terminal_tables:
+            terminal_tables.append(root_table)
+
+        if terminal_tables:
+            consumer_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": terminal_tables},
+            )
+            for crow in consumer_rows:
+                nodes.append(
+                    DependencyNode(
+                        name=crow["name"],
+                        kind="external_consumer",
+                        table=crow["table_qualified"],
+                    )
+                )
+
         # Populate hint if result is empty (Step 4.2)
+        # Only fire the "terminal output" hint when there are also no external consumers.
         hint = None
-        if not nodes:
+        column_nodes = [n for n in nodes if n.kind == "column"]
+        consumer_nodes = [n for n in nodes if n.kind == "external_consumer"]
+        if not column_nodes and not consumer_nodes:
             hint = (
                 "No downstream consumers found — this column may be a terminal output. "
                 "If you expected consumers, confirm the consuming files were indexed "
@@ -1380,12 +1499,36 @@ def db_info() -> DbInfoResult:
                 "column lineage may be incomplete for those files."
             )
 
+    # Compute freshness from the stored SHA + first Repo node path
+    _freshness_kwargs: dict = {}
+    try:
+        _indexed_sha = db.get_indexed_sha()
+        _repo_rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        if _repo_rows and _indexed_sha is not None and _repo_rows[0].get("path"):
+            _root = Path(_repo_rows[0]["path"])
+            _f = compute_freshness(_root, _indexed_sha)
+            _freshness_kwargs = {
+                "indexed_sha": _f.indexed_sha,
+                "head_sha": _f.head_sha,
+                "stale_by_commits": _f.stale_by_commits,
+                "dirty": _f.dirty,
+            }
+        elif _indexed_sha is not None:
+            _freshness_kwargs = {"indexed_sha": str(_indexed_sha)}
+    except NotImplementedError:
+        # Neo4j backend raises NotImplementedError for get_indexed_sha — report null
+        pass
+    except Exception:
+        # Any unexpected error must not crash the db_info tool
+        pass
+
     return DbInfoResult(
         schema_version=schema_version,
         node_counts=node_counts,
         column_lineage_edges=column_lineage_edges,
         parse_quality=parse_quality,
         warnings=warnings,
+        **_freshness_kwargs,
     )
 
 
@@ -1495,6 +1638,19 @@ def submit_feedback(
         return {"status": "skipped"}
 
 
+def _matched_presentation_prefix(table_qualified: str, prefixes: list[str]) -> str | None:
+    """Return the first configured presentation prefix the table matches, else None.
+
+    Prefixes are pre-lowercased by get_presentation_prefixes; compare lowercased so an
+    ``IA_ANALYTICS.foo`` table matches an ``ia_`` prefix.
+    """
+    tql = table_qualified.lower()
+    for p in prefixes:
+        if tql.startswith(p):
+            return p
+    return None
+
+
 @mcp.tool()
 @_timed_tool("analyze_unused")
 def analyze_unused() -> UnusedTablesResult:
@@ -1516,17 +1672,44 @@ def analyze_unused() -> UnusedTablesResult:
     """
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         # Single aggregation — no Python per-row graph traversal.
         unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
         total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
         total_tables_scanned = total_rows[0]["n"] if total_rows else 0
 
+        prefixes = get_presentation_prefixes(root)
+
+        # Build a set of tables that have at least one CONSUMED_BY edge, using a single
+        # BATCH query over all unused tables (one round-trip, not one per table).
+        unused_table_names = [row["table_qualified"] for row in unused_rows]
+        consumed_tables: set[str] = set()
+        if unused_table_names:
+            batch_rows = db.run_read(
+                GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+                {"table_qualifieds": unused_table_names},
+            )
+            for crow in batch_rows:
+                consumed_tables.add(crow["table_qualified"])
+
         candidates: list[UnusedCandidate] = []
+        presentation_facing: list[PresentationCandidate] = []
         for row in unused_rows:
             tq = row["table_qualified"]
             if noise_filter.is_noise(tq):
+                continue
+            has_consumer = tq in consumed_tables
+            matched = _matched_presentation_prefix(tq, prefixes)
+            if matched is not None:
+                presentation_facing.append(
+                    PresentationCandidate(
+                        table_qualified=tq,
+                        matched_prefix=matched,
+                        has_external_consumer=has_consumer,
+                    )
+                )
                 continue
             candidates.append(
                 UnusedCandidate(
@@ -1545,14 +1728,21 @@ def analyze_unused() -> UnusedTablesResult:
             )
 
         hint = None
-        if not candidates:
+        if not candidates and not presentation_facing:
             hint = (
                 "No unused-table candidates found. All indexed tables have at least one "
                 "within-corpus consumer, or the graph is empty."
             )
+        elif not candidates and presentation_facing:
+            hint = (
+                f"No dead-code candidates outside the declared egress layer. "
+                f"{len(presentation_facing)} terminal/presentation leaf(s) are reported "
+                f"separately (expected to have no in-corpus consumer)."
+            )
 
         return UnusedTablesResult(
             candidates=candidates,
+            presentation_facing=presentation_facing,
             total_tables_scanned=total_tables_scanned,
             hint=hint,
         )
