@@ -141,7 +141,7 @@ kind_filter = (
     ""
     if include_intermediate
     else "OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) "
-    "WITH src, q, direct, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    "WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
 )
 ```
 
@@ -152,29 +152,32 @@ kind_filter = (
     ""
     if include_intermediate
     else "OPTIONAL MATCH (t:SqlTable {qualified: dst.table_qualified}) "
-    "WITH dst, q, direct, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    "WITH c, dst, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
 )
 ```
 
 > **WITH-clause placement (developer-critical):** the current `kind_filter` is interpolated
 > **before** the `OPTIONAL MATCH (src)-[direct...]` / `OPTIONAL MATCH (q...)` lines (analyze.py:50–51 /
 > 111–112). A `WITH` introduces a scope boundary; every variable used downstream must be
-> carried through it. With Half B placed at the current `kind_filter` position, the variables
-> bound **before** it are only `c`, `src` (upstream) / `c`, `dst` (downstream) — `direct` and
-> `q` are bound **after**. Therefore the `WITH` must carry only the already-bound variables.
-> The corrected interpolation order is:
+> carried through it, and **every variable referenced in the `WITH`/`WHERE` must already be
+> bound at that point**. With Half B placed at the current `kind_filter` position, the
+> variables bound **before** it are only `c`, `src` (upstream) / `c`, `dst` (downstream); the
+> `t` from the immediately-preceding `OPTIONAL MATCH (t:SqlTable ...)`; `direct` and `q` are
+> bound **after**. Therefore the `WITH` must carry exactly the three variables in scope at the
+> interpolation point — the anchor (`c`), the source/destination (`src`/`dst`), and the optional
+> table node (`t`) the `WHERE` filters on. The corrected interpolation order is:
 >
 > 1. The `MATCH (c)<-[*]-(src)` line (binds `c`, `src`).
-> 2. `OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) WITH c, src WHERE t.kind IS NULL OR t.kind IN ['table','external']`
+> 2. `OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table','external']`
 > 3. The existing `OPTIONAL MATCH (src)-[direct...]->(c)` + `OPTIONAL MATCH (q...)` + `RETURN`.
 >
-> i.e. the `WITH` projects **only `c, src`** (upstream) / **`c, dst`** (downstream), NOT
-> `q`/`direct`. The example blocks above list `q, direct` for illustration — **use the
-> 2-variable form (`WITH c, src` / `WITH c, dst`)** because those are the only variables in
-> scope at the interpolation point. The developer must verify the final assembled query string
-> parses (a Cypher syntax error here is the most likely implementation slip). Apply the same
-> change to the **bare-ref fallback** queries (analyze.py:57–64 upstream, 118–125 downstream)
-> which reuse the same `kind_filter` string — no extra work, the f-string already reuses it.
+> i.e. the `WITH` projects exactly **`c, src, t`** (upstream) / **`c, dst, t`** (downstream).
+> Omitting `t` makes the `WHERE t.kind ...` fail with "Variable t not in scope"; listing
+> `q`/`direct` (bound only later) is also invalid. The code blocks above use the verified
+> three-variable form. The developer must verify the **fully assembled query string** parses (a
+> Cypher syntax error here is the most likely implementation slip). Apply the same change to the
+> **bare-ref fallback** queries (analyze.py:57–64 upstream, 118–125 downstream) which reuse the
+> same `kind_filter` string — no extra work, the f-string already reuses it.
 
 This exact OPTIONAL-MATCH pattern was verified in the issue write-ups to return the real
 sources on the already-broken graph **with no re-index**, while still excluding CTE
@@ -209,13 +212,14 @@ the skill teaches in [`skill.py`](../src/sqlcg/server/skill.py)). **No MCP query
 `GET_UPSTREAM_DEPENDENCIES_FILTERED` block** from `queries.cypher`, its `queries.py:31`
 binding, and the `test_queries_loader.py:29` assertion — leaving dead inner-join filter code
 in the tree is exactly the kind of latent #38-shaped trap #40 warns about, and there is no
-call site to keep it for. (If the plan-reviewer prefers to keep it, the fallback is to convert
-its body to the OPTIONAL-MATCH form for symmetry — but removal is the recommended option since
-no caller exists.)
+call site to keep it for.
 
-> **Open question O1 (for plan-reviewer):** confirm removal of
-> `GET_UPSTREAM_DEPENDENCIES_FILTERED` is acceptable vs. converting it to OPTIONAL-MATCH. Both
-> are documented; removal is the default in this plan.
+> **O1 — DECIDED (plan-reviewer confirmed):** `GET_UPSTREAM_DEPENDENCIES_FILTERED` is
+> **removed**, not converted to OPTIONAL-MATCH. The removal is atomic: the `queries.cypher`
+> block, the `queries.py:31` binding, and the `test_queries_loader.py:29` loadability assertion
+> all go in the same commit. There is no production caller, so converting it would only preserve
+> an unreachable inner-join-filter trap of exactly the #38 shape. This is the final disposition,
+> not an open question.
 
 #### Tests for Cluster 1 (#40 — fix the ineffective guards, do not merely add to them)
 
@@ -265,6 +269,14 @@ integration tier — real in-memory KùzuDB):
 > the recall guard — that is precisely the blind pattern #40 rejects. The acceptance gate is:
 > reverting either half of the fix makes **at least one new guard** red while the old raw-edge
 > anchors stay green (demonstrating the old guards' blindness, now covered).
+>
+> **Guard asymmetry (which guard catches which revert):** the two new guards are NOT redundant —
+> they are sentinels for opposite halves. **Guard 2 (graph-completeness invariant) is the primary
+> Half-A sentinel:** it is query-independent, so reverting Half A (dropping the src-table
+> emission) reds it directly. **Guard 1 (surface-recall) is the Half-B sentinel:** it runs the
+> exact filtered CLI query, so reverting Half B (restoring the inner-join filter) reds it. The
+> acceptance phrase "revert either half → a guard reds" is therefore true **via different
+> guards**, not the same one — keep both.
 
 #### SCHEMA_VERSION
 
@@ -341,6 +353,9 @@ Then pass `read_only=True` at every **read-only** CLI call site:
 - [`find.py`](../src/sqlcg/cli/commands/find.py): `table` (21), `column` (45), `pattern` (64).
 - [`db.py`](../src/sqlcg/cli/commands/db.py): `info` (78), `list-repos` (170). **Do NOT** change
   `init` (36) or `reset` (49) — those write.
+- [`gain.py`](../src/sqlcg/cli/commands/gain.py): Section F parse-quality read (126) — the
+  `with get_backend() as backend` / `run_read` block, already inside a `try/except` that skips
+  on no-graph. Pure read.
 
 > **Constant/fallback alignment:** `read_only` defaults to `False` so all existing writer call
 > sites (`index`, `reindex` direct path, `watch`, `db init/reset`, server `init_backend`) are
@@ -424,17 +439,20 @@ write-path/hook halves are verified and pinned (PR 3). **No genuine #29 extensio
 **Step 1.2 — Half B: invert CLI kind-filter (#38).**
 - Files: [`src/sqlcg/cli/commands/analyze.py`](../src/sqlcg/cli/commands/analyze.py)
   (`upstream` 38–43, `downstream` 99–104).
-- Acceptance: `kind_filter` uses `OPTIONAL MATCH ... WITH c, src WHERE t.kind IS NULL OR t.kind
-  IN ['table','external']` (and `c, dst` for downstream); the assembled query string parses;
+- Acceptance: `kind_filter` uses `OPTIONAL MATCH ... WITH c, src, t WHERE t.kind IS NULL OR
+  t.kind IN ['table','external']` (and `c, dst, t` for downstream); the assembled query string
+  parses;
   bare-ref fallback inherits the same string; `--include-intermediate` still yields the empty
   filter (unchanged behaviour).
 
-**Step 1.3 — Remove dead `GET_UPSTREAM_DEPENDENCIES_FILTERED`.**
+**Step 1.3 — Remove dead `GET_UPSTREAM_DEPENDENCIES_FILTERED` (DECIDED: remove, atomic).**
 - Files: [`queries.cypher`](../src/sqlcg/core/queries.cypher) (remove block 41–45),
   [`queries.py`](../src/sqlcg/core/queries.py) (remove line 31 binding),
   [`test_queries_loader.py`](../tests/unit/test_queries_loader.py) (remove line 29 assertion).
 - Acceptance: grep confirms zero remaining references to `GET_UPSTREAM_DEPENDENCIES_FILTERED`
-  in `src/` and `tests/`; suite still loads. (Gated on plan-reviewer O1.)
+  in `src/` and `tests/`; suite still loads. All three deletions land in the same commit (no
+  intermediate state where the binding loads a missing query or the test asserts a removed
+  name). Removal is the confirmed disposition — do **not** convert to OPTIONAL-MATCH.
 
 **Step 1.4 — Guard 1: surface-recall anchor (CLI filter + MCP).**
 - Files: new
@@ -468,9 +486,12 @@ write-path/hook halves are verified and pinned (PR 3). **No genuine #29 extensio
 **Step 2.2 — pass `read_only=True` at read call sites.**
 - Files: [`analyze.py`](../src/sqlcg/cli/commands/analyze.py) (upstream/downstream/impact/
   failures/unused), [`find.py`](../src/sqlcg/cli/commands/find.py) (table/column/pattern),
-  [`db.py`](../src/sqlcg/cli/commands/db.py) (info, list-repos). NOT `db init`/`reset`.
-- Acceptance: grep confirms each listed read command opens `get_backend(read_only=True)`;
-  writers unchanged.
+  [`db.py`](../src/sqlcg/cli/commands/db.py) (info, list-repos),
+  [`gain.py`](../src/sqlcg/cli/commands/gain.py) (Section F parse-quality read at gain.py:126,
+  currently `with get_backend() as backend` → `run_read`). NOT `db init`/`reset`.
+- Acceptance: grep confirms each listed read command opens `get_backend(read_only=True)`
+  (including `gain.py:126`, whose current `with get_backend(read_only=True) as backend` form
+  must be asserted); writers unchanged.
 
 **Step 2.3 — missing/empty-DB read-only degradation.**
 - Files: call sites and/or `config.py`.
@@ -547,8 +568,8 @@ write-path/hook halves are verified and pinned (PR 3). **No genuine #29 extensio
 - [ ] **#28 write:** `--notify` routes through a live server (no second writer) and falls
       through to direct write when no server is present.
 - [ ] **Version:** `1.1.2` in `pyproject.toml` and `src/sqlcg/__init__.py`.
-- [ ] **Dead code:** zero references to `GET_UPSTREAM_DEPENDENCIES_FILTERED` remain (or, per O1,
-      it is converted to OPTIONAL-MATCH).
+- [ ] **Dead code:** zero references to `GET_UPSTREAM_DEPENDENCIES_FILTERED` remain (query,
+      binding, and loader assertion all removed atomically — DECIDED, not converted).
 
 ---
 
@@ -573,7 +594,7 @@ highest-severity recall fix). PRs 2 and 3 can proceed in parallel after PR 1 if 
 | Half A breaks `upsert_nodes_bulk` homogeneity (mismatched keys) | Plan pins the identical key set; homogeneity check (kuzu_backend.py:225) would raise loudly in tests, not silently. |
 | Half A inflates `execute()` count (perf invariant) | Append-only to batched list; `test_upsert_batch_invariant.py` / `test_perf_scaling_guard.py` gate it. |
 | Read-only open of missing DB crashes | Step 2.3 + dedicated test; degrade to existing empty-DB hint. |
-| Removing dead FILTERED query breaks a hidden caller | Grep confirms no production call site; O1 left for plan-reviewer; fallback is convert-to-OPTIONAL-MATCH instead of delete. |
+| Removing dead FILTERED query breaks a hidden caller | Grep confirms no production call site (only the loader test referenced it); removal is the confirmed disposition (O1 decided); all three deletions land atomically in one commit so the loader never references a missing query. |
 | Single-hop CTE fixture falsely green (#39 trap) | Fixtures mandated to be ≥2-CTE-hop and UNION-ALL branch CTEs. |
 | Neo4j backend has no `read_only` semantics | `read_only` is a no-op for Neo4j (no single-writer lock); documented in `get_backend`. |
 
@@ -594,11 +615,13 @@ highest-severity recall fix). PRs 2 and 3 can proceed in parallel after PR 1 if 
 
 None blocking — the feature (a four-issue patch release) is well-defined by the issues and the
 task brief, and aligns with the `ARCHITECTURE_REVIEW.md` "read-only enforcement" v1 decision
-(Open Questions §3). One non-blocking decision is recorded for the plan-reviewer:
+(Open Questions §3).
 
-### Open Question O1 (non-blocking, for plan-reviewer)
+### O1 — RESOLVED
 
-Confirm the disposition of the dead `GET_UPSTREAM_DEPENDENCIES_FILTERED` query:
-**(a) remove it** (this plan's default — no production caller), or **(b) convert its body to
-the OPTIONAL-MATCH form** for symmetry with the CLI. Both are safe; removal avoids leaving a
-latent inner-join-filter trap of exactly the #38 shape.
+The disposition of the dead `GET_UPSTREAM_DEPENDENCIES_FILTERED` query is **remove it**
+(plan-reviewer confirmed). The query block, its `queries.py:31` binding, and the
+`test_queries_loader.py:29` loadability assertion are deleted atomically in Step 1.3. The
+convert-to-OPTIONAL-MATCH alternative is rejected — there is no production caller, so converting
+would only preserve an unreachable inner-join-filter trap of exactly the #38 shape. No open
+questions remain; the plan is ready for the developer.
