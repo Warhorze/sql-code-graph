@@ -1,3 +1,82 @@
+## Handoff — plan-reviewer → developer: v1.1.1 batch-upsert perf + bugfix batch  [commit TBD]
+
+DATE: 2026-06-01
+PLAN: plan/v1.1.1_batch_upsert_perf.md
+BRANCH: feat/cluster-b-provenance
+STATUS: READY FOR IMPLEMENTATION (APPROVE-with-corrections)
+
+VERDICT: APPROVE-with-corrections. 4 warnings corrected in-place in the plan.
+No blockers found. Failing acceptance tests committed separately.
+
+CORRECTIONS MADE TO PLAN (all warnings, no blockers):
+  W1 (highest risk — edge dedup key): Plan incorrectly claimed Python dedup of
+     COLUMN_LINEAGE edges should use full-property-tuple key to preserve "distinct
+     edges from different queries". WRONG: upsert_edges_bulk generates
+     MERGE (src)-[r:COLUMN_LINEAGE]->(dst) — KuzuDB already collapses by (src, dst)
+     pair, last-writer-wins on query_id/transform/confidence. The Python dedup key
+     must be (src_key, dst_key) only, matching the graph's MERGE cardinality. Using
+     full-property-tuple is more expensive and sends redundant UNWIND rows. Corrected
+     in the edge dedup key bullet, the "Open design point resolved" paragraph, and
+     the Risks table row. IMPORTANT: F1-AC4 equivalence test (batch vs batch_size=1)
+     is still the correct acceptance criterion — it pins identical edge COUNT and
+     properties, which is the observable truth regardless of dedup key.
+
+  W2 (F2 scope correction): Plan claimed the rglob branch was already fixed in #24
+     and only the git-walk branch was broken. Live test (rglob regression test)
+     confirms BOTH branches are currently broken with a relative root. The walker.py
+     fix (resolve root once at top of walk_sql_files) fixes both. Corrected in F2
+     description. Regression tests cover both branches.
+
+  W3 (Step 1.6 patch target): The failure-isolation test said "patch to throw" without
+     naming the target. Added explicit instruction: patch Indexer._build_file_rows,
+     NOT _upsert_parsed_file (which after the refactor is the thin wrapper only used by
+     reindex_file, not by _flush_batch).
+
+  W4 (Risks table): COLUMN_LINEAGE distinctness risk row reworded to accurately
+     reflect that this is not a new risk — KuzuDB already collapses same-pair edges.
+
+WIRING GREPS VERIFIED:
+  - _flush_batch at indexer.py:290 — CONFIRMED
+  - _upsert_parsed_file call inside _flush_batch at indexer.py:306-310 — CONFIRMED
+  - 10 execute() calls (Phase C) at indexer.py:1115-1135 — CONFIRMED
+  - resync_changed batch loops at indexer.py:736, :752 — CONFIRMED
+  - reindex_file call site at indexer.py:796 — CONFIRMED
+  - walker.py line 12-24 (_git_sql_files), line 44 (walk_sql_files use_git branch) — CONFIRMED
+  - ignore.py:37-38 (is_ignored resolve + relative_to) — CONFIRMED
+  - tools.py:95 logger = getLogger — CONFIRMED
+  - tools.py:173-193 _assert_indexed — CONFIRMED; line 189 is the no-Repo fallback comment
+  - indexer.py:1211-1218 W1 warning, :1219 edge_rows.append — CONFIRMED
+
+PHASE C FLUSH ORDER: 4 upsert_nodes_bulk + 6 upsert_edges_bulk = 10 execute() per batch.
+Confirmed at lines 1115-1135. KuzuBackend.upsert_nodes_bulk at :210, upsert_edges_bulk at :245.
+
+FAILURE ISOLATION REASONING: VERIFIED CORRECT. Today catch at _flush_batch:317-321 wraps
+per-file upsert within the shared txn; after F1 the catch wraps _build_file_rows (pure, no db
+access), so build-time errors stay per-file isolated. Flush-time errors (backend UNWIND fails)
+already fail the whole batch txn today — no regression in that class.
+
+SMALL-REPO GUARANTEE: F1-AC3 (byte-identical 20-file repo) + F1-AC4 (batch vs batch_size=1
+equivalence on shared-dimension fixture) are the correct tests. Both specified.
+
+PERF INVARIANTS: All 8 CLAUDE.md invariants preserved. The new batch method must use
+upsert_nodes_bulk/upsert_edges_bulk exclusively (guard: test_upsert_batch_invariant.py).
+
+FAILING TESTS COMMITTED:
+  - tests/unit/test_upsert_batch_invariant.py (F1/F3):
+      test_v1_1_1_F1_flat_bulk_call_count_N_vs_2N_in_single_batch — FAILS (40 != 80 calls)
+      test_v1_1_1_F1_batch_size_1_scales_linearly_non_vacuous_check — PASSES (spy is live)
+      test_v1_1_1_F1_bulk_not_per_row_invariant_preserved — PASSES (already holds)
+      test_v1_1_1_F1_flush_row_batch_method_exists — SKIPPED (method not yet defined)
+  - tests/e2e/test_cli_index.py (F2, appended):
+      test_v1_1_1_F2_index_relative_path_git_walk_no_crash — FAILS (ValueError exit_code=1)
+      test_v1_1_1_F2_index_relative_path_rglob_fallback_no_crash — FAILS (ValueError exit_code=1)
+
+PR SEQUENCING (unchanged):
+  PR-1 (F1, big) first, then PR-3 (depends on PR-1), PR-2 + PR-4 independent.
+  PR-5 (CREATE fast-path) DEFERRED — do not start until PR-1 measured.
+
+NEXT: developer implements PR-1 first.
+
 ## Current State — architect-planner: v1.1.1 upsert-batch perf + bugfix batch
 
 ACTIVE AGENT: architect-planner
