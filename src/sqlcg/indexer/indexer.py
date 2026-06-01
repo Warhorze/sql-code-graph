@@ -4,6 +4,7 @@ import multiprocessing as mp
 import queue
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlcg.core.config import get_external_consumers, get_presentation_prefixes
@@ -20,6 +21,141 @@ from sqlcg.utils.ignore import load_ignore_spec
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
+
+
+@dataclass
+class FileRowSet:
+    """Row dicts produced from a single ParsedFile (Phase A output).
+
+    Pure data container — no db access, no execute(). Used as the unit
+    passed from _build_file_rows to BatchRowBuffer.extend().
+    """
+
+    file_rows: list[dict] = field(default_factory=list)
+    table_rows: list[dict] = field(default_factory=list)
+    column_rows: list[dict] = field(default_factory=list)
+    query_rows: list[dict] = field(default_factory=list)
+    defined_in_edges: list[dict] = field(default_factory=list)
+    has_column_edges: list[dict] = field(default_factory=list)
+    query_defined_in_edges: list[dict] = field(default_factory=list)
+    selects_from_edges: list[dict] = field(default_factory=list)
+    column_lineage_edges: list[dict] = field(default_factory=list)
+    star_source_edges: list[dict] = field(default_factory=list)
+    counts: dict = field(
+        default_factory=lambda: {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
+    )
+    parse_quality_key: str = "full"
+
+
+@dataclass
+class BatchRowBuffer:
+    """Accumulated row dicts across all files in a batch.
+
+    Used by _flush_row_batch to dedup and flush once per batch instead of
+    once per file — the v1.1.1 perf improvement (~13,400 → ~270 execute()).
+    """
+
+    file_rows: list[dict] = field(default_factory=list)
+    table_rows: list[dict] = field(default_factory=list)
+    column_rows: list[dict] = field(default_factory=list)
+    query_rows: list[dict] = field(default_factory=list)
+    defined_in_edges: list[dict] = field(default_factory=list)
+    has_column_edges: list[dict] = field(default_factory=list)
+    query_defined_in_edges: list[dict] = field(default_factory=list)
+    selects_from_edges: list[dict] = field(default_factory=list)
+    column_lineage_edges: list[dict] = field(default_factory=list)
+    star_source_edges: list[dict] = field(default_factory=list)
+
+    def extend(self, rows: FileRowSet) -> None:
+        """Accumulate one file's row sets into this buffer."""
+        self.file_rows.extend(rows.file_rows)
+        self.table_rows.extend(rows.table_rows)
+        self.column_rows.extend(rows.column_rows)
+        self.query_rows.extend(rows.query_rows)
+        self.defined_in_edges.extend(rows.defined_in_edges)
+        self.has_column_edges.extend(rows.has_column_edges)
+        self.query_defined_in_edges.extend(rows.query_defined_in_edges)
+        self.selects_from_edges.extend(rows.selects_from_edges)
+        self.column_lineage_edges.extend(rows.column_lineage_edges)
+        self.star_source_edges.extend(rows.star_source_edges)
+
+    @classmethod
+    def from_single(cls, rows: FileRowSet) -> "BatchRowBuffer":
+        """Build a single-file batch buffer (used by the thin _upsert_parsed_file wrapper)."""
+        buf = cls()
+        buf.extend(rows)
+        return buf
+
+
+def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
+    """Dedup accumulated rows across the batch, then issue the 10 bulk calls ONCE.
+
+    This is the v1.1.1 batch-flush core: called once per batch (not once per file).
+    Dedup keys mirror the graph's MERGE cardinality:
+      - file_rows:             path (primary key)
+      - table_rows:            qualified (primary key); prefers row with non-empty
+                               defined_in_file so DEFINED_IN provenance is preserved.
+      - column_rows:           id (primary key)
+      - query_rows:            id (primary key, globally unique path:index)
+      - edge rows:             (src_key, dst_key) only — matches MERGE (src)-[r]->(dst)
+                               cardinality; KuzuDB cannot hold two edges of the same
+                               type between the same pair.
+
+    Performance invariant: calls each upsert_*_bulk at most ONCE per invocation;
+    never calls upsert_node / upsert_edge per row.
+    Guard: tests/unit/test_upsert_batch_invariant.py
+    """
+    # --- Phase B: batch-scoped dedup ---
+    # For table_rows, prefer defined rows (non-empty defined_in_file) so provenance
+    # is not lost when a shared table is referenced by multiple files.
+    table_dedup: dict[str, dict] = {}
+    for r in buf.table_rows:
+        key = r["qualified"]
+        existing = table_dedup.get(key)
+        if existing is None or (not existing.get("defined_in_file") and r.get("defined_in_file")):
+            table_dedup[key] = r
+    table_rows = list(table_dedup.values())
+
+    column_rows = list({r["id"]: r for r in buf.column_rows}.values())
+    query_rows = list({r["id"]: r for r in buf.query_rows}.values())
+    file_rows = list({r["path"]: r for r in buf.file_rows}.values())
+
+    # Edge dedup by (src_key, dst_key) — matches MERGE (src)-[r]->(dst) cardinality.
+    defined_in_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.defined_in_edges}.values()
+    )
+    has_column_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.has_column_edges}.values()
+    )
+    query_defined_in_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.query_defined_in_edges}.values()
+    )
+    selects_from_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.selects_from_edges}.values()
+    )
+    column_lineage_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.column_lineage_edges}.values()
+    )
+    star_source_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.star_source_edges}.values()
+    )
+
+    # --- Phase C: flush in dependency order (nodes before their edges) ---
+    db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)
+    db.upsert_nodes_bulk(NodeLabel.TABLE, table_rows)
+    db.upsert_nodes_bulk(NodeLabel.COLUMN, column_rows)
+    db.upsert_nodes_bulk(NodeLabel.QUERY, query_rows)
+
+    db.upsert_edges_bulk(NodeLabel.TABLE, NodeLabel.FILE, RelType.DEFINED_IN, defined_in_edges)
+    db.upsert_edges_bulk(NodeLabel.TABLE, NodeLabel.COLUMN, RelType.HAS_COLUMN, has_column_edges)
+    db.upsert_edges_bulk(
+        NodeLabel.QUERY, NodeLabel.FILE, RelType.QUERY_DEFINED_IN, query_defined_in_edges
+    )
+    db.upsert_edges_bulk(NodeLabel.QUERY, NodeLabel.TABLE, RelType.SELECTS_FROM, selects_from_edges)
+    db.upsert_edges_bulk(
+        NodeLabel.COLUMN, NodeLabel.COLUMN, RelType.COLUMN_LINEAGE, column_lineage_edges
+    )
+    db.upsert_edges_bulk(NodeLabel.QUERY, NodeLabel.TABLE, RelType.STAR_SOURCE, star_source_edges)
 
 
 def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
@@ -288,37 +424,15 @@ class Indexer:
         }
 
         def _flush_batch(batch: list[ParsedFile]) -> None:
-            """Upsert a batch of ParsedFile objects in a single transaction.
+            """Accumulate rows for the batch and flush once (v1.1.1 batch-upsert path).
 
-            On any per-file exception, the file is recorded as failed but the
-            transaction continues for the remaining files in the batch. This
-            matches the legacy per-file behaviour where one bad file did not
-            abort the whole index run.
+            Per-file row-building errors are isolated inside _upsert_file_batch; good
+            files always flush together in a single transaction.
 
             Note: sqlcg watch's reindex_file uses a separate code path with
             its own short per-file transaction. PERF-BATCH only affects index_repo.
             """
-            if not batch:
-                return
-            with db.transaction():
-                for parsed_in_batch in batch:
-                    try:
-                        counts = self._upsert_parsed_file(
-                            parsed_in_batch,
-                            db,
-                            defined_table_registry=defined_table_registry,
-                        )
-                        nonlocal_counts["tables"] += counts["tables"]
-                        nonlocal_counts["edges"] += counts["edges"]
-                        nonlocal_counts["star_sources"] += counts.get("star_sources", 0)
-                        nonlocal_counts["columns_defined"] += counts.get("columns_defined", 0)
-                        q_key = parsed_in_batch.parse_quality.value.lower()
-                        nonlocal_counts["quality"][q_key] += 1
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to upsert %s: %s — skipping", parsed_in_batch.path, exc
-                        )
-                        nonlocal_counts["quality"]["failed"] += 1
+            self._upsert_file_batch(batch, db, defined_table_registry, nonlocal_counts)
 
         if profile:
             _t_upsert_start = time.perf_counter()
@@ -728,41 +842,28 @@ class Indexer:
             for pf in closure_results:
                 db.delete_nodes_for_file(pf.path_str)
 
-        # Flush in batches using the same pattern as index_repo._flush_batch
+        # Flush in batches using the shared _upsert_file_batch path (v1.1.1 batch-flush).
+        # resync_changed does not surface tables/edges/quality counts in its summary, so
+        # a temporary counts dict is passed and discarded after each batch.
+        _resync_counts: dict = {
+            "tables": 0,
+            "edges": 0,
+            "star_sources": 0,
+            "columns_defined": 0,
+            "quality": {"full": 0, "table_only": 0, "scripting_fallback": 0, "failed": 0},
+        }
         batch: list[ParsedFile] = []
         for pf in all_results:
             batch.append(pf)
             if len(batch) >= batch_size:
-                with db.transaction():
-                    for pf_in_batch in batch:
-                        try:
-                            self._upsert_parsed_file(
-                                pf_in_batch,
-                                db,
-                                defined_table_registry=defined_table_registry,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "resync_changed: upsert failed for %s: %s — skipping",
-                                pf_in_batch.path,
-                                exc,
-                            )
+                self._upsert_file_batch(
+                    batch, db, defined_table_registry, _resync_counts, "resync_changed: "
+                )
                 batch = []
         if batch:
-            with db.transaction():
-                for pf_in_batch in batch:
-                    try:
-                        self._upsert_parsed_file(
-                            pf_in_batch,
-                            db,
-                            defined_table_registry=defined_table_registry,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "resync_changed: upsert failed for %s: %s — skipping",
-                            pf_in_batch.path,
-                            exc,
-                        )
+            self._upsert_file_batch(
+                batch, db, defined_table_registry, _resync_counts, "resync_changed: "
+            )
 
         # ---- Step 8: Single star expansion (same as index_repo) ------------------
         self._expand_star_sources(db)
@@ -870,40 +971,31 @@ class Indexer:
         """Canonical graph key for a table/column: lowercased full_id."""
         return full_id.lower()
 
-    def _upsert_parsed_file(
+    def _build_file_rows(
         self,
         parsed: ParsedFile,
-        db: GraphBackend,
         defined_table_registry: dict[str, str] | None = None,
-    ) -> dict:
-        """Map ParsedFile → graph nodes/edges using bulk upsert.
+    ) -> FileRowSet:
+        """Build all row dicts for one ParsedFile — Phase A (pure, no db access).
+
+        Extracts the four node-row lists and six edge-row lists from a ParsedFile.
+        No execute(), no db argument. A build-time exception here is caught by the
+        per-file try/except in _upsert_file_batch so the bad file is isolated from
+        the rest of the batch.
 
         Args:
-            parsed: ParsedFile to upsert
-            db: GraphBackend instance
+            parsed: ParsedFile to build rows for
+            defined_table_registry: Optional cross-file DDL dedup registry
 
         Returns:
-            Dict with keys: tables, edges, columns_defined, star_sources
+            FileRowSet with all row lists and per-file counts/quality key
         """
-        counts = {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
-
-        # --- Phase A: collect rows from parsed model ---
-
-        file_rows: list[dict] = []
-        table_rows: list[dict] = []  # NodeLabel.TABLE
-        column_rows: list[dict] = []  # NodeLabel.COLUMN
-        query_rows: list[dict] = []  # NodeLabel.QUERY
-
-        defined_in_edges: list[dict] = []  # TABLE -> FILE
-        has_column_edges: list[dict] = []  # TABLE -> COLUMN
-        query_defined_in_edges: list[dict] = []  # QUERY -> FILE
-        selects_from_edges: list[dict] = []  # QUERY -> TABLE
-        column_lineage_edges: list[dict] = []  # COLUMN -> COLUMN
-        star_source_edges: list[dict] = []  # QUERY -> TABLE
+        rows = FileRowSet()
+        rows.parse_quality_key = parsed.parse_quality.value.lower()
 
         # File node
         cause, failed = dominant_cause(parsed.errors)
-        file_rows.append(
+        rows.file_rows.append(
             {
                 "path": parsed.path_str,
                 "dialect": parsed.dialect or "",
@@ -930,7 +1022,7 @@ class Indexer:
                 if hasattr(parsed, "errors"):
                     parsed.errors.append(f"duplicate_ddl:{table.full_id}:already_in:{first_file}")
 
-            table_rows.append(
+            rows.table_rows.append(
                 {
                     "qualified": table.full_id,
                     "name": table.name,
@@ -940,8 +1032,8 @@ class Indexer:
                     "defined_in_file": parsed.path_str,
                 }
             )
-            defined_in_edges.append({"src_key": table.full_id, "dst_key": parsed.path_str})
-            counts["tables"] += 1
+            rows.defined_in_edges.append({"src_key": table.full_id, "dst_key": parsed.path_str})
+            rows.counts["tables"] += 1
 
         # Build a map of target.full_id -> QueryNode for column lookup
         defined_by_query = {
@@ -961,7 +1053,7 @@ class Indexer:
 
             for col_name in qnode.defined_columns:
                 col_id = f"{table.full_id}.{col_name}"
-                column_rows.append(
+                rows.column_rows.append(
                     {
                         "id": col_id,
                         "col_name": col_name,
@@ -971,15 +1063,15 @@ class Indexer:
                         "table_name": table.name,
                     }
                 )
-                has_column_edges.append(
+                rows.has_column_edges.append(
                     {"src_key": table.full_id, "dst_key": col_id, "source": "ddl"}
                 )
-                counts["columns_defined"] += 1
+                rows.counts["columns_defined"] += 1
 
         # Query nodes and related edges
         for i, stmt in enumerate(parsed.statements):
             query_id = f"{parsed.path_str}:{i}"
-            query_rows.append(
+            rows.query_rows.append(
                 {
                     "id": query_id,
                     "file_path": parsed.path_str,
@@ -993,7 +1085,7 @@ class Indexer:
                     "start_line": stmt.start_line,
                 }
             )
-            query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
+            rows.query_defined_in_edges.append({"src_key": query_id, "dst_key": parsed.path_str})
 
             # Source table edges — apply structural role from TableRef.role.
             # Real source tables have role="table"; CTE aliases have role="cte".
@@ -1001,7 +1093,7 @@ class Indexer:
             for src_table in stmt.sources:
                 if src_table.full_id == "<output>":
                     continue
-                table_rows.append(
+                rows.table_rows.append(
                     {
                         "qualified": src_table.full_id,
                         "name": src_table.name,
@@ -1011,7 +1103,7 @@ class Indexer:
                         "defined_in_file": "",
                     }
                 )
-                selects_from_edges.append({"src_key": query_id, "dst_key": src_table.full_id})
+                rows.selects_from_edges.append({"src_key": query_id, "dst_key": src_table.full_id})
 
             # Column lineage edges.
             # CTE destination tables (role="cte") are not in stmt.sources so they are not
@@ -1024,7 +1116,7 @@ class Indexer:
                 # Exclude <output> sink — it is a synthetic fallback, not a real table
                 if edge.dst.table.full_id == "<output>":
                     continue
-                column_rows.append(
+                rows.column_rows.append(
                     {
                         "id": src_id,
                         "col_name": edge.src.name,
@@ -1034,7 +1126,7 @@ class Indexer:
                         "table_name": edge.src.table.name,
                     }
                 )
-                column_rows.append(
+                rows.column_rows.append(
                     {
                         "id": dst_id,
                         "col_name": edge.dst.name,
@@ -1046,7 +1138,7 @@ class Indexer:
                 )
                 # Emit CTE destination table nodes so they appear as SqlTable with kind="cte"
                 if edge.dst.table.role == "cte":
-                    table_rows.append(
+                    rows.table_rows.append(
                         {
                             "qualified": edge.dst.table.full_id,
                             "name": edge.dst.table.name,
@@ -1056,7 +1148,7 @@ class Indexer:
                             "defined_in_file": "",
                         }
                     )
-                column_lineage_edges.append(
+                rows.column_lineage_edges.append(
                     {
                         "src_key": src_id,
                         "dst_key": dst_id,
@@ -1065,11 +1157,11 @@ class Indexer:
                         "query_id": query_id,
                     }
                 )
-                counts["edges"] += 1
+                rows.counts["edges"] += 1
 
             # STAR_SOURCE edges for graph-backend expansion — real source tables, keep kind="table"
             for star in stmt.star_sources:
-                table_rows.append(
+                rows.table_rows.append(
                     {
                         "qualified": star.source.full_id,
                         "name": star.source.name,
@@ -1079,7 +1171,7 @@ class Indexer:
                         "defined_in_file": "",
                     }
                 )
-                star_source_edges.append(
+                rows.star_source_edges.append(
                     {
                         "src_key": query_id,
                         "dst_key": star.source.full_id,
@@ -1088,12 +1180,12 @@ class Indexer:
                         "confidence": 0.8,
                     }
                 )
-                counts["star_sources"] += 1
+                rows.counts["star_sources"] += 1
 
             # Upsert target table node (if not already a defined_table)
             # so that star expansion can create destination columns
             if stmt.target and stmt.target.full_id not in defined_table_ids:
-                table_rows.append(
+                rows.table_rows.append(
                     {
                         "qualified": stmt.target.full_id,
                         "name": stmt.target.name,
@@ -1104,37 +1196,79 @@ class Indexer:
                     }
                 )
 
-        # --- Phase B: deduplicate rows within each group ---
-        # Cypher MERGE is idempotent under deduplication, but we deduplicate in Python
-        # to reduce payload size
-        table_rows = list({r["qualified"]: r for r in table_rows}.values())
-        column_rows = list({r["id"]: r for r in column_rows}.values())
-        query_rows = list({r["id"]: r for r in query_rows}.values())
+        return rows
 
-        # --- Phase C: flush in dependency order (nodes before their edges) ---
-        db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)
-        db.upsert_nodes_bulk(NodeLabel.TABLE, table_rows)
-        db.upsert_nodes_bulk(NodeLabel.COLUMN, column_rows)
-        db.upsert_nodes_bulk(NodeLabel.QUERY, query_rows)
+    def _upsert_file_batch(
+        self,
+        batch: list[ParsedFile],
+        db: GraphBackend,
+        defined_table_registry: dict[str, str],
+        nonlocal_counts: dict,
+        warning_prefix: str = "",
+    ) -> None:
+        """Accumulate rows for all files in batch, then flush once in one transaction.
 
-        db.upsert_edges_bulk(NodeLabel.TABLE, NodeLabel.FILE, RelType.DEFINED_IN, defined_in_edges)
-        db.upsert_edges_bulk(
-            NodeLabel.TABLE, NodeLabel.COLUMN, RelType.HAS_COLUMN, has_column_edges
-        )
-        db.upsert_edges_bulk(
-            NodeLabel.QUERY, NodeLabel.FILE, RelType.QUERY_DEFINED_IN, query_defined_in_edges
-        )
-        db.upsert_edges_bulk(
-            NodeLabel.QUERY, NodeLabel.TABLE, RelType.SELECTS_FROM, selects_from_edges
-        )
-        db.upsert_edges_bulk(
-            NodeLabel.COLUMN, NodeLabel.COLUMN, RelType.COLUMN_LINEAGE, column_lineage_edges
-        )
-        db.upsert_edges_bulk(
-            NodeLabel.QUERY, NodeLabel.TABLE, RelType.STAR_SOURCE, star_source_edges
-        )
+        Per-file failure isolation: _build_file_rows (pure) runs per file inside its
+        own try/except — a bad file is recorded as failed and excluded from the buffer;
+        the remaining good files flush together. Flush-time backend errors (rare) fail
+        the whole batch transaction, which is already the behaviour inside db.transaction().
 
-        return counts
+        Args:
+            batch: List of ParsedFile objects to upsert
+            db: GraphBackend instance
+            defined_table_registry: Cross-file DDL dedup registry
+            nonlocal_counts: Mutable summary dict updated in place (tables/edges/quality/…)
+            warning_prefix: Optional prefix for warning log messages (e.g. "resync_changed: ")
+        """
+        if not batch:
+            return
+        buf = BatchRowBuffer()
+        for parsed_in_batch in batch:
+            try:
+                file_rows = self._build_file_rows(parsed_in_batch, defined_table_registry)
+            except Exception as exc:
+                logger.warning(
+                    "%sFailed to build rows for %s: %s — skipping",
+                    warning_prefix,
+                    parsed_in_batch.path,
+                    exc,
+                )
+                nonlocal_counts["quality"]["failed"] += 1
+                continue
+            buf.extend(file_rows)
+            nonlocal_counts["tables"] += file_rows.counts["tables"]
+            nonlocal_counts["edges"] += file_rows.counts["edges"]
+            nonlocal_counts["star_sources"] += file_rows.counts.get("star_sources", 0)
+            nonlocal_counts["columns_defined"] += file_rows.counts.get("columns_defined", 0)
+            nonlocal_counts["quality"][file_rows.parse_quality_key] += 1
+        with db.transaction():
+            _flush_row_batch(db, buf)
+
+    def _upsert_parsed_file(
+        self,
+        parsed: ParsedFile,
+        db: GraphBackend,
+        defined_table_registry: dict[str, str] | None = None,
+    ) -> dict:
+        """Thin single-file wrapper used by reindex_file and sqlcg watch.
+
+        Builds one file's rows (pure) and flushes them immediately — semantically
+        equivalent to the old per-file upsert, but now via the shared builder/flusher
+        split. The caller (reindex_file at indexer.py:796) wraps this in its own
+        db.transaction(); this method does NOT open a transaction.
+
+        Args:
+            parsed: ParsedFile to upsert
+            db: GraphBackend instance
+            defined_table_registry: Optional cross-file DDL dedup registry
+
+        Returns:
+            Dict with keys: tables, edges, columns_defined, star_sources
+        """
+        file_rows = self._build_file_rows(parsed, defined_table_registry)
+        buf = BatchRowBuffer.from_single(file_rows)
+        _flush_row_batch(db, buf)
+        return file_rows.counts
 
     def _expand_star_sources(self, db: GraphBackend) -> int:
         """Run the post-ingestion star expansion query.

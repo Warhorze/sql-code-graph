@@ -369,28 +369,27 @@ def test_duplicate_ddl_warns(temp_db, tmp_path, caplog):
 
 
 def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
-    """duplicate_ddl:<table> must appear in the indexer's error channel after duplicate DDL."""
-    # We need to reach into parsed.errors; easiest is to patch the indexer
-    # and capture what _upsert_parsed_file receives.
+    """duplicate_ddl:<table> must appear in the indexer's error channel after duplicate DDL.
+
+    After v1.1.1 (batch-flush refactor), _build_file_rows is the place where
+    duplicate_ddl errors are appended to parsed.errors, so we patch it to capture
+    the errors (not _upsert_parsed_file, which is now a single-file wrapper used
+    only by reindex_file, not the batch path).
+    """
     from unittest.mock import patch
 
     captured_errors: list[list[str]] = []
-    original_upsert = Indexer._upsert_parsed_file
+    original_build = Indexer._build_file_rows
 
-    def recording_upsert(self, parsed, db, defined_table_registry=None):
-        result = original_upsert(
-            self,
-            parsed,
-            db,
-            defined_table_registry=defined_table_registry,
-        )
+    def recording_build(self, parsed, defined_table_registry=None):
+        result = original_build(self, parsed, defined_table_registry)
         captured_errors.append(list(parsed.errors))
         return result
 
     (tmp_path / "a.sql").write_text("CREATE TABLE BA.t (x INT);\n")
     (tmp_path / "b.sql").write_text("CREATE TABLE BA.t (x INT, y INT);\n")
 
-    with patch.object(Indexer, "_upsert_parsed_file", recording_upsert):
+    with patch.object(Indexer, "_build_file_rows", recording_build):
         Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     all_errors = [e for errors in captured_errors for e in errors]
