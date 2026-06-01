@@ -40,6 +40,9 @@ def walk_sql_files(root: Path, spec: pathspec.PathSpec, use_git: bool = True) ->
     Yields:
         Path objects for .sql files not matching ignore patterns
     """
+    # Resolve once so both branches yield absolute paths and is_ignored's
+    # path.relative_to(root) never encounters a relative-vs-absolute mismatch.
+    root = Path(root).resolve()
     if use_git:
         git_files = _git_sql_files(root)
         if git_files is not None:
