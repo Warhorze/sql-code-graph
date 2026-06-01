@@ -1349,6 +1349,7 @@ class Indexer:
                     warnings.append(
                         f"Warning: external consumer '{spec.name}' "
                         f"references non-presentation table '{target}'"
+                        f" — edge created anyway (advisory)"
                     )
                 edge_rows.append({"src_key": target, "dst_key": spec.name})
 

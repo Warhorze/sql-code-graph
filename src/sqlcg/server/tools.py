@@ -189,6 +189,10 @@ def _assert_indexed(db: GraphBackend) -> None:
     # Fallback: accept a graph with File nodes but no Repo (test-only or partial state).
     file_rows = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})
     if file_rows and file_rows[0]["n"] > 0:
+        logger.debug(
+            "File nodes present but no Repo node — accepting as test-only/partial graph; "
+            "a production graph should always have a Repo node"
+        )
         return
     raise NotIndexedError("No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first.")
 
