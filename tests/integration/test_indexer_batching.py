@@ -162,3 +162,150 @@ def test_batch_size_observable_in_return_dict(tmp_path):
         )
 
     db.close()
+
+
+def _write_shared_dim_corpus(corpus_path: Path) -> None:
+    """Write a corpus where one shared dimension table is referenced by 3 view files.
+
+    dim_customer is DEFINED in ddl/dim_customer.sql (defined_in_file non-empty).
+    Three view files (view_a, view_b, view_c) each SELECT a column FROM dim_customer,
+    producing three distinct COLUMN_LINEAGE edges mapping different src columns to the
+    same dim_customer column.
+
+    This exercises the cross-file batch dedup path:
+    - table_rows for dim_customer appear 4 times across files (1 DDL + 3 ref rows);
+      dedup must keep the row with non-empty defined_in_file.
+    - COLUMN_LINEAGE edges (src_key, dst_key) are unique across files in this fixture
+      (each view maps its own column), so all three edges must survive dedup.
+    """
+    corpus_path.mkdir(parents=True, exist_ok=True)
+    ddl_dir = corpus_path / "ddl"
+    ddl_dir.mkdir()
+
+    # dim_customer DDL — defines the shared dimension table with a 'customer_id' column
+    (ddl_dir / "dim_customer.sql").write_text(
+        "CREATE TABLE dim_customer (customer_id INT, customer_name VARCHAR);",
+        encoding="utf-8",
+    )
+
+    # Three view files each joining against dim_customer
+    views_dir = corpus_path / "views"
+    views_dir.mkdir()
+    (views_dir / "view_a.sql").write_text(
+        "CREATE VIEW view_a AS SELECT a.customer_id AS cid_a FROM dim_customer a;",
+        encoding="utf-8",
+    )
+    (views_dir / "view_b.sql").write_text(
+        "CREATE VIEW view_b AS SELECT b.customer_id AS cid_b FROM dim_customer b;",
+        encoding="utf-8",
+    )
+    (views_dir / "view_c.sql").write_text(
+        "CREATE VIEW view_c AS SELECT c.customer_id AS cid_c FROM dim_customer c;",
+        encoding="utf-8",
+    )
+
+
+def _get_graph_state_with_properties(db: KuzuBackend) -> dict:
+    """Query the graph for counts AND properties needed to prove F1-AC4.
+
+    Returns a dict with:
+      - node/edge counts (same as the existing equivalence test)
+      - dim_customer.defined_in_file  — must be non-empty (provenance preserved)
+      - COLUMN_LINEAGE edge property sets (query_id, transform, confidence) sorted
+        for deterministic comparison
+    """
+    tables = sorted(r["q"] for r in db.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {}))
+    edge_count = db.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"]
+    col_count = db.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"]
+
+    # defined_in_file provenance for the shared dim_customer table
+    dim_rows = db.run_read(
+        "MATCH (t:SqlTable) WHERE t.name = 'dim_customer' RETURN t.defined_in_file AS dif",
+        {},
+    )
+    dim_defined_in_file = dim_rows[0]["dif"] if dim_rows else None
+
+    # All COLUMN_LINEAGE edge properties — sorted so comparison is order-independent
+    edge_props = sorted(
+        (r["src"], r["dst"], r["transform"], r["confidence"], r["query_id"])
+        for r in db.run_read(
+            "MATCH (src:SqlColumn)-[e:COLUMN_LINEAGE]->(dst:SqlColumn) "
+            "RETURN src.id AS src, dst.id AS dst, "
+            "e.transform AS transform, e.confidence AS confidence, "
+            "e.query_id AS query_id",
+            {},
+        )
+    )
+
+    return {
+        "tables": tables,
+        "edge_count": edge_count,
+        "col_count": col_count,
+        "dim_defined_in_file": dim_defined_in_file,
+        "edge_props": edge_props,
+    }
+
+
+def test_shared_dim_batch_vs_per_file_properties_identical(tmp_path):
+    """F1-AC4: batch path and batch_size=1 produce identical graphs including properties.
+
+    Exercises the cross-file batch dedup path introduced in PR-1 (v1.1.1):
+      - dim_customer appears in 4 files (1 DDL + 3 views); the dedup must keep
+        the row with non-empty defined_in_file (provenance guard).
+      - Three COLUMN_LINEAGE edges (one per view file) all have distinct (src,dst)
+        pairs so all three must survive dedup; their properties (query_id, transform,
+        confidence) must be identical between the two indexing paths.
+
+    Guards the Risks table entry: 'defined_in_file provenance lost when a shared
+    table is deduped across files' and 'batch dedup silently dropping
+    COLUMN_LINEAGE.query_id/transform'.
+    """
+    corpus_path = tmp_path / "corpus"
+    _write_shared_dim_corpus(corpus_path)
+
+    # Index with batch_size=1 (per-file flush — the reference path)
+    db1 = KuzuBackend(":memory:")
+    db1.init_schema()
+    Indexer().index_repo(corpus_path, "snowflake", db1, use_git=False, batch_size=1)
+    state1 = _get_graph_state_with_properties(db1)
+    db1.close()
+
+    # Index with batch_size=50 (all 4 files in one batch — exercises cross-file dedup)
+    db50 = KuzuBackend(":memory:")
+    db50.init_schema()
+    Indexer().index_repo(corpus_path, "snowflake", db50, use_git=False, batch_size=50)
+    state50 = _get_graph_state_with_properties(db50)
+    db50.close()
+
+    # dim_customer.defined_in_file must be non-empty in both paths (provenance preserved)
+    assert state1["dim_defined_in_file"], (
+        "batch_size=1: dim_customer.defined_in_file is empty — provenance lost"
+    )
+    assert state50["dim_defined_in_file"], (
+        "batch_size=50: dim_customer.defined_in_file is empty — "
+        "batch dedup dropped provenance from the DDL row"
+    )
+
+    # The two paths must agree on which file defines dim_customer
+    assert state1["dim_defined_in_file"] == state50["dim_defined_in_file"], (
+        f"defined_in_file mismatch: batch_size=1 → {state1['dim_defined_in_file']!r}, "
+        f"batch_size=50 → {state50['dim_defined_in_file']!r}"
+    )
+
+    # COLUMN_LINEAGE edge properties must be identical (query_id, transform, confidence)
+    assert state1["edge_props"] == state50["edge_props"], (
+        f"COLUMN_LINEAGE edge properties differ between batch paths:\n"
+        f"  batch_size=1 : {state1['edge_props']}\n"
+        f"  batch_size=50: {state50['edge_props']}"
+    )
+
+    # Node/edge counts must match (existing equivalence check extended to this fixture)
+    assert state1["tables"] == state50["tables"], (
+        f"Table sets differ: {state1['tables']} vs {state50['tables']}"
+    )
+    assert state1["edge_count"] == state50["edge_count"], (
+        f"COLUMN_LINEAGE counts differ: {state1['edge_count']} vs {state50['edge_count']}"
+    )
+    assert state1["col_count"] == state50["col_count"], (
+        f"Column counts differ: {state1['col_count']} vs {state50['col_count']}"
+    )
