@@ -1,10 +1,10 @@
-## Current State — developer: F2 Phase A — provenance + node-kind prose gap closed
+## Current State — architect-planner: v1.1.1 upsert-batch perf + bugfix batch
 
-ACTIVE AGENT: developer
-FEATURE: F2 — bundle a Claude skill (Phase A prose gap)
+ACTIVE AGENT: architect-planner
+FEATURE: v1.1.1 batch-upsert perf + relative-path bugfix + upsert-batch guard
 BRANCH: feat/cluster-b-provenance
-PLAN: plan/feature_F2_bundle_claude_skill.md
-STATUS: PR UPDATED (#37) — ready for plan-compliance check
+PLAN: plan/v1.1.1_batch_upsert_perf.md
+STATUS: PLANNING — drafting plan from live ../dwh verification findings (1-4)
 COMMIT: 9b15571
 
 FILES CHANGED:
