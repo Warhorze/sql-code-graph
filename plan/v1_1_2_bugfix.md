@@ -666,3 +666,76 @@ questions remain; the plan is ready for the developer.
   write lock, enabling concurrent CLI read sessions).  The "reads succeed while the MCP server
   is live" use-case is a known limitation noted for future work.  No production code changed.
 - **Date**: 2026-06-01
+
+---
+
+## Plan Compliance — 2026-06-01
+
+**Verdict: COMPLIANT-WITH-NOTES.** All four issues are implemented as planned; the suite is
+green (968 passed / 0 failed) and every perf invariant holds. One test-design note on #40
+(the Half-B negative sentinel) is a non-blocking follow-up, documented below. No blocker for
+merge.
+
+### Per-criterion table
+
+| AC (plan §Acceptance Criteria) | Status | Evidence |
+|---|---|---|
+| #39: `SqlTable {qualified:'staging.src_a'}` has `kind='table'` after index | MET | `indexer.py:1137-1146` Half A; verified by `test_cte_source_node_invariant.py::test_multi_hop_cte_source_tables_have_nodes` (asserts node + `kind='table'`) |
+| #39: `find table` finds CTE-body-only source | MET | Node now emitted; `find.py:18` reads it; invariant guard proves existence |
+| #38: `analyze upstream` (default flags) returns physical sources, not "No results" | MET | `analyze.py:38-42` Half B; `test_cte_recall_guard.py::test_multi_hop_cte_cli_filtered_returns_physical_source` |
+| #38: `--include-intermediate` still includes CTE nodes | MET | `analyze.py` ternary keeps empty `kind_filter` when `include_intermediate` (unchanged) |
+| #38 (no-reindex): inverted filter returns sources on already-broken graph | MET (by design) | `OPTIONAL MATCH ... WHERE t.kind IS NULL` keeps node-less sources; Half-B independence preserved |
+| #40: reverting Half A OR Half B reds ≥1 new guard; raw-edge anchors stay green | **PARTIAL** | Half A revert **proven** to red Guard 2 (3 tests) + Guard 1 MCP test (re-verified live). Half B (isolated production revert) reds **nothing** — see Note 1 |
+| #40: recall guard asserts CLI filtered-query + MCP output, not raw edges | MET | `test_cte_recall_guard.py` builds the exact filtered query string + drives `GET_UPSTREAM_DEPENDENCIES_QUERY` / `TRACE_COLUMN_LINEAGE_QUERY`; no raw `MATCH (s)-[:COLUMN_LINEAGE]->(d)` assertion |
+| #40: graph-completeness invariant is query-independent, reds on missing src nodes | MET | `test_cte_source_node_invariant.py` checks graph structure directly; reverting Half A reds all 3 (re-verified live) |
+| schema_alias: emitted `SqlTable.qualified` == column `table_qualified` post-alias | MET | `test_cte_schema_alias_guard.py` (node-equality + end-to-end alias+filter composition, strengthened in `a6f218a`) |
+| No `SCHEMA_VERSION` change (`schema.py` still `"6"`); reindex gate unchanged | MET | `schema.py:6` = `"6"`; no DDL diff |
+| Perf: Half A adds no new `execute()` calls; batch/scaling guards green | MET | Half A appends to batched `rows.table_rows` only; `test_perf_scaling_guard`, `test_upsert_batch_invariant`, `test_bulk_upsert_invariant`, `test_T09_01_qualify_once` all green (re-run) |
+| #28 read: read commands open `read_only=True` (wiring asserted) | MET | `analyze.py` (45/106/178/214/231), `find.py` (18/42/61), `db.py` (78/170), `gain.py` (123); `test_readonly_under_lock.py::test_read_command_opens_readonly_backend` (10 parametrized sites) |
+| #28 read: two concurrent read-only processes succeed (reader/reader) | MET | `test_cross_process_reader_reader_concurrency` (real `multiprocessing.spawn`, asserts rows) |
+| #28 read (known limitation): read-only open while a writer holds the lock fails "Database is locked" | MET (re-scoped) | `test_cross_process_writer_blocks_readonly_open`; docstrings in `config.py`/`kuzu_backend.py` corrected; matches Deviation 1 |
+| #28 read: read-only open of never-indexed DB shows empty-DB hint, no crash | MET | `config.py:380-391` catches `RuntimeError` w/ `"READ ONLY"`, surfaces init hint; `test_readonly_open_of_missing_db_raises_empty_db_hint` |
+| #28 hook: hooks contain `--notify` + visible stderr, no bare `\|\| true` | MET | `test_git_hooks_notify.py` (template + installed, both hooks) |
+| #28 write: `--notify` routes via live server; falls through to direct write when none | MET | Pre-existing `test_reindex_via_server.py` (13 green: `test_no_server_still_falls_through_and_updates_graph`, `test_timeout_in_process_exits_zero_no_direct_write`); documented in commit `7ef2b6c` |
+| Version `1.1.2` in `pyproject.toml` and `src/sqlcg/__init__.py` | MET | `pyproject.toml:7`, `__init__.py:3` |
+| Dead code: zero `GET_UPSTREAM_DEPENDENCIES_FILTERED` refs (atomic removal) | MET | Removed in one commit (`4ce0ded`) from `queries.cypher`, `queries.py`, `test_queries_loader.py`; grep across `src/`+`tests/` = 0 hits |
+
+### Notes (non-blocking follow-ups for a later ticket)
+
+**Note 1 — #40 Half-B has no isolated negative sentinel (test-design gap, not a code bug).**
+The recall guards build a *hardcoded mirror* of `analyze.py`'s `kind_filter` string rather than
+invoking the `analyze upstream` command, so reverting Half B in production code (`analyze.py`)
+reds **no** guard. Re-verified live: reverting the guard's mirror to the inner-join form *also*
+stays green whenever Half A is present, because Half A makes the source `SqlTable` node exist and
+the inner `MATCH` then succeeds. The plan's "Guard 1 = Half-B sentinel" claim (plan §"Guard
+asymmetry") and the `test_cte_recall_guard.py` module docstring are therefore overstated; only
+the *combined* Half-A+Half-B revert reds the CLI guards — a nuance the `test_cte_schema_alias_guard.py`
+docstring (lines 137-145) correctly documents but the Guard 1 docstring does not. This is the
+exact class of blind-guard trap #40 was meant to close, applied one level up: Half B's *positive*
+behavior (inverted filter returns sources, excludes CTEs) is well covered, but a future edit that
+restores the inner-join filter in `analyze.py` would not be caught by any guard. **Follow-up:**
+either (a) have one guard import and assert against the live `analyze.py` filter string, or (b)
+add a guard that indexes WITHOUT Half A (or deletes the src `SqlTable` node post-index) and asserts
+the inverted filter still returns the node-less source — the genuine pre-Half-A scenario the plan
+intended. Recommend the Guard 1 / module docstrings be corrected to match `test_cte_schema_alias_guard.py`'s
+honest framing. Severity: low — Half B is defense-in-depth for pre-Half-A graphs; positive behavior is proven.
+
+**Note 2 — Step 3.2 satisfied by pre-existing tests (documented deviation).** No
+`test_reindex_notify.py` was added; the `--notify` fallthrough/timeout coverage already exists in
+`test_reindex_via_server.py` (13 green) and is documented in commit `7ef2b6c`. The plan permitted
+"extend the above *or* `test_reindex_notify.py`". Acceptable; no action.
+
+**Note 3 — `gain.py:123` read-only site not in the parametrized wiring test.** The `gain` Section-F
+read correctly passes `read_only=True` (verified in source/diff) but is absent from
+`_READ_CALL_SITES` in `test_readonly_under_lock.py`. Low risk (covered by source diff, guarded by
+no dedicated test). **Follow-up:** add `gain` to the parametrized wiring list.
+
+### Hygiene gate
+- Version `1.1.2` in both files. PASS.
+- No new methods (only `get_backend(read_only=...)` defaulted param; many call sites). PASS.
+- No TODO/FIXME in any changed source happy path. PASS.
+- `sprint_08` measurement JSONs and `scratch_bootstrap_golden.py` are **NOT** in any commit
+  (working-tree only). PASS. `.claude/progress.txt` is tracked on `master` (not gitignored) and
+  received a routine 6-line planner append in the planning commit `b695cbd`; not in the four PR
+  code commits. Acceptable — pre-existing tracked file, consistent with prior maintenance.
+- Dead-query removal atomic; grep-clean. PASS.
