@@ -3,12 +3,23 @@
 These tests MUST FAIL before the developer implements the fix. They are the definition of
 done for plan/v1_1_3_union_cte_star.md.
 
-Root cause (confirmed by plan-reviewer 2026-06-01):
+Root cause (confirmed empirically 2026-06-01):
   A CTE whose body is a 3-branch UNION ALL (A UNION ALL B UNION ALL C) produces
   zero incoming COLUMN_LINEAGE edges. `qualify()` mutates the AST in-place and
   expands `SELECT *` for a 2-branch union, but for N≥3 branches `cte_body.this`
   is a nested Union (not a Select), so `Union.expressions = []` and the inner
-  column loop body never executes. `cte_union.*` become islands.
+  column loop body never executes. `cte_union.*` become islands (the node is
+  never even created as a lineage target).
+
+The fix (HOP-PRESERVING — see plan):
+  Walk to the deepest left-branch exp.Select (whose star the statement-level
+  qualify already expanded into explicit columns) and run the EXISTING no-`sources=`
+  sg_lineage call per column. With no `sources=`, sqlglot resolves to the BRANCH CTE
+  columns (cte_a.total_amt, ...), so the emitted edge is
+  `cte_union.col <- cte_X.col` — the CTE hop is PRESERVED, consistent with the
+  explicit-column union path and the anchor tests. Physical sources are reached by
+  MULTI-HOP traversal through the preserved cte_X nodes, NOT by collapsing the hop.
+  No `sources=` is introduced anywhere.
 
 Guard design (the #40 lesson):
   - Fixture is 3 sibling CTEs with identical explicit column lists, unioned via
@@ -16,6 +27,9 @@ Guard design (the #40 lesson):
     `cte_union.total_amt` has 0 incoming edges (confirmed empirically).
   - All assertions check observable graph output (edge presence, specific ids),
     never "no exception raised".
+  - The hop-preservation sentinel asserts the direct upstream is a BRANCH CTE
+    column, not a collapsed physical source — it reds if a future `sources=`
+    regression collapses the hop.
   - test_explicit_column_union_still_traces uses the 2-branch explicit-column
     fixture already proven green (test_cte_recall_guard.py) — anti-regression.
 
@@ -28,7 +42,6 @@ import pytest
 
 from sqlcg.cli.commands.analyze import _kind_filter
 from sqlcg.core.kuzu_backend import KuzuBackend
-from sqlcg.core.queries import GET_UPSTREAM_DEPENDENCIES_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.indexer import Indexer
 
@@ -127,8 +140,9 @@ def test_union_star_cte_gets_incoming_edges(db, tmp_path):
     where cte_body.this is a nested Union; Union.expressions=[] so the CTE-projection
     loop body never executes).
 
-    GREEN after fix: Step 1.1 walks to deepest left-branch Select; Step 1.2 passes
-    union_cte_sources= to sg_lineage so the star expands to physical source columns.
+    GREEN after fix: Step 1.1 walks to the deepest left-branch Select (whose star
+    qualify already expanded), and the EXISTING no-`sources=` sg_lineage call emits
+    CTE_PROJECTION edges from the branch CTE columns — the hop is preserved.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
@@ -143,27 +157,32 @@ def test_union_star_cte_gets_incoming_edges(db, tmp_path):
     assert len(incoming_ids) > 0, (
         "cte_union.total_amt has 0 incoming COLUMN_LINEAGE edges — it is an island.\n"
         "This is the 3-branch UNION ALL star bug (plan/v1_1_3_union_cte_star.md).\n"
-        "The fix must walk to the deepest left-branch Select (Step 1.1) and pass\n"
-        "union_cte_sources= to sg_lineage (Step 1.2) so the star expands."
+        "The fix must walk to the deepest left-branch Select (Step 1.1) and reuse the\n"
+        "existing no-`sources=` sg_lineage call so the branch CTE columns are emitted."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — edge shape: incoming edges must carry CTE_PROJECTION + physical sources
+# Test 2 — HOP-PRESERVATION sentinel: direct upstream must be a BRANCH CTE column
 #
-# RED TODAY: no edges at all (0 rows from the query above)
-# GREEN AFTER FIX: edges emitted with transform=CTE_PROJECTION from physical sources
+# RED TODAY: no edges at all (0 rows from the query)
+# GREEN AFTER FIX: edges emitted with transform=CTE_PROJECTION whose source is a
+#   branch CTE column (cte_a.total_amt, ...), NOT a collapsed physical source.
+#   This reds if a future sources= regression collapses the CTE hop.
 # ---------------------------------------------------------------------------
 
 
 def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
-    """After the fix, incoming edges to cte_union carry transform='CTE_PROJECTION'.
+    """After the fix, incoming edges to cte_union carry CTE_PROJECTION from BRANCH CTEs.
 
-    Also verifies that at least one physical source (staging.src_*) is a direct
-    upstream of cte_union — not just another CTE intermediate — because sg_lineage
-    with sources= collapses the CTE hop to the physical source.
+    Hop-preservation contract: the DIRECT (1-hop) upstream of cte_union.total_amt must be
+    a branch CTE column (cte_a.total_amt / cte_b / cte_c), NOT a physical source. The fix
+    uses the existing no-`sources=` sg_lineage call, which stops at the CTE boundary and
+    preserves the hop — consistent with the explicit-column union path and the anchor tests.
 
-    RED TODAY: 0 edges, assertion on non-empty set fails.
+    RED TODAY: 0 edges (island), assertion on non-empty set fails.
+    GUARD: if a future change reintroduces `sources=` and collapses the hop to
+    staging.src_*, the branch-CTE-column assertion below reds.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
@@ -176,8 +195,9 @@ def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
     rows = db.run_read(q, {})
 
     assert len(rows) > 0, (
-        "cte_union.total_amt has 0 incoming edges. Expected CTE_PROJECTION edges from "
-        "physical sources after the star-over-N-branch-union fix."
+        "cte_union.total_amt has 0 incoming edges (island).\n"
+        "Expected CTE_PROJECTION edges from BRANCH CTE columns after the "
+        "hop-preserving star-over-N-branch-union fix."
     )
 
     transforms = {r["transform"] for r in rows}
@@ -186,55 +206,82 @@ def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
         f"got: {transforms}"
     )
 
-    physical_src_ids = {r["id"] for r in rows if "staging." in r["id"]}
-    assert len(physical_src_ids) > 0, (
-        "No physical source (staging.*) in direct upstream of cte_union.total_amt.\n"
-        f"Upstream ids: {sorted(r['id'] for r in rows)}\n"
-        "After fix, sg_lineage with sources= should collapse CTE hops to physical sources."
+    upstream_ids = {r["id"] for r in rows}
+
+    # Hop-preservation: the direct upstream MUST be branch CTE columns, not physical sources.
+    branch_cte_ids = {
+        uid
+        for uid in upstream_ids
+        if uid in {"cte_a.total_amt", "cte_b.total_amt", "cte_c.total_amt"}
+    }
+    assert len(branch_cte_ids) > 0, (
+        "Direct upstream of cte_union.total_amt contains no branch CTE column "
+        "(cte_a/cte_b/cte_c.total_amt).\n"
+        f"Upstream ids: {sorted(upstream_ids)}\n"
+        "The fix must PRESERVE the CTE hop (no `sources=`): the direct upstream is the "
+        "branch CTE column, not a collapsed physical source."
+    )
+
+    # Negative: the hop must NOT be collapsed — no physical source as a DIRECT upstream.
+    physical_src_ids = {uid for uid in upstream_ids if "staging." in uid}
+    assert not physical_src_ids, (
+        "A physical source appears as a DIRECT (1-hop) upstream of cte_union.total_amt: "
+        f"{sorted(physical_src_ids)}.\n"
+        "This means the CTE hop was COLLAPSED (a `sources=` regression). The fix must keep "
+        "the branch CTE columns as the direct upstream; physical sources are reached only "
+        "via multi-hop traversal (see test_union_star_cte_mcp_upstream_reaches_physical_sources)."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — MCP upstream of cte_union.total_amt must return physical sources
+# Test 3 — multi-hop upstream of cte_union.total_amt must reach physical sources
+#          THROUGH the preserved cte_X hop
 #
-# RED TODAY: GET_UPSTREAM_DEPENDENCIES_QUERY starting at cte_union.total_amt
-#   returns [] — the node has no incoming edges (island). MCP cannot answer
-#   "where does cte_union.total_amt come from?"
-# GREEN AFTER FIX: returns staging.src_a/b/c.amount from the CTE_PROJECTION edges.
+# RED TODAY: cte_union.total_amt is an island — a multi-hop upstream traversal
+#   returns [] because the node has 0 incoming edges. The end-to-end chain
+#   through cte_union is broken.
+# GREEN AFTER FIX: the hop is preserved (cte_union <- cte_X <- staging.src_*), so a
+#   multi-hop *1..N traversal reaches staging.src_a/b/c.amount through cte_X.
+#
+# NOTE: a 1-hop GET_UPSTREAM_DEPENDENCIES_QUERY would (correctly) return only the
+# branch CTEs after the fix, since the hop is preserved. We therefore use a multi-hop
+# CLI-shaped traversal (the production _kind_filter) to validate the end-to-end chain.
 # ---------------------------------------------------------------------------
 
 
-def test_union_star_cte_mcp_upstream_returns_physical_sources(db, tmp_path):
-    """MCP get_upstream_dependencies starting at cte_union.total_amt returns physical sources.
+def test_union_star_cte_mcp_upstream_reaches_physical_sources(db, tmp_path):
+    """Multi-hop upstream of cte_union.total_amt reaches physical sources via the preserved hop.
 
-    RED TODAY: cte_union.total_amt is an island — GET_UPSTREAM_DEPENDENCIES_QUERY
-    returns [] because the node has 0 incoming COLUMN_LINEAGE edges.
+    RED TODAY: cte_union.total_amt is an island — the multi-hop traversal returns []
+    because the node has 0 incoming COLUMN_LINEAGE edges. The chain through cte_union
+    cannot be walked.
 
-    GREEN AFTER FIX: incoming CTE_PROJECTION edges exist from physical sources
-    (sg_lineage with sources= collapses CTE hops to staging.src_*).
+    GREEN AFTER FIX: the hop is preserved (cte_union <- cte_X.total_amt <- staging.src_*),
+    so the *1..N traversal reaches staging.src_a/b/c.amount THROUGH the branch CTE nodes —
+    no hop collapse.
 
-    Note: this is a more precise test than walking from the final mart.* target,
-    because the outer SELECT body_scope already emits direct mart.* <- staging.*
-    edges that would make that traversal pass vacuously even without the fix.
+    Uses the production analyze._kind_filter (as the v1.1.2 guards do), so a filter
+    regression also reds this test.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
-    rows = db.run_read(GET_UPSTREAM_DEPENDENCIES_QUERY, {"id": "cte_union.total_amt"})
+    rows = db.run_read(_upstream_query(depth=5), {"ref": "cte_union.total_amt"})
     upstream_ids = {r["id"] for r in rows}
 
     assert len(upstream_ids) > 0, (
-        "GET_UPSTREAM_DEPENDENCIES_QUERY returned 0 results for cte_union.total_amt.\n"
+        "Multi-hop upstream traversal returned 0 results for cte_union.total_amt.\n"
         "The node is a lineage island — no incoming edges.\n"
-        "After fix: sources= resolves the 3-branch union star and emits CTE_PROJECTION edges."
+        "After fix: the deepest-Select walk reconnects cte_union via the preserved CTE hop."
     )
 
-    # At least one physical source must be reachable in the 1-hop upstream
+    # Physical sources must be reachable via multi-hop traversal THROUGH the cte_X hop.
     physical_sources = {uid for uid in upstream_ids if "staging." in uid}
     assert len(physical_sources) > 0, (
-        f"MCP upstream of cte_union.total_amt did not reach any physical source.\n"
+        f"Multi-hop upstream of cte_union.total_amt did not reach any physical source.\n"
         f"Found: {sorted(upstream_ids)}\n"
-        "Expected staging.src_* after sources= resolution collapses the CTE hop."
+        "After fix, the chain cte_union <- cte_X.total_amt <- staging.src_*.amount must be "
+        "walkable; physical sources are reached via the preserved hop, not by collapsing it."
     )
 
 

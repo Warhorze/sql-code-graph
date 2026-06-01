@@ -1,31 +1,32 @@
 # Feature Plan: v1.1.3 — `SELECT *` over a `UNION ALL` of sibling CTEs (residual #38)
 
-> **plan-reviewer corrections — 2026-06-01**
+> **architect-planner hop-preserving redesign — 2026-06-01**
 >
-> **B1 (BLOCKER)**: The 2-branch UNION ALL fixture in Step 2.1 does NOT reproduce the DWH
-> island. `qualify()` mutates the AST in-place: for a 2-branch UNION ALL, `qualify()`
-> expands `SELECT *` inside `cte_union` to explicit columns before the CTE-projection loop
-> runs. After expansion, `projection_source.expressions` is no longer `[Star]`, so the
-> star-skip (`base.py:988-994`) never fires and the loop iterates the explicit columns
-> successfully. The 2-branch fixture already works today — no fix is needed for it.
+> Implementation surfaced a design flaw in the prior `sources=` approach. The prior plan
+> passed the sibling CTE bodies as `sources=` to `sg_lineage` on the union-star path. That
+> **collapses the CTE hop**: it emits `cte_union.col ← physical_source.col` directly,
+> skipping the `cte_a`/`cte_b`/`cte_c` intermediate. This is wrong for two reasons:
 >
-> The actual island occurs with **N-branch UNION ALL (N≥3)**, where `cte_body.this` is
-> itself a `Union` (not a `Select`). `Union.expressions` is always `[]` (empty), so
-> `projection_source.expressions = []` and the inner `for cte_col_expr` loop body never
-> executes. **Fix: change the fixture to a 3-branch UNION ALL** (adds a `cte_c` branch)
-> so the guard is red on current code for the right reason. Step 1.1 must also be
-> corrected to walk to the deepest left-branch Select (not just `cte_body.this`).
+> 1. **It breaks the anchor tests.** [`test_anchor_ma_aantal_op_order.py`](../tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py)
+>    asserts the intermediate CTE hop is PRESERVED — e.g. link 3:
+>    `bm_orders.aantal_op_order → openstaand_combined.aantal_op_order`. A `sources=`
+>    union-star path would have produced `openstaand_combined ← physical` directly.
+> 2. **It makes the graph inconsistent.** Explicit-column unions (the `openstaand_combined`
+>    anchor case, and `test_union_all_cte_*` in `test_cte_recall_guard.py`) already preserve
+>    the CTE hop because they call `sg_lineage(col, body)` with **no `sources=`**. Star-unions
+>    must behave identically — the CTE hop must be preserved, consistent with explicit-column
+>    unions and the rest of the graph.
 >
-> **B2 (BLOCKER)**: Step 1.1 only handles the case where `projection_source.expressions`
-> is `[Star]` (2-branch, direct left Select). For N≥3 branches, `projection_source` is a
-> `Union` with `.expressions = []` — the plan's detection condition is never satisfied.
-> **Fix: traverse to the deepest left-branch Select** (`while isinstance(ps, exp.Union):
-> ps = ps.this`) before checking for the star. Only then check `ps.expressions == [Star]`.
-> The `cte_body_sql` serialization of the full union body is unaffected (still correct).
+> **User decision: star-unions preserve the CTE hop too.** The corrected fix is therefore a
+> **simplification, not a `sources=` addition**. The `sources=` / `union_cte_sources`
+> mechanism is removed from this plan entirely. See Design § "The fix approach" below for
+> the corrected, verified design.
 >
-> **Branching note (non-blocking)**: this plan targets v1.1.3 but lives on
-> `feat/v1.1.2-bugfix`. Implementation must land on a fresh branch (`fix/v1.1.3-union-cte-star`
-> off `master` or after PR #41 merges), not extend PR #41.
+> The earlier plan-reviewer blockers (B1: 3-branch fixture required; B2: walk to deepest
+> left-branch Select) are CORRECT and retained — the column-derivation walk is the only real
+> change. Only the `sources=` half is removed.
+>
+> **Branching note**: implementation lands on `feat/v1.1.3-union-cte-star`.
 
 ## Summary
 
@@ -40,9 +41,10 @@ shape that survived the v1.1.2 general CTE-recall fix (PR #41).
 
 - The CTE-projection loop in [`base.py`](../src/sqlcg/parsers/base.py) `_extract_column_lineage`
   (lines ~946–1041): when a CTE body is a `UNION` whose branches are `SELECT *`
-  over **same-statement sibling CTEs**, give `sg_lineage` the sibling CTE bodies as
-  `sources=` so it can expand the star against each branch's CTE schema and union the
-  per-branch lineage onto the unioning CTE's columns.
+  over **same-statement sibling CTEs**, derive the column list by walking to the deepest
+  left-branch `exp.Select` (whose star the statement-level `qualify` has already expanded
+  into explicit columns) and run the **existing no-`sources=`** `sg_lineage` call per column
+  so each branch CTE column is preserved as the upstream (`cte_union.col ← cte_X.col`).
 - A synthetic integration fixture reproducing the shape (≥2 sibling CTEs with
   identical explicit column lists, unioned via `UNION ALL`, star-selected) plus a guard
   that goes red on the bug and green on the fix.
@@ -62,8 +64,10 @@ shape that survived the v1.1.2 general CTE-recall fix (PR #41).
   (`EXPAND_STAR_SOURCES`) or the `StarSource` dataclass. That mechanism keys off a
   query's `target_table` (INSERT/CREATE target); a CTE has no target table, so it is
   the wrong carrier for this shape (see Design § "Why not STAR_SOURCE").
-- **Do NOT** expand stars against arbitrary cross-file CTAS bodies here — only the
-  same-statement sibling CTEs that the union branches name (keeps it O(N_refs)).
+- **Do NOT** pass `sources=` to `sg_lineage` on the union-star path, and do NOT build a
+  `union_cte_sources` map. The corrected design preserves the CTE hop by reusing the
+  existing no-`sources=` call; introducing `sources=` would collapse the hop and break the
+  anchor tests. There is no cross-file or sibling-CTE inlining here.
 - The 4 timeout files and the server-side write-lock (#28) are out of scope.
 
 ## Design
@@ -74,86 +78,92 @@ The unioning CTE's projections are populated by the **CTE-projection loop**, not
 main column loop. The relevant code is
 [`base.py:946–1041`](../src/sqlcg/parsers/base.py):
 
-- `base.py:964–975` — for a `UNION` CTE body, `projection_source = cte_body.this`
-  (the left branch) is used for **column names**, and `cte_body_sql = cte_body.sql(...)`
-  (line 982) serializes the **whole union body in isolation**.
-- `base.py:988–994` — the left branch of `cte_insert` is `SELECT *`, so its single
-  projection is an `exp.Star`, which the loop **skips** (`continue`). No column name is
-  derived from the star, so **no `sg_lineage` call is made at all** for `cte_insert`'s
-  real columns.
-- `base.py:1011–1015` — even if a concrete column name reached this call, the
-  serialized body `"SELECT * FROM cte_voorraad_bouwmarkt UNION ALL SELECT * FROM
-  cte_voorraad_webshop UNION ALL SELECT * FROM cte_voorraad_igdc"` is passed to
-  `sg_lineage` with **no `sources=`**, so the sibling CTE names are undefined relations
-  and sqlglot raises `SqlglotError: Cannot find column '<col>' in query`. The exception
-  is swallowed at `base.py:1035`.
+- `base.py:972–975` — for a `UNION` CTE body, `projection_source = cte_body.this`
+  (the *immediate* left child) is used for **column names**, and
+  `cte_body_sql = cte_body.sql(...)` (line 982) serializes the **whole union body in
+  isolation**.
+- For a **2-branch** union, `cte_body.this` is an `exp.Select`, and the statement-level
+  `qualify` at `base.py:670` (which mutates `body` in place) has already expanded
+  `SELECT *` into explicit columns there — so `projection_source.expressions` carries the
+  real columns and the loop works today.
+- For an **N≥3-branch** union (`A UNION ALL B UNION ALL C`), sqlglot parses as
+  `Union(this=Union(this=A, expression=B), expression=C)`. So `cte_body.this` is *itself a
+  `Union`*, and **`Union.expressions` is always `[]`**. Thus `projection_source.expressions
+  == []`, the inner `for cte_col_expr` loop body **never executes**, and `cte_union.*`
+  receive **zero incoming edges** → islands. This is the residual #38 bug.
 
-**Confirmed empirically** against the real file
-`/home/ignwrad/Projects/dwh/etl/sql/fact/wtfe_kpi_voorraad_artikel_voorraadlocatie.sql`
-through the full indexer pipeline:
+**Confirmed empirically** by indexing the synthetic 3-branch fixture (Step 2.1) through the
+full `Indexer().index_repo` pipeline against in-memory KuzuDB:
 
-| Column | Incoming `COLUMN_LINEAGE` | Status |
+| Node | Incoming `COLUMN_LINEAGE` today | Status |
 |---|---|---|
-| `cte_voorraad_bouwmarkt.ma_vrije_vrd` | `← ba.wtfs_voorraad_dagstand.ma_vrije_vrd` (CTE_PROJECTION) | OK (branch traces) |
-| `ba_tmp.wtfe_kpi_voorraad_artikel_voorraadlocatie.ma_vrije_vrd` | `← cte_insert.ma_vrije_vrd` (SELECT) | OK (final target linked) |
-| **`cte_insert.ma_vrije_vrd`** | **(none)** | **ISLAND — the residual bug** |
+| `cte_a.total_amt` | `← staging.src_a.amount` (CTE_PROJECTION) | OK (branch traces) |
+| `cte_b.total_amt` | `← staging.src_b.amount` (CTE_PROJECTION) | OK (branch traces) |
+| `cte_c.total_amt` | `← staging.src_c.amount` (CTE_PROJECTION) | OK (branch traces) |
+| `mart.union_star_dst.total_amt` | `← staging.src_{a,b,c}.amount` (SELECT) | OK (outer scope collapses the missing CTE) |
+| **`cte_union.total_amt`** | **(node does not exist — never a lineage target)** | **ISLAND — the residual bug** |
 
-And the isolated minimal repro of the failing call:
-
-```python
-sg_lineage("ma_vrije_vrd",
-           "SELECT * FROM cte_a UNION ALL SELECT * FROM cte_b",
-           dialect="snowflake")
-# → SqlglotError: Cannot find column 'MA_VRIJE_VRD' in query.
-```
-
-Note: the whole-statement `qualify` of the real file **succeeds** (so `body_scope` is
-built and the *outer* `final ← cte_insert` edge is emitted via the main loop). The gap
-is strictly the **upstream side of `cte_insert`**, produced by the CTE-projection loop.
+Note: the whole-statement `qualify` succeeds, and it **expands `SELECT *` into the deepest
+left-branch `Select` of `cte_union`** (verified: that Select's projections become
+`CTE_A.GRP_KEY AS GRP_KEY`, `CTE_A.TOTAL_AMT AS TOTAL_AMT`). The columns ARE available — the
+loop simply reads the *wrong* node (`cte_body.this`, an empty-`expressions` `Union`) instead
+of walking down to that deepest `Select`.
 
 ### The fix approach
 
-Two coordinated changes inside the CTE-projection loop (`base.py:946–1041`):
+**One change** inside the CTE-projection loop (`base.py:946–1041`): correct the
+column-derivation source. **No `sources=` is introduced anywhere.**
 
-1. **Resolve the union branch column names, not the star.** When `cte_body` is a
-   `exp.Union` and the left-branch projection is a bare `exp.Star` (or
-   `<alias>.*`), derive the column-name list from the **referenced sibling CTE's**
-   projection instead of skipping. The branch's `FROM` relation name (e.g.
-   `cte_voorraad_bouwmarkt`) is looked up in `combined_sources` (already built at
-   `base.py:626–644`, keyed lowercase, carrying every same-statement CTE body). Use the
-   first branch's referenced CTE as the authoritative column list (union branches must
-   be union-compatible; the existing explicit-column union path already assumes left-branch
-   column names at `base.py:970–973`).
+1. **Walk to the deepest left-branch `Select` for column names.** When `cte_body` is an
+   `exp.Union`, set `projection_source` by walking
+   `ps = cte_body.this; while isinstance(ps, exp.Union): ps = ps.this`, then use
+   `ps.expressions` as the column list. This is computed **once per CTE**, O(N_branches),
+   before the per-column loop. Because the statement-level `qualify` (base.py:670) already
+   expanded the star into this deepest `Select` in place, `ps.expressions` holds the real,
+   explicit columns (`grp_key`, `total_amt`) — not a bare `Star`. This single change fixes
+   the N≥3 island: the loop now iterates real columns. For N=2 the walk is a no-op
+   (`cte_body.this` is already a `Select`), so existing behaviour is preserved.
 
-2. **Give `sg_lineage` the sibling CTE bodies as `sources=`.** Build a
-   `dependency_filter`-style map containing **only** the CTE names that this union body
-   references (parsed once from the union body's `exp.Table` nodes), drawn from
-   `combined_sources`. Pass that filtered map as `sources=` to the existing
-   `sg_lineage(cte_col_name, cte_body_sql, dialect=..., sources=<filtered_siblings>)`
-   call at `base.py:1011`. sqlglot then expands `*` against each branch CTE's schema and
-   unions the per-branch lineage. Verified:
+2. **Run the SAME existing no-`sources=` `sg_lineage` call per column.** The call at
+   `base.py:1011` is left exactly as-is:
 
    ```python
-   sg_lineage("ma_vrije_vrd", "SELECT * FROM cte_a UNION ALL SELECT * FROM cte_b",
-              dialect="snowflake", sources={"cte_a": <body>, "cte_b": <body>})
-   # → resolves; leaves reach VRD.MA_VRIJE_VRD on both WTFS_VOORRAAD_DAGSTAND
-   #   and WTFS_VOORRAAD_DAGSTAND_WEBSHOP branches.
+   root = sg_lineage(cte_col_name, cte_body_sql, dialect=self.DIALECT)  # NO sources=
    ```
 
-   The resulting tree leaves are the **physical source tables** of each branch
-   (`ba.wtfs_voorraad_dagstand`, `ba.wtfs_voorraad_dagstand_webshop`), so
-   `_lineage_node_to_edges` emits, per branch:
-   `cte_insert.<col> ← <branch_physical_source>.<col>`, tagged `CTE_PROJECTION`.
+   With no `sources=`, sqlglot resolves the union body's column to its **branch-CTE leaves**
+   — it stops at the CTE boundary because the branch relations (`CTE_A`, `CTE_B`, `CTE_C`)
+   are the `FROM` targets within the serialized body and are not further inlined. Verified
+   against the qualified `cte_union` body:
+
+   ```python
+   sg_lineage("total_amt",
+              'SELECT "CTE_A"."GRP_KEY" AS "GRP_KEY", "CTE_A"."TOTAL_AMT" AS "TOTAL_AMT" '
+              'FROM "CTE_A" AS "CTE_A" UNION ALL ... UNION ALL ...',
+              dialect="snowflake")
+   # leaves: "CTE_A"."TOTAL_AMT", "CTE_B"."TOTAL_AMT", "CTE_C"."TOTAL_AMT"
+   ```
+
+   `_lineage_node_to_edges` therefore emits, per branch:
+   `cte_union.<col> ← cte_X.<col>`, tagged `CTE_PROJECTION` — **the CTE hop is preserved**,
+   identical in spirit to the explicit-column union path (`openstaand_combined ← bm_orders`).
+
+3. **Physical sources are reached by multi-hop traversal, not by collapse.** The branch
+   CTEs already receive their own `cte_X.<col> ← physical.<col>` `CTE_PROJECTION` edges from
+   normal processing (see the empirical table above). So a multi-hop upstream walk from
+   `cte_union.total_amt` reaches `staging.src_*.amount` *through* the preserved `cte_X` hop —
+   no edge collapses, no `sources=` inlining.
 
 ### Edge semantics, transform tag, and confidence
 
 - Carry the reconnection with **plain `COLUMN_LINEAGE`**, reusing the existing
   `transform="CTE_PROJECTION"` tag the CTE loop already applies at `base.py:1031`.
-  This keeps it identical to how every other CTE projection edge is recorded.
+  This keeps it identical to how every other CTE projection edge — including explicit-column
+  unions — is recorded.
 - **Confidence 1.0** — the same as all other `CTE_PROJECTION` edges (`base.py:1032`
   passes `edge.confidence` through; the leaf edges are emitted at confidence 1.0 by
-  `_lineage_node_to_edges`). The star is structurally resolved against a known CTE
-  schema, not inferred, so it is not a 0.8 `STAR_EXPANSION`.
+  `_lineage_node_to_edges`). The star is structurally resolved by the statement-level
+  `qualify`, not inferred, so it is not a 0.8 `STAR_EXPANSION`.
 
 ### Why not STAR_SOURCE / STAR_EXPANSION
 
@@ -167,22 +177,24 @@ guard or, worse, mis-attach the branch columns to the statement's final target. 
 sqlglot-resolved `CTE_PROJECTION` path is correct because it attaches to the **CTE name**
 (`cte_dst_table = TableRef(name=cte_alias, role="cte")`, `base.py:963`).
 
-### Why this stays one hop and does not collapse other CTE chains
+### Why this preserves the CTE hop (and matches explicit-column unions)
 
-Passing `sources=` makes sqlglot inline the branch CTE bodies, so the emitted edge is
-`cte_insert.<col> ← <branch physical source>.<col>` (the `cte_a` hop is collapsed inside
-*this* edge). This is acceptable and does **not** regress the eb19f29 anchor case
-because:
-- The branch CTE's own projection edge (`cte_a.<col> ← src.<col>`) is still emitted by
-  the CTE-projection loop's iteration over `cte_a`, so the `cte_a` intermediate node
-  remains in the graph with its upstream intact.
-- The downstream `final ← cte_insert` edge already exists (main loop).
-- Net effect: `cte_insert` gains incoming edges to the physical sources, reconnecting
-  the two healthy halves. The `--include-intermediate` traversal still shows
-  `cte_a`/`cte_b` via their own edges.
+Because **no `sources=`** is passed, sqlglot does NOT inline the branch CTE bodies. The
+emitted edge is `cte_union.<col> ← cte_X.<col>` — the `cte_X` intermediate is the direct
+upstream, preserving the hop. This is the same behaviour the explicit-column union path
+already exhibits (`openstaand_combined.aantal_op_order ← bm_orders.aantal_op_order`,
+anchor link 3) and is consistent with the rest of the graph:
+- The branch CTE's own projection edge (`cte_X.<col> ← physical.<col>`) is emitted by the
+  CTE-projection loop's iteration over `cte_X`, so the physical source is reachable via a
+  **multi-hop** walk through the preserved `cte_X` node.
+- The downstream `final ← cte_union` edge already exists (main loop).
+- Net effect: `cte_union` gains incoming edges to the **branch CTE columns**, reconnecting
+  the chain without collapsing any hop. A multi-hop upstream traversal reaches the physical
+  sources; a 1-hop traversal stops at the branch CTEs — exactly like every other CTE in the
+  graph.
 
-This `sources=` is scoped to **same-statement siblings only** (typically 2–4 CTEs),
-filtered to the names the union body references — it is NOT the cross-file corpus.
+There is **no `sources=`** and no `union_cte_sources` map. The fix does not reference the
+cross-file corpus at all — it only corrects which AST node the column list is read from.
 
 ### API Changes
 
@@ -203,52 +215,61 @@ No new third-party dependencies. Uses existing sqlglot `lineage()` `sources=` pa
 
 ### Phase 1: Star-over-union-CTE resolution in the parser
 
-**Step 1.1**: In the CTE-projection loop, detect a union body whose **deepest
-left-branch** projection is a star and derive the column-name list from the referenced
-sibling CTE.
+**Step 1.1**: In the CTE-projection loop, when the CTE body is a `UNION`, derive the
+column list from the **deepest left-branch `exp.Select`** instead of `cte_body.this`.
 - Files affected: [`src/sqlcg/parsers/base.py`](../src/sqlcg/parsers/base.py)
-  (`_extract_column_lineage`, the `for cte in cte_expressions` block at ~946–1041).
-- Detail: when `isinstance(cte_body, exp.Union)`, walk to the **deepest left-branch
-  `exp.Select`** by traversing `ps = cte_body.this` until `isinstance(ps, exp.Select)`
-  (i.e. `while isinstance(ps, exp.Union): ps = ps.this`). This handles both 2-branch
-  (`cte_body.this` is a `Select`) and N-branch (`cte_body.this` is itself a `Union`
-  whose `.expressions` is always `[]`). Only when `ps.expressions` is a single `exp.Star`
-  (or `<alias>.*`) do we take the star-expansion path: collect the union body's referenced
-  relation names from its `exp.Table` nodes (left branch first), look the first one up in
-  `combined_sources`, and use **that** CTE body's non-star projections to supply
-  `cte_col_name`s. Fall back to the existing behaviour (skip) if the referenced relation
-  is not a known sibling CTE in `combined_sources`.
-- **Why `cte_body.this` alone is insufficient**: for a 3-branch `A UNION ALL B UNION ALL C`,
-  sqlglot parses as `Union(this=Union(this=A, expression=B), expression=C)`. The outer
-  `Union.this` is another `Union`, whose `.expressions` = `[]` (empty). Checking
-  `projection_source.expressions == [Star]` never matches. Walking to the deepest
-  `Select` is O(N_branches) per CTE — once, before the per-column loop.
-- The branch-CTE column-list lookup and the union body's referenced-CTE set are computed
-  **once per CTE**, before the per-column loop (perf invariant: no per-column re-parse).
-- Acceptance: for the synthetic 3-branch fixture, `cte_union`'s projected columns are
-  enumerated from the first referenced branch CTE's explicit column list.
+  (`_extract_column_lineage`, the `for cte in cte_expressions` block at ~946–1041),
+  specifically the `projection_source` assignment at lines 972–975.
+- Detail: replace
+  ```python
+  if isinstance(cte_body, exp.Union):
+      projection_source = cte_body.this
+  else:
+      projection_source = cte_body
+  ```
+  with a walk to the deepest left-branch `Select`:
+  ```python
+  if isinstance(cte_body, exp.Union):
+      projection_source = cte_body.this
+      while isinstance(projection_source, exp.Union):
+          projection_source = projection_source.this
+  else:
+      projection_source = cte_body
+  ```
+  This is computed **once per CTE**, before the per-column loop — O(N_branches). It is the
+  ONLY production change required.
+- **Why this works**: the statement-level `qualify` at `base.py:670` mutates `body` in place
+  and expands `SELECT *` into the deepest left-branch `Select` of the union. After the walk,
+  `projection_source.expressions` holds the real explicit columns (`grp_key`, `total_amt`),
+  so the existing star-skip at lines 990–994 no longer fires on every projection and the
+  inner loop iterates real column names. For 2-branch unions the `while` is a no-op
+  (`cte_body.this` is already a `Select`), so the existing behaviour is byte-for-byte
+  preserved.
+- **Why `cte_body.this` alone is insufficient**: for `A UNION ALL B UNION ALL C`, sqlglot
+  parses as `Union(this=Union(this=A, expression=B), expression=C)`. The outer `Union.this`
+  is another `Union`, whose `.expressions == []`. Reading `cte_body.this.expressions` yields
+  `[]` → zero iterations → the island.
+- Acceptance: for the synthetic 3-branch fixture, `cte_union`'s projected columns
+  (`grp_key`, `total_amt`) are enumerated and reach the per-column `sg_lineage` call.
 
-**Step 1.2**: Pass the filtered sibling-CTE bodies to the `sg_lineage` call so the star
-expands.
-- Files affected: same loop, the `sg_lineage(cte_col_name, cte_body_sql, ...)` call at
-  `base.py:1011`.
-- Detail: build `union_cte_sources = {name: combined_sources[name] for name in
-  referenced_cte_names if name in combined_sources}` **once before the per-column loop**,
-  and pass it as `sources=union_cte_sources`. The referenced-name set is the
-  `dependency_filter` that keeps this O(N_refs), not O(N_corpus).
-- This `sources=` is only added on the union-star path; the existing explicit-column CTE
-  path keeps calling `sg_lineage` with no `sources=` (unchanged) so we do not alter the
-  general-recall behaviour the v1.1.2 guards pin.
-- Acceptance: `sg_lineage` resolves; `_lineage_node_to_edges` emits
-  `cte_insert.<col> ← <branch physical source>.<col>` `CTE_PROJECTION` edges for every
-  branch.
+**Step 1.2**: Do NOT change the `sg_lineage` call. It MUST remain `sg_lineage(cte_col_name,
+cte_body_sql, dialect=self.DIALECT)` with **no `sources=`**.
+- Files affected: same loop; this is a **negative** requirement — the call at `base.py:1011`
+  stays exactly as-is.
+- Detail: with no `sources=`, sqlglot resolves each union-body column to its branch-CTE
+  leaves (`cte_a.total_amt`, `cte_b.total_amt`, `cte_c.total_amt`), so
+  `_lineage_node_to_edges` emits `cte_union.<col> ← cte_X.<col>` `CTE_PROJECTION` edges —
+  the CTE hop is preserved, identical to the explicit-column union path. Introducing
+  `sources=` here would collapse the hop and break the anchor tests; do NOT do it.
+- Acceptance: incoming edges to `cte_union.total_amt` have branch-CTE-column sources
+  (`cte_a.total_amt` etc.), NOT physical sources; the call signature is unchanged from HEAD.
 
 **Step 1.3**: Keep the loop allocation-light — verify no per-column serialization or
-per-column `combined_sources` rebuild was introduced.
+per-column work was introduced.
 - Files affected: same loop.
-- Detail: `cte_body_sql` stays hoisted (already at `base.py:982`); the
-  `union_cte_sources` map and the branch column-name list are built once per CTE before
-  the inner `for cte_col_expr` loop.
+- Detail: `cte_body_sql` stays hoisted (already at `base.py:982`); the deepest-Select walk
+  is done once per CTE in the `projection_source` assignment (Step 1.1), before the inner
+  `for cte_col_expr` loop. No map is built, no `sources=` is constructed.
 - Acceptance: see Perf-invariant section; `test_perf_scaling_guard.py` stays green.
 
 ### Phase 2: Tests
@@ -315,19 +336,25 @@ hot-path op is introduced (only if Step 1 adds a counted op).
   1. `test_union_star_cte_gets_incoming_edges` — after indexing the **3-branch** fixture,
      `MATCH (s)-[:COLUMN_LINEAGE]->(c:SqlColumn {id:'cte_union.total_amt'}) RETURN s.id`
      returns **a non-empty set** (any incoming edge). **Goes red on current code**: with
-     the 3-branch fixture, `cte_union.total_amt` has 0 incoming edges today (the island).
-     After the fix, incoming edges exist (from physical sources via `sources=` resolution).
-     This is the central bug sentinel. Note: the fix emits `staging.src_*.amount ->
-     cte_union.total_amt` directly (sqlglot collapses the CTE hop when `sources=` is
-     passed), so the upstream set includes physical sources, not just CTE intermediates.
-  2. `test_union_star_cte_final_target_reaches_both_sources` — the end-to-end CLI-shaped
-     traversal from `mart.union_star_dst.total_amt` upstream reaches both
-     `staging.src_a.amount` and `staging.src_b.amount` (chain reconnected across the
-     `cte_union` boundary). Uses the production `analyze._kind_filter` helper (as the
-     v1.1.2 guards do), so a filter regression also reds it.
-  3. `test_explicit_column_union_still_traces` — a sibling test using the **existing**
-     `_UNION_ALL_SQL`-style explicit-column union to prove the fix did not change the
-     already-working path (anti-regression for the general recall).
+     the 3-branch fixture, `cte_union.total_amt` has 0 incoming edges today (the island —
+     the node is never even created). After the fix, incoming edges exist from the **branch
+     CTE columns**. This is the central bug sentinel.
+  2. `test_union_star_cte_incoming_edges_are_cte_projection` — the incoming edges to
+     `cte_union.total_amt` carry `transform="CTE_PROJECTION"` and their source is a **branch
+     CTE column** (`cte_a.total_amt`), NOT a collapsed physical source. This is the
+     hop-preserving sentinel: it would FAIL if a future `sources=` regression collapsed the
+     hop to `staging.src_*.amount`. RED today (0 edges).
+  3. `test_union_star_cte_mcp_upstream_reaches_physical_sources` — a multi-hop (CLI-shaped)
+     upstream traversal from `cte_union.total_amt` reaches `staging.src_a/b/c.amount`
+     **through the preserved `cte_X` hop**. Uses the production `analyze._kind_filter` helper
+     (as the v1.1.2 guards do), so a filter regression also reds it. RED today (island; the
+     node has no incoming edges so the traversal returns nothing). This validates the
+     end-to-end chain reaches physical sources WITHOUT collapsing the hop — note the 1-hop
+     `GET_UPSTREAM_DEPENDENCIES_QUERY` would only return the branch CTEs (correct), so the
+     physical-source assertion MUST use a multi-hop `*1..N` traversal.
+  4. `test_explicit_column_union_still_traces` — a sibling test using an explicit-column
+     2-branch union to prove the fix did not change the already-working path
+     (anti-regression for the general recall). GREEN today and after the fix.
 - **Perf invariant suite (gate, must stay green)**:
   [`test_perf_scaling_guard.py`](../tests/unit/test_perf_scaling_guard.py),
   [`test_T09_01_qualify_once.py`](../tests/unit/test_T09_01_qualify_once.py),
@@ -347,23 +374,23 @@ main per-column scope path. It must still respect every invariant:
 | Invariant | How this fix preserves it |
 |---|---|
 | `qualify`/`build_scope` imported at module level | Untouched — no new imports added in `base.py` body. |
-| `exp.expand()` with file-level `sources` filtered by `dependency_filter` (O(N_refs)) | The new `sources=` passed to `sg_lineage` is the **same-statement sibling CTE** map, filtered to only the union body's referenced names (the dependency_filter). It is NOT the cross-file corpus. No new `exp.expand()` call is added. |
+| `exp.expand()` with file-level `sources` filtered by `dependency_filter` (O(N_refs)) | Untouched — no new `exp.expand()` call is added, and **no `sources=` is passed to `sg_lineage`**. The fix only changes which AST node the column list is read from (deepest left-branch Select). |
 | `body_scope` built once per statement | Untouched — the main loop's `body_scope` logic at `base.py:646–692` is not modified. The CTE loop does not build a `body_scope`. |
 | Pure-literal skip | Untouched — the branch CTE column enumeration skips star/literal projections exactly as the existing `cte_projections` loop does. |
-| `copy=False` + `trim_selects=False` when a scope is passed | Untouched — the CTE-projection `sg_lineage` call uses a serialized string + `sources=`, not a `scope=`. The scope-path kwargs at `base.py:895–909` are not modified. |
+| `copy=False` + `trim_selects=False` when a scope is passed | Untouched — the CTE-projection `sg_lineage` call uses a serialized string with no `scope=` and no `sources=`. The scope-path kwargs at `base.py:895–909` are not modified. |
 | INSERT body copied once | Untouched — INSERT block at `base.py:713–808` not modified. |
-| `body_scope` built before column loop, never lazily inside | Untouched. The new per-CTE work (`union_cte_sources` map + branch column-name list) is computed **once per CTE before the inner `for cte_col_expr` loop**, mirroring the existing hoist of `cte_body_sql` at `base.py:982`. No per-column re-parse or re-serialize. |
+| `body_scope` built before column loop, never lazily inside | Untouched. The only new per-CTE work (the deepest-left-`Select` walk in the `projection_source` assignment) is done **once per CTE before the inner `for cte_col_expr` loop**, O(N_branches). No per-column re-parse, re-serialize, or `sg_lineage` call-count change. |
 | Bulk/batch upsert paths | Untouched — `indexer.py` not modified. |
 
-**Complexity statement**: the added work is O(N_branch_cols + N_referenced_ctes) per
-union CTE, computed once before the per-column loop. The per-column `sg_lineage` calls
-are unchanged in count (one per branch column, as the existing CTE loop already does);
-only their `sources=` argument is populated on the union-star path. There is no new
-op that scales with column-count squared, no full-corpus expand, and no per-column
-qualify/build_scope. Both scales (20-file and 1600-file) are unaffected: small repos see
-the same fast path; the DWH corpus gains 80 reconnected `cte_insert` islands at the same
-indexing cost (the failing `sg_lineage` call already ran and threw — we replace a swallowed
-exception with a successful resolution at equal call count).
+**Complexity statement**: the only added work is the O(N_branches) deepest-left-`Select`
+walk per union CTE, computed once before the per-column loop. The per-column `sg_lineage`
+calls are **unchanged in count and signature** (one per branch column, no `sources=`) — for
+N≥3 unions the loop previously made *zero* calls (empty `expressions`), so the fix turns a
+no-op into the same call the explicit-column path already makes. There is no new op that
+scales with column-count squared, no full-corpus expand, no `sources=` inlining, and no
+per-column qualify/build_scope. Both scales (20-file and 1600-file) are unaffected: small
+repos see the same fast path; the DWH corpus gains its reconnected `cte_union` islands at
+negligible incremental cost (one cheap pointer walk per union CTE).
 
 **Gating tests**: `test_perf_scaling_guard.py`, `test_T09_01_qualify_once.py`,
 `test_bulk_upsert_invariant.py`, `test_upsert_batch_invariant.py` must all stay green.
@@ -372,36 +399,47 @@ exception with a successful resolution at equal call count).
 
 - [ ] On the **3-branch** synthetic fixture, `cte_union.total_amt` has ≥1 incoming
       `COLUMN_LINEAGE` edge (currently 0 — confirmed island with 3 branches).
-- [ ] `test_union_star_cte_gets_incoming_edges` is **red on `master`/pre-fix** (0 edges;
-      verified with the 3-branch fixture) and **green after the fix**.
-- [ ] End-to-end: upstream traversal from `mart.union_star_dst.total_amt` reaches both
-      physical sources through the reconnected `cte_union` boundary.
+- [ ] The incoming edges to `cte_union.total_amt` have **branch CTE columns** as their
+      source (`cte_a.total_amt`, `cte_b.total_amt`, `cte_c.total_amt`), NOT a collapsed
+      physical source — the CTE hop is preserved.
+- [ ] `test_union_star_cte_gets_incoming_edges` and
+      `test_union_star_cte_incoming_edges_are_cte_projection` are **red at HEAD/pre-fix**
+      (0 edges; verified with the 3-branch fixture) and **green after the fix**.
+- [ ] End-to-end: a **multi-hop** upstream traversal from `cte_union.total_amt` reaches the
+      physical sources `staging.src_{a,b,c}.amount` *through* the preserved `cte_X` hop.
 - [ ] The existing explicit-column union path is unchanged: `test_union_all_cte_*` in
-      [`test_cte_recall_guard.py`](../tests/integration/test_cte_recall_guard.py) stay green.
+      [`test_cte_recall_guard.py`](../tests/integration/test_cte_recall_guard.py) and the
+      anchor tests in
+      [`test_anchor_ma_aantal_op_order.py`](../tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py)
+      (which assert the intermediate CTE hop is preserved) stay green.
+- [ ] No `sources=` is passed to `sg_lineage` anywhere on the union-star path; no
+      `union_cte_sources` map exists in the code.
 - [ ] All four perf-invariant guards stay green; `pyright` 0 errors; `ruff` clean.
 - [ ] Full suite passes (no new failures, skips, or xfails introduced beyond the new tests).
 - [ ] Edges carry `transform="CTE_PROJECTION"` and `confidence=1.0` (no `STAR_SOURCE` row
       and no `STAR_EXPANSION` edge is emitted for the CTE-internal union).
 - [ ] Version reports `1.1.3`.
-- [ ] (Manual, on the private DWH corpus, not in CI) re-index reduces `cte_insert.*`
-      islands from 80 toward ~0 and `ba.wtfe_kpi_voorraad_artikel_voorraadlocatie.ma_vrije_vrd`
-      `--raw --include-intermediate --depth 12` reaches a `da.`/`ban.` raw source again.
+- [ ] (Manual, on the private DWH corpus, not in CI) re-index reconnects the `cte_*` union
+      islands and `ba.wtfe_kpi_voorraad_artikel_voorraadlocatie.ma_vrije_vrd`
+      `--raw --include-intermediate --depth 12` reaches a `da.`/`ban.` raw source again
+      through the preserved branch-CTE hops.
 
 ## Risks and Mitigations
 
 | Risk | Mitigation |
 |---|---|
-| sqlglot collapses the branch-CTE hop, hiding `cte_a`/`cte_b` from a `--include-intermediate` trace | The branch CTE's own projection edge (`cte_a.<col> ← src.<col>`) is still emitted by the loop's iteration over `cte_a`, so the intermediate node survives. Confirmed: `cte_voorraad_bouwmarkt.ma_vrije_vrd` already has its upstream edge in the live graph. |
-| `sources=` accidentally pulls in cross-file CTAS bodies and explodes | The map is built strictly from `combined_sources` filtered to the union body's referenced relation names (same-statement siblings only). Explicitly NOT the corpus map. |
-| Branch CTEs are not union-compatible / column counts differ | We take the first branch's referenced CTE column list (the existing union path already assumes left-branch column names at `base.py:970–973`). Mismatched branches degrade to the current behaviour (no edge), never to a wrong edge. |
-| Regressing the general CTE recall the v1.1.2 guards pin | The `sources=` argument is added **only** on the star-over-union path; the explicit-column path is byte-for-byte unchanged. `test_cte_recall_guard.py` + the new `test_explicit_column_union_still_traces` gate this. |
-| Perf regression in the hot loop | New work is once-per-CTE, O(N_refs); same `sg_lineage` call count. Gated by `test_perf_scaling_guard.py`. |
+| A future change reintroduces `sources=` and collapses the CTE hop | `test_union_star_cte_incoming_edges_are_cte_projection` asserts the source is a **branch CTE column**, not a physical source — it reds if the hop collapses. The anchor tests also red. The plan explicitly forbids `sources=` (Step 1.2). |
+| The statement-level `qualify` fails, so the star is NOT expanded into the deepest Select | On qualify failure the deepest `Select` still holds a bare `Star`, the existing star-skip fires, and the CTE degrades to today's behaviour (no edge) — never a wrong edge. This matches the current fallback exactly. |
+| Branch CTEs are not union-compatible / column counts differ | Column names come from the qualified deepest left-branch `Select` (union branches must be union-compatible; sqlglot's qualify already enforces left-branch column names). Mismatched branches degrade to no edge, never to a wrong edge. |
+| Regressing the general CTE recall the v1.1.2 guards pin | The only change is the `projection_source` walk; the `sg_lineage` call (no `sources=`) is byte-for-byte unchanged, and for 2-branch unions the walk is a no-op. `test_cte_recall_guard.py`, the anchor tests, and the new `test_explicit_column_union_still_traces` gate this. |
+| Perf regression in the hot loop | New work is once-per-CTE, O(N_branches) pointer walk; `sg_lineage` call count and signature unchanged. Gated by `test_perf_scaling_guard.py`. |
 | `qualify()` in-place mutation changes `cte_body_sql` for 2-branch fixtures | `qualify()` mutates the AST in-place; for 2-branch unions it expands `SELECT *` to explicit columns, so `cte_body_sql` (line 982) serializes the qualified SQL. This means the 2-branch case already works today (qualify rescues it). The fix targets the case where the star is NOT expanded: 3+ branches (`projection_source` is a Union with `.expressions = []`) or future edge cases where qualify doesn't expand. The guard MUST use a 3-branch fixture to exercise the true unrescued path. |
 
 ## PR Breakdown
 
-Single PR (`fix(#38): expand SELECT * across a UNION ALL of sibling CTEs`):
-- `src/sqlcg/parsers/base.py` (CTE-projection loop, Steps 1.1–1.3)
+Single PR (`fix(#38): trace SELECT * across a UNION ALL of sibling CTEs (hop-preserving)`):
+- `src/sqlcg/parsers/base.py` (CTE-projection loop, Steps 1.1–1.3 — the deepest-left-`Select`
+  walk only; the `sg_lineage` call is unchanged, no `sources=`)
 - `tests/integration/test_union_cte_star_recall_guard.py` (NEW, Step 2.1)
 - `pyproject.toml`, `src/sqlcg/__init__.py`, `uv.lock` (version bump, Step 3.1)
 - (optional) `tests/unit/test_perf_scaling_guard.py` (only if a new counted op is added)
@@ -411,16 +449,25 @@ migration path (CLAUDE.md "No backward compatibility").
 
 ## Blocking Questions
 
-**Corrected by plan-reviewer 2026-06-01** — two blockers found and fixed in-plan above.
-Original "None blocking" verdict was incorrect.
+**None blocking.** The hop-preserving redesign (2026-06-01) resolves the design flaw the
+prior `sources=` approach introduced. The verified facts:
+- The statement-level `qualify` (base.py:670) expands `SELECT *` into the deepest
+  left-branch `Select` of the union CTE (verified: deepest projections =
+  `CTE_A.TOTAL_AMT AS TOTAL_AMT`).
+- The existing no-`sources=` `sg_lineage` call on that body yields branch-CTE-column leaves
+  (`CTE_A.TOTAL_AMT`, `CTE_B.TOTAL_AMT`, `CTE_C.TOTAL_AMT`), preserving the CTE hop.
+- Today's 3-branch fixture produces zero incoming edges to `cte_union.total_amt` (the node
+  never exists) — confirmed by indexing through the full pipeline.
 
-**B1 (FIXED IN-PLAN)**: 2-branch fixture masked the bug. Changed to 3-branch in Step 2.1
-and Test Strategy. The 2-branch case already works today because `qualify()` expands the
-star in-place; the real island is the N≥3 branch case.
+**B1 (retained)**: 3-branch fixture required — the 2-branch case already works because
+`qualify()` expands the star in-place into a direct `Select`. Step 2.1 uses 3 branches.
 
-**B2 (FIXED IN-PLAN)**: Step 1.1 only checked `projection_source.expressions == [Star]`
-but for N≥3 branches `projection_source` is a Union with `.expressions = []`. Fixed to
-walk to the deepest left-branch Select first.
+**B2 (retained)**: Step 1.1 walks to the deepest left-branch `Select`
+(`while isinstance(ps, exp.Union): ps = ps.this`); for N≥3 branches `cte_body.this` is a
+`Union` with `.expressions == []`. This walk is the ONLY production change.
+
+**Superseded**: the prior `sources=` / `union_cte_sources` mechanism is removed entirely —
+it collapsed the CTE hop and broke the anchor tests.
 
 Non-blocking note:
 - ARCHITECTURE_REVIEW.md does not yet record this residual #38 disposition (the finding
