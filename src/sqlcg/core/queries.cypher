@@ -38,12 +38,6 @@ RETURN dst.id AS id, dst.col_name AS col_name, dst.table_qualified AS table_qual
 MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
 RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
 
--- GET_UPSTREAM_DEPENDENCIES_FILTERED
-MATCH (dst:SqlColumn {id: $id})<-[:COLUMN_LINEAGE]-(src:SqlColumn)
-MATCH (t:SqlTable {qualified: src.table_qualified})
-WHERE t.kind IN ['table', 'external']
-RETURN src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
-
 -- SEARCH_SQL_PATTERN
 MATCH (q:SqlQuery)-[:QUERY_DEFINED_IN]->(f:File)
 WHERE contains(q.sql, $query)

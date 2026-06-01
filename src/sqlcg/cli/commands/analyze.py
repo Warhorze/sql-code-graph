@@ -34,12 +34,16 @@ def upstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
+    # Half B (#38): use OPTIONAL MATCH so a missing SqlTable node (e.g. CTE-body source not yet
+    # re-indexed after #39 fix) is KEPT rather than silently dropped.  WHERE t.kind IS NULL OR
+    # t.kind IN [...] means: keep when node absent (NULL) OR when kind is a physical source.
+    # CTE aliases (kind='cte') and derived tables (kind='derived') are filtered out.
     kind_filter = (
         ""
         if include_intermediate
-        else "MATCH (t:SqlTable {qualified: src.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
+        else "OPTIONAL MATCH (t:SqlTable {qualified: src.table_qualified}) "
+        "WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
     )
 
     with get_backend() as backend:
@@ -95,12 +99,15 @@ def downstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
+    # Half B (#38): OPTIONAL MATCH keeps sources whose SqlTable node is absent (NULL) or is a
+    # physical kind.  WITH c, dst, t carries the three variables in scope at this interpolation
+    # point; direct and q are bound later in the query.
     kind_filter = (
         ""
         if include_intermediate
-        else "MATCH (t:SqlTable {qualified: dst.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
+        else "OPTIONAL MATCH (t:SqlTable {qualified: dst.table_qualified}) "
+        "WITH c, dst, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
     )
 
     with get_backend() as backend:
