@@ -1684,3 +1684,9 @@ Handoff — plan-reviewer (2026-05-30):
   NOTE: No failing acceptance tests written in this focused re-gate (this was
     a verification-only pass per user instruction "Do not edit the plan").
     The plan is ready for developer implementation as-is.
+
+## Current State — architect-planner: v1.1.2 bug-fix release  [2026-06-01]
+AGENT: architect-planner
+FEATURE: v1.1.2 bug-fix release (issues #38, #39, #40, #28; #29 = dependency context)
+OUTPUT: plan/v1_1_2_bugfix.md
+STATUS: planning — ready for plan-reviewer on completion
