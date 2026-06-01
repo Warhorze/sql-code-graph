@@ -31,6 +31,42 @@ PR: https://github.com/Warhorze/sql-code-graph/pull/37
 
 NEXT: architect-planner plan-compliance check.
 
+## Handoff — architect-planner → developer: v1.1.1 batch-upsert perf + bugfix batch
+
+DATE: 2026-06-01
+PLAN: plan/v1.1.1_batch_upsert_perf.md (committed 6a0aa91)
+BRANCH: feat/cluster-b-provenance
+
+SUMMARY: Plan covering 4 findings from a live ../dwh verification of the v1.1.0 branch.
+Upsert pass is 75% of index wall-time (169.3s/224.6s) because it fires ~13,400 backend
+round-trips (10 execute()/file). Refactor to accumulate row dicts across a batch, dedup
+once per batch, flush each upsert_*_bulk once per batch (~270 total). All 8 CLAUDE.md
+perf invariants respected; the bulk-not-per-row invariant is STRENGTHENED, not weakened.
+
+PR BREAKDOWN (sequenced):
+  - PR-1 (F1, big): batch-scoped upsert. Split _upsert_parsed_file into _build_file_rows
+    (pure, per-file) + _flush_row_batch (per-batch). Hoist _upsert_file_batch shared by
+    index_repo._flush_batch AND resync_changed. reindex_file/watch OUT OF SCOPE (thin
+    single-file wrapper preserves it). indexer.py only.
+  - PR-2 (F2, indep): walk_sql_files resolves root once → fixes `sqlcg index <rel-path>`
+    ValueError (sibling of closed #24, which missed the git-walk branch). walker.py + e2e
+    regression test. Single caller confirmed (indexer.py:116).
+  - PR-3 (F3, depends on PR-1): new tests/unit/test_upsert_batch_invariant.py pinning
+    flat bulk-call count N vs 2N per batch + CLAUDE.md invariant-table row. Author LAST.
+  - PR-4 (F4, indep): W1 external-consumer warning text (keep edge, clarify message,
+    indexer.py:1215-1218); W2 _assert_indexed no-Repo DEBUG log (tools.py:189, logger
+    confirmed at tools.py:95).
+  - PR-5 (CREATE fast-path): DEFERRED follow-up, NOT in v1.1.1. Needs cross-batch node
+    dedup pre-req. Do not start until PR-1 merged + re-measured.
+
+MEASUREMENT: re-run `uv run sqlcg index ../dwh --profile`; baseline upsert 169.3s / wall
+224.6s; target upsert meaningfully under 169s and wall under 240s; conservative bar 3-5x
+upsert reduction. Record before/after in postmortem.
+
+BLOCKING QUESTIONS: none.
+
+NEXT: plan-reviewer gate, then developer implements PR-1 first.
+
 ## Current State — developer: hygiene_config_path_and_survivors (all 4 phases)
 
 ACTIVE AGENT: developer
