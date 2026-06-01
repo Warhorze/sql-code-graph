@@ -58,7 +58,10 @@ class KuzuBackend(GraphBackend):
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
             buffer_pool_size_mb: Buffer pool size in MB (0 = use KuzuDB default)
-            read_only: Open in read-only mode (allows concurrent indexing)
+            read_only: Open in read-only mode.  Enables concurrent read-only
+                opens (reader/reader concurrency) by not taking the exclusive
+                write lock.  Does NOT allow reads while a read-write writer
+                holds the lock — KùzuDB's exclusive lock is process-level.
 
         Raises:
             RuntimeError: If the database is locked or cannot be opened.

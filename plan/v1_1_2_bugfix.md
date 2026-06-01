@@ -560,8 +560,16 @@ write-path/hook halves are verified and pinned (PR 3). **No genuine #29 extensio
 - [ ] **No `SCHEMA_VERSION` change** (`schema.py` still `"6"`); reindex gate unchanged.
 - [ ] **Perf:** Half A adds no new `execute()` calls; `test_upsert_batch_invariant.py` and
       `test_perf_scaling_guard.py` stay green.
-- [ ] **#28 read:** with a writer holding the lock, `analyze upstream`, `db info`, and
-      `find table` succeed (read-only) and return real rows.
+- [ ] **#28 read:** read commands (`analyze upstream`, `db info`, `find table`, etc.)
+      open the backend with `read_only=True` (call-site wiring asserted by test).
+- [ ] **#28 read:** two concurrent read-only processes can open the same DB simultaneously
+      and return expected rows (reader/reader concurrency — the genuine #28 benefit).
+- [ ] **#28 read (known limitation):** a `read_only=True` open while a read-write writer
+      process holds the exclusive lock fails with "Database is locked" — KùzuDB's exclusive
+      write lock is process-level and cannot be bypassed by `read_only=True`.  Reads during
+      an active writer remain unsupported; future work is to route such reads through the
+      live MCP server.  This behavior is asserted by cross-process test
+      `test_cross_process_writer_blocks_readonly_open`.
 - [ ] **#28 read:** read-only open of a never-indexed DB shows the empty-DB hint, no crash.
 - [ ] **#28 hook:** generated hooks contain `--notify` + visible stderr warning, no bare
       `|| true` swallow.
@@ -625,3 +633,36 @@ The disposition of the dead `GET_UPSTREAM_DEPENDENCIES_FILTERED` query is **remo
 convert-to-OPTIONAL-MATCH alternative is rejected — there is no production caller, so converting
 would only preserve an unreachable inner-join-filter trap of exactly the #38 shape. No open
 questions remain; the plan is ready for the developer.
+
+---
+
+### Deviations
+
+#### Deviation 1: #28 acceptance criterion re-scoped — cross-process lock reality
+- **Reason**: Live cross-process measurement showed that KùzuDB's lock is a *native exclusive
+  write lock* at the OS process level.  When a read-write process holds the DB, every other open
+  fails — including `read_only=True`.  The original Step 2.4 acceptance criterion ("with a writer
+  holding the lock, analyze upstream / db info / find table succeed read-only and return real rows")
+  is NOT achievable for KùzuDB and would require routing reads through the live server (deferred,
+  see §Cluster 2 Non-Goals).  The in-process test `test_readonly_open_succeeds_while_writer_holds_lock`
+  was passing vacuously because this KùzuDB build does not enforce the lock within a single process.
+- **Change**: The test file `tests/integration/test_readonly_under_lock.py` was rewritten:
+  - `test_readonly_open_succeeds_while_writer_holds_lock` (same-process, vacuous, false claim)
+    is deleted and replaced by two cross-process tests using `multiprocessing.spawn`:
+    - `test_cross_process_reader_reader_concurrency`: a spawned read-only child holds the DB
+      while the main process opens it read-only and asserts it returns expected rows.  Pins the
+      genuine #28 benefit (reader/reader concurrency).
+    - `test_cross_process_writer_blocks_readonly_open`: a spawned read-write child holds the DB
+      while the main process attempts a read-only open and asserts it raises RuntimeError with
+      "Database is locked".  Documents the known limitation and prevents a future docstring claim
+      that `read_only=True` bypasses a writer's exclusive lock.
+  - Docstrings in `src/sqlcg/core/config.py` (`get_backend`) and
+    `src/sqlcg/core/kuzu_backend.py` (`KuzuBackend.__init__`) corrected to state the accurate
+    semantics: `read_only` enables reader/reader concurrency; it does NOT allow reads while a
+    read-write writer holds the exclusive lock.
+  - The #28 acceptance criterion in this plan is updated to match (reader/reader concurrency
+    asserted; writer-blocks-reader documented as known limitation, not a success criterion).
+- **Impact**: Scope is the same (the real #28 benefit — CLI reads no longer take the exclusive
+  write lock, enabling concurrent CLI read sessions).  The "reads succeed while the MCP server
+  is live" use-case is a known limitation noted for future work.  No production code changed.
+- **Date**: 2026-06-01

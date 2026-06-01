@@ -350,9 +350,17 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 
     Args:
-        read_only: Open in read-only mode.  KùzuDB allows concurrent readers
-            alongside the single writer, so CLI read commands pass ``True``
-            here to avoid taking the write lock while the MCP server is live.
+        read_only: Open in read-only mode.  When ``True``, the KùzuDB open
+            does not take an exclusive write lock, enabling *multiple concurrent
+            read-only opens* (reader/reader concurrency).  CLI read commands
+            pass ``True`` so they do not hold the exclusive write lock and
+            therefore do not block other concurrent readers or a pending reindex.
+            Note: this does NOT allow reads while a read-write writer already
+            holds the exclusive lock — KùzuDB's exclusive write lock is
+            process-level; a ``read_only=True`` open still fails with
+            "Database is locked" when a writer is active.  Reads during an
+            active writer remain a known limitation (future work: route reads
+            through the live MCP server).
             Neo4j has no single-writer lock; this flag is a no-op there.
             All writer call sites (index, reindex, db init/reset, server
             init_backend) use the default ``False``.
