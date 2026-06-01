@@ -1,3 +1,58 @@
+## Handoff — developer: v1.1.1 batch-upsert perf + bugfix batch  [2026-06-01]
+
+DATE: 2026-06-01
+PLAN: plan/v1.1.1_batch_upsert_perf.md
+BRANCH: feat/cluster-b-provenance
+STATUS: IMPLEMENTATION COMPLETE — ready for plan-compliance check
+
+COMMITS:
+  6333936  fix(F2): resolve walker root once so relative paths yield absolute paths
+  de55adf  feat(F1): batch-scoped upsert — 10 execute() per batch not per file
+  5a7be47  docs(F3): add _flush_row_batch per-batch invariant row to CLAUDE.md
+  6fb4e5b  fix(F4): W1 warning text clarifies edge created; W2 debug log on no-Repo fallback
+
+FILES CHANGED:
+  - src/sqlcg/indexer/walker.py (F2: root.resolve() at top of walk_sql_files)
+  - src/sqlcg/indexer/indexer.py (F1: FileRowSet, BatchRowBuffer, _build_file_rows,
+      _flush_row_batch, _upsert_file_batch, thin _upsert_parsed_file wrapper;
+      resync_changed/index_repo both use _upsert_file_batch; W1 warning text)
+  - src/sqlcg/server/tools.py (W2 debug log on no-Repo fallback)
+  - CLAUDE.md (F3: new invariant row + test_upsert_batch_invariant.py mention)
+  - tests/integration/test_indexer_commits.py (patch target updated to _build_file_rows)
+  - tests/integration/test_star_resolution.py (patch target updated to _build_file_rows)
+
+TEST RESULTS (full suite incl. e2e):
+  830 passed, 7 skipped, 3 xfailed, 0 failed
+  - 4 F1 acceptance tests: PASS
+      test_v1_1_1_F1_flat_bulk_call_count_N_vs_2N_in_single_batch — PASS
+      test_v1_1_1_F1_batch_size_1_scales_linearly_non_vacuous_check — PASS
+      test_v1_1_1_F1_bulk_not_per_row_invariant_preserved — PASS
+      test_v1_1_1_F1_flush_row_batch_method_exists — PASS
+  - 2 F2 e2e tests: PASS
+      test_v1_1_1_F2_index_relative_path_git_walk_no_crash — PASS
+      test_v1_1_1_F2_index_relative_path_rglob_fallback_no_crash — PASS
+  - Perf invariants: test_perf_scaling_guard (4), test_T09_01_qualify_once (2),
+      test_bulk_upsert_invariant (1), test_upsert_batch_invariant (4) — all green
+  - pyright: 0 errors | ruff: all checks passed
+
+WIRING VERIFIED:
+  - _build_file_rows: def (indexer.py:979) + called from _upsert_file_batch + _upsert_parsed_file
+  - _flush_row_batch: def (module-level, not method) + called from _upsert_file_batch + _upsert_parsed_file
+  - _upsert_file_batch: def (indexer.py:1206) + called from _flush_batch (index_repo) + resync_changed
+  - _upsert_parsed_file: def (indexer.py:1252) + called from reindex_file (indexer.py:902)
+  - "edge created anyway": indexer.py:1352
+  - "no Repo node": tools.py:193
+
+DEVIATIONS:
+  - Two tests that patched _upsert_parsed_file updated to patch _build_file_rows
+    (test_indexer_commits.py + test_star_resolution.py). This is expected because
+    the batch path no longer calls _upsert_parsed_file (only reindex_file does).
+    The patch-target change is correct per plan Step 1.6 ("patch Indexer._build_file_rows").
+
+  - PR-5 (CREATE fast-path): DEFERRED as planned. Not implemented.
+
+NEXT: architect-planner plan-compliance check.
+
 ## Handoff — plan-reviewer → developer: v1.1.1 batch-upsert perf + bugfix batch  [commit TBD]
 
 DATE: 2026-06-01
