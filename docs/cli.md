@@ -17,7 +17,7 @@ bash scripts/generate_cli_docs.sh
 | `watch` | Watch a directory and re-index on SQL file changes. |
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
-| `install` | Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json). |
+| `install` | Register sqlcg as an MCP server in Claude Code. |
 | `uninstall` | Uninstall sqlcg from Claude Code and optionally clean up resources. |
 | `version` | Show version. |
 | `db` | Database management commands |
@@ -71,13 +71,15 @@ Schema aliases (staging schema → canonical schema) can be configured in
 | --- | --- | --- | --- | --- | --- |
 | --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
-| --timeout-per-file | INTEGER | No | No | 5 | Timeout per file in seconds |
+| --timeout-per-file | INTEGER | No | No | 10 | Timeout per file in seconds |
 | --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
 | --batch-size | INTEGER | No | No | 50 | Files per KuzuDB transaction in the upsert pass. Default 50 balances commit-overhead reduction (vs. legacy per-file commits) against per-batch memory cost. Lower values are safer for memory-constrained machines; higher values give marginal speedup at the cost of larger working sets. Set to 1 to reproduce legacy per-file commit behaviour. |
 | --no-ddl | BOOLEAN | No | No | False | Skip table-node upserts for DDL-only files |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
+| --verbose, -v | BOOLEAN | No | No | False | Print parse warnings to stderr instead of log file |
 | --debug | BOOLEAN | No | No | False | Show detailed log output during indexing |
 | --profile / --no-profile | BOOLEAN | No | No | False | Emit per-stage timing after indexing |
+| --include-working-tree | BOOLEAN | No | No | False | Index the working tree including uncommitted changes. Marks freshness as 'indexed with working-tree changes'. |
 
 ## `sqlcg reindex`
 
@@ -106,7 +108,8 @@ build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init
 | --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary output |
 | --batch-size | INTEGER | No | No | 50 | Files per KuzuDB transaction (same default as index command) |
-| --timeout-per-file | INTEGER | No | No | 5 | Per-file parse timeout in seconds |
+| --timeout-per-file | INTEGER | No | No | 10 | Per-file parse timeout in seconds |
+| --notify | BOOLEAN | No | No | False | If a server is live on this DB, route the reindex through the server (avoids lock contention). Falls back to direct write if no server is found. |
 
 ## `sqlcg watch`
 
@@ -181,7 +184,10 @@ If no metrics database exists, prints a message and exits 0.
 sqlcg install [OPTIONS]
 ```
 
-Register sqlcg as an MCP server in Claude Code (~/.claude/settings.json).
+Register sqlcg as an MCP server in Claude Code.
+
+Runs ``claude mcp add -s user sql-code-graph <cmd> <args>`` when the
+``claude`` CLI is on PATH; otherwise writes ~/.claude.json directly.
 
 Also provisions a Claude skill file (SKILL.md) at the chosen location.
 Pass --scope project or --scope global to specify where the skill is written.
@@ -333,7 +339,7 @@ Find a table by name.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| _none_ |  |  |  |  |  |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
 
 ## `sqlcg find column`
 
@@ -347,7 +353,7 @@ Find a column by table.column reference.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| _none_ |  |  |  |  |  |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
 
 ## `sqlcg find pattern`
 
@@ -394,6 +400,8 @@ Trace upstream column lineage.
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --depth | INTEGER | No | No | 5 | Maximum traversal depth |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
+| --include-intermediate | BOOLEAN | No | No | False | Include CTE/derived intermediate nodes |
 
 ## `sqlcg analyze downstream`
 
@@ -408,6 +416,8 @@ Trace downstream column lineage.
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --depth | INTEGER | No | No | 5 | Maximum traversal depth |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
+| --include-intermediate | BOOLEAN | No | No | False | Include CTE/derived intermediate nodes |
 
 ## `sqlcg analyze impact`
 
@@ -421,7 +431,7 @@ Show all queries impacted by a table.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| _none_ |  |  |  |  |  |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
 
 ## `sqlcg analyze failures`
 
@@ -431,6 +441,9 @@ sqlcg analyze failures [OPTIONS]
 
 List files that failed to parse, with their dominant cause (E-code bucket).
 
+Valid --cause buckets (from highest to lowest severity):
+timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip.
+
 Requires a graph indexed with sqlcg >= v3 (schema version 3). Re-index
 with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
 an earlier version.
@@ -439,7 +452,7 @@ an earlier version.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --cause | TEXT | No | No |  | Filter by E-code bucket (e.g. E5, timeout) |
+| --cause | TEXT | No | No |  | Filter by E-code bucket. Valid values: timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip |
 | --limit | INTEGER | No | No | 100 | Maximum rows to return |
 
 ## `sqlcg analyze unused`
@@ -455,6 +468,7 @@ Find tables with no query references.
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --threshold | INTEGER | No | No | 0 | Minimum reference count threshold |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
 
 ## `sqlcg mcp`
 
@@ -471,6 +485,9 @@ MCP server commands
 | `setup` | Print or write MCP server config JSON. |
 | `start` | Start the MCP server. |
 | `best-practices` | Print MCP tool best-practices (the fact/heuristic boundary). |
+| `status` | Print server status JSON (connects to control socket). |
+| `stop` | Stop the running MCP server gracefully. |
+| `restart` | Stop the server. The client (editor) must respawn. |
 
 ## `sqlcg mcp setup`
 
@@ -479,6 +496,11 @@ sqlcg mcp setup [OPTIONS]
 ```
 
 Print or write MCP server config JSON.
+
+--print (default): print the JSON snippet for manual insertion.
+--write: write to ~/.claude.json under mcpServers.user (the correct path
+         for Claude Code — not settings.json, which Claude Code does not read
+         for MCP servers).
 
 ### Options
 
@@ -517,6 +539,72 @@ that have not installed the skill.
 | --- | --- | --- | --- | --- | --- |
 | _none_ |  |  |  |  |  |
 
+## `sqlcg mcp status`
+
+```bash
+sqlcg mcp status [OPTIONS]
+```
+
+Print server status JSON (connects to control socket).
+
+Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
+stale_by_commits, connected_clients, uptime when a server is live.
+
+When no server is found: {"running": false}.
+When the PID file exists with a live process but the socket is unavailable:
+{"running": true, "degraded": "socket unavailable", ...}.
+
+R3 (stale socket): if the socket file exists but the server is not
+responding (ConnectionRefusedError / FileNotFoundError), falls through
+to the PID-file probe — never hangs or errors on a dead socket.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| _none_ |  |  |  |  |  |
+
+## `sqlcg mcp stop`
+
+```bash
+sqlcg mcp stop [OPTIONS]
+```
+
+Stop the running MCP server gracefully.
+
+Sends a ``stop`` op via the control socket; waits up to 5 s for the
+socket file to disappear (confirming clean exit).  Falls back to SIGTERM
+on the PID-file PID if the socket is unavailable.
+
+R3 (stale socket): ``ConnectionRefusedError`` / ``FileNotFoundError`` are
+caught — never hangs on a dead socket.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| _none_ |  |  |  |  |  |
+
+## `sqlcg mcp restart`
+
+```bash
+sqlcg mcp restart [OPTIONS]
+```
+
+Stop the server. The client (editor) must respawn.
+
+v1.1 cannot re-parent an editor-spawned stdio process.  This command
+stops the current server and prints guidance for the user to restart
+the MCP server via their editor's MCP configuration.
+
+True auto-restart (re-parenting stdio) is deferred to v1.2.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| _none_ |  |  |  |  |  |
+
 ## `sqlcg git`
 
 ```bash
@@ -542,6 +630,8 @@ Install git hooks for sqlcg integration.
 Writes a post-checkout hook that triggers incremental resync after branch switches
 and a post-merge hook that triggers resync after pulls/merges.
 Idempotent: running multiple times produces one hook entry per hook.
+The hooks embed the absolute path of the installing sqlcg binary so version skew
+between the installed binary and the hook command is avoided.
 
 ### Options
 
