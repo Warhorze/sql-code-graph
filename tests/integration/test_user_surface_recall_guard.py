@@ -371,3 +371,85 @@ def test_tc7_cte_only_source_is_findable(indexed_db):
         "No COLUMN_LINEAGE edges from staging.src_a columns — "
         "the CTE-only source exists as a node but is disconnected from lineage."
     )
+
+
+# ---------------------------------------------------------------------------
+# TC6b — Downstream terminal-sink location present (fix_downstream_sink_location.md)
+# ---------------------------------------------------------------------------
+
+
+def _downstream_filtered_query(depth: int = 5) -> str:
+    """Build the exact downstream query analyze.py constructs with kind_filter ON.
+
+    Uses the production _kind_filter("dst", ...) so any regression there reds
+    this test — mirrors the upstream helper above, direction reversed.
+    Drives the user-facing analyze downstream path, not raw COLUMN_LINEAGE
+    traversal (ARCHITECTURE_REVIEW.md §19.3).
+    """
+    kf = _kind_filter("dst", include_intermediate=False)
+    return (
+        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+        f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+        f"{kf}"
+        f"OPTIONAL MATCH (dst)-[dstedge:{RelType.COLUMN_LINEAGE}]->() "
+        "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
+        "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
+        "RETURN dst.id AS id, file AS file, line AS line LIMIT 100"
+    )
+
+
+def test_tc6b_downstream_sink_location_present(indexed_db):
+    """Terminal-sink downstream result must carry a real file:line, not NULL.
+
+    Shape C: mart.fact_kpi.measure is the final INSERT target — it has no
+    outgoing COLUMN_LINEAGE edge (nothing downstream consumes it) but it IS
+    reachable as a downstream result from staging.src_a.x.  The current
+    outgoing-edge binding ``(dst)-[dstedge]->()`` finds no edge for this sink
+    → file/line are NULL → renders '?'.
+
+    This test is RED on master (outgoing-edge query) and must flip GREEN after
+    the Step 1.1 fix in fix_downstream_sink_location.md (incoming-edge query).
+
+    TC6 (upstream) does NOT cover this: TC6 asserts file:line for a column that
+    HAS an outgoing edge (a source).  TC6b explicitly targets a terminal sink —
+    the case that caused 81% '?' on the DWH corpus.
+    """
+    db, _ = indexed_db
+
+    # First confirm mart.fact_kpi.measure has zero outgoing COLUMN_LINEAGE edges —
+    # if this assertion fails, the fixture changed and the sink choice is wrong.
+    outgoing_count = db.run_read(
+        f"MATCH (c:{NodeLabel.COLUMN} {{id: $id}})-[:{RelType.COLUMN_LINEAGE}]->() "
+        "RETURN count(*) AS n",
+        {"id": "mart.fact_kpi.measure"},
+    )
+    sink_outgoing = outgoing_count[0]["n"] if outgoing_count else 0
+    assert sink_outgoing == 0, (
+        f"mart.fact_kpi.measure has {sink_outgoing} outgoing COLUMN_LINEAGE edge(s) — "
+        "it is no longer a terminal sink.  Choose a different sink column for TC6b."
+    )
+
+    # Run the downstream query starting from a physical source.
+    # The terminal sink mart.fact_kpi.measure must appear in the result.
+    query = _downstream_filtered_query()
+    rows = db.run_read(query, {"ref": "staging.src_a.x"})
+    assert rows, "No downstream results from staging.src_a.x — TC1/upstream lineage may be broken."
+
+    sink_rows = [r for r in rows if r["id"] == "mart.fact_kpi.measure"]
+    assert sink_rows, (
+        f"mart.fact_kpi.measure not found in downstream results.\n"
+        f"Returned ids: {sorted(r['id'] for r in rows)}"
+    )
+
+    # The load-bearing assertion: the terminal sink must have a real file, not NULL.
+    # This is RED on master (outgoing-edge query returns NULL for a sink) and GREEN
+    # after the fix (incoming-edge query finds the producing INSERT query's file_path).
+    sink_file = sink_rows[0].get("file")
+    assert sink_file is not None and sink_file != "", (
+        f"mart.fact_kpi.measure has file='{sink_file}' (NULL/empty) — "
+        "the downstream location-binding query uses the outgoing edge, "
+        "which is absent for a terminal sink.  "
+        "Fix: flip OPTIONAL MATCH (dst)-[dstedge:COLUMN_LINEAGE]->() "
+        "to OPTIONAL MATCH ()-[dstedge:COLUMN_LINEAGE]->(dst) in analyze.py "
+        "lines ~134 and ~146 (fix_downstream_sink_location.md Step 1.1)."
+    )
