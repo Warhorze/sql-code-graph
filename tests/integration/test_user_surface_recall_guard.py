@@ -391,7 +391,7 @@ def _downstream_filtered_query(depth: int = 5) -> str:
         f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
         f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
         f"{kf}"
-        f"OPTIONAL MATCH (dst)-[dstedge:{RelType.COLUMN_LINEAGE}]->() "
+        f"OPTIONAL MATCH ()-[dstedge:{RelType.COLUMN_LINEAGE}]->(dst) "
         "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
         "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
         "RETURN dst.id AS id, file AS file, line AS line LIMIT 100"
