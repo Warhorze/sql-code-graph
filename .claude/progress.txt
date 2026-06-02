@@ -1,4 +1,56 @@
-## Current State — developer: v1.2.0 read-proxy  [2026-06-02]
+## Handoff — developer: v1.2.1-bugfix  [2026-06-02]
+
+ACTIVE AGENT: developer (complete)
+FEATURE: v1.2.1 — open lineage bug fixes + effective regression guards
+TARGET BRANCH: master
+PLAN: plan/v1_2_1_bugfix.md
+BRANCH: feat/v1.2.1-bugfix
+STATUS: PR OPEN — ready for plan-compliance check
+
+COMMITS:
+  0505c9d  fix(T-00): restore OPTIONAL-MATCH kind filter + aggregate file:line per source (Phase 0 + #45.1)
+  ee8b2a0  feat(T-01): add #40 user-surface recall guard suite TC1–TC7 (Phase 1)
+  7dda6f8  fix(T-44): #44 canonical INSERT-target resolution — derive, thread, apply (Phase 2)
+  ac765d3  refactor(T-05): delete resolve_pass2 dead code + realign tests (Phase 5)
+  73a8439  fix(T-00): _kind_filter uses WITH…WHERE for row filtering + dedup prefers structural kind
+  9cd1f6e  fix(T-00): update test wiring — patch run_read_routed (v1.2.0+) not get_backend
+
+KEY FILES CHANGED:
+  - src/sqlcg/cli/commands/analyze.py (Phase 0 + #45.1: _kind_filter WITH…WHERE fix)
+  - src/sqlcg/lineage/aggregator.py (Phase 2: canonical_by_bare index)
+  - src/sqlcg/indexer/indexer.py (Phase 2: _build_file_rows canonical resolution + dedup fix)
+  - tests/integration/test_user_surface_recall_guard.py (Phase 1: TC1–TC7)
+  - tests/unit/test_canonical_target_resolution.py (Phase 2: unit tests)
+  - tests/integration/test_cross_file_lineage.py (Phase 5: realigned to index_repo)
+  - tests/unit/test_resolve_pass2_passes_dependency_filter.py (Phase 5: realigned)
+  - tests/unit/test_aggregator.py / test_aggregator_skip.py (Phase 5: resolve_pass2 removed)
+  - tests/integration/test_pr3_kind_tagging.py (fix: run_read_routed + dst DDL)
+  - tests/integration/test_readonly_under_lock.py (fix: run_read_routed wiring test)
+  - tests/integration/test_indexer_commits.py (fix: _build_file_rows signature)
+  - tests/integration/test_star_resolution.py (fix: _build_file_rows signature)
+  - pyproject.toml, src/sqlcg/__init__.py, uv.lock (version 1.2.1)
+
+TEST RESULTS:
+  999 passed, 7 skipped, 2 xfailed, 0 failed
+  - TC1–TC7 (test_user_surface_recall_guard.py): 7/7 PASS
+  - CTE recall guards (test_cte_recall_guard.py 6/6): PASS
+  - Union-CTE star recall (4/4): PASS
+  - Perf invariants (scaling, qualify-once, bulk-upsert, batch-upsert): 11/11 PASS
+  - pyright: 0 errors | ruff: all checks passed
+
+DEVIATIONS:
+  1. _kind_filter implementation in Phase 0 had a bug: OPTIONAL MATCH WHERE alone
+     does not filter rows in KuzuDB (it applies to the match attempt only). Added
+     explicit WITH {alias}, t WHERE ... clause. This is the original PR1 pattern.
+  2. _flush_row_batch dedup didn't prefer structural kinds. New Rule 2 added.
+  3. Pre-existing test failures from v1.2.0 (test_pr3_kind_tagging, test_readonly_under_lock)
+     fixed in the same PR — these were regressions from the run_read_routed refactor.
+
+NEXT: architect-planner plan-compliance check.
+
+---
+
+## Handoff — developer: v1.2.0 read-proxy  [2026-06-02]
 
 ACTIVE AGENT: developer
 FEATURE: v1.2.0 — server-routed read proxy (closes remaining half of #28: concurrent reads under write lock)
@@ -1997,3 +2049,13 @@ Handoff — plan-reviewer (2026-05-30):
   NOTE: No failing acceptance tests written in this focused re-gate (this was
     a verification-only pass per user instruction "Do not edit the plan").
     The plan is ready for developer implementation as-is.
+
+## Current State — architect-planner: v1.2.1 bugfix  [2026-06-02]
+ACTIVE AGENT: architect-planner
+FEATURE: v1.2.1 patch — open lineage bugs (#39/#44/#45) + #40 guards + read-proxy filter regression
+PLAN: plan/v1_2_1_bugfix.md
+STATUS: drafting plan
+KEY FINDING: v1.2.0 read-proxy (b7b3449) removed analyze._kind_filter and reverted the #38/#39
+  "Half B" OPTIONAL-MATCH/kind-IS-NULL filter to an inner-join (kind IN ['table','external']).
+  This (a) re-drops node-less sources and (b) breaks test_cte_recall_guard import (_kind_filter gone).
+  #39 node emission + residual-#38 union-cte-star are ALREADY in code (1.1.3); findings doc was vs 1.1.2.
