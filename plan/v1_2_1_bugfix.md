@@ -523,3 +523,89 @@ to include it here.
 - **Change**: Updated tests to patch `run_read_routed` (the v1.2.0 seam) instead of `get_backend`; updated `_build_file_rows` wrapper signatures; added DDL for `dst` in scenario_c so the fixture has a DDL-resolved target.
 - **Impact**: Full suite now green (999 passed). No production behaviour changed.
 - **Date**: 2026-06-02
+
+---
+
+## Plan Compliance — 2026-06-02
+
+**Verdict: PASS** — all in-scope phases implemented as planned; deviations documented.
+Verified against `git diff master...feat/v1.2.1-bugfix` (PR #48, head `feat/v1.2.1-bugfix`,
+base `master`) and a live run of the recall guard suite (7/7 green).
+
+> **Branch note (not a defect):** the implementation commits live on `feat/v1.2.1-bugfix`
+> (PR #48 head), while the plan/docs branch is `plan/v1.2.1-bugfix`. `git diff master...plan/v1.2.1-bugfix`
+> shows only the plan file — the code is on `feat/`. This is a branch-naming split, not missing work.
+
+### Phase-by-phase
+
+- **Phase 0 (read-proxy filter regression / #39 read-half) — PASS.** `_kind_filter("src"/"dst")`
+  reintroduced in [`analyze.py`](../src/sqlcg/cli/commands/analyze.py); all four inline filter strings
+  (upstream primary + fallback, downstream primary + fallback) replaced with helper calls; OPTIONAL-MATCH
+  + `WITH … WHERE t.kind IS NULL OR t.kind IN ['table','external']` form restored. Two unplanned bugs
+  surfaced and were fixed (Deviations 1 + 2) — see assessment below.
+- **Phase 1 (#40 guard suite) — PASS.** [`test_user_surface_recall_guard.py`](../tests/integration/test_user_surface_recall_guard.py)
+  TC1–TC7 present, driving the production `_kind_filter` query + MCP parity. Verified 7/7 green on a live run.
+- **Phase 2 (#44 canonical INSERT-target) — PASS.** `canonical_by_bare` / `_ambiguous_bare` built in
+  [`CrossFileAggregator.register_pass1`](../src/sqlcg/lineage/aggregator.py) from DDL tables only; rewrite
+  applied in [`_build_file_rows`](../src/sqlcg/indexer/indexer.py) (not the dead `resolve_pass2`), threaded
+  via `_upsert_file_batch` from `index_repo`. Resolved canonical row keeps `kind:"table"`, derives all
+  fields from the canonical `full_id`; unresolved synthetic target emitted `kind:"derived"`; ambiguous
+  bare names left untouched. Degrades to no-op when `canonical_by_bare is None` (single-file path), per the
+  documented known limitation. TC3 green.
+- **Phase 3 (#45 — #45.1 file:line + #45.2 cte_* leak) — PASS (folded into commits `0505c9d` + `7dda6f8`,
+  not labelled "Phase 3").** This is the key reconciliation point (developer's report omitted #45 by name):
+  - **#45.1 (`file:line` on every source row) — implemented.** All four analyze queries rebind location
+    from the source's *outgoing* edge (`(src)-[srcedge:COLUMN_LINEAGE]->()`) and aggregate
+    `WITH src, min(q.start_line) AS line, min(q.file_path) AS file` **before** `LIMIT 100`. Landed in
+    commit `0505c9d` ("Phase 0 + #45.1"). TC6 asserts both non-null `file:line` **and** row count ==
+    distinct-source count (the required anti-fanout check) — green.
+  - **#45.2 (`cte_*` / synthetic leak suppression) — implemented structurally.** The graph-truth approach
+    chosen in the plan: unresolved synthetic INSERT targets are emitted `kind:"derived"` (Phase 2,
+    commit `7dda6f8`), and the restored `kind IN ['table','external']` filter excludes them. No name-prefix
+    belt was needed. TC4 green. The dedup Rule 2 fix (Deviation 2) is what makes this hold for CTE aliases
+    that are first seen as `kind='table'` source references.
+  - **Why the developer's report didn't name #45:** #45 was split into #45.1 (in the Phase 0/#45.1 commit)
+    and #45.2 (in the Phase 2/#44 commit). The work shipped under those two commits rather than a separate
+    "Phase 3" — so it was reported by mechanism (kind filter, file:line aggregation) rather than by issue
+    number. **#45 was NOT dropped; it shipped and is guarded by TC4 + TC6.**
+- **Phase 5 (`resolve_pass2` dead-code dedup) — PASS.** `resolve_pass2` deleted from
+  [`aggregator.py`](../src/sqlcg/lineage/aggregator.py); stale docstring reference in
+  [`ansi_parser.py`](../src/sqlcg/parsers/ansi_parser.py) updated; four affected test files realigned to the
+  production `index_repo` pass-2 path.
+- **Phase 6 (release plumbing) — PASS.** Version `1.2.1` in pyproject + `__init__.py`; `uv.lock` refreshed;
+  pyright + ruff clean per developer report.
+
+### Assessment of the two unplanned bugs (Deviations 1 + 2)
+
+Both are **within the plan's intent, not scope creep** — they are implementation-mechanism corrections to
+behaviour the plan already specified, and both are now load-bearing for the plan's own acceptance criteria:
+
+1. **OPTIONAL MATCH `WHERE` does not filter rows in KuzuDB (Deviation 1).** The plan's Design §"Read-proxy
+   filter regression" already prescribed "the OPTIONAL MATCH + `t.kind IS NULL OR t.kind IN [...]` form".
+   The plan's example snippet (lines 107–114) omitted the trailing `WITH {alias}, t WHERE …` that KuzuDB
+   requires to actually filter the surrounding row — a fidelity gap in the *plan snippet*, not a new
+   requirement. The developer's fix restores the original PR1 pattern. This is a **plan-snippet correction**;
+   the intent (Half B keeps node-less sources, excludes CTE/derived) is unchanged and is exactly what TC1/TC4
+   now verify.
+2. **Dedup kind-precedence (Deviation 2).** The plan's #45.2 mechanism *depends on* CTE/derived nodes
+   carrying their structural kind in the graph, but did not anticipate that a CTE alias is emitted twice
+   (first `kind='table'` as a source reference, then `kind='cte'` as a destination) and that the existing
+   first-seen-wins batch dedup would keep the wrong one. Without the new Rule 2 (structural kind beats
+   default `table`), the kind filter would silently fail to suppress CTE nodes and #45.2 would not hold.
+   This is a **necessary precondition the plan missed**, now correctly handled in `_flush_row_batch`.
+
+**Risk recorded:** Deviation 2 touches `_flush_row_batch`, a documented performance-invariant hot path
+(per-batch dedup). The change is pure dict-comparison logic in the existing dedup loop — no new `execute()`,
+no change to flush cardinality — so the batch-upsert invariant is preserved; the developer reports the
+batch/scaling guards green. This is captured in ARCHITECTURE_REVIEW.md (see update below). No new risk to
+the perf budget.
+
+### Minor note (non-blocking, no action required for merge)
+
+TC4's docstring ([`test_user_surface_recall_guard.py`](../tests/integration/test_user_surface_recall_guard.py)
+L228–232) reads as if Phase 2's `kind:"derived"` emission is still pending ("will be extended … after
+Phase 2"). Phase 2 has landed, so the prose is mildly stale; the assertion itself is correct and green. The
+synthetic fixture uses short CTE names (a, b, u, j) rather than `cte_*`, so TC4's naming-pattern assertion is
+satisfied trivially on the fixture while the structural `kind:"derived"` mechanism is what defends the real
+DWH corpus (where `cte_insert` names appear). A future doc-only tidy could update the docstring; not a
+compliance failure.

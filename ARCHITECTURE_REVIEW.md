@@ -478,7 +478,15 @@ both concrete backends override it — the blueprint does not enforce this.
 Risk: HIGH. A failed re-index leaves orphaned graph nodes that produce incorrect
 lineage results until the next full re-index.
 
-### 3.2 [HIGH] `CrossFileAggregator.resolve_pass2` re-opens files without error handling
+### 3.2 ~~[HIGH]~~ **RESOLVED (v1.2.1)** `CrossFileAggregator.resolve_pass2` re-opens files without error handling
+
+**Resolution (2026-06-02, v1.2.1, PR #48):** `resolve_pass2` was deleted entirely. It had
+zero production call sites — the production pass-2 path in `index_repo` reimplements the
+dep-filter + reparse logic inline (worker calls `parse_file(..., dependency_filter=...)`
+in [`pool.py`](src/sqlcg/indexer/pool.py)), and that path already handles file-read errors
+defensively. The dead method (and the four tests that exercised it) were the same
+test-measures-a-dead-path blind-spot class as #40. Tests realigned to drive `index_repo`
+end-to-end. See [`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) Phase 5.
 
 ```python
 def resolve_pass2(self, parser, parsed):
@@ -2947,4 +2955,70 @@ editor owns the stdio process lifecycle and v1.1 has no launcher to re-spawn it
   owner-only, but any same-uid local process can send `stop`/`reindex`).
 - **Freshness on every tool result by default** — v1.1 ships it gated/off to
   protect hot-path latency; default-on pending an overhead measurement.
+
+## 18. v1.2.1 — Lineage recall guards + canonical INSERT target + CTE filter fixes
+
+Review date: 2026-06-02 · Reconciled by: architect-planner · Branch:
+`feat/v1.2.1-bugfix` · PR #48 · Verdict: **PLAN-COMPLIANT (PASS)**
+
+Patch release fixing the residual user-facing lineage defects (#44 canonical-name
+split, #45 `file:line=?` + `cte_*` leak), repairing the v1.2.0 read-proxy filter
+regression (the #39 read-half), deleting the dead `resolve_pass2` (resolves §3.2),
+and landing the #40 user-surface regression-guard suite. Plan:
+[`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) (full phase-by-phase compliance log appended there).
+
+### 18.1 #44 — canonical INSERT-target resolution
+
+A new `CrossFileAggregator.canonical_by_bare` index (bare name → sole DDL `full_id`)
+plus `_ambiguous_bare` (names defined in >1 schema, never rewritten) is built in
+`register_pass1` from DDL tables only. It is threaded `index_repo` →
+`_upsert_file_batch` → `_build_file_rows`, where an unqualified / non-DDL INSERT
+target whose bare name resolves to a sole DDL canonical is rewritten to share that
+node's identity (`qualified` == DDL `full_id`, all fields derived from the canonical),
+keeping `kind:"table"`. The fix lands in the node-emission loop, **not** the deleted
+`resolve_pass2` and **not** the per-column lineage hot path — pure row-dict mutation,
+no new `execute()`. Degrades to a no-op when `canonical_by_bare is None`
+(single-file `reindex_file` / `resync_changed` paths) — known limitation, re-index is
+the migration path per CLAUDE.md.
+
+### 18.2 #45 — `file:line` recall + structural `cte_*` suppression
+
+- **#45.1**: `analyze upstream/downstream` now bind location from the source's
+  *outgoing* `COLUMN_LINEAGE` edge and aggregate `WITH … min(start_line), min(file_path)`
+  **before** `LIMIT 100`, so multi-hop sources carry a real `file:line` and the limit
+  counts distinct sources, not edge-fanout rows.
+- **#45.2**: chosen mechanism is **graph-truth, not a name heuristic** — unresolved
+  synthetic INSERT targets are emitted `kind:"derived"` (the #44 emission change), and
+  the restored `kind IN ['table','external']` read filter excludes them. No name-prefix
+  belt was needed.
+
+### 18.3 Two implementation invariants discovered during the fix
+
+Both are now load-bearing; recorded so a future refactor does not silently undo them.
+
+1. **KuzuDB: a `WHERE` clause inside `OPTIONAL MATCH` filters the match attempt, not
+   the surrounding row.** To filter rows on an optionally-matched node's property, an
+   explicit `WITH <carried>, t WHERE …` must follow. `analyze._kind_filter` uses this
+   form (`OPTIONAL MATCH (t:SqlTable {…}) WITH <alias>, t WHERE t.kind IS NULL OR …`).
+   The `IS NULL` branch is intentional: it keeps node-less physical sources (the #39
+   tail) while CTE/derived intermediates (`kind='cte'`/`'derived'`) are excluded.
+   Guarded by TC1/TC4 in [`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py).
+2. **`_flush_row_batch` dedup must prefer structural kinds over the default `'table'`.**
+   A CTE alias is emitted twice in a batch — first `kind='table'` (incidental source
+   reference) then `kind='cte'` (CTE destination). The pre-existing first-seen-wins
+   dedup kept the wrong one, defeating #45.2. New Rule 2: `{'cte','derived','external'}`
+   beats default `'table'` (Rule 1 — DDL provenance via `defined_in_file` — still takes
+   precedence). This logic lives in the documented `_flush_row_batch` perf hot path but
+   is pure dict comparison in the existing dedup loop — no change to flush cardinality,
+   batch/scaling guards stay green (CLAUDE.md performance invariants intact).
+
+### 18.4 Resolved / out-of-scope
+
+- **§3.2 `resolve_pass2`** — RESOLVED (deleted; see §3.2 update).
+- **Residual #38 (UNION-ALL sibling CTEs)** — already fixed in 1.1.3; live DWH
+  re-verification (80→47 `cte_insert` islands) recorded in the plan; the surviving 47
+  are likely legitimately source-less computed measures, not a regression. Shape B of
+  the #40 guard now asserts a computed-measure projection so a real gap there reds the guard.
+- **#28 server read-only-by-default + reindex escalation** — out of 1.2.1; recommended
+  as a separate minor (1.3.0). The read half is already handled by the v1.2.0 routing proxy.
 - **`connected_clients` fidelity** — best-effort `1` today; no real counter.
