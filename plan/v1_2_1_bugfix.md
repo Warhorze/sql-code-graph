@@ -501,3 +501,25 @@ to include it here.
   `kind: "table"`. Shape C's fixture-verification prerequisite (Phase 3) pins both branches; if a
   real physical target legitimately has no DDL, that is the #39 node-less tail, handled by the
   `IS NULL` branch of the restored filter — confirm against the fixture before relying on the kind drop.
+
+---
+
+### Deviations
+
+#### Deviation 1: _kind_filter missing WITH…WHERE clause
+- **Reason**: The Phase 0 implementation of `_kind_filter` used `OPTIONAL MATCH ... WHERE t.kind IS NULL OR t.kind IN [...]` without an explicit `WITH {alias}, t WHERE` clause after it. In KuzuDB, the WHERE in an OPTIONAL MATCH applies to the match attempt only — it does not filter surrounding rows. Without the `WITH … WHERE`, all rows pass through regardless of the CTE node's kind. The original PR1 fix (commit `4ce0ded`) used `WITH c, src/dst, t WHERE t.kind IS NULL OR t.kind IN [...]` — this form is correct.
+- **Change**: Added `WITH {node_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external']` to the `_kind_filter` return value, replacing the lone OPTIONAL MATCH WHERE clause.
+- **Impact**: Filter now correctly excludes CTE/derived intermediate nodes from default output. TC1–TC7 all green.
+- **Date**: 2026-06-02
+
+#### Deviation 2: _flush_row_batch dedup preferred first-seen kind (CTE kind overwritten)
+- **Reason**: When a CTE alias appears in `stmt.sources` (outer SELECT FROM my_cte), it is emitted with `kind='table'` (default). Later in the column-lineage loop, it is also emitted with `kind='cte'` (CTE destination). The dedup kept the first occurrence (kind='table'), so the CTE node ended up with the wrong kind in the graph.
+- **Change**: Added Rule 2 to the table_rows dedup: prefer structural kinds (`cte`, `derived`, `external`) over the default `kind='table'`. This ensures the CTE destination emission wins over the incidental source-reference emission.
+- **Impact**: CTE nodes now retain `kind='cte'` in the graph, enabling the kind filter to correctly exclude them.
+- **Date**: 2026-06-02
+
+#### Deviation 3: Pre-existing v1.2.0 test regressions fixed in same PR
+- **Reason**: `test_pr3_kind_tagging.py`, `test_readonly_under_lock.py`, `test_indexer_commits.py`, and `test_star_resolution.py` were already failing on `master` due to the v1.2.0 read-proxy refactor removing `get_backend` from analyze/find/db/gain and changing `_build_file_rows`'s signature. These are not regressions from v1.2.1 work but were uncovered by running the full test suite.
+- **Change**: Updated tests to patch `run_read_routed` (the v1.2.0 seam) instead of `get_backend`; updated `_build_file_rows` wrapper signatures; added DDL for `dst` in scenario_c so the fixture has a DDL-resolved target.
+- **Impact**: Full suite now green (999 passed). No production behaviour changed.
+- **Date**: 2026-06-02
