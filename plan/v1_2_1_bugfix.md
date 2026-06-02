@@ -206,6 +206,11 @@ Land the fixture + TC1–TC7 exactly as specified in
 - Synthetic committable fixture carrying shapes **A** (≥2 CTE hops), **B** (UNION-ALL branch
   CTE), **C** (`INSERT INTO mart.fact_kpi` + separate DDL `CREATE TABLE mart.fact_kpi`),
   **D** (source referenced only inside a CTE body).
+- **Shape B must include a computed-measure projection** (e.g. a unioned column that is an
+  arithmetic/ratio expression over branch columns, not a plain pass-through), and TC2 must
+  assert its sources resolve. Rationale: the live DWH re-verification (see "Scope decision")
+  found 47 surviving `cte_insert` islands that are overwhelmingly computed measures — this is
+  the only assertion that would catch whether that residual is a real un-fixed shape.
 - Tests drive the **public surface** (the exact `analyze` filtered query via the production
   `_kind_filter`, and the MCP trace tool) — never a raw `COLUMN_LINEAGE` `MATCH`.
 - TC3 (#44 canonical name) and TC6 (#45 `file:line`) are written to be **RED before** the
@@ -300,9 +305,19 @@ name-prefix belt only if a synthetic node lacks a `SqlTable` node — verify on 
 
 - **Residual #38 (UNION-ALL of sibling CTEs)** — **OUT.** Already fixed in 1.1.3 (`f6f276b`),
   guarded by `test_union_cte_star_recall_guard.py`. The findings doc reporting 80 islands ran
-  against 1.1.2 (pre-fix). Re-opening it would duplicate shipped work. If a *fresh* DWH eval on
-  1.2.1 still shows islands, file a new narrow issue with a 1.2.x repro — do not pad this patch
-  on a stale measurement.
+  against 1.1.2 (pre-fix). Re-opening it would duplicate shipped work.
+  - **Live re-verification on current `master` (2026-06-02, DWH 1335 files)** confirms the fix
+    holds: the findings-doc dead-end column `cte_insert.ma_vrije_vrd` now has 3 upstream
+    `COLUMN_LINEAGE` edges (the three branch CTEs) and its chain reaches physical `da.*` raw
+    sources. Corpus-wide `cte_insert` islands dropped **80 → 47**.
+  - **Known-unknown — 47 `cte_insert` islands remain** (down from 80, *not* zero). Sampling them
+    they are overwhelmingly computed/derived measures (`ma_aantal_…_r_k`, `…_x_i`,
+    `ma_vrije_vrd_1_op_1`, bare `ma`) — likely arithmetic/ratio expressions that may be
+    legitimately source-less, but possibly a distinct un-fixed shape. **This is a measured fact,
+    not a regression claim.** Do *not* scope a fix into 1.2.1 on it; instead, the #40 guard's
+    UNION-ALL case (shape B) must also assert a **computed-measure** projection so a real gap here
+    would turn the guard red. If 1.2.1's eval still shows islands after that guard lands green,
+    file a fresh narrow issue with a 1.2.x repro — do not pad this patch on a stale measurement.
 - **#28 server write lock** — **OUT of 1.2.1; recommend a separate minor (1.3.0).** The read
   half is already handled by the v1.2.0 routing proxy (CLI reads route through the live server).
   The remaining ask — server opens read-only by default and *escalates* to read-write only around
