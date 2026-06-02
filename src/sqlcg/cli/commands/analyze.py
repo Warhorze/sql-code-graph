@@ -22,11 +22,17 @@ console = Console()
 def _kind_filter(node_alias: str, *, include_intermediate: bool) -> str:
     """Build the SqlTable kind-filter clause for upstream/downstream queries.
 
-    Uses an OPTIONAL MATCH + ``kind IS NULL OR kind IN [...]`` form (Half B of the
-    #38/#39 fix) so that a node-less physical source — one whose SqlTable node is
-    absent because it was only seen inside a CTE body before re-index — is KEPT, not
-    dropped.  CTE/derived intermediates carry ``kind='cte'`` or ``kind='derived'`` and
-    are excluded by the ``kind IN [...]`` guard; ``IS NULL`` does not match them.
+    Uses an OPTIONAL MATCH + explicit ``WITH … WHERE t.kind IS NULL OR …`` form
+    (Half B of the #38/#39 fix) so that a node-less physical source — one whose
+    SqlTable node is absent because it was only seen inside a CTE body before
+    re-index — is KEPT, not dropped.  CTE/derived intermediates carry
+    ``kind='cte'`` or ``kind='derived'`` and are excluded by the
+    ``kind IN [...]`` guard; ``IS NULL`` matches the absent-node case (t = NULL
+    → t.kind = NULL → IS NULL is TRUE).
+
+    The ``WITH {node_alias}, t WHERE`` clause is required: an OPTIONAL MATCH
+    WHERE clause in KuzuDB applies to the match attempt and does not filter the
+    surrounding row.  The subsequent WITH … WHERE is the actual row filter.
 
     Args:
         node_alias: The Cypher alias for the column node whose table is filtered
@@ -35,14 +41,14 @@ def _kind_filter(node_alias: str, *, include_intermediate: bool) -> str:
                               all intermediates including CTE nodes are kept.
 
     Returns:
-        A Cypher fragment string (with trailing space) to embed directly in the query,
-        or an empty string when include_intermediate is True.
+        A Cypher fragment string (with trailing space) to embed directly in the
+        query, or an empty string when include_intermediate is True.
     """
     if include_intermediate:
         return ""
     return (
         f"OPTIONAL MATCH (t:SqlTable {{qualified: {node_alias}.table_qualified}}) "
-        f"WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+        f"WITH {node_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
     )
 
 

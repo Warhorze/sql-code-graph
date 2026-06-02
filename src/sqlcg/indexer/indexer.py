@@ -93,8 +93,11 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     This is the v1.1.1 batch-flush core: called once per batch (not once per file).
     Dedup keys mirror the graph's MERGE cardinality:
       - file_rows:             path (primary key)
-      - table_rows:            qualified (primary key); prefers row with non-empty
-                               defined_in_file so DEFINED_IN provenance is preserved.
+      - table_rows:            qualified (primary key); prefers (1) row with non-empty
+                               defined_in_file so DEFINED_IN provenance is preserved;
+                               (2) structural kind ('cte','derived','external') over
+                               default 'table' so CTE aliases keep kind='cte' even when
+                               also seen as source references with the default kind.
       - column_rows:           id (primary key)
       - query_rows:            id (primary key, globally unique path:index)
       - edge rows:             (src_key, dst_key) only — matches MERGE (src)-[r]->(dst)
@@ -108,12 +111,27 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     # --- Phase B: batch-scoped dedup ---
     # For table_rows, prefer defined rows (non-empty defined_in_file) so provenance
     # is not lost when a shared table is referenced by multiple files.
+    # Also prefer structurally-assigned kinds ('cte', 'derived', 'external') over the
+    # default 'table' kind: a CTE alias emitted first as a source reference (kind='table'
+    # default) and later confirmed as a CTE destination (kind='cte') must keep 'cte' so
+    # the kind filter correctly excludes it from default filtered output.
+    _structural_kinds = {"cte", "derived", "external"}
     table_dedup: dict[str, dict] = {}
     for r in buf.table_rows:
         key = r["qualified"]
         existing = table_dedup.get(key)
-        if existing is None or (not existing.get("defined_in_file") and r.get("defined_in_file")):
+        if existing is None:
             table_dedup[key] = r
+        else:
+            # Rule 1: prefer rows with defined_in_file (DDL provenance)
+            if not existing.get("defined_in_file") and r.get("defined_in_file"):
+                table_dedup[key] = r
+            # Rule 2: prefer structural kind over default 'table'
+            elif (
+                existing.get("kind", "table") not in _structural_kinds
+                and r.get("kind", "table") in _structural_kinds
+            ):
+                table_dedup[key] = r
     table_rows = list(table_dedup.values())
 
     column_rows = list({r["id"]: r for r in buf.column_rows}.values())
