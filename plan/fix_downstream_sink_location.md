@@ -1,6 +1,6 @@
 # Feature Plan: Downstream sink `file:line` recall
 
-> Status: **STUB — drafted by architect-planner, not yet plan-reviewed.**
+> Status: **plan-reviewed — READY FOR IMPLEMENTATION.**
 > Source: ARCHITECTURE_REVIEW.md §19.2 (v1.2.1 live DWH re-verification, 2026-06-02).
 
 ## Summary
@@ -71,12 +71,19 @@ None. No schema, index, or dependency change.
 ### Phase 2: Guard
 **Step 2.1**: Add `test_tc6b_downstream_sink_location_present` to
 [`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py).
-- Pick a fixture column that is a **terminal sink** (reachable downstream, no outgoing
-  edge). Assert its row carries a non-null `file` and `line`. This is the case TC6
-  (upstream, located source) does **not** cover.
-- Acceptance: the new test is RED against the current outgoing-edge query and GREEN
-  after the Step 1.1 flip (verify by running it on `master` first, then on the branch).
-  Assert observable output (`file` non-null on the sink row), not "no exception".
+- The terminal sink to use from the existing A–D corpus is **`mart.fact_kpi.measure`**.
+  It is the final INSERT target — it has no outgoing `COLUMN_LINEAGE` edge (nothing
+  downstream consumes it), but it IS reachable as a downstream result from
+  `staging.src_a.x`. Confirm this via `MATCH (c:SqlColumn {id: 'mart.fact_kpi.measure'})-
+  [:COLUMN_LINEAGE]->() RETURN count(*)` returning 0 before relying on it.
+- Build the downstream query using `_kind_filter("dst", include_intermediate=False)` —
+  the same helper `analyze downstream` calls — so the guard drives the production query
+  path, not raw edge traversal (ARCHITECTURE_REVIEW.md §19.3).
+- Start the traversal from `staging.src_a.x` (a physical source) and assert that the
+  row for `mart.fact_kpi.measure` carries a non-null `file` field. Assert observable
+  output (non-null `file` value), not "no exception raised".
+- Acceptance: the new test is RED against the current outgoing-edge query on master and
+  GREEN after the Step 1.1 flip. Verify by running it before and after the edit.
 
 ## Test Strategy
 - Integration: the new TC6b guard on the in-fixture sink (above).
@@ -92,8 +99,9 @@ None. No schema, index, or dependency change.
 - [ ] A terminal-sink downstream result renders a real `file:line` (TC6b green).
 - [ ] TC6b is demonstrably RED on `master` before the fix (proves it guards the bug).
 - [ ] Full test suite green; no perf/scaling guard regression.
-- [ ] Version bumped to 1.2.2 (patch) per CLAUDE.md release process, or folded into
-      the next lineage minor — decide with the user before opening the PR.
+- [ ] Version bumped to **1.2.2** (patch) per CLAUDE.md release process — standalone
+      release, branched off `master` after PR #48 merges and `v1.2.1` is tagged.
+      Do NOT fold into PR #48 or v1.2.1.
 
 ## Risks and Mitigations
 - **Risk: a `dst` with multiple incoming edges from different queries.** `min()`
@@ -101,6 +109,7 @@ None. No schema, index, or dependency change.
   lowest-line producing query deterministically. Mitigation: keep the
   `WITH dst, min(...), min(...)` aggregate-before-`LIMIT` shape exactly as upstream.
 - **Risk: TC6 false-confidence (it passes on a located case).** Mitigation: Phase 2
-  explicitly targets a *sink*, the case TC6 misses; prove RED-on-master.
+  explicitly targets a *sink* — `mart.fact_kpi.measure` with zero outgoing edges —
+  the case TC6 misses; prove RED-on-master before the fix.
 - **Risk: scope creep into server tools.** Out of scope — this ticket is the CLI
   `analyze downstream` path only.
