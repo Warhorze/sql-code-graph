@@ -59,6 +59,27 @@ This project uses `uv`. Never activate a virtualenv manually, never use `pip`, n
 | Lint | `rtk uv run ruff check src tests` |
 | Format | `uv run ruff format src tests` |
 
+## Releasing (version bump + tag)
+
+Every feature/fix PR that ships bumps the version; after it merges to `master`, tag the release.
+Do **all** of this — the tag is the step most easily forgotten.
+
+1. **Bump the version** (in the feature branch, before the PR merges):
+   - [`pyproject.toml`](pyproject.toml) `version = "X.Y.Z"`
+   - [`src/sqlcg/__init__.py`](src/sqlcg/__init__.py) `__version__ = "X.Y.Z"`
+   - `uv lock` (refreshes the lockfile's own version entry)
+   - **SemVer**: new capability/surface → **minor** (`1.1.x` → `1.2.0`); bug fix only → **patch**.
+     No backward-compat shims, so an additive feature is still minor (not major) when nothing breaks.
+2. **Merge the PR to `master`** (squash or `--merge` per the existing `Merge #NN` history).
+3. **Tag the merge commit on `master`** — **annotated**, `v`-prefixed, message `vX.Y.Z — <one-line summary>`:
+   ```bash
+   git checkout master && git pull --ff-only origin master
+   git tag -a vX.Y.Z -m "vX.Y.Z — <summary>" <merge-commit-sha>
+   git push origin vX.Y.Z
+   ```
+   All existing tags are annotated and look like `v1.1.3` (never bare `1.1.3`). Confirm with
+   `git tag -l --format='%(contents)' vX.Y.Z` and verify it points at the master merge commit.
+
 ## Target scale — serve both ends of the spectrum
 
 This project must work correctly and comfortably at two very different scales:
