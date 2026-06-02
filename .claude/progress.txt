@@ -1,10 +1,50 @@
-## Current State — architect-planner: v1.2.0 read-proxy  [2026-06-01]
+## Current State — developer: v1.2.0 read-proxy  [2026-06-02]
 
-ACTIVE AGENT: architect-planner
+ACTIVE AGENT: developer
 FEATURE: v1.2.0 — server-routed read proxy (closes remaining half of #28: concurrent reads under write lock)
-TARGET BRANCH: master (feat/v1.1.3-union-cte-star is a separate in-flight feature)
+TARGET BRANCH: master
 PLAN: plan/v1_2_0_read_proxy.md
-STATUS: plan drafted — ready for plan-reviewer gate
+BRANCH: plan/v1.2.0-read-proxy
+STATUS: CODE COMPLETE + TESTED (uncommitted) — Phases 0-4 done. Test suite GREEN:
+  572 passed, 1 skipped, 1 xfailed (full unit + new integration + reindex back-compat).
+  Ready for commit / plan-compliance.
+
+SESSION 2026-06-02 (Opus) — verification + test completion:
+  - VERIFIED the load-bearing assumption empirically: on Kuzu 0.11.3 a second-process
+    read_only=True open FAILS ("Could not set lock") while a writer holds the DB.
+    Confirms the proxy is necessary (a plain read_only fallback cannot fix #28).
+  - Wrote tests/unit/test_read_client.py (8 tests: framed round-trip, >64KiB no-truncation,
+    timeout→typer.Exit caught by bare except, error-response raise, run_read_routed fallback
+    asserts get_backend(read_only=True)).
+  - Wrote tests/integration/test_read_via_server.py (3 scenarios: A #28-proof — separate
+    process gets LOCKED but socket query returns rows; D read-only guard rejects CREATE,
+    graph unchanged; F >64KiB result not truncated). Drives _control_socket_task in-process
+    with a real lock-holding backend (avoids flaky mcp-start subprocess).
+  - FIXED 2 stale tests in test_unqualified_fallback.py (scenario C-downstream + D still
+    patched analyze.get_backend, which no longer exists — repointed to run_read_routed).
+  - DEVIATION from plan: removed server_is_live() — shipped uncalled (run_read_routed uses
+    query_via_server's None-return; stale socket → ConnectionRefused → None covers Scenario C).
+    CLAUDE.md "grep-confirmed call site" rule. Public API is now query_via_server + run_read_routed.
+  - Added README "Reads while the server is running (v1.2.0)" note (Step 4.2).
+  - ruff + pyright clean on new files.
+  NOTE: full `pytest tests/unit` will hang/fail if orphaned sqlcg processes hold the DEFAULT
+  db lock (test_mcp_stdio_smoke / test_star_schema_unit). Kill stray `[sqlcg]` procs first.
+
+PLAN-REVIEWER CORRECTIONS (2026-06-01):
+  B1: get_backend() has no read_only param today → added Phase 0 / Step 0.1 to add read_only
+      pass-through to KuzuBackend; corrected the phantom config.py:362-363 docstring cite
+      (actual docstring config.py:350-357 has no "route reads" note).
+  B2: framed receive loop mechanism specified — server: BufferedByteReceiveStream +
+      receive_until(b"\n", max_bytes=64) + receive_exactly(n); client: recv-exactly
+      (makefile/loop), never single recv. server.py:122 is receive(4096) today.
+  W1: analyze.py line numbers fixed (~45,106,174,210,227 not 67/126/194/230/247); enumerated
+      all 6 run_read incl. downstream loop ~156; db.py clarified (only db info + list-repos;
+      db init/reset are write paths, out of scope).
+  W2: documented sniff is server-side request-path only; unframed client gets JSONDecodeError.
+  W3: run_read_routed raises typer.Exit (Exception-derived) on server-busy → gain.py:134
+      except Exception degrades gracefully.
+  Notes: control.py:39 with_suffix → graph.sock (pre-existing cosmetic); reindex_lock rename
+      = all 7 occurrences incl docstrings.
 
 ---
 

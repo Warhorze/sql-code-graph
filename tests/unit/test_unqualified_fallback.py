@@ -74,7 +74,7 @@ def test_scenario_c_upstream_fallback_fires_when_primary_empty() -> None:
     "fact_t.amount" as a source node, but the user queries "mart.fact_t.amount".
     The fallback must find "fact_t.amount" results and print a hint.
     """
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from typer.testing import CliRunner
 
@@ -85,7 +85,7 @@ def test_scenario_c_upstream_fallback_fires_when_primary_empty() -> None:
     # Primary query (qualified ref) returns empty; fallback (bare ref) returns results.
     bare_node_id = "mart.orders.amount"
 
-    def mock_run_read(query: str, params: dict) -> list[dict]:
+    def mock_run_read_routed(query: str, params: dict) -> list[dict]:
         # Qualified ref returns nothing; bare ref returns a result.
         if params.get("ref") == "mart.fact_t.amount":
             return []
@@ -93,12 +93,7 @@ def test_scenario_c_upstream_fallback_fires_when_primary_empty() -> None:
             return [{"id": bare_node_id}]
         return []
 
-    backend = MagicMock()
-    backend.__enter__ = MagicMock(return_value=backend)
-    backend.__exit__ = MagicMock(return_value=False)
-    backend.run_read = MagicMock(side_effect=mock_run_read)
-
-    with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=mock_run_read_routed):
         result = runner.invoke(app, ["analyze", "upstream", "mart.fact_t.amount", "--raw"])
 
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
@@ -115,7 +110,7 @@ def test_scenario_c_upstream_fallback_fires_when_primary_empty() -> None:
 
 def test_scenario_c_downstream_fallback_fires_when_primary_empty() -> None:
     """analyze downstream fires bare-name fallback analogous to upstream."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from typer.testing import CliRunner
 
@@ -124,19 +119,14 @@ def test_scenario_c_downstream_fallback_fires_when_primary_empty() -> None:
     runner = CliRunner()
     bare_node_id = "mart.report.col"
 
-    def mock_run_read(query: str, params: dict) -> list[dict]:
+    def mock_run_read_routed(query: str, params: dict) -> list[dict]:
         if params.get("ref") == "mart.fact_t.amount":
             return []
         if params.get("bare") == "fact_t.amount":
             return [{"id": bare_node_id}]
         return []
 
-    backend = MagicMock()
-    backend.__enter__ = MagicMock(return_value=backend)
-    backend.__exit__ = MagicMock(return_value=False)
-    backend.run_read = MagicMock(side_effect=mock_run_read)
-
-    with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=mock_run_read_routed):
         result = runner.invoke(app, ["analyze", "downstream", "mart.fact_t.amount", "--raw"])
 
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
@@ -160,7 +150,7 @@ def test_scenario_d_no_fallback_when_primary_succeeds() -> None:
     When the INSERT target was properly indexed as "mart.fact_t", the primary
     query succeeds and the bare-name fallback block must not execute.
     """
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from typer.testing import CliRunner
 
@@ -171,18 +161,13 @@ def test_scenario_d_no_fallback_when_primary_succeeds() -> None:
 
     call_log: list[dict] = []
 
-    def mock_run_read(query: str, params: dict) -> list[dict]:
+    def mock_run_read_routed(query: str, params: dict) -> list[dict]:
         call_log.append(dict(params))
         if params.get("ref") == "mart.fact_t.amount":
             return [{"id": primary_node_id}]
         return []
 
-    backend = MagicMock()
-    backend.__enter__ = MagicMock(return_value=backend)
-    backend.__exit__ = MagicMock(return_value=False)
-    backend.run_read = MagicMock(side_effect=mock_run_read)
-
-    with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=mock_run_read_routed):
         result = runner.invoke(app, ["analyze", "upstream", "mart.fact_t.amount", "--raw"])
 
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"

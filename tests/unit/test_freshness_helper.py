@@ -13,7 +13,7 @@ Scenarios from sprint_12_v1.1.0.md PR-A:
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -274,28 +274,27 @@ class TestCliEmptyDb:
 
         runner = CliRunner()
 
-        with patch("sqlcg.cli.commands.db.get_backend") as mock_get_backend:
-            mock_backend = MagicMock()
-            mock_backend.__enter__.return_value = mock_backend
-            mock_backend.__exit__.return_value = None
-            mock_backend.get_schema_version.return_value = "6"
-            # Empty DB: no indexed SHA, no Repo nodes
-            mock_backend.get_indexed_sha.return_value = None
-
-            def run_read_side_effect(query: str, _params: dict):
-                if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
-                    return [{"n": 0}]
-                if "path" in query and "Repo" in query:
-                    return []  # no repo rows
-                if "Repo" in query:
-                    return [{"count": 0}]
-                if "parsing_mode" in query:
-                    return []
+        def run_read_routed_side_effect(query: str, _params: dict):
+            # Schema version
+            if "SchemaVersion" in query and "indexed_sha" not in query:
+                return [{"version": "6"}]
+            # Indexed SHA (None = empty DB)
+            if "indexed_sha" in query:
+                return [{"sha": None}]
+            # Repo path for freshness
+            if "Repo" in query and "path" in query and "COUNT" not in query and "name" not in query:
+                return []  # no repo rows
+            if "STAR_SOURCE" in query or "STAR_EXPANSION" in query:
+                return [{"n": 0}]
+            if "Repo" in query and "COUNT" in query:
                 return [{"count": 0}]
+            if "parsing_mode" in query:
+                return []
+            return [{"count": 0}]
 
-            mock_backend.run_read.side_effect = run_read_side_effect
-            mock_get_backend.return_value = mock_backend
-
+        with patch(
+            "sqlcg.cli.commands.db.run_read_routed", side_effect=run_read_routed_side_effect
+        ):
             result = runner.invoke(app, ["info"])
 
         assert result.exit_code == 0, f"Expected exit 0, got {result.exit_code}: {result.output}"

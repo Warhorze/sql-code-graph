@@ -40,12 +40,11 @@ class TestGainRatio:
                 MockPath.return_value = mock_path
 
                 with (
-                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.run_read_routed", return_value=[]),
                     patch("sqlcg.cli.commands.gain.console"),
                 ):
-                    # Section F opens a graph backend; mock it so the unit test
-                    # never touches a real KuzuDB.
-                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
+                    # Section F routes through run_read_routed; mock returns [] so
+                    # the parse-quality section is skipped cleanly.
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -80,12 +79,9 @@ class TestGainRatio:
                 MockPath.return_value = mock_path
 
                 with (
-                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.run_read_routed", return_value=[]),
                     patch("sqlcg.cli.commands.gain.console"),
                 ):
-                    # Section F opens a graph backend; mock it so the unit test
-                    # never touches a real KuzuDB.
-                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
                     gain_cmd(_metrics_path=mock_path)
                     assert mock_metrics.execute_query.called
 
@@ -119,12 +115,9 @@ class TestGainRatio:
                 MockPath.return_value = mock_path
 
                 with (
-                    patch("sqlcg.cli.commands.gain.get_backend") as mock_get_backend,
+                    patch("sqlcg.cli.commands.gain.run_read_routed", return_value=[]),
                     patch("sqlcg.cli.commands.gain.console"),
                 ):
-                    # Section F opens a graph backend; mock it so the unit test
-                    # never touches a real KuzuDB.
-                    mock_get_backend.return_value.__enter__.return_value.run_read.return_value = []
                     try:
                         gain_cmd(_metrics_path=mock_path)
                     except ZeroDivisionError:
