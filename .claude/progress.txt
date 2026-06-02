@@ -1,3 +1,47 @@
+## Handoff — architect-planner: v1.2.1 live-verification residual findings triage  [2026-06-02]
+
+ACTIVE AGENT: architect-planner (complete)
+CONTEXT: live DWH re-verification of v1.2.1 (PASS) surfaced 2 residual findings.
+DECISIONS (recorded in ARCHITECTURE_REVIEW.md §19):
+  - 19.1 scratch-object classification leak (~22% tmp_*/temp_*/cte_* in table-kind):
+    KEEP, LOW. Fix must be at classification time (no name-prefix filter, per s18.2) —
+    emit kind='derived' for TEMP/TRANSIENT CTAS targets in _build_file_rows (reuse #44
+    plumbing). Unqualified single-token nodes explicitly out of scope. No plan stub yet.
+  - 19.2 downstream file:line='?' on terminal sinks (81% of rows): KEEP, HIGH reward /
+    LOW effort. Bug, not deliberate. Flip downstream location binding from outgoing
+    (dst)-[]->()  to incoming  ()-[]->(dst)  in analyze.py (2 queries). Upstream stays.
+    Plan stub: plan/fix_downstream_sink_location.md. Suggested release 1.2.2.
+  - Shared root: both are graph→user presentation-layer defects (same #38/#40 blind
+    spot); guards MUST drive the user-facing analyze path, not raw edges. TC6 is
+    upstream-only and does NOT cover the 19.2 sink case.
+
+NEXT: 19.2 is the pick-up candidate (plan-reviewer → developer). 19.1 pull when a
+      lineage-coverage sprint next touches _build_file_rows.
+
+---
+
+## Handoff — architect-planner: v1.2.1 plan-compliance  [2026-06-02]
+
+ACTIVE AGENT: architect-planner (complete — PASS)
+FEATURE: v1.2.1 — open lineage bug fixes + effective regression guards
+BRANCH: feat/v1.2.1-bugfix (PR #48)
+VERDICT: PLAN-COMPLIANT (PASS) — committed 4868d55
+
+KEY RECONCILIATION (#45 was the open question):
+  - #45 NOT dropped. #45.1 (file:line aggregation) shipped in 0505c9d;
+    #45.2 (cte_* leak via kind=derived) shipped in 7dda6f8. Reported by
+    mechanism, not issue number — that is why the dev report didn't name #45.
+  - TC4 (#45.2) + TC6 (#45.1) green on a live run (7/7 guard suite).
+  - The two discovered bugs are WITHIN plan intent, recorded as invariants:
+    (1) KuzuDB OPTIONAL-MATCH WHERE filters the match, not the row → needs
+        WITH...WHERE; (2) _flush_row_batch dedup must prefer structural kind.
+    Both in ARCHITECTURE_REVIEW.md s18.3. s3.2 resolve_pass2 marked RESOLVED.
+
+NEXT: code-reviewer (or merge per shepherd policy — see MEMORY: skip code-reviewer).
+      Post-merge: tag v1.2.1 on master (CLAUDE.md release step — easily forgotten).
+
+---
+
 ## Handoff — developer: v1.2.1-bugfix  [2026-06-02]
 
 ACTIVE AGENT: developer (complete)

@@ -3022,3 +3022,96 @@ Both are now load-bearing; recorded so a future refactor does not silently undo 
 - **#28 server read-only-by-default + reindex escalation** — out of 1.2.1; recommended
   as a separate minor (1.3.0). The read half is already handled by the v1.2.0 routing proxy.
 - **`connected_clients` fidelity** — best-effort `1` today; no real counter.
+
+## 19. v1.2.1 live DWH re-verification — two residual findings (2026-06-02)
+
+Source: live verification of the v1.2.1 fixes against the full DWH corpus
+(`../dwh`, 1,335 SQL files, clean index ~1:56). **The v1.2.1 fixes themselves
+PASSED** — both findings below are residual / design-limit behaviour surfaced by
+the run, not regressions in PR #48. Corpus graph snapshot (kind-typed `SqlTable`):
+2,222 `table` / 383 `cte` / 272 `derived`.
+
+### 19.1 [KEEP — LOW] Residual scratch-object leak into the default `analyze` surface
+
+**Measurement.** The #45.2 fix essentially closed the `cte_` leak it targeted:
+of nodes still typed `kind='table'`, only 3 carry a `cte_` prefix (vs 383 now
+correctly `kind='cte'`). The broader leak persists: **495 of 2,222 `table`-kind
+nodes (~22%) carry scratch-object name prefixes** — 471 `tmp_*`, 21 `temp_*`,
+3 `cte_*` — plus ~575 unqualified single-token nodes (a mix of real bare tables
+and CTE aliases). These surface in default (filtered) `analyze` output because the
+filter is correctly kind-based (graph-truth) but these aliases were never classified
+`cte`/`derived` at parse/aggregation time. This is the known #38 islands residual
+(s18.4 / `47 cte_insert islands`); the leak is now `tmp_*`-dominated, not
+`cte_*`-dominated. See memory `project_issue38_cte_filter_regression`.
+
+**Decision: KEEP as a future ticket, LOW priority.** Rationale tied to existing
+decisions:
+- The standing **"no name-prefix filtering"** decision (s18.2; CLAUDE.md) is correct
+  and stays. The fix therefore **cannot** live in the filter — it must happen at
+  **classification time** in the aggregator/parser, exactly like the #44 synthetic
+  INSERT-target → `kind='derived'` emission change (s18.1). A `CREATE [OR REPLACE]
+  TEMP/TRANSIENT TABLE tmp_x AS SELECT …` whose target is a scratch object should be
+  emitted `kind='derived'` at `_build_file_rows` time, the same place #44 already
+  rewrites node identity. 492/495 of the leak (`tmp_*`/`temp_*`) are this CTAS-into-
+  scratch shape — addressable by classifying on the parsed CTAS-into-temp statement
+  kind (DDL-derived structural truth), **not** on the name prefix.
+- **Non-goal for the ticket:** the ~575 unqualified single-token nodes. They are a
+  genuine mix of real bare tables and CTE aliases; auto-classifying them risks
+  hiding real physical tables from the default surface (a false-negative worse than
+  the current cosmetic leak). They stay `kind='table'` until a structural signal
+  (CTE membership, CTAS target) is available — never a name guess.
+
+**Risk/reward.** Reward: cleaner default `analyze` surface, ~22% fewer scratch
+intermediates leaking; closes the visible tail of #38. Risk: medium — must classify
+on parsed statement structure (TEMP/TRANSIENT CTAS target), and must not reclassify
+a real `tmp_`-named physical table that is read by a non-CTAS statement; needs a guard
+asserting a real table named `tmp_*` is still surfaced. Effort: medium (one emission
+site, reuses #44 plumbing, plus a behavioural guard). Below the open HIGH §3.x items
+and Finding 19.2 in the ranking. Recorded here; no plan stub drafted yet (pull when
+a lineage-coverage sprint next touches `_build_file_rows`).
+
+### 19.2 [KEEP — HIGH reward / LOW effort] `file:line='?'` on downstream terminal sinks
+
+**Measurement.** The #45.1 fix rebinds a result's location from its **outgoing**
+`COLUMN_LINEAGE` edge ("where is this column used as a source"). For *downstream*
+traces this means terminal sinks render `?`: a sink has no outgoing edge, so
+`min(q.start_line)`/`min(q.file_path)` are NULL. Corpus measurement: of 36,892
+distinct columns reachable as a downstream result, **29,827 (81%) are sinks → render
+`file:line='?'`**. The fix populates only the locatable 19%. Upstream is unaffected
+(an upstream source legitimately has an outgoing edge). The TC6 guard asserts non-null
+`file:line` on one specific *located* case, so it passed despite the 81%.
+
+**Decision: KEEP — pick up next.** This is a genuine bug, **not** deliberate
+semantics. Analysis tied to #45.1's own intent:
+- #45.1 chose the outgoing edge so a *source*'s location reads as "where it is
+  produced/consumed as a source" — correct for the **upstream** direction. The same
+  pattern was copied verbatim into the **downstream** query
+  ([`analyze.py`](src/sqlcg/cli/commands/analyze.py) lines 134–137, fallback 146–149):
+  `OPTIONAL MATCH (dst)-[dstedge]->()`. For a downstream *result*, the natural,
+  user-meaningful location is the query that **produced** the column — i.e. the
+  **incoming** edge `()-[dstedge]->(dst)`, not the outgoing one.
+- **Key lever (confirmed in code):** every one of the 36,892 columns has an incoming
+  `COLUMN_LINEAGE` edge by definition — that is how it became a downstream result —
+  and that producing query carries a real `start_line`/`file_path`. Flipping the two
+  downstream `OPTIONAL MATCH` arrows from `(dst)-[dstedge]->()` to
+  `()-[dstedge]->(dst)` binds location from the producing query, turning ~81% of `?`
+  rows into a real `file:line`. Upstream stays on the outgoing edge unchanged.
+
+**Risk/reward.** Reward: HIGH — ~81% of downstream result rows flip from `?` to a
+real `file:line` on a corpus this shape. Effort: LOW — a ~2-line arrow flip in two
+downstream queries (primary + bare-name fallback), no schema/index/perf change, no
+parser change. Risk: LOW and bounded — only the downstream direction; upstream and
+the kind-filter (s18.3) untouched. The one trap: TC6 passes today on a located case,
+so it does **not** catch the regression — the ticket must add a guard asserting a
+**terminal sink** (no outgoing edge) renders a real `file:line`, not `?`.
+Plan stub drafted: [`fix_downstream_sink_location.md`](plan/fix_downstream_sink_location.md).
+Suggested release: patch (1.2.2) or fold into the next lineage minor.
+
+### 19.3 Cross-finding note
+
+Both findings share the v1.2.1 root theme: the *graph store* is correct (edges intact,
+kinds mostly right); the defects live in the **graph→user presentation layer**
+(filter classification for 19.1, location binding for 19.2) — the same blind-spot
+class as #38/#40 where anchors traversing raw edges pass while the user-facing query
+path is wrong. Any guard for either must drive the **user-facing `analyze` path**,
+not raw `COLUMN_LINEAGE` traversal.
