@@ -321,6 +321,14 @@ When the target resolves to a sole DDL canonical, emit the row with the canonica
   `fact_kpi.measure`; the schema-less duplicate node no longer appears in `find`.
 - Invariant guard: the change is pure row-dict mutation in the node-emission loop — no new
   `execute()`, no per-row `upsert_node`. Perf scaling + bulk/batch upsert guards must stay green.
+- **Known limitation (single-file paths):** `reindex_file` (indexer.py L897) and `resync_changed`
+  call `_upsert_parsed_file`/`_upsert_file_batch` **without a `CrossFileAggregator`**, so
+  `canonical_by_bare` is not threaded in there — the #44 rewrite applies only on a full
+  `index_repo` run. A single-file re-index of a previously-indexed file will re-create the
+  schema-less node until the next full re-index. This is acceptable per CLAUDE.md ("re-index is
+  the migration path"); the resolution helper **must degrade to a no-op (no rewrite) when
+  `canonical_by_bare` is `None`/absent** — never raise on a missing lookup. State this in the
+  helper's contract.
 
 ### Phase 3 — #45 (flips TC6 green) + cte_* leak
 **Step 3.1** Rebind `file:line` to the source node's outgoing edge in `upstream`/`downstream`
@@ -360,7 +368,10 @@ the production indexer by the integration suites that run `index_repo` end-to-en
 is cleaner than introducing a new helper seam.
 
 **Step 5.1** Delete `resolve_pass2` from `aggregator.py`. Confirm no production caller (grep:
-only tests + the inline `index_repo` logic reference it).
+only tests + the inline `index_repo` logic reference it). **Also fix the stale doc reference at
+[`ansi_parser.py`](../src/sqlcg/parsers/ansi_parser.py) L88**, which names
+`CrossFileAggregator.resolve_pass2` in a docstring — after deletion it points at a non-existent
+method. Update it to reference the production `index_repo` pass-2 dispatch instead.
 **Step 5.2** Rewrite/realign the four test files:
 - `test_resolve_pass2_passes_dependency_filter.py` — the `dependency_filter` contract it pins is
   the inline `dep_names` computation in `index_repo` (indexer.py ~L356) + the worker call in
