@@ -80,6 +80,10 @@ regression** (which is #39's read half), all verified by **landing the #40 guard
 - **#40** — land the user-surface regression-guard suite from
   [`fix_issue_40_user_surface_regression_guards.md`](fix_issue_40_user_surface_regression_guards.md)
   (synthetic committable fixture A–D + TC1–TC7), as the verification layer for the above.
+- **`resolve_pass2` dead-code dedup** — delete the dead `CrossFileAggregator.resolve_pass2`
+  (zero production call sites; production inlines its logic in `index_repo`) and realign its tests
+  at the production pass-2 path. Pure dedup + test realignment, no graph-output change. This is the
+  root cause of B1 — the same #40-class blind spot (tests measuring a path production doesn't run).
 - **Version bump** to `1.2.1` (pyproject, `__init__.py`, `uv lock`).
 
 ### Non-goals
@@ -118,17 +122,19 @@ def _kind_filter(node_alias: str, *, include_intermediate: bool) -> str:
 
 ### #44 — INSERT-target canonical-name resolution
 
-**Where:** [`CrossFileAggregator`](../src/sqlcg/lineage/aggregator.py) already holds the DDL
-identity map. `register_pass1` records `self.sources[table.full_id] = parsed` for every
-`parsed.defined_tables`. Add a parallel **bare-name → canonical full_id** index built from the
-*DDL-defined* tables only:
+**Where the index is BUILT vs. where it is APPLIED — these are two different sites:**
+
+*Build the index in `register_pass1`* — [`CrossFileAggregator`](../src/sqlcg/lineage/aggregator.py)
+already holds the DDL identity map. `register_pass1` iterates `parsed.defined_tables`
+(aggregator.py L34) and records `self.sources[table.full_id] = parsed`. Add a parallel
+**bare-name → canonical full_id** index built from those *DDL-defined* tables, in the same loop:
 
 ```python
 # in __init__:
 self.canonical_by_bare: dict[str, str] = {}   # bare name (lower) -> sole DDL full_id
 self._ambiguous_bare: set[str] = set()        # bare names defined by >1 schema (do NOT rewrite)
 
-# in register_pass1, for each table in parsed.defined_tables:
+# in register_pass1, in the existing `for table in parsed.defined_tables:` loop (L34):
 bare = (table.name or "").lower()
 if bare:
     if bare in self.canonical_by_bare and self.canonical_by_bare[bare] != table.full_id:
@@ -136,26 +142,48 @@ if bare:
     self.canonical_by_bare[bare] = table.full_id
 ```
 
-**Resolution rule (applied in `resolve_pass2`, before re-parse emits the target node):**
-for a statement whose `target` is unqualified *or* whose `target.full_id` is not itself a
-DDL-defined table, if `target.name.lower()` maps to exactly one DDL canonical (not in
-`_ambiguous_bare`), rewrite the target `TableRef` to the canonical `db`/`catalog`/`name`.
-Ambiguous bare names are left untouched (the existing `_bare_ref` CLI hint already covers
-the multi-schema case — do not silently merge across schemas).
+*Apply the rewrite in `_build_file_rows`* (indexer.py L974), **not** in
+`CrossFileAggregator.resolve_pass2`. **`resolve_pass2` has zero production call sites** — the
+production pass-2 path in `index_repo` reimplements the dep-filter+reparse logic inline
+(indexer.py ~L353-373 computes `dep_names` and dispatches `parse_pass2` tasks; the worker calls
+`parser_p2.parse_file(..., dependency_filter=...)` directly in [`pool.py`](../src/sqlcg/indexer/pool.py)
+L129; `resync_changed` calls `parse_file()` directly too). `resolve_pass2` is a duplicate kept
+alive only by tests (see Phase 5). Targeting it would land the #44 fix in dead code.
 
-**Critical (CLAUDE.md alias rule):** the rewrite must produce a `TableRef` whose `full_id`
-is *identical* to the DDL table's `full_id`, so the INSERT-target `SqlTable` node, its
-`SqlColumn.table_qualified`, and the DDL node all share one identity. Mirror the
-`#39 Half A` discipline: derive every emitted field from the same resolved `TableRef`.
+The INSERT-target synthetic `SqlTable` node is emitted in `_build_file_rows` at indexer.py
+**~L1204-1215** — the `if stmt.target and stmt.target.full_id not in defined_table_ids:` block
+that appends a `table_rows` dict with `kind: "table"`. This is the row whose `qualified` becomes
+the duplicate schema-less node. Apply the canonical rewrite here, when the row is built:
 
-**Re-emission must dedup to a no-op** — the canonical node already exists from the DDL pass;
-`upsert_nodes_bulk` (Phase A→B→C) is keyed on `qualified`, so re-emitting the same identity
-is a no-op. Do **not** add a per-row `upsert_node` (Performance invariant).
+- **Thread the canonical index in alongside `defined_table_registry`**, which already flows into
+  `_build_file_rows` (signature `_build_file_rows(self, parsed, defined_table_registry=None)`,
+  indexer.py L974-977; called from `_upsert_file_batch` L1246 and `_upsert_parsed_file` L1286).
+  Pass `aggregator.canonical_by_bare` / `aggregator._ambiguous_bare` down the same call chain
+  (`index_repo` → `_upsert_file_batch` / `_upsert_parsed_file` → `_build_file_rows`).
+- **Resolution rule:** when building the INSERT-target row for a `stmt.target` that is unqualified
+  *or* whose `full_id` is not itself a DDL-defined table (`stmt.target.full_id not in
+  defined_table_ids`), if `stmt.target.name.lower()` maps to exactly one DDL canonical (present
+  in `canonical_by_bare`, **not** in `_ambiguous_bare`), use the canonical `full_id` (and its
+  `name`/`db`/`catalog`) for the emitted row instead of the raw target. Ambiguous bare names are
+  left untouched — the existing `_bare_ref` CLI hint already covers the multi-schema case; do not
+  silently merge across schemas.
 
-> Open design point for plan-reviewer / architect-reviewer: confirm the rewrite belongs in
-> `resolve_pass2` (so it is applied once, with the full DDL map available) rather than in the
-> per-statement parser (which lacks cross-file DDL knowledge in pass 1). The aggregator is the
-> only place that has both the target and the complete DDL identity map.
+**Critical (CLAUDE.md alias rule):** the emitted row's `qualified` must be *identical* to the DDL
+table's `full_id`, so the INSERT-target `SqlTable` node, its `SqlColumn.table_qualified`, and the
+DDL node all share one identity. Mirror the `#39 Half A` discipline: derive every emitted field
+from the same resolved canonical, not a mix of canonical id + raw name.
+
+**Re-emission must dedup to a no-op** — when the canonical node already exists from the DDL pass,
+`upsert_nodes_bulk` (Phase A→B→C) is keyed on `qualified`, so re-emitting the same identity is a
+no-op. Do **not** add a per-row `upsert_node` (Performance invariant). The change is pure row-dict
+mutation inside the existing node-emission loop — no new `execute()`.
+
+**Kind decision for the emitted node (resolves W2 — see #45.2 below):** today this block hardcodes
+`kind: "table"` for *every* INSERT target, including synthetic ones. Phase 2 changes this so that
+**only** rows resolved to a DDL canonical keep `kind: "table"`; a synthetic INSERT target that does
+*not* resolve to a DDL table is emitted with a distinct non-physical kind (`kind: "derived"`) so the
+read-surface `kind_filter` excludes it. This makes the #45.2 `cte_insert` leak a graph-truth drop
+rather than a name-prefix heuristic. See #45.2 for the verification prerequisite.
 
 ### #45.1 — `file:line` on every source row
 
@@ -164,40 +192,60 @@ column** (`OPTIONAL MATCH (src)-[direct:COLUMN_LINEAGE]->(c)`), which only exist
 immediate neighbour of `c`. Multi-hop sources have no such direct edge → `direct.query_id`
 is null → `q` is null → [`_add_file_line_col`](../src/sqlcg/cli/commands/analyze.py) renders `?`.
 
-**Fix:** bind the location from the edge **leaving the source node** — the first
-`COLUMN_LINEAGE` edge out of `src` (the edge that defines where `src` is *read*), e.g.
+**Fix:** bind the location from the edge **leaving the source node** — a `COLUMN_LINEAGE` edge
+out of `src` (an edge that defines where `src` is *read*). The
+`OPTIONAL MATCH (src)-[srcedge:COLUMN_LINEAGE]->()` pattern is **one row per outgoing edge per
+`src`**, so it multiplies rows. **Aggregation is REQUIRED, not conditional** — without it the
+existing `LIMIT 100` silently drops the 101st *distinct* `src.id`. Aggregate per source **before**
+the `LIMIT`, e.g.:
 
 ```
+MATCH (c:SqlColumn {id: $ref})<-[:COLUMN_LINEAGE*1..$depth]-(src:SqlColumn)
+{kind_filter}
 OPTIONAL MATCH (src)-[srcedge:COLUMN_LINEAGE]->()
 OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id})
-RETURN src.id AS id, q.file_path AS file, q.start_line AS line ...
+WITH src, min(q.start_line) AS line, ... AS file   // one row per src.id
+RETURN src.id AS id, file AS file, line AS line LIMIT 100
 ```
+
+(`downstream` mirrors this with `dst` in place of `src`.) The `WITH … min(q.start_line) … ` group
+**must collapse to one row per `src.id` before `LIMIT 100`** so the limit counts distinct sources,
+not edge-fanout rows.
 
 This requires `query_id` to be populated on `COLUMN_LINEAGE` edges (it is — #31/#32 shipped
 `query_id`/`confidence`; the DWH eval confirms `start_line` on all 5630 `SqlQuery` nodes).
-A source with several outgoing edges may match more than one query; pick deterministically
-(e.g. `ORDER BY q.start_line` and take the edge whose `dst` is on the traversed path if
-expressible, otherwise any one — a real `file:line` beats `?`). Decide the tie-break in
-implementation and assert it in TC6.
-
-> Note for plan-reviewer: `srcedge` is unbounded (`-> ()`), so confirm it does not explode
-> row count via the existing `LIMIT 100` + `RETURN src.id AS id ...` dedup. If it multiplies
-> rows, aggregate with `min(q.start_line)` per `src` in the RETURN.
+A source with several outgoing edges resolves to multiple `(file, line)` pairs; the aggregation
+picks deterministically — take `min(q.start_line)` and the `file` of that same edge (carry both
+in the grouping key or use the matching `file` for the chosen `min` line). A real `file:line`
+beats `?`. TC6 asserts both: every physical-source row carries a real `file:line` **and** the row
+count equals the distinct-source count (no fanout multiplication).
 
 ### #45.2 — suppress `cte_*` synthetic nodes from filtered output
 
-With the restored `_kind_filter` (OPTIONAL-MATCH + `kind IN ['table','external']`), a node
-**with** a `SqlTable` node of `kind='cte'`/`'derived'` is already excluded. The DWH leak was
-the synthetic `cte_insert` node: confirm it carries a non-`table` kind (`'cte'`) so the filter
-drops it. If `cte_insert`-style synthetic nodes are emitted without a `SqlTable` node at all,
-the `IS NULL` branch would *keep* them — so #45.2 needs an explicit belt-and-braces guard:
-in [`_filter_column_results`](../src/sqlcg/cli/commands/analyze.py) (the post-query
-`NoiseFilter` pass, default path only), drop rows whose table component matches the synthetic
-`cte_*`/derived prefix. Keep them under `--raw` / `--include-intermediate`. TC4 pins this.
+**Decision (resolves W2): the kind-based filter alone does NOT drop the leak as code stands today.**
+The current `_build_file_rows` INSERT-target block (indexer.py ~L1212) emits *every* synthetic
+INSERT target with `kind: "table"` — including the `cte_insert` node. So the restored
+`kind_filter` (`kind IN ['table','external']`) would still *keep* it. The fix is therefore
+**structural, in Phase 2's node emission**, not a separate read-surface heuristic:
 
-> Resolve in implementation: prefer the kind-based filter (graph-truth) over a name-prefix
-> filter (heuristic). Only add the name-prefix drop if a synthetic node legitimately lacks a
-> `SqlTable` node — confirm against the fixture, do not guess.
+- **Chosen approach (graph-truth):** the Phase 2 (#44) node-emission change assigns a **distinct
+  non-physical kind (`kind: "derived"`)** to any INSERT-target / synthetic node that does *not*
+  resolve to a DDL canonical (see #44 "Kind decision"). With that, the restored
+  `kind IN ['table','external']` filter excludes the `cte_insert` leak by graph truth — one change
+  fixes both #44 (canonical rows stay `kind: "table"` and survive) and #45.2 (unresolved synthetic
+  rows become `kind: "derived"` and are filtered) cleanly, with no name-prefix heuristic.
+- **Fixture-verification prerequisite for Phase 3:** before relying on the kind filter alone,
+  Phase 3 must confirm on the A–D fixture (shape C: `INSERT INTO mart.fact_kpi` against
+  `CREATE TABLE mart.fact_kpi`, plus a synthetic `cte_insert`-style target) that (a) the resolved
+  canonical target is emitted `kind: "table"` and survives the filter, and (b) the unresolved
+  synthetic target is emitted `kind: "derived"` and is dropped from default output, present under
+  `--raw`/`--include-intermediate`.
+- **Fallback (name-prefix belt) only if the structural kind change proves infeasible** against the
+  fixture (e.g. a synthetic node is emitted with no `SqlTable` row at all, so `kind` is `NULL` and
+  the `IS NULL` branch keeps it): then add a post-query drop in
+  [`_filter_column_results`](../src/sqlcg/cli/commands/analyze.py) (default path only) for rows
+  whose table component matches the synthetic `cte_*`/derived prefix, kept under `--raw`. This is
+  the belt, not the primary mechanism. TC4 pins the observable outcome either way.
 
 ### #40 — guard suite (reused design, no re-derivation)
 
@@ -221,14 +269,24 @@ Land the fixture + TC1–TC7 exactly as specified in
 ## Implementation steps (dependency-ordered)
 
 > Ordering rationale: the regression fix + restored `_kind_filter` is the foundation the
-> guard suite imports, so it goes first; then the guards (some RED); then #44/#45 flip them green.
+> guard suite imports, so it goes first; then the guards (some RED); then #44/#45 flip them green;
+> then the `resolve_pass2` dead-code dedup + test realignment (independent of #44, runs after it);
+> finally release plumbing.
 
 ### Phase 0 — Read-proxy filter regression (foundation; also #39 read-half)
 **Step 0.1** Reintroduce `_kind_filter(node_alias, *, include_intermediate)` in
-[`analyze.py`](../src/sqlcg/cli/commands/analyze.py); replace both inline filter strings in
-`upstream`/`downstream` with calls to it; restore the OPTIONAL-MATCH + `kind IS NULL OR kind IN`
-form.
-- Call sites (grep-confirmed required): `upstream` (was L38-43), `downstream` (was L98-103),
+[`analyze.py`](../src/sqlcg/cli/commands/analyze.py); replace **all four** inline filter strings
+with calls to it; restore the OPTIONAL-MATCH + `kind IS NULL OR kind IN` form.
+- The inline filter appears **4 times** (verified), and all four must be replaced:
+  1. `upstream` primary query — analyze.py ~L38-43 (`{qualified: src.table_qualified}`)
+  2. `upstream` bare-name **fallback** query — analyze.py ~L56-63 (reuses `kind_filter`, same string)
+  3. `downstream` primary query — analyze.py ~L98-103 (`{qualified: dst.table_qualified}`)
+  4. `downstream` bare-name **fallback** query — analyze.py ~L116-123
+  (`upstream` calls `_kind_filter("src", …)`; `downstream` calls `_kind_filter("dst", …)`; each
+  command computes the helper string once and reuses it in both its primary and fallback query, so
+  the fallback paths are covered by the same single call — but the developer must confirm both
+  fallback strings actually use the helper variable, not a second inline copy.)
+- Call sites (grep-confirmed required): `upstream` + its fallback, `downstream` + its fallback,
   and the import in [`test_cte_recall_guard.py`](../tests/integration/test_cte_recall_guard.py) L32.
 - Acceptance: `test_cte_recall_guard.py` collects and passes; `_half_b_keeps_node_less_physical_source`
   green; deleting a source's `SqlTable` node still returns the source via the CLI-filtered query.
@@ -244,30 +302,98 @@ form.
 
 ### Phase 2 — #44 canonical-name resolution (flips TC3 green)
 **Step 2.1** Add `canonical_by_bare` / `_ambiguous_bare` index in
-[`CrossFileAggregator.register_pass1`](../src/sqlcg/lineage/aggregator.py).
-**Step 2.2** Apply the rewrite in `resolve_pass2` before the target node is emitted; leave
-ambiguous bare names untouched.
-- Call site: `resolve_pass2` is called from the indexer two-pass loop (grep-confirm the
-  existing call in [`indexer.py`](../src/sqlcg/indexer/indexer.py) before opening the PR).
-- Test file: `tests/unit/test_canonical_target_resolution.py` (unit: ambiguous bare name not
-  rewritten; sole-DDL match rewritten; emitted node `full_id` == DDL `full_id`).
+[`CrossFileAggregator.register_pass1`](../src/sqlcg/lineage/aggregator.py) — populated in the
+existing `for table in parsed.defined_tables:` loop (aggregator.py L34). DDL-defined tables only.
+**Step 2.2** Apply the rewrite in **`_build_file_rows`** (indexer.py L974), at the INSERT-target
+node-emission block (~L1204-1215). Thread `aggregator.canonical_by_bare` /
+`aggregator._ambiguous_bare` down the call chain alongside the existing `defined_table_registry`
+(`index_repo` → `_upsert_file_batch` L1246 / `_upsert_parsed_file` L1286 → `_build_file_rows`).
+When the target resolves to a sole DDL canonical, emit the row with the canonical `full_id`/`name`/
+`db`/`catalog` and keep `kind: "table"`; when it does **not** resolve to a DDL table, emit
+`kind: "derived"` (W2 — feeds #45.2). Leave ambiguous bare names untouched.
+- Call site: `_build_file_rows` is called from `_upsert_file_batch` (indexer.py L1246) and
+  `_upsert_parsed_file` (L1286) — both grep-confirmed. **Do NOT target `resolve_pass2`** — it has
+  zero production call sites (the production pass-2 path inlines its logic; see Phase 5 / #44 design).
+- Test file: `tests/unit/test_canonical_target_resolution.py` (unit on the resolution helper:
+  ambiguous bare name not rewritten; sole-DDL match rewritten; emitted row `qualified` == DDL
+  `full_id`; unresolved synthetic target gets `kind: "derived"`).
 - Acceptance: TC3 green — querying `mart.fact_kpi.measure` returns the **same** source set as
   `fact_kpi.measure`; the schema-less duplicate node no longer appears in `find`.
+- Invariant guard: the change is pure row-dict mutation in the node-emission loop — no new
+  `execute()`, no per-row `upsert_node`. Perf scaling + bulk/batch upsert guards must stay green.
 
 ### Phase 3 — #45 (flips TC6 green) + cte_* leak
 **Step 3.1** Rebind `file:line` to the source node's outgoing edge in `upstream`/`downstream`
-queries; handle the multi-edge tie-break deterministically.
-**Step 3.2** Confirm/repair `cte_*` suppression in the default path (kind filter first;
-name-prefix belt only if a synthetic node lacks a `SqlTable` node — verify on the fixture).
+queries. **Aggregate per `src`/`dst` BEFORE `LIMIT 100`** (required — the `srcedge` match
+multiplies rows; without the `WITH … min(q.start_line) …` grouping the limit drops distinct
+sources). Pick `min(q.start_line)` with its matching `file` deterministically.
+**Step 3.2** Confirm `cte_*` suppression via the **kind filter** (graph-truth) now that Phase 2
+emits unresolved synthetic INSERT targets as `kind: "derived"`. **Fixture-verification prerequisite:**
+confirm on shape C that the resolved canonical target is `kind: "table"` (survives) and the
+synthetic target is `kind: "derived"` (dropped from default, kept under `--raw`). Only add the
+name-prefix belt in `_filter_column_results` if a synthetic node turns out to carry a `NULL` kind
+on the fixture.
 - Test file: `tests/integration/test_user_surface_recall_guard.py` (TC6 + TC4 assertions).
 - Acceptance: TC6 green — every physical-source row carries a real `file:line`, only synthetic
-  nodes may be `?`; TC4 green — no `cte_*` row in default output, present under `--raw`.
+  nodes may be `?`, **and the row count equals the distinct-source count** (no edge-fanout
+  multiplication); TC4 green — no `cte_*`/derived row in default output, present under `--raw`.
 
-### Phase 4 — Release plumbing
-**Step 4.1** Bump `version = "1.2.1"` in [`pyproject.toml`](../pyproject.toml) and
+### Phase 5 — `resolve_pass2` dead-code dedup + test realignment (the root cause of B1)
+**Why this phase exists:** B1 happened because the production pass-2 path (`index_repo` →
+`parse_pass2` dispatch → [`pool.py`](../src/sqlcg/indexer/pool.py) worker → `parse_file(...,
+dependency_filter=...)`) *reimplements* `CrossFileAggregator.resolve_pass2` inline. So
+`resolve_pass2` is **dead production code**, and every test that exercises it
+([`test_cross_file_lineage.py`](../tests/integration/test_cross_file_lineage.py),
+[`test_resolve_pass2_passes_dependency_filter.py`](../tests/unit/test_resolve_pass2_passes_dependency_filter.py),
+[`test_aggregator.py`](../tests/unit/test_aggregator.py),
+[`test_aggregator_skip.py`](../tests/unit/test_aggregator_skip.py)) validates a layer production
+never runs — the **same blind-spot class as #40** (tests measuring a path production doesn't use).
+
+**Chosen approach (preferred — delete + repoint):** delete `resolve_pass2` from
+[`aggregator.py`](../src/sqlcg/lineage/aggregator.py) and repoint its cross-file-lineage *behaviour*
+tests at the production path. The pure-pure pieces production still uses (`register_pass1`,
+`cross_file_sources`, `_needs_pass2`) stay. Justification: the dep-filter + reparse logic already
+lives once in `index_repo`'s pass-2 dispatch; extracting a shared helper that both `index_repo` and
+the tests call is the fallback only if the worker path is impractical to unit-test — but the
+behaviour these tests care about (view/CTAS cross-file column lineage) is already covered through
+the production indexer by the integration suites that run `index_repo` end-to-end, so repointing
+is cleaner than introducing a new helper seam.
+
+**Step 5.1** Delete `resolve_pass2` from `aggregator.py`. Confirm no production caller (grep:
+only tests + the inline `index_repo` logic reference it).
+**Step 5.2** Rewrite/realign the four test files:
+- `test_resolve_pass2_passes_dependency_filter.py` — the `dependency_filter` contract it pins is
+  the inline `dep_names` computation in `index_repo` (indexer.py ~L356) + the worker call in
+  `pool.py` L129. Repoint these to assert the dispatch path builds `dep_names` from
+  `referenced_tables` and passes it as `dependency_filter` (drive `index_repo` on a tiny two-file
+  cross-file fixture and assert the resulting graph carries the cross-file edge, OR unit-test the
+  extracted `dep_names` computation if Step 5 takes the helper fallback).
+- `test_cross_file_lineage.py` — replace the `resolve_pass2(parser, parsed)` loop with an
+  `index_repo` run over the temp fixture; assert the same cross-file column-lineage edges on the
+  resulting graph (observable output, not the dead method's return).
+- `test_aggregator.py` / `test_aggregator_skip.py` — the parts that assert `register_pass1` /
+  `_needs_pass2` / identity-skip behaviour stay (those are live); drop only the `resolve_pass2`
+  re-read/identity assertions, re-expressing the "deleted file during pass 2" warning as a check on
+  the production reparse path if that warning still exists there, else delete it with a note.
+- **Confirm: pure dedup + test-realignment, no production behaviour change.** No graph output
+  changes; this only removes a duplicate and points tests at the real path.
+
+**Sequencing:** independent of #44 — the #44 fix lands in `_build_file_rows` regardless of whether
+`resolve_pass2` exists. Run Phase 5 **after** Phase 2 so the #44 work isn't entangled with the test
+churn; it can also land as the final code phase before release plumbing.
+
+**Patch-scope judgement:** this stays a **patch (1.2.1)** — it removes a duplicate and realigns
+tests at the production path; it ships no new capability and changes no graph output. The
+test-realignment is the only sizeable part; if during implementation it proves larger than a patch
+warrants (e.g. the integration fixtures need substantial new scaffolding), **stop and recommend
+splitting Phase 5 into a follow-up `chore/` PR** — but the default, per the user's instruction, is
+to include it here.
+
+### Phase 6 — Release plumbing
+**Step 6.1** Bump `version = "1.2.1"` in [`pyproject.toml`](../pyproject.toml) and
 `__version__` in [`src/sqlcg/__init__.py`](../src/sqlcg/__init__.py); run `uv lock`.
 (Tagging is post-merge per CLAUDE.md — not part of this plan.)
-**Step 4.2** Full suite green: `uv run pytest`; `uv run pyright`; `uv run ruff check src tests`.
+**Step 6.2** Full suite green: `uv run pytest`; `uv run pyright`; `uv run ruff check src tests`.
 - Acceptance: perf scaling guard ([`test_perf_scaling_guard.py`](../tests/unit/test_perf_scaling_guard.py))
   and bulk/batch upsert invariants stay green (no hot-path regression from Phase 2).
 
@@ -281,6 +407,10 @@ name-prefix belt only if a synthetic node lacks a `SqlTable` node — verify on 
   primary recall defence.
 - **Regression repair proof**: `test_cte_recall_guard.py` collects again and its
   `_half_b_keeps_node_less_physical_source` is green (proves Phase 0).
+- **Phase 5 realignment**: `test_cross_file_lineage.py`, `test_resolve_pass2_passes_dependency_filter.py`,
+  `test_aggregator.py`, `test_aggregator_skip.py` rewritten so the cross-file-lineage assertions run
+  through the production `index_repo`/pool pass-2 path, not the deleted `resolve_pass2`. Live
+  `register_pass1`/`_needs_pass2` assertions retained.
 - **Invariants untouched**: perf scaling + bulk/batch upsert guards must stay green (Phase 2
   only adds dedup-no-op node emission in the node loop, not the per-column lineage loop).
 - **Observable-output rule**: every TC asserts on rendered CLI output / returned source sets,
@@ -294,10 +424,18 @@ name-prefix belt only if a synthetic node lacks a `SqlTable` node — verify on 
 - [ ] TC3: `analyze upstream "mart.fact_kpi.measure"` (schema-qualified DDL name) returns the
       same physical-source set as the schema-less spelling; no schema-less duplicate node in `find`.
 - [ ] TC6: every physical-source row in `analyze upstream/downstream` carries a real `file:line`;
-      only synthetic nodes may show `?`.
-- [ ] TC4: no `cte_*`/derived row appears in default output; present under `--raw`.
+      only synthetic nodes may show `?`; **row count == distinct-source count** (the per-`src`/`dst`
+      aggregation collapses edge fanout before `LIMIT 100`, so no distinct source is silently dropped).
+- [ ] TC4: no `cte_*`/derived row appears in default output; present under `--raw`. The drop is
+      graph-truth: unresolved synthetic INSERT targets are emitted `kind: "derived"` (Phase 2) and the
+      `kind IN ['table','external']` filter excludes them (name-prefix belt only if the fixture forces it).
 - [ ] TC1/TC2/TC5/TC7 green (multi-hop recall, UNION-ALL completeness, CLI↔MCP parity, find/unused honesty).
-- [ ] #44 rewrite leaves ambiguous bare names untouched (unit test asserts no cross-schema merge).
+- [ ] #44 rewrite lands in `_build_file_rows` (not the dead `resolve_pass2`); resolved canonical row
+      `qualified` == DDL `full_id` and `kind: "table"`; ambiguous bare names untouched
+      (unit test asserts no cross-schema merge).
+- [ ] `CrossFileAggregator.resolve_pass2` is deleted (or deduped behind a shared helper) and its
+      tests assert cross-file lineage through the production `index_repo`/pool path; no graph-output
+      change (pure dedup + test realignment).
 - [ ] No new per-row `upsert_node`/`upsert_edge`; perf scaling + bulk/batch upsert guards green.
 - [ ] `version == "1.2.1"` in pyproject + `__init__.py`; `uv lock` refreshed; pyright + ruff clean.
 
@@ -335,7 +473,20 @@ name-prefix belt only if a synthetic node lacks a `SqlTable` node — verify on 
 - **R2 — #44 cross-schema mis-merge** (two schemas define the same bare name).
   *Mitigation*: `_ambiguous_bare` excludes them; unit test asserts no rewrite; the existing
   `_bare_ref` CLI hint stays for the ambiguous case.
-- **R3 — #45.1 row multiplication** from the unbounded `srcedge` match.
-  *Mitigation*: aggregate `min(start_line)` per `src`; TC6 asserts row identity, not just `file:line`.
-- **R4 — Phase 2 hot-path regression.** *Mitigation*: change is in the node-emission loop with
-  dedup-no-op upsert; perf scaling + bulk/batch guards are blocking acceptance criteria.
+- **R3 — #45.1 row multiplication** from the unbounded `srcedge` match silently dropping the 101st
+  distinct source under `LIMIT 100`. *Mitigation*: aggregation per `src`/`dst` before `LIMIT` is a
+  **required** step, not conditional; TC6 asserts row count == distinct-source count, not just `file:line`.
+- **R4 — Phase 2 hot-path regression.** *Mitigation*: change is pure row-dict mutation in the
+  node-emission loop with dedup-no-op upsert (no new `execute()`); perf scaling + bulk/batch guards
+  are blocking acceptance criteria.
+- **R5 — Phase 5 test-realignment scope creep.** Deleting `resolve_pass2` and repointing four test
+  files could balloon beyond a patch. *Mitigation*: it changes no graph output (pure dedup); if the
+  fixture scaffolding proves large the plan permits splitting Phase 5 into a follow-up `chore/` PR
+  without blocking the #44/#45 fixes (which are independent of Phase 5).
+- **R6 — #44/#45.2 kind change mis-tags a real physical target as `derived`.** If a genuine physical
+  INSERT target fails to resolve to a DDL canonical (no `CREATE TABLE` for it), Phase 2 would emit it
+  `kind: "derived"` and the filter would hide it. *Mitigation*: only targets that are unqualified
+  *or* not DDL-defined are eligible for `derived`; a target that *is* its own DDL table keeps
+  `kind: "table"`. Shape C's fixture-verification prerequisite (Phase 3) pins both branches; if a
+  real physical target legitimately has no DDL, that is the #39 node-less tail, handled by the
+  `IS NULL` branch of the restored filter — confirm against the fixture before relying on the kind drop.
