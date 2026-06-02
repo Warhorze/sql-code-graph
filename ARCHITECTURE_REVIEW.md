@@ -2961,6 +2961,13 @@ editor owns the stdio process lifecycle and v1.1 has no launcher to re-spawn it
 Review date: 2026-06-02 · Reconciled by: architect-planner · Branch:
 `feat/v1.2.1-bugfix` · PR #48 · Verdict: **PLAN-COMPLIANT (PASS)**
 
+> **Bundled release note (2026-06-02):** the v1.2.1 bugfix scope (this section) and the
+> downstream-sink `file:line` fix (§19.2) ship as a **single `v1.2.2` release** — the
+> lower `v1.2.1` tag is skipped (precedent: v1.1.2→v1.1.3). Both change sets live on
+> `feat/v1.2.1-bugfix` (PR #48, fast-forwarded to `b5bf7a3`); version is `1.2.2`. The
+> combined plan-compliance verdict (PASS, both scopes) is recorded in
+> [`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) → "Bundled v1.2.2 release compliance".
+
 Patch release fixing the residual user-facing lineage defects (#44 canonical-name
 split, #45 `file:line=?` + `cte_*` leak), repairing the v1.2.0 read-proxy filter
 regression (the #39 read-half), deleting the dead `resolve_pass2` (resolves §3.2),
@@ -3070,7 +3077,7 @@ site, reuses #44 plumbing, plus a behavioural guard). Below the open HIGH §3.x 
 and Finding 19.2 in the ranking. Recorded here; no plan stub drafted yet (pull when
 a lineage-coverage sprint next touches `_build_file_rows`).
 
-### 19.2 [KEEP — HIGH reward / LOW effort] `file:line='?'` on downstream terminal sinks
+### 19.2 [RESOLVED in v1.2.2] `file:line='?'` on downstream terminal sinks
 
 **Measurement.** The #45.1 fix rebinds a result's location from its **outgoing**
 `COLUMN_LINEAGE` edge ("where is this column used as a source"). For *downstream*
@@ -3107,6 +3114,15 @@ so it does **not** catch the regression — the ticket must add a guard assertin
 Plan stub drafted: [`fix_downstream_sink_location.md`](plan/fix_downstream_sink_location.md).
 Suggested release: patch (1.2.2) or fold into the next lineage minor.
 
+**RESOLVED — shipped in v1.2.2 (bundled with v1.2.1; see §18 bundled-release note).**
+Both downstream queries in [`analyze.py`](src/sqlcg/cli/commands/analyze.py) (primary
+L134, bare-name fallback L146) now bind location from the **incoming**
+`()-[dstedge:COLUMN_LINEAGE]->(dst)` edge — the producing query — so terminal sinks
+carry a real `file:line`. Upstream (L77/L89) keeps the outgoing-edge binding, unchanged.
+Guarded by the TC6b terminal-sink test in
+[`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py),
+demonstrably RED on master before the fix.
+
 ### 19.3 Cross-finding note
 
 Both findings share the v1.2.1 root theme: the *graph store* is correct (edges intact,
@@ -3115,3 +3131,17 @@ kinds mostly right); the defects live in the **graph→user presentation layer**
 class as #38/#40 where anchors traversing raw edges pass while the user-facing query
 path is wrong. Any guard for either must drive the **user-facing `analyze` path**,
 not raw `COLUMN_LINEAGE` traversal.
+
+### 19.4 [KEEP — LOW] TC6b guard reconstructs the query instead of running `analyze downstream`
+
+Raised by the plan-reviewer on the §19.2 sink fix. The TC6b terminal-sink guard's helper
+`_downstream_filtered_query()` in
+[`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py)
+**reconstructs the downstream Cypher query string** rather than invoking
+`analyze.downstream()` end-to-end. It therefore can drift from the production query if
+[`analyze.py`](src/sqlcg/cli/commands/analyze.py) changes and the helper is not updated in
+lockstep — exactly the §19.3 blind-spot (a guard not driving the true user-facing path).
+The fix held for v1.2.2 (the helper mirrors the shipped query), but the divergence risk is
+structural. **Future hardening:** replace the string-reconstruction helper with a
+`CliRunner`-based guard that runs the real `analyze downstream` command and asserts the
+rendered output. LOW priority; below §19.1 and the open §3.x items. No plan stub drafted.

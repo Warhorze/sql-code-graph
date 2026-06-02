@@ -99,9 +99,13 @@ None. No schema, index, or dependency change.
 - [ ] A terminal-sink downstream result renders a real `file:line` (TC6b green).
 - [ ] TC6b is demonstrably RED on `master` before the fix (proves it guards the bug).
 - [ ] Full test suite green; no perf/scaling guard regression.
-- [ ] Version bumped to **1.2.2** (patch) per CLAUDE.md release process — standalone
-      release, branched off `master` after PR #48 merges and `v1.2.1` is tagged.
-      Do NOT fold into PR #48 or v1.2.1.
+- [ ] Version bumped to **1.2.2** (patch) per CLAUDE.md release process.
+      **Bundling decision (2026-06-02, supersedes the original standalone plan):** this
+      sink fix and the v1.2.1 bugfix scope ship together as a single **v1.2.2** release;
+      the lower `v1.2.1` tag is **skipped** (precedent: v1.1.2→v1.1.3). The bundled work
+      lives on `feat/v1.2.1-bugfix` (PR #48, fast-forwarded to `b5bf7a3`). The combined
+      plan-compliance verdict is recorded in
+      [`v1_2_1_bugfix.md`](v1_2_1_bugfix.md) under "Bundled v1.2.2 release compliance".
 
 ## Risks and Mitigations
 - **Risk: a `dst` with multiple incoming edges from different queries.** `min()`

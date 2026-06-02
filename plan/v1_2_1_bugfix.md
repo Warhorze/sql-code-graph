@@ -609,3 +609,61 @@ synthetic fixture uses short CTE names (a, b, u, j) rather than `cte_*`, so TC4'
 satisfied trivially on the fixture while the structural `kind:"derived"` mechanism is what defends the real
 DWH corpus (where `cte_insert` names appear). A future doc-only tidy could update the docstring; not a
 compliance failure.
+
+## Bundled v1.2.2 release compliance — 2026-06-02
+
+**Verdict: PASS (combined).** The v1.2.1 bugfix scope (this plan) and the downstream-sink
+`file:line` fix ([`fix_downstream_sink_location.md`](fix_downstream_sink_location.md), ARCHITECTURE_REVIEW
+§19.2) ship together as a single **v1.2.2** release. This is the authoritative combined sign-off for the
+full bundled scope, superseding the two prior per-scope sign-offs (the v1.2.1 "Plan Compliance — 2026-06-02"
+above, and the plan-reviewer GO on the sink fix) as the single release gate.
+
+### Bundling decision
+
+The lower `v1.2.1` tag is **skipped**; the bundle releases as `v1.2.2` (precedent: v1.1.2→v1.1.3). Both
+change sets live on `feat/v1.2.1-bugfix` (PR #48), fast-forwarded to commit `b5bf7a3`. The stale acceptance
+criterion in the sink plan ("standalone release … after `v1.2.1` is tagged. Do NOT fold into PR #48") has
+been corrected in [`fix_downstream_sink_location.md`](fix_downstream_sink_location.md) to record the bundle.
+
+### Branch contents verified (`git log --oneline master..feat/v1.2.1-bugfix`, 18 commits)
+
+The branch contains exactly the v1.2.1 bugfix commits plus the four sink-fix commits, and nothing stray:
+- v1.2.1 bugfix set: `b36aa5a`, `ab0fcf2`, `8621705`, `018d6ee`, `0505c9d`, `ee8b2a0`, `7dda6f8`, `ac765d3`,
+  `9cd1f6e`, `1f3834f`, `f48d8fb`, `418730b`, `4868d55`.
+- `4714a8a` — docs(arch): triage v1.2.1 residuals (findings §19).
+- `e5bb4c7` — docs(plan): downstream sink fix plan (§19.2).
+- `b17f4f8` — test(TC6b): RED acceptance guard for the terminal-sink location bug.
+- `b5bf7a3` — fix(TC6b): flip downstream location binding to the incoming edge — v1.2.2.
+
+### Version verified — 1.2.2 (no leftover v1.2.1 release expectation)
+
+- [`pyproject.toml`](../pyproject.toml) `version = "1.2.2"`.
+- [`src/sqlcg/__init__.py`](../src/sqlcg/__init__.py) `__version__ = "1.2.2"`.
+- [`uv.lock`](../uv.lock) `sql-code-graph` package entry `version = "1.2.2"` (the other `1.2.2` matches in
+  the lock are unrelated third-party packages — `python-dotenv`, etc.).
+- No doc reference now implies a separate `v1.2.1` release/tag is still expected; the sole stale reference
+  (sink plan line 102) was corrected.
+
+### Scope coverage
+
+- **v1.2.1 scope (Phases 0–6).** PASS — see the per-phase "Plan Compliance — 2026-06-02" log above. Code
+  state unchanged by the bundling; the prior per-phase verdicts stand.
+- **Sink fix (§19.2).** PASS. Both downstream queries in
+  [`analyze.py`](../src/sqlcg/cli/commands/analyze.py) (primary L134, bare-name fallback L146) bind location
+  from the **incoming** edge `()-[dstedge:COLUMN_LINEAGE]->(dst)`. The upstream queries (L77/L89) retain the
+  **outgoing** `(src)-[srcedge]->()` binding — unchanged, as the plan's non-goals require. The TC6b terminal-
+  sink guard landed in [`test_user_surface_recall_guard.py`](../tests/integration/test_user_surface_recall_guard.py)
+  (test at L377, helper `_downstream_filtered_query()` at L381), and was demonstrably RED on master before the
+  fix (committed separately as `b17f4f8`).
+
+### Suite / static checks (per release report)
+
+Full suite green: 1000 passed / 7 skipped / 2 xfailed / 0 failed; pyright + ruff clean.
+
+### Out-of-scope follow-up flagged (recorded in ARCHITECTURE_REVIEW §19.4, LOW)
+
+The TC6b guard's helper `_downstream_filtered_query()` **reconstructs the downstream Cypher query string**
+rather than invoking `analyze.downstream()` end-to-end. It can therefore drift from the production query if
+`analyze.py` changes and the helper is not updated in lockstep — the exact §19.3 blind-spot class (guard
+not driving the user-facing path). Future hardening: replace it with a `CliRunner`-based guard that runs the
+real `analyze downstream` command. LOW priority; recorded as ARCHITECTURE_REVIEW §19.4.
