@@ -22,17 +22,33 @@ class CrossFileAggregator:
         # Maps lowercased table name (bare name) -> exp.Select body for CTAS statements.
         # Populated during register_pass1 and used to seed sources_map in pass 2.
         self.cross_file_sources: dict[str, Any] = {}
+        # #44 canonical-name index: bare name (lowercased) -> sole DDL-defined full_id.
+        # Built from DDL-defined tables only (defined_tables, not CTAS bodies).
+        # Used by _build_file_rows to rewrite an unqualified INSERT-target to the
+        # canonical full_id so INSERT-target nodes share identity with the DDL node.
+        self.canonical_by_bare: dict[str, str] = {}
+        # Bare names defined by >1 schema — do NOT rewrite (ambiguous).
+        self._ambiguous_bare: set[str] = set()
 
     def register_pass1(self, parsed: ParsedFile) -> None:
         """Register a pass-1 result and build view/table source map.
 
-        Also harvests CTAS bodies from statements for cross-file temp-table resolution.
+        Also harvests CTAS bodies from statements for cross-file temp-table resolution,
+        and builds the bare-name → canonical-full_id index (#44) from DDL tables.
 
         Args:
             parsed: ParsedFile from pass 1
         """
         for table in parsed.defined_tables:
             self.sources[table.full_id] = parsed
+            # #44: build canonical_by_bare index from DDL-defined tables
+            bare = (table.name or "").lower()
+            if bare:
+                if bare in self.canonical_by_bare and self.canonical_by_bare[bare] != table.full_id:
+                    # Same bare name defined in multiple schemas → ambiguous, never rewrite
+                    self._ambiguous_bare.add(bare)
+                else:
+                    self.canonical_by_bare[bare] = table.full_id
 
         # Harvest CTAS bodies from statements for cross-file resolution.
         # Key convention matches AnsiParser.parse_file line 109: lowercased bare name.
