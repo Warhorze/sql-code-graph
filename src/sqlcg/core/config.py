@@ -350,18 +350,13 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a graph backend instance respecting the SQLCG_BACKEND env var.
 
     Args:
-        read_only: Open in read-only mode.  When ``True``, the KùzuDB open
-            does not take an exclusive write lock, enabling *multiple concurrent
-            read-only opens* (reader/reader concurrency).  CLI read commands
-            pass ``True`` so they do not hold the exclusive write lock and
-            therefore do not block other concurrent readers or a pending reindex.
-            Note: this does NOT allow reads while a read-write writer already
-            holds the exclusive lock — KùzuDB's exclusive write lock is
-            process-level; a ``read_only=True`` open still fails with
-            "Database is locked" when a writer is active.  Reads during an
-            active writer remain a known limitation (future work: route reads
-            through the live MCP server).
-            Neo4j has no single-writer lock; this flag is a no-op there.
+        read_only: Open the database in read-only mode. For KuzuBackend this
+            enables multiple concurrent read-only opens (reader/reader
+            concurrency), but does NOT allow reads while a read-write writer
+            holds the exclusive process lock — that requires routing through the
+            live MCP server via ``read_client.run_read_routed`` (v1.2.0).
+            Ignored for Neo4jBackend (Neo4j has no single-writer process lock;
+            the flag is a no-op and the normal connection is opened).
             All writer call sites (index, reindex, db init/reset, server
             init_backend) use the default ``False``.
 
@@ -370,6 +365,13 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
 
     Raises:
         ValueError: If backend type is not recognized
+
+    Note:
+        CLI read commands (find, analyze, db info, gain) route through a live
+        MCP server via ``read_client.run_read_routed`` (v1.2.0) when a server
+        is live, falling back to ``get_backend(read_only=True)`` when no server
+        is present. The fallback path still contends for the process lock under
+        an active writer (Windows / no-server fallback only).
     """
     backend_type = os.getenv("SQLCG_BACKEND", "kuzu")
 
@@ -396,7 +398,7 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
         from sqlcg.core.neo4j_backend import Neo4jBackend
 
         neo4j_cfg = Neo4jConfig.from_env()
-        # Neo4j has no single-writer lock; read_only is a no-op here.
+        # read_only is ignored for Neo4j — no single-writer process lock.
         return Neo4jBackend(neo4j_cfg.uri, neo4j_cfg.user, neo4j_cfg.password)
     else:
         raise ValueError(f"Unknown backend type: {backend_type}")

@@ -410,7 +410,10 @@ class TestAnalyzeNoiseFilter:
         backend.__exit__ = MagicMock(return_value=False)
         backend.run_read = MagicMock(return_value=[{"id": backup_id}, {"id": normal_id}])
 
-        with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+        with patch(
+            "sqlcg.cli.commands.analyze.run_read_routed",
+            return_value=[{"id": backup_id}, {"id": normal_id}],
+        ):
             # Default: noise filtered out
             result_default = runner.invoke(app, ["analyze", "upstream", "ba.fact.col"])
 
@@ -425,7 +428,10 @@ class TestAnalyzeNoiseFilter:
             f"Normal node {normal_id!r} must appear in output. Output: {result_default.output}"
         )
 
-        with patch("sqlcg.cli.commands.analyze.get_backend", return_value=backend):
+        with patch(
+            "sqlcg.cli.commands.analyze.run_read_routed",
+            return_value=[{"id": backup_id}, {"id": normal_id}],
+        ):
             # --raw: backup node restored
             result_raw = runner.invoke(app, ["analyze", "upstream", "ba.fact.col", "--raw"])
 

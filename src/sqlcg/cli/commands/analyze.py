@@ -8,38 +8,15 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from sqlcg.core.config import get_backend
 from sqlcg.core.queries import GET_TABLE_EXTERNAL_CONSUMERS_QUERY
 from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.server.read_client import run_read_routed
 
 if TYPE_CHECKING:
     from sqlcg.server.noise_filter import NoiseFilter
 
 app = typer.Typer(help="Lineage analysis")
 console = Console()
-
-
-def _kind_filter(source_alias: str, include_intermediate: bool) -> str:
-    """Build the Half-B (#38) kind filter for the lineage traversal query.
-
-    When ``include_intermediate`` is False, the filter uses ``OPTIONAL MATCH`` plus
-    ``t.kind IS NULL OR t.kind IN ['table', 'external']`` so a source whose SqlTable
-    node is ABSENT (a CTE-body source on a graph indexed before the #39 fix, or not yet
-    re-indexed) is KEPT rather than silently dropped.  Reverting this to an inner
-    ``MATCH (t:SqlTable {...}) ... WHERE t.kind IN [...]`` is the #38 regression:
-    node-less physical sources vanish from results.
-
-    ``source_alias`` is ``src`` for upstream and ``dst`` for downstream — it names both
-    the node whose table is looked up and the variable carried through the WITH clause.
-    This is the single production source of the filter string; the #40 recall guard
-    imports it so reverting Half B here turns the guard red.
-    """
-    if include_intermediate:
-        return ""
-    return (
-        f"OPTIONAL MATCH (t:SqlTable {{qualified: {source_alias}.table_qualified}}) "
-        f"WITH c, {source_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
-    )
 
 
 @app.command("upstream")
@@ -57,49 +34,49 @@ def upstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
-    # Half B (#38): use OPTIONAL MATCH so a missing SqlTable node (e.g. CTE-body source not yet
-    # re-indexed after #39 fix) is KEPT rather than silently dropped.  WHERE t.kind IS NULL OR
-    # t.kind IN [...] means: keep when node absent (NULL) OR when kind is a physical source.
-    # CTE aliases (kind='cte') and derived tables (kind='derived') are filtered out.
-    kind_filter = _kind_filter("src", include_intermediate)
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    kind_filter = (
+        ""
+        if include_intermediate
+        else "MATCH (t:SqlTable {qualified: src.table_qualified}) "
+        "WHERE t.kind IN ['table', 'external'] "
+    )
 
-    with get_backend(read_only=True) as backend:
-        results = backend.run_read(
-            f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+    results = run_read_routed(
+        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
+        f"{kind_filter}"
+        f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
+        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+        "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+        {"ref": ref},
+    )
+    if not results and len(ref.split(".")) >= 3:
+        bare = _bare_ref(ref)
+        fallback_results = run_read_routed(
+            f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
             f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
             f"{kind_filter}"
             f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
             "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
             "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
-            {"ref": ref},
+            {"bare": bare},
         )
-        if not results and len(ref.split(".")) >= 3:
-            bare = _bare_ref(ref)
-            fallback_results = backend.run_read(
-                f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
-                f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-                f"{kind_filter}"
-                f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-                "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-                "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
-                {"bare": bare},
+        if fallback_results:
+            console.print(
+                f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                "The INSERT target may have been indexed without a schema prefix. "
+                "Multiple tables with the same unqualified name in different schemas "
+                "would all match — re-index with an explicit schema for precise results."
             )
-            if fallback_results:
-                console.print(
-                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
-                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
-                    "The INSERT target may have been indexed without a schema prefix. "
-                    "Multiple tables with the same unqualified name in different schemas "
-                    "would all match — re-index with an explicit schema for precise results."
-                )
-                results = fallback_results
-        if not raw:
-            from sqlcg.server.noise_filter import NoiseFilter
+            results = fallback_results
+    if not raw:
+        from sqlcg.server.noise_filter import NoiseFilter
 
-            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
-            results = _filter_column_results(results, nf)
-        _print_table(_add_file_line_col(results), ["id", "file:line"])
+        nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+        results = _filter_column_results(results, nf)
+    _print_table(_add_file_line_col(results), ["id", "file:line"])
 
 
 @app.command("downstream")
@@ -117,72 +94,73 @@ def downstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them.
-    # Half B (#38): OPTIONAL MATCH keeps sources whose SqlTable node is absent (NULL) or is a
-    # physical kind.  WITH c, dst, t carries the three variables in scope at this interpolation
-    # point; direct and q are bound later in the query.
-    kind_filter = _kind_filter("dst", include_intermediate)
+    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
+    kind_filter = (
+        ""
+        if include_intermediate
+        else "MATCH (t:SqlTable {qualified: dst.table_qualified}) "
+        "WHERE t.kind IN ['table', 'external'] "
+    )
 
-    with get_backend(read_only=True) as backend:
-        results = backend.run_read(
-            f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+    results = run_read_routed(
+        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
+        f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
+        f"{kind_filter}"
+        f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
+        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
+        "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+        {"ref": ref},
+    )
+    if not results and len(ref.split(".")) >= 3:
+        bare = _bare_ref(ref)
+        fallback_results = run_read_routed(
+            f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
             f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
             f"{kind_filter}"
             f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
             "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
             "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
-            {"ref": ref},
+            {"bare": bare},
         )
-        if not results and len(ref.split(".")) >= 3:
-            bare = _bare_ref(ref)
-            fallback_results = backend.run_read(
-                f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
-                f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-                f"{kind_filter}"
-                f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
-                "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-                "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
-                {"bare": bare},
+        if fallback_results:
+            console.print(
+                f"[yellow]Hint:[/yellow] No results for '{ref}'. "
+                f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
+                "The INSERT target may have been indexed without a schema prefix. "
+                "Multiple tables with the same unqualified name in different schemas "
+                "would all match — re-index with an explicit schema for precise results."
             )
-            if fallback_results:
-                console.print(
-                    f"[yellow]Hint:[/yellow] No results for '{ref}'. "
-                    f"Found {len(fallback_results)} edge(s) under bare name '{bare}'. "
-                    "The INSERT target may have been indexed without a schema prefix. "
-                    "Multiple tables with the same unqualified name in different schemas "
-                    "would all match — re-index with an explicit schema for precise results."
-                )
-                results = fallback_results
-        if not raw:
-            from sqlcg.server.noise_filter import NoiseFilter
+            results = fallback_results
+    if not raw:
+        from sqlcg.server.noise_filter import NoiseFilter
 
-            nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
-            results = _filter_column_results(results, nf)
-        _print_table(_add_file_line_col(results), ["id", "file:line"])
+        nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+        results = _filter_column_results(results, nf)
+    _print_table(_add_file_line_col(results), ["id", "file:line"])
 
-        # Append external consumer rows for terminal tables (scalar query, one per terminal).
-        # Resolve terminal tables from the column results; fall back to the root column's table.
-        terminal_tables: set[str] = set()
-        for r in results:
-            tbl = _col_id_to_table(r["id"])
-            if tbl:
-                terminal_tables.add(tbl)
-        # Also check the root column's table (in case no downstream columns were found).
-        root_parts = ref.rsplit(".", 1)
-        if len(root_parts) == 2:
-            terminal_tables.add(root_parts[0])
-        consumer_rows: list[dict] = []
-        for tbl in sorted(terminal_tables):
-            rows_ec = backend.run_read(
-                GET_TABLE_EXTERNAL_CONSUMERS_QUERY,
-                {"table_qualified": tbl},
+    # Append external consumer rows for terminal tables (scalar query, one per terminal).
+    # Resolve terminal tables from the column results; fall back to the root column's table.
+    terminal_tables: set[str] = set()
+    for r in results:
+        tbl = _col_id_to_table(r["id"])
+        if tbl:
+            terminal_tables.add(tbl)
+    # Also check the root column's table (in case no downstream columns were found).
+    root_parts = ref.rsplit(".", 1)
+    if len(root_parts) == 2:
+        terminal_tables.add(root_parts[0])
+    consumer_rows: list[dict] = []
+    for tbl in sorted(terminal_tables):
+        rows_ec = run_read_routed(
+            GET_TABLE_EXTERNAL_CONSUMERS_QUERY,
+            {"table_qualified": tbl},
+        )
+        for ec in rows_ec:
+            consumer_rows.append(
+                {"id": f"[external] {ec['name']} ({ec['consumer_type']})", "file:line": ""}
             )
-            for ec in rows_ec:
-                consumer_rows.append(
-                    {"id": f"[external] {ec['name']} ({ec['consumer_type']})", "file:line": ""}
-                )
-        if consumer_rows:
-            _print_table(consumer_rows, ["id", "file:line"])
+    if consumer_rows:
+        _print_table(consumer_rows, ["id", "file:line"])
 
 
 @app.command("impact")
@@ -191,19 +169,18 @@ def impact(  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Show all queries impacted by a table."""
-    with get_backend(read_only=True) as backend:
-        results = backend.run_read(
-            f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
-            f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
-            "RETURN DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target LIMIT 100",
-            {"t": table},
-        )
-        if not raw:
-            from sqlcg.server.noise_filter import NoiseFilter
+    results = run_read_routed(
+        f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
+        f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
+        "RETURN DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target LIMIT 100",
+        {"t": table},
+    )
+    if not raw:
+        from sqlcg.server.noise_filter import NoiseFilter
 
-            nf = NoiseFilter.from_config()
-            results = [r for r in results if not nf.is_noise(r.get("target", ""))]
-        _print_table(results, ["id", "kind"])
+        nf = NoiseFilter.from_config()
+        results = [r for r in results if not nf.is_noise(r.get("target", ""))]
+    _print_table(results, ["id", "kind"])
 
 
 @app.command("failures")
@@ -227,15 +204,14 @@ def failures(
     with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
     an earlier version.
     """
-    with get_backend(read_only=True) as backend:
-        cypher = (
-            f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
-            "AND ($cause IS NULL OR f.parse_cause = $cause) "
-            "RETURN f.path AS path, f.parse_cause AS cause "
-            f"ORDER BY f.parse_cause LIMIT {limit}"
-        )
-        rows = backend.run_read(cypher, {"cause": cause})
-        _print_table(rows, ["path", "cause"])
+    cypher = (
+        f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
+        "AND ($cause IS NULL OR f.parse_cause = $cause) "
+        "RETURN f.path AS path, f.parse_cause AS cause "
+        f"ORDER BY f.parse_cause LIMIT {limit}"
+    )
+    rows = run_read_routed(cypher, {"cause": cause})
+    _print_table(rows, ["path", "cause"])
 
 
 @app.command("unused")
@@ -244,18 +220,17 @@ def unused(
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
     """Find tables with no query references."""
-    with get_backend(read_only=True) as backend:
-        results = backend.run_read(
-            f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
-            "RETURN DISTINCT t.qualified AS qualified LIMIT 100",
-            {},
-        )
-        if not raw:
-            from sqlcg.server.noise_filter import NoiseFilter
+    results = run_read_routed(
+        f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
+        "RETURN DISTINCT t.qualified AS qualified LIMIT 100",
+        {},
+    )
+    if not raw:
+        from sqlcg.server.noise_filter import NoiseFilter
 
-            nf = NoiseFilter.from_config()
-            results = [r for r in results if not nf.is_noise(r["qualified"])]
-        _print_table(results, ["qualified"])
+        nf = NoiseFilter.from_config()
+        results = [r for r in results if not nf.is_noise(r["qualified"])]
+    _print_table(results, ["qualified"])
 
 
 def _bare_ref(ref: str) -> str:

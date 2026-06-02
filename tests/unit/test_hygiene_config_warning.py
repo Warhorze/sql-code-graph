@@ -183,12 +183,11 @@ def test_hygiene_find_column_filters_noise_by_default() -> None:
     """
     # ba.foo_bck is a noise table (matches *_bck glob)
     noise_col = {"id": "ba.foo_bck.order_id"}
-    backend = _make_backend([noise_col])
 
     nf_instance = MagicMock()
     nf_instance.is_noise.return_value = True  # foo_bck → noise
 
-    with patch("sqlcg.cli.commands.find.get_backend", return_value=backend):
+    with patch("sqlcg.cli.commands.find.run_read_routed", return_value=[noise_col]):
         with patch("sqlcg.server.noise_filter.NoiseFilter.from_config", return_value=nf_instance):
             result = _runner.invoke(cli_app, ["find", "column", "foo_bck.order_id"])
 
@@ -206,9 +205,8 @@ def test_hygiene_find_column_raw_keeps_noise() -> None:
     find_column has no --raw flag yet.
     """
     noise_col = {"id": "ba.foo_bck.order_id"}
-    backend = _make_backend([noise_col])
 
-    with patch("sqlcg.cli.commands.find.get_backend", return_value=backend):
+    with patch("sqlcg.cli.commands.find.run_read_routed", return_value=[noise_col]):
         result = _runner.invoke(cli_app, ["find", "column", "--raw", "foo_bck.order_id"])
 
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"

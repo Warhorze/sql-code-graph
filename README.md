@@ -229,6 +229,16 @@ sqlcg mcp restart                      # stop the server (client must respawn it
 sqlcg version                          # show installed version
 ```
 
+### Reads while the server is running (v1.2.0)
+
+KuzuDB allows a single writer, so while the MCP server is live it holds the
+database lock. CLI **read** commands (`find`, `analyze`, `db info`, `list-repos`,
+`gain`) automatically route their query through the running server over its
+control socket and return rows as usual — no flag, no config. When no server is
+running they open the database directly, exactly as before. If the server is
+mid-reindex the read waits for it to finish rather than failing with
+"Database is locked".
+
 ## Supported dialects
 
 sqlcg is built on [sqlglot](https://github.com/tobymao/sqlglot), so other dialects

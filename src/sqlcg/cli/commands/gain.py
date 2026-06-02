@@ -7,8 +7,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from sqlcg.core.config import get_backend
 from sqlcg.metrics import store as metrics_module
+from sqlcg.server.read_client import run_read_routed
 from sqlcg.utils.logging import getLogger
 
 logger = getLogger(__name__)
@@ -120,19 +120,21 @@ def gain_cmd(
         )
         execute_cypher_ratio = execute_cypher_count / total_calls if total_calls > 0 else 0
 
-        # Section F: parse quality from graph
+        # Section F: parse quality from graph.
+        # run_read_routed raises typer.Exit (Exception-derived, NOT SystemExit) on
+        # server-busy timeout, so the except-Exception block degrades gracefully
+        # (skips the parse-quality section) instead of crashing gain (WARNING 3).
         parse_quality: dict[str, int] | None = None
         try:
-            with get_backend(read_only=True) as backend:
-                mode_rows = backend.run_read(
-                    "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
-                    " COUNT(q) AS cnt ORDER BY cnt DESC",
-                    {},
-                )
-                if mode_rows and "mode" in mode_rows[0]:
-                    parse_quality = {str(r["mode"]): int(r["cnt"]) for r in mode_rows}
+            mode_rows = run_read_routed(
+                "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
+                " COUNT(q) AS cnt ORDER BY cnt DESC",
+                {},
+            )
+            if mode_rows and "mode" in mode_rows[0]:
+                parse_quality = {str(r["mode"]): int(r["cnt"]) for r in mode_rows}
         except Exception:
-            pass  # graph not available — skip quality section
+            pass  # graph not available or server busy — skip quality section
 
         if json_output:
             payload: dict = {

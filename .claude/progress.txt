@@ -1,3 +1,148 @@
+## Current State — developer: v1.2.0 read-proxy  [2026-06-02]
+
+ACTIVE AGENT: developer
+FEATURE: v1.2.0 — server-routed read proxy (closes remaining half of #28: concurrent reads under write lock)
+TARGET BRANCH: master
+PLAN: plan/v1_2_0_read_proxy.md
+BRANCH: plan/v1.2.0-read-proxy
+STATUS: CODE COMPLETE + TESTED (uncommitted) — Phases 0-4 done. Test suite GREEN:
+  572 passed, 1 skipped, 1 xfailed (full unit + new integration + reindex back-compat).
+  Ready for commit / plan-compliance.
+
+SESSION 2026-06-02 (Opus) — verification + test completion:
+  - VERIFIED the load-bearing assumption empirically: on Kuzu 0.11.3 a second-process
+    read_only=True open FAILS ("Could not set lock") while a writer holds the DB.
+    Confirms the proxy is necessary (a plain read_only fallback cannot fix #28).
+  - Wrote tests/unit/test_read_client.py (8 tests: framed round-trip, >64KiB no-truncation,
+    timeout→typer.Exit caught by bare except, error-response raise, run_read_routed fallback
+    asserts get_backend(read_only=True)).
+  - Wrote tests/integration/test_read_via_server.py (3 scenarios: A #28-proof — separate
+    process gets LOCKED but socket query returns rows; D read-only guard rejects CREATE,
+    graph unchanged; F >64KiB result not truncated). Drives _control_socket_task in-process
+    with a real lock-holding backend (avoids flaky mcp-start subprocess).
+  - FIXED 2 stale tests in test_unqualified_fallback.py (scenario C-downstream + D still
+    patched analyze.get_backend, which no longer exists — repointed to run_read_routed).
+  - DEVIATION from plan: removed server_is_live() — shipped uncalled (run_read_routed uses
+    query_via_server's None-return; stale socket → ConnectionRefused → None covers Scenario C).
+    CLAUDE.md "grep-confirmed call site" rule. Public API is now query_via_server + run_read_routed.
+  - Added README "Reads while the server is running (v1.2.0)" note (Step 4.2).
+  - ruff + pyright clean on new files.
+  NOTE: full `pytest tests/unit` will hang/fail if orphaned sqlcg processes hold the DEFAULT
+  db lock (test_mcp_stdio_smoke / test_star_schema_unit). Kill stray `[sqlcg]` procs first.
+
+PLAN-REVIEWER CORRECTIONS (2026-06-01):
+  B1: get_backend() has no read_only param today → added Phase 0 / Step 0.1 to add read_only
+      pass-through to KuzuBackend; corrected the phantom config.py:362-363 docstring cite
+      (actual docstring config.py:350-357 has no "route reads" note).
+  B2: framed receive loop mechanism specified — server: BufferedByteReceiveStream +
+      receive_until(b"\n", max_bytes=64) + receive_exactly(n); client: recv-exactly
+      (makefile/loop), never single recv. server.py:122 is receive(4096) today.
+  W1: analyze.py line numbers fixed (~45,106,174,210,227 not 67/126/194/230/247); enumerated
+      all 6 run_read incl. downstream loop ~156; db.py clarified (only db info + list-repos;
+      db init/reset are write paths, out of scope).
+  W2: documented sniff is server-side request-path only; unframed client gets JSONDecodeError.
+  W3: run_read_routed raises typer.Exit (Exception-derived) on server-busy → gain.py:134
+      except Exception degrades gracefully.
+  Notes: control.py:39 with_suffix → graph.sock (pre-existing cosmetic); reindex_lock rename
+      = all 7 occurrences incl docstrings.
+
+---
+
+## Handoff — developer: v1.1.3 union-cte-star  [2026-06-01]
+
+ACTIVE AGENT: developer (complete)
+FEATURE: v1.1.3 — SELECT * over N-branch UNION ALL of sibling CTEs (residual #38)
+BRANCH: feat/v1.1.3-union-cte-star
+PLAN: plan/v1_1_3_union_cte_star.md
+STATUS: PR OPEN — ready for plan-compliance check
+PR: https://github.com/Warhorze/sql-code-graph/pull/42
+
+COMMITS:
+  f6f276b  fix(#38): derive union-CTE columns from deepest branch SELECT — preserve hop
+
+FILES CHANGED:
+  - src/sqlcg/parsers/base.py (Step 1.1: deepest-left-branch Select walk in CTE-projection loop)
+  - pyproject.toml (Step 3.1: version bump 1.1.2 → 1.1.3)
+  - src/sqlcg/__init__.py (Step 3.1: __version__ = "1.1.3")
+  - uv.lock (updated lockfile)
+
+PRODUCTION CHANGE (base.py:976-981):
+  Before: if isinstance(cte_body, exp.Union): projection_source = cte_body.this
+  After:  if isinstance(cte_body, exp.Union):
+              projection_source = cte_body.this
+              while isinstance(projection_source, exp.Union):
+                  projection_source = projection_source.this
+  The while loop walks to the deepest left-branch Select once per CTE, O(N_branches).
+  The sg_lineage call is byte-for-byte unchanged (no sources=, no union_cte_sources).
+
+TEST RESULTS:
+  Acceptance tests (test_union_cte_star_recall_guard.py):
+    - test_union_star_cte_gets_incoming_edges: PASS (was RED)
+    - test_union_star_cte_incoming_edges_are_cte_projection: PASS (was RED)
+    - test_union_star_cte_mcp_upstream_reaches_physical_sources: PASS (was RED)
+    - test_explicit_column_union_still_traces: PASS (stayed GREEN)
+  Anchor tests (test_anchor_ma_aantal_op_order.py 6/6): PASS
+  CTE recall guards (test_cte_recall_guard, test_cte_source_node_invariant, test_cte_schema_alias_guard): PASS
+  Perf invariant guards (scaling, qualify-once, bulk-upsert, batch-upsert): 11/11 PASS
+  Full suite (excl. e2e): 879 passed, 4 skipped, 1 xfailed, 0 failed
+  pyright: 0 errors | ruff: all checks passed
+
+WIRING VERIFIED:
+  - No sources= in CTE-projection loop (grep confirmed)
+  - No union_cte_sources anywhere (grep confirmed)
+  - projection_source walk: def + inline in CTE-projection loop, used before for cte_col_expr loop
+  - CTE hop preserved: test_union_star_cte_incoming_edges_are_cte_projection asserts direct
+    upstream is branch CTE column (cte_a.total_amt), NOT physical source
+
+DEVIATIONS: None. The fix is exactly Step 1.1 as specified in the corrected plan.
+  The unstaged changes were from a prior abandoned attempt (same correct changes, not yet committed).
+
+NEXT: architect-planner plan-compliance check.
+
+---
+
+## Handoff — architect-planner: v1.1.3 union-cte-star HOP-PRESERVING REDESIGN  [2026-06-01]
+
+ACTIVE AGENT: architect-planner (complete)
+FEATURE: v1.1.3 — SELECT * over N-branch UNION ALL of sibling CTEs (residual #38)
+BRANCH: feat/v1.1.3-union-cte-star
+
+WHY REVISED: implementation surfaced a design flaw. The prior plan passed sources= to
+sg_lineage on the union-star path, which COLLAPSES the CTE hop (cte_union.col <- physical.col
+directly). That broke the anchor tests (bm_orders.aantal_op_order -> openstaand_combined.*
+hop must be preserved) and made the graph inconsistent: explicit-column unions keep the CTE
+hop, star-unions would not. User decision: star-unions MUST preserve the CTE hop too.
+
+CORRECTED DESIGN (simplification, NOT a sources= addition):
+  - Only real change: when projection_source is exp.Union, walk to deepest left-branch
+    exp.Select (while isinstance(ps, exp.Union): ps = ps.this) and use ps.expressions as
+    the column list. Computed ONCE per CTE, O(N_branches).
+  - The statement-level qualify (base.py:670) mutates `body` in place and expands SELECT *
+    into the deepest left-branch Select of cte_union (VERIFIED: deepest projs =
+    'CTE_A.TOTAL_AMT AS TOTAL_AMT'). So the columns ARE derivable post-qualify.
+  - Then the SAME existing no-sources= sg_lineage(col, cte_body_sql) call runs per column.
+    VERIFIED: with no sources=, leaves are CTE_A.TOTAL_AMT / CTE_B / CTE_C (branch CTE cols),
+    emitting cte_union.col <- cte_X.col CTE_PROJECTION edges — hop preserved.
+  - union_cte_sources / sources= mechanism FULLY REMOVED from the plan.
+  - Branch CTEs already get cte_X.col <- physical.col from normal processing; multi-hop
+    upstream traversal reaches physical sources.
+
+PERF: trivially preserved. Same sg_lineage call count, no sources= inlining, no new
+exp.expand(); only added cost is O(N_branches) deepest-Select walk once per union CTE.
+
+TESTS REVISED (tests/integration/test_union_cte_star_recall_guard.py):
+  - test_union_star_cte_gets_incoming_edges: >=1 incoming edge (unchanged intent). RED today.
+  - test_union_star_cte_incoming_edges_are_cte_projection: now asserts source is a BRANCH
+    CTE column (cte_a.total_amt), NOT a collapsed physical source. RED today.
+  - test_union_star_cte_mcp_upstream_reaches_physical_sources: multi-hop traversal still
+    reaches staging.src_* THROUGH the preserved hops. RED today (island, returns []).
+  - test_explicit_column_union_still_traces: GREEN today and after fix.
+  Anchor tests tests/snowflake/anchors/test_anchor_ma_aantal_op_order.py: GREEN at HEAD.
+
+NEXT: developer implements Step 1.1 (deepest-Select walk) on feat/v1.1.3-union-cte-star.
+
+---
+
 ## Handoff — plan-reviewer: v1.1.3 union-cte-star  [2026-06-01]
 
 ACTIVE AGENT: plan-reviewer (complete)
@@ -1852,9 +1997,3 @@ Handoff — plan-reviewer (2026-05-30):
   NOTE: No failing acceptance tests written in this focused re-gate (this was
     a verification-only pass per user instruction "Do not edit the plan").
     The plan is ready for developer implementation as-is.
-
-## Current State — architect-planner: v1.1.2 bug-fix release  [2026-06-01]
-AGENT: architect-planner
-FEATURE: v1.1.2 bug-fix release (issues #38, #39, #40, #28; #29 = dependency context)
-OUTPUT: plan/v1_1_2_bugfix.md
-STATUS: planning — ready for plan-reviewer on completion

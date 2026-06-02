@@ -77,24 +77,39 @@ async def _control_socket_task(
     db_path: "Path",
     backend_ref: "Callable[[], GraphBackend | None]",
     stop_event: "anyio.Event",
-    reindex_lock: "anyio.Lock",
+    backend_lock: "anyio.Lock",
     start_time: float,
 ) -> None:
     """Accept control connections on ``<db>.sock`` and dispatch ops.
 
-    Supported ops (newline-delimited JSON request → response):
+    Supported ops:
 
     - ``{"op": "status"}`` → running state, pid, db_path, freshness, uptime.
+      Unframed (legacy single-recv protocol).
     - ``{"op": "stop"}`` → sends ``{"ok": true}`` then signals stop via
-      *stop_event*.  The ``_run_with_control`` coroutine watches this event
-      and closes stdin to trigger EOF in the MCP stdio loop.
+      *stop_event*.  Unframed.
     - ``{"op": "reindex", "root", "from", "to", "dialect"}`` → runs
       ``Indexer.resync_changed`` off the event-loop thread via
-      ``anyio.to_thread.run_sync``, serialised behind *reindex_lock* (R1, R2).
+      ``anyio.to_thread.run_sync``, serialised behind *backend_lock* (R1, R2).
+      Unframed.
+    - ``{"op": "query", "cypher": ..., "params": ...}`` → executes a
+      read-only Cypher query on the single backend connection, serialised
+      behind *backend_lock*.  **Length-prefixed framing** (v1.2.0):
+      ``<decimal-byte-length>\\n<json-body>`` on both request and response.
 
-    R2 (single connection): all backend mutations go through ``reindex_lock``
-    so concurrent notify calls never touch the single Kuzu connection
-    simultaneously.
+    Framing protocol (v1.2.0, ``query`` op only):
+      Request: ``b"<len>\\n" + json_body`` — server detects by sniffing the
+      first line; a bare decimal integer → framed.  Unframed requests always
+      start with ``{`` (never a digit), so the sniff is unambiguous.
+      Response: same ``<len>\\n<body>`` format for framed requests; unframed
+      response for unframed requests.  Old clients that use the unframed
+      ``s.recv(65536)`` + ``json.loads`` pattern will get a loud
+      ``json.JSONDecodeError`` if they accidentally receive a framed response —
+      NOT silent truncation.  Only the new ``read_client`` sends framed
+      requests, so this does not affect existing callers.
+
+    R2 (single connection): all backend operations go through ``backend_lock``
+    so concurrent calls never touch the single Kuzu connection simultaneously.
 
     R8 teardown ordering: the caller must cancel this task BEFORE calling
     ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
@@ -108,8 +123,24 @@ async def _control_socket_task(
     import anyio
     import anyio.abc as _anyio_abc
     import anyio.to_thread as _to_thread
+    from anyio.streams.buffered import BufferedByteReceiveStream
 
     from sqlcg.core.config import get_db_path as _get_db_path
+
+    # Read-only keyword allow-list for the ``query`` op.  Only these leading
+    # keywords are permitted — anything that starts with a write keyword is
+    # rejected before execution.  This is a guard against accidental mutation,
+    # not a security boundary (the socket is already 0o600 / owner-only).
+    _QUERY_ALLOWED_KEYWORDS = frozenset({"MATCH", "RETURN", "WITH", "CALL", "UNWIND", "OPTIONAL"})
+
+    def _is_read_only_cypher(cypher: str) -> bool:
+        """Return True iff the leading keyword is in the read-only allow-list."""
+        import re
+
+        m = re.match(r"\s*(?:--[^\n]*)?\s*(\w+)", cypher, re.IGNORECASE)
+        if not m:
+            return False
+        return m.group(1).upper() in _QUERY_ALLOWED_KEYWORDS
 
     sp = sock_path(db_path)
 
@@ -119,8 +150,29 @@ async def _control_socket_task(
     async def _handle_connection(stream: _anyio_abc.SocketStream) -> None:
         async with stream:
             try:
-                raw = await stream.receive(4096)
-                req = json.loads(raw)
+                # Sniff for framed vs unframed request.
+                # Framed (query op, v1.2.0): ``<decimal-len>\n<json-body>``
+                # Unframed (legacy status/stop/reindex): JSON object starting with ``{``
+                # The sniff is unambiguous: unframed JSON always starts with ``{``,
+                # never a bare decimal digit.
+                buf = BufferedByteReceiveStream(stream)
+                first_line = await buf.receive_until(b"\n", max_bytes=64)
+
+                try:
+                    body_len = int(first_line.strip())
+                    framed = True
+                except ValueError:
+                    framed = False
+
+                if framed:
+                    # Framed request: read exactly body_len bytes then parse.
+                    raw_body = await buf.receive_exactly(body_len)
+                    req = json.loads(raw_body)
+                else:
+                    # Unframed request (legacy ops): first_line IS the JSON
+                    # (terminated by \n as sent by the client).
+                    req = json.loads(first_line)
+
                 op = req.get("op")
 
                 if op == "status":
@@ -195,15 +247,42 @@ async def _control_socket_task(
                                     dialect,
                                 )
 
-                            async with reindex_lock:
+                            async with backend_lock:
                                 # R1: run off event-loop thread; R2: lock serialises
                                 summary = await _to_thread.run_sync(_do_reindex)
                             resp = {"ok": True, "summary": summary}
 
+                elif op == "query":
+                    # Framed op (v1.2.0): read-only Cypher query over the socket.
+                    # Must only be called with a framed request (sniff above sets framed=True).
+                    cypher = req.get("cypher", "")
+                    params = req.get("params") or {}
+                    if not _is_read_only_cypher(cypher):
+                        resp = {"error": "query op is read-only"}
+                    else:
+                        db = backend_ref()
+                        if db is None:
+                            resp = {"error": "backend not available"}
+                        else:
+
+                            def _do_query() -> list:
+                                return db.run_read(cypher, params)
+
+                            async with backend_lock:
+                                # R1: run off event-loop thread; R2: lock serialises
+                                # reads and writes on the single Kuzu connection.
+                                rows = await _to_thread.run_sync(_do_query)
+                            resp = {"ok": True, "rows": rows}
+
                 else:
                     resp = {"error": f"unknown op: {op!r}"}
 
-                await stream.send(json.dumps(resp).encode() + b"\n")
+                # Send response: framed for framed requests, unframed for legacy ops.
+                resp_bytes = json.dumps(resp).encode()
+                if framed:
+                    await stream.send(f"{len(resp_bytes)}\n".encode() + resp_bytes)
+                else:
+                    await stream.send(resp_bytes + b"\n")
 
             except Exception as exc:
                 try:
@@ -289,16 +368,16 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
     with ``abandon_on_cancel=False``).  We cannot interrupt it without
     killing the process; ``_stop_watcher`` does cleanup first.
 
-    ``reindex_lock`` is created once here and passed into
-    ``_control_socket_task`` so concurrent notify calls are serialised
-    behind a single lock (R2).
+    ``backend_lock`` is created once here and passed into
+    ``_control_socket_task`` so concurrent control ops (reindex, query) are
+    serialised behind a single lock on the Kuzu connection (R2).
     """
     import anyio
 
     import sqlcg.server.tools as _tools
 
     stop_event = anyio.Event()
-    reindex_lock = anyio.Lock()  # R2: serialise reindex ops (Kuzu not thread-safe)
+    backend_lock = anyio.Lock()  # R2: serialise all backend ops (Kuzu not thread-safe)
 
     async with anyio.create_task_group() as tg:
         if sys.platform != "win32":
@@ -308,7 +387,7 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
                 db_path,
                 lambda: _tools._backend,
                 stop_event,
-                reindex_lock,
+                backend_lock,
                 start_time,
             )
             # Watch stop_event; shuts down and calls os._exit(0).
