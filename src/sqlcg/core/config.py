@@ -357,6 +357,8 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
             live MCP server via ``read_client.run_read_routed`` (v1.2.0).
             Ignored for Neo4jBackend (Neo4j has no single-writer process lock;
             the flag is a no-op and the normal connection is opened).
+            All writer call sites (index, reindex, db init/reset, server
+            init_backend) use the default ``False``.
 
     Returns:
         A GraphBackend instance (KuzuBackend by default, or Neo4jBackend)
@@ -377,11 +379,21 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
         from sqlcg.core.kuzu_backend import KuzuBackend
 
         kuzu_cfg = KuzuConfig.from_env()
-        return KuzuBackend(
-            str(kuzu_cfg.db_path),
-            buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
-            read_only=read_only,
-        )
+        try:
+            return KuzuBackend(
+                str(kuzu_cfg.db_path),
+                buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
+                read_only=read_only,
+            )
+        except RuntimeError as exc:
+            if read_only and "READ ONLY" in str(exc):
+                # KùzuDB refuses to open a non-existent or empty DB in read-only
+                # mode ("Cannot create an empty database under READ ONLY mode").
+                # Surface the same empty-DB guidance the user sees from `db info`.
+                raise RuntimeError(
+                    "Database not initialised — run 'sqlcg db init' and 'sqlcg index <path>' first."
+                ) from exc
+            raise
     elif backend_type == "neo4j":
         from sqlcg.core.neo4j_backend import Neo4jBackend
 

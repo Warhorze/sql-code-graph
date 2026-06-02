@@ -1126,6 +1126,24 @@ class Indexer:
                         "table_name": edge.src.table.name,
                     }
                 )
+                # Half A (#39): emit a SqlTable node for the source table.
+                # CTE-body-only sources are not in stmt.sources (which only covers
+                # tables reachable via the parser's top-level FROM list), so they were
+                # previously missing from the graph.  edge.src.table is a frozen
+                # TableRef with schema-aliasing already applied at parse time — the
+                # qualified value is guaranteed to match edge.src.table_qualified.
+                # key set is identical to other table_rows entries → upsert_nodes_bulk
+                # homogeneity preserved; MERGE on primary key deduplicates re-emits.
+                rows.table_rows.append(
+                    {
+                        "qualified": edge.src.table.full_id,
+                        "name": edge.src.table.name,
+                        "catalog": edge.src.table.catalog or "",
+                        "db": edge.src.table.db or "",
+                        "kind": edge.src.table.role,
+                        "defined_in_file": "",
+                    }
+                )
                 rows.column_rows.append(
                     {
                         "id": dst_id,
