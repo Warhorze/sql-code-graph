@@ -381,8 +381,16 @@ def test_duplicate_ddl_error_recorded_in_parsed_errors(temp_db, tmp_path):
     captured_errors: list[list[str]] = []
     original_build = Indexer._build_file_rows
 
-    def recording_build(self, parsed, defined_table_registry=None):
-        result = original_build(self, parsed, defined_table_registry)
+    def recording_build(
+        self,
+        parsed,
+        defined_table_registry=None,
+        canonical_by_bare=None,
+        ambiguous_bare=None,
+    ):
+        result = original_build(
+            self, parsed, defined_table_registry, canonical_by_bare, ambiguous_bare
+        )
         captured_errors.append(list(parsed.errors))
         return result
 

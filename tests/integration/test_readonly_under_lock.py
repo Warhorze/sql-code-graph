@@ -325,34 +325,39 @@ _READ_CALL_SITES = [
 def test_read_command_opens_readonly_backend(
     module: str, func_name: str, call_kwargs: dict
 ) -> None:
-    """Assert each CLI read command calls get_backend(read_only=True).
+    """Assert each CLI read command routes reads through run_read_routed.
 
-    Patches get_backend at the import site inside the command module (not at
-    the definition site in config.py) so the mock intercepts the actual call.
-    Reverting read_only=True at any call site makes the corresponding case fail.
+    Since v1.2.0, CLI read commands no longer call get_backend(read_only=True)
+    directly — they call run_read_routed() which handles server-routing and falls
+    back to get_backend(read_only=True) when no server is live.  This test
+    verifies that the seam is used, not the old direct get_backend call.
+
+    Patches run_read_routed at the import site inside the command module so the
+    mock intercepts the actual call.  Reverting a read command to bypass
+    run_read_routed (e.g. inline get_backend) makes the corresponding case fail.
     """
     mod = importlib.import_module(module)
     func = getattr(mod, func_name)
 
-    captured: list[dict] = []
+    called: list[bool] = []
 
-    def _capturing(**kw):  # type: ignore[override]
-        captured.append(kw)
-        return _make_mock_backend()
+    def _capturing_routed(cypher, params, **kw):  # type: ignore[override]
+        called.append(True)
+        return []  # empty result set — downstream code handles gracefully
 
-    # Patch at the module where get_backend is used (imported-by-name), not at
-    # the definition site (sqlcg.core.config).
-    with patch(f"{module}.get_backend", _capturing):
+    # Patch at the module where run_read_routed is used (imported-by-name).
+    with patch(f"{module}.run_read_routed", _capturing_routed):
         try:
             func(**call_kwargs)
         except SystemExit:
-            pass  # typer.Exit is fine; kwarg capture is what matters
+            pass  # typer.Exit is fine; call capture is what matters
         except Exception:
-            pass  # backend mock may cause downstream errors; kwarg capture is what matters
+            pass  # downstream errors after mock return are not our concern
 
-    assert captured, f"{func_name}: get_backend was not called"
-    assert captured[0].get("read_only") is True, (
-        f"{func_name}: expected get_backend(read_only=True), got get_backend(**{captured[0]})"
+    assert called, (
+        f"{func_name}: run_read_routed was not called. "
+        "CLI read commands must route through run_read_routed (v1.2.0+) "
+        "so reads fall back to read_only=True when no server is live."
     )
 
 
@@ -394,17 +399,21 @@ def test_db_reset_does_not_open_readonly_backend() -> None:
 
 
 def test_gain_cmd_opens_readonly_backend() -> None:
-    """gain (Section F parse-quality read) must open get_backend(read_only=True).
+    """gain (Section F parse-quality read) must route through run_read_routed.
 
-    gain_cmd's backend call is inside a conditional (only reached when the metrics DB
-    exists), so it is pinned by source inspection rather than the parametrized invoke
-    test above.  Reverting the flag at gain.py's read site reds this.
+    Since v1.2.0, gain.py uses run_read_routed() for read queries so that when
+    the server is live, the query routes through the server socket rather than
+    opening the DB directly (which would hit the write lock).  run_read_routed
+    falls back to get_backend(read_only=True) when no server is running.
+
+    Pinned by source inspection — reverting to a direct get_backend() call or
+    removing run_read_routed from gain.py's read path reds this test.
     """
     import inspect
 
     from sqlcg.cli.commands import gain as gain_module
 
     source = inspect.getsource(gain_module.gain_cmd)
-    assert "get_backend(read_only=True)" in source, (
-        "gain_cmd must open its parse-quality read with get_backend(read_only=True)"
+    assert "run_read_routed" in source, (
+        "gain_cmd must route its parse-quality read through run_read_routed (v1.2.0+)"
     )

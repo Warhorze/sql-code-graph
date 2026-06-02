@@ -70,12 +70,17 @@ class TestPerFileCommitBoundary:
         call_count = 0
         original_build = indexer._build_file_rows
 
-        def failing_build(parsed, defined_table_registry=None):
+        def failing_build(
+            parsed,
+            defined_table_registry=None,
+            canonical_by_bare=None,
+            ambiguous_bare=None,
+        ):
             nonlocal call_count
             call_count += 1
             if call_count == 3:
                 raise RuntimeError("Simulated build failure")
-            return original_build(parsed, defined_table_registry)
+            return original_build(parsed, defined_table_registry, canonical_by_bare, ambiguous_bare)
 
         with patch.object(indexer, "_build_file_rows", side_effect=failing_build):
             summary = indexer.index_repo(tmp_path, dialect=None, db=backend)
