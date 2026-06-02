@@ -19,6 +19,33 @@ app = typer.Typer(help="Lineage analysis")
 console = Console()
 
 
+def _kind_filter(node_alias: str, *, include_intermediate: bool) -> str:
+    """Build the SqlTable kind-filter clause for upstream/downstream queries.
+
+    Uses an OPTIONAL MATCH + ``kind IS NULL OR kind IN [...]`` form (Half B of the
+    #38/#39 fix) so that a node-less physical source — one whose SqlTable node is
+    absent because it was only seen inside a CTE body before re-index — is KEPT, not
+    dropped.  CTE/derived intermediates carry ``kind='cte'`` or ``kind='derived'`` and
+    are excluded by the ``kind IN [...]`` guard; ``IS NULL`` does not match them.
+
+    Args:
+        node_alias: The Cypher alias for the column node whose table is filtered
+                    (``"src"`` for upstream, ``"dst"`` for downstream).
+        include_intermediate: When True, return an empty string (no filtering);
+                              all intermediates including CTE nodes are kept.
+
+    Returns:
+        A Cypher fragment string (with trailing space) to embed directly in the query,
+        or an empty string when include_intermediate is True.
+    """
+    if include_intermediate:
+        return ""
+    return (
+        f"OPTIONAL MATCH (t:SqlTable {{qualified: {node_alias}.table_qualified}}) "
+        f"WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    )
+
+
 @app.command("upstream")
 def upstream(  # noqa: B008
     ref: str = typer.Argument(..., help="Column reference"),  # noqa: B008
@@ -35,20 +62,16 @@ def upstream(  # noqa: B008
         raise typer.Exit(1)
 
     # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "MATCH (t:SqlTable {qualified: src.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
-    )
+    kf = _kind_filter("src", include_intermediate=include_intermediate)
 
     results = run_read_routed(
         f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
         f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kind_filter}"
-        f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-        "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+        f"{kf}"
+        f"OPTIONAL MATCH (src)-[srcedge:{RelType.COLUMN_LINEAGE}]->() "
+        "OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id}) "
+        "WITH src, min(q.start_line) AS line, min(q.file_path) AS file "
+        "RETURN src.id AS id, file AS file, line AS line LIMIT 100",
         {"ref": ref},
     )
     if not results and len(ref.split(".")) >= 3:
@@ -56,10 +79,11 @@ def upstream(  # noqa: B008
         fallback_results = run_read_routed(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
             f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-            f"{kind_filter}"
-            f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-            "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-            "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+            f"{kf}"
+            f"OPTIONAL MATCH (src)-[srcedge:{RelType.COLUMN_LINEAGE}]->() "
+            "OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id}) "
+            "WITH src, min(q.start_line) AS line, min(q.file_path) AS file "
+            "RETURN src.id AS id, file AS file, line AS line LIMIT 100",
             {"bare": bare},
         )
         if fallback_results:
@@ -95,20 +119,16 @@ def downstream(  # noqa: B008
         raise typer.Exit(1)
 
     # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kind_filter = (
-        ""
-        if include_intermediate
-        else "MATCH (t:SqlTable {qualified: dst.table_qualified}) "
-        "WHERE t.kind IN ['table', 'external'] "
-    )
+    kf = _kind_filter("dst", include_intermediate=include_intermediate)
 
     results = run_read_routed(
         f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
         f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-        f"{kind_filter}"
-        f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
-        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-        "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+        f"{kf}"
+        f"OPTIONAL MATCH (dst)-[dstedge:{RelType.COLUMN_LINEAGE}]->() "
+        "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
+        "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
+        "RETURN dst.id AS id, file AS file, line AS line LIMIT 100",
         {"ref": ref},
     )
     if not results and len(ref.split(".")) >= 3:
@@ -116,10 +136,11 @@ def downstream(  # noqa: B008
         fallback_results = run_read_routed(
             f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
             f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-            f"{kind_filter}"
-            f"OPTIONAL MATCH (c)-[direct:{RelType.COLUMN_LINEAGE}]->(dst) "
-            "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-            "RETURN dst.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100",
+            f"{kf}"
+            f"OPTIONAL MATCH (dst)-[dstedge:{RelType.COLUMN_LINEAGE}]->() "
+            "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
+            "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
+            "RETURN dst.id AS id, file AS file, line AS line LIMIT 100",
             {"bare": bare},
         )
         if fallback_results:
