@@ -93,8 +93,11 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     This is the v1.1.1 batch-flush core: called once per batch (not once per file).
     Dedup keys mirror the graph's MERGE cardinality:
       - file_rows:             path (primary key)
-      - table_rows:            qualified (primary key); prefers row with non-empty
-                               defined_in_file so DEFINED_IN provenance is preserved.
+      - table_rows:            qualified (primary key); prefers (1) row with non-empty
+                               defined_in_file so DEFINED_IN provenance is preserved;
+                               (2) structural kind ('cte','derived','external') over
+                               default 'table' so CTE aliases keep kind='cte' even when
+                               also seen as source references with the default kind.
       - column_rows:           id (primary key)
       - query_rows:            id (primary key, globally unique path:index)
       - edge rows:             (src_key, dst_key) only — matches MERGE (src)-[r]->(dst)
@@ -108,12 +111,27 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     # --- Phase B: batch-scoped dedup ---
     # For table_rows, prefer defined rows (non-empty defined_in_file) so provenance
     # is not lost when a shared table is referenced by multiple files.
+    # Also prefer structurally-assigned kinds ('cte', 'derived', 'external') over the
+    # default 'table' kind: a CTE alias emitted first as a source reference (kind='table'
+    # default) and later confirmed as a CTE destination (kind='cte') must keep 'cte' so
+    # the kind filter correctly excludes it from default filtered output.
+    _structural_kinds = {"cte", "derived", "external"}
     table_dedup: dict[str, dict] = {}
     for r in buf.table_rows:
         key = r["qualified"]
         existing = table_dedup.get(key)
-        if existing is None or (not existing.get("defined_in_file") and r.get("defined_in_file")):
+        if existing is None:
             table_dedup[key] = r
+        else:
+            # Rule 1: prefer rows with defined_in_file (DDL provenance)
+            if not existing.get("defined_in_file") and r.get("defined_in_file"):
+                table_dedup[key] = r
+            # Rule 2: prefer structural kind over default 'table'
+            elif (
+                existing.get("kind", "table") not in _structural_kinds
+                and r.get("kind", "table") in _structural_kinds
+            ):
+                table_dedup[key] = r
     table_rows = list(table_dedup.values())
 
     column_rows = list({r["id"]: r for r in buf.column_rows}.values())
@@ -432,7 +450,14 @@ class Indexer:
             Note: sqlcg watch's reindex_file uses a separate code path with
             its own short per-file transaction. PERF-BATCH only affects index_repo.
             """
-            self._upsert_file_batch(batch, db, defined_table_registry, nonlocal_counts)
+            self._upsert_file_batch(
+                batch,
+                db,
+                defined_table_registry,
+                nonlocal_counts,
+                canonical_by_bare=aggregator.canonical_by_bare,
+                ambiguous_bare=aggregator._ambiguous_bare,
+            )
 
         if profile:
             _t_upsert_start = time.perf_counter()
@@ -975,6 +1000,8 @@ class Indexer:
         self,
         parsed: ParsedFile,
         defined_table_registry: dict[str, str] | None = None,
+        canonical_by_bare: dict[str, str] | None = None,
+        ambiguous_bare: set[str] | None = None,
     ) -> FileRowSet:
         """Build all row dicts for one ParsedFile — Phase A (pure, no db access).
 
@@ -986,6 +1013,13 @@ class Indexer:
         Args:
             parsed: ParsedFile to build rows for
             defined_table_registry: Optional cross-file DDL dedup registry
+            canonical_by_bare: Optional #44 bare-name → canonical full_id index
+                (populated by CrossFileAggregator.register_pass1 from DDL tables).
+                When provided, unqualified INSERT targets whose bare name maps to
+                exactly one DDL canonical are rewritten to use the canonical full_id.
+                When None, the rewrite is skipped (single-file / reindex_file path).
+            ambiguous_bare: Optional set of bare names defined in >1 schema.
+                These are never rewritten — the existing _bare_ref CLI hint handles them.
 
         Returns:
             FileRowSet with all row lists and per-file counts/quality key
@@ -1201,15 +1235,53 @@ class Indexer:
                 rows.counts["star_sources"] += 1
 
             # Upsert target table node (if not already a defined_table)
-            # so that star expansion can create destination columns
+            # so that star expansion can create destination columns.
+            # #44: when a canonical_by_bare index is available, attempt to resolve
+            # an unqualified / wrong-schema INSERT target to its DDL-canonical full_id
+            # so that INSERT-target nodes share identity with the DDL node.
             if stmt.target and stmt.target.full_id not in defined_table_ids:
+                target_qualified = stmt.target.full_id
+                target_name = stmt.target.name
+                target_db = stmt.target.db or ""
+                target_catalog = stmt.target.catalog or ""
+                target_kind = "table"
+
+                # #44 canonical-name resolution: if bare name maps unambiguously to a
+                # DDL-defined table, use the canonical full_id for the emitted row.
+                # Degrading to no-op when canonical_by_bare is None (single-file path).
+                if canonical_by_bare is not None:
+                    bare = (stmt.target.name or "").lower()
+                    if bare and bare not in (ambiguous_bare or set()) and bare in canonical_by_bare:
+                        # Resolve to the sole DDL canonical — keeps kind='table'
+                        canonical_id = canonical_by_bare[bare]
+                        target_qualified = canonical_id
+                        # Derive name/db/catalog from the canonical full_id parts.
+                        # full_id format: "db.name" or "catalog.db.name" or "name"
+                        parts = canonical_id.split(".")
+                        if len(parts) >= 3:
+                            target_name = parts[-1]
+                            target_db = parts[-2]
+                            target_catalog = parts[-3]
+                        elif len(parts) == 2:
+                            target_name = parts[-1]
+                            target_db = parts[-2]
+                            target_catalog = ""
+                        else:
+                            target_name = canonical_id
+                            target_db = ""
+                            target_catalog = ""
+                    else:
+                        # Not resolved to a DDL canonical — mark as derived so the
+                        # kind filter excludes it from default (non-raw) output (#45.2)
+                        target_kind = "derived"
+
                 rows.table_rows.append(
                     {
-                        "qualified": stmt.target.full_id,
-                        "name": stmt.target.name,
-                        "catalog": stmt.target.catalog or "",
-                        "db": stmt.target.db or "",
-                        "kind": "table",
+                        "qualified": target_qualified,
+                        "name": target_name,
+                        "catalog": target_catalog,
+                        "db": target_db,
+                        "kind": target_kind,
                         "defined_in_file": "",
                     }
                 )
@@ -1223,6 +1295,8 @@ class Indexer:
         defined_table_registry: dict[str, str],
         nonlocal_counts: dict,
         warning_prefix: str = "",
+        canonical_by_bare: dict[str, str] | None = None,
+        ambiguous_bare: set[str] | None = None,
     ) -> None:
         """Accumulate rows for all files in batch, then flush once in one transaction.
 
@@ -1237,13 +1311,19 @@ class Indexer:
             defined_table_registry: Cross-file DDL dedup registry
             nonlocal_counts: Mutable summary dict updated in place (tables/edges/quality/…)
             warning_prefix: Optional prefix for warning log messages (e.g. "resync_changed: ")
+            canonical_by_bare: Optional #44 bare-name → canonical full_id index.
+                When provided, unqualified INSERT targets are rewritten to their DDL
+                canonical full_id.  None on single-file / reindex_file paths.
+            ambiguous_bare: Optional set of bare names defined in >1 schema.
         """
         if not batch:
             return
         buf = BatchRowBuffer()
         for parsed_in_batch in batch:
             try:
-                file_rows = self._build_file_rows(parsed_in_batch, defined_table_registry)
+                file_rows = self._build_file_rows(
+                    parsed_in_batch, defined_table_registry, canonical_by_bare, ambiguous_bare
+                )
             except Exception as exc:
                 logger.warning(
                     "%sFailed to build rows for %s: %s — skipping",

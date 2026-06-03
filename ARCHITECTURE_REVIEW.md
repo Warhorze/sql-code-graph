@@ -478,7 +478,15 @@ both concrete backends override it — the blueprint does not enforce this.
 Risk: HIGH. A failed re-index leaves orphaned graph nodes that produce incorrect
 lineage results until the next full re-index.
 
-### 3.2 [HIGH] `CrossFileAggregator.resolve_pass2` re-opens files without error handling
+### 3.2 ~~[HIGH]~~ **RESOLVED (v1.2.1)** `CrossFileAggregator.resolve_pass2` re-opens files without error handling
+
+**Resolution (2026-06-02, v1.2.1, PR #48):** `resolve_pass2` was deleted entirely. It had
+zero production call sites — the production pass-2 path in `index_repo` reimplements the
+dep-filter + reparse logic inline (worker calls `parse_file(..., dependency_filter=...)`
+in [`pool.py`](src/sqlcg/indexer/pool.py)), and that path already handles file-read errors
+defensively. The dead method (and the four tests that exercised it) were the same
+test-measures-a-dead-path blind-spot class as #40. Tests realigned to drive `index_repo`
+end-to-end. See [`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) Phase 5.
 
 ```python
 def resolve_pass2(self, parser, parsed):
@@ -2947,4 +2955,193 @@ editor owns the stdio process lifecycle and v1.1 has no launcher to re-spawn it
   owner-only, but any same-uid local process can send `stop`/`reindex`).
 - **Freshness on every tool result by default** — v1.1 ships it gated/off to
   protect hot-path latency; default-on pending an overhead measurement.
+
+## 18. v1.2.1 — Lineage recall guards + canonical INSERT target + CTE filter fixes
+
+Review date: 2026-06-02 · Reconciled by: architect-planner · Branch:
+`feat/v1.2.1-bugfix` · PR #48 · Verdict: **PLAN-COMPLIANT (PASS)**
+
+> **Bundled release note (2026-06-02):** the v1.2.1 bugfix scope (this section) and the
+> downstream-sink `file:line` fix (§19.2) ship as a **single `v1.2.2` release** — the
+> lower `v1.2.1` tag is skipped (precedent: v1.1.2→v1.1.3). Both change sets live on
+> `feat/v1.2.1-bugfix` (PR #48, fast-forwarded to `b5bf7a3`); version is `1.2.2`. The
+> combined plan-compliance verdict (PASS, both scopes) is recorded in
+> [`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) → "Bundled v1.2.2 release compliance".
+
+Patch release fixing the residual user-facing lineage defects (#44 canonical-name
+split, #45 `file:line=?` + `cte_*` leak), repairing the v1.2.0 read-proxy filter
+regression (the #39 read-half), deleting the dead `resolve_pass2` (resolves §3.2),
+and landing the #40 user-surface regression-guard suite. Plan:
+[`v1_2_1_bugfix.md`](plan/v1_2_1_bugfix.md) (full phase-by-phase compliance log appended there).
+
+### 18.1 #44 — canonical INSERT-target resolution
+
+A new `CrossFileAggregator.canonical_by_bare` index (bare name → sole DDL `full_id`)
+plus `_ambiguous_bare` (names defined in >1 schema, never rewritten) is built in
+`register_pass1` from DDL tables only. It is threaded `index_repo` →
+`_upsert_file_batch` → `_build_file_rows`, where an unqualified / non-DDL INSERT
+target whose bare name resolves to a sole DDL canonical is rewritten to share that
+node's identity (`qualified` == DDL `full_id`, all fields derived from the canonical),
+keeping `kind:"table"`. The fix lands in the node-emission loop, **not** the deleted
+`resolve_pass2` and **not** the per-column lineage hot path — pure row-dict mutation,
+no new `execute()`. Degrades to a no-op when `canonical_by_bare is None`
+(single-file `reindex_file` / `resync_changed` paths) — known limitation, re-index is
+the migration path per CLAUDE.md.
+
+### 18.2 #45 — `file:line` recall + structural `cte_*` suppression
+
+- **#45.1**: `analyze upstream/downstream` now bind location from the source's
+  *outgoing* `COLUMN_LINEAGE` edge and aggregate `WITH … min(start_line), min(file_path)`
+  **before** `LIMIT 100`, so multi-hop sources carry a real `file:line` and the limit
+  counts distinct sources, not edge-fanout rows.
+- **#45.2**: chosen mechanism is **graph-truth, not a name heuristic** — unresolved
+  synthetic INSERT targets are emitted `kind:"derived"` (the #44 emission change), and
+  the restored `kind IN ['table','external']` read filter excludes them. No name-prefix
+  belt was needed.
+
+### 18.3 Two implementation invariants discovered during the fix
+
+Both are now load-bearing; recorded so a future refactor does not silently undo them.
+
+1. **KuzuDB: a `WHERE` clause inside `OPTIONAL MATCH` filters the match attempt, not
+   the surrounding row.** To filter rows on an optionally-matched node's property, an
+   explicit `WITH <carried>, t WHERE …` must follow. `analyze._kind_filter` uses this
+   form (`OPTIONAL MATCH (t:SqlTable {…}) WITH <alias>, t WHERE t.kind IS NULL OR …`).
+   The `IS NULL` branch is intentional: it keeps node-less physical sources (the #39
+   tail) while CTE/derived intermediates (`kind='cte'`/`'derived'`) are excluded.
+   Guarded by TC1/TC4 in [`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py).
+2. **`_flush_row_batch` dedup must prefer structural kinds over the default `'table'`.**
+   A CTE alias is emitted twice in a batch — first `kind='table'` (incidental source
+   reference) then `kind='cte'` (CTE destination). The pre-existing first-seen-wins
+   dedup kept the wrong one, defeating #45.2. New Rule 2: `{'cte','derived','external'}`
+   beats default `'table'` (Rule 1 — DDL provenance via `defined_in_file` — still takes
+   precedence). This logic lives in the documented `_flush_row_batch` perf hot path but
+   is pure dict comparison in the existing dedup loop — no change to flush cardinality,
+   batch/scaling guards stay green (CLAUDE.md performance invariants intact).
+
+### 18.4 Resolved / out-of-scope
+
+- **§3.2 `resolve_pass2`** — RESOLVED (deleted; see §3.2 update).
+- **Residual #38 (UNION-ALL sibling CTEs)** — already fixed in 1.1.3; live DWH
+  re-verification (80→47 `cte_insert` islands) recorded in the plan; the surviving 47
+  are likely legitimately source-less computed measures, not a regression. Shape B of
+  the #40 guard now asserts a computed-measure projection so a real gap there reds the guard.
+- **#28 server read-only-by-default + reindex escalation** — out of 1.2.1; recommended
+  as a separate minor (1.3.0). The read half is already handled by the v1.2.0 routing proxy.
 - **`connected_clients` fidelity** — best-effort `1` today; no real counter.
+
+## 19. v1.2.1 live DWH re-verification — two residual findings (2026-06-02)
+
+Source: live verification of the v1.2.1 fixes against the full DWH corpus
+(`../dwh`, 1,335 SQL files, clean index ~1:56). **The v1.2.1 fixes themselves
+PASSED** — both findings below are residual / design-limit behaviour surfaced by
+the run, not regressions in PR #48. Corpus graph snapshot (kind-typed `SqlTable`):
+2,222 `table` / 383 `cte` / 272 `derived`.
+
+### 19.1 [KEEP — LOW] Residual scratch-object leak into the default `analyze` surface
+
+**Measurement.** The #45.2 fix essentially closed the `cte_` leak it targeted:
+of nodes still typed `kind='table'`, only 3 carry a `cte_` prefix (vs 383 now
+correctly `kind='cte'`). The broader leak persists: **495 of 2,222 `table`-kind
+nodes (~22%) carry scratch-object name prefixes** — 471 `tmp_*`, 21 `temp_*`,
+3 `cte_*` — plus ~575 unqualified single-token nodes (a mix of real bare tables
+and CTE aliases). These surface in default (filtered) `analyze` output because the
+filter is correctly kind-based (graph-truth) but these aliases were never classified
+`cte`/`derived` at parse/aggregation time. This is the known #38 islands residual
+(s18.4 / `47 cte_insert islands`); the leak is now `tmp_*`-dominated, not
+`cte_*`-dominated. See memory `project_issue38_cte_filter_regression`.
+
+**Decision: KEEP as a future ticket, LOW priority.** Rationale tied to existing
+decisions:
+- The standing **"no name-prefix filtering"** decision (s18.2; CLAUDE.md) is correct
+  and stays. The fix therefore **cannot** live in the filter — it must happen at
+  **classification time** in the aggregator/parser, exactly like the #44 synthetic
+  INSERT-target → `kind='derived'` emission change (s18.1). A `CREATE [OR REPLACE]
+  TEMP/TRANSIENT TABLE tmp_x AS SELECT …` whose target is a scratch object should be
+  emitted `kind='derived'` at `_build_file_rows` time, the same place #44 already
+  rewrites node identity. 492/495 of the leak (`tmp_*`/`temp_*`) are this CTAS-into-
+  scratch shape — addressable by classifying on the parsed CTAS-into-temp statement
+  kind (DDL-derived structural truth), **not** on the name prefix.
+- **Non-goal for the ticket:** the ~575 unqualified single-token nodes. They are a
+  genuine mix of real bare tables and CTE aliases; auto-classifying them risks
+  hiding real physical tables from the default surface (a false-negative worse than
+  the current cosmetic leak). They stay `kind='table'` until a structural signal
+  (CTE membership, CTAS target) is available — never a name guess.
+
+**Risk/reward.** Reward: cleaner default `analyze` surface, ~22% fewer scratch
+intermediates leaking; closes the visible tail of #38. Risk: medium — must classify
+on parsed statement structure (TEMP/TRANSIENT CTAS target), and must not reclassify
+a real `tmp_`-named physical table that is read by a non-CTAS statement; needs a guard
+asserting a real table named `tmp_*` is still surfaced. Effort: medium (one emission
+site, reuses #44 plumbing, plus a behavioural guard). Below the open HIGH §3.x items
+and Finding 19.2 in the ranking. Recorded here; no plan stub drafted yet (pull when
+a lineage-coverage sprint next touches `_build_file_rows`).
+
+### 19.2 [RESOLVED in v1.2.2] `file:line='?'` on downstream terminal sinks
+
+**Measurement.** The #45.1 fix rebinds a result's location from its **outgoing**
+`COLUMN_LINEAGE` edge ("where is this column used as a source"). For *downstream*
+traces this means terminal sinks render `?`: a sink has no outgoing edge, so
+`min(q.start_line)`/`min(q.file_path)` are NULL. Corpus measurement: of 36,892
+distinct columns reachable as a downstream result, **29,827 (81%) are sinks → render
+`file:line='?'`**. The fix populates only the locatable 19%. Upstream is unaffected
+(an upstream source legitimately has an outgoing edge). The TC6 guard asserts non-null
+`file:line` on one specific *located* case, so it passed despite the 81%.
+
+**Decision: KEEP — pick up next.** This is a genuine bug, **not** deliberate
+semantics. Analysis tied to #45.1's own intent:
+- #45.1 chose the outgoing edge so a *source*'s location reads as "where it is
+  produced/consumed as a source" — correct for the **upstream** direction. The same
+  pattern was copied verbatim into the **downstream** query
+  ([`analyze.py`](src/sqlcg/cli/commands/analyze.py) lines 134–137, fallback 146–149):
+  `OPTIONAL MATCH (dst)-[dstedge]->()`. For a downstream *result*, the natural,
+  user-meaningful location is the query that **produced** the column — i.e. the
+  **incoming** edge `()-[dstedge]->(dst)`, not the outgoing one.
+- **Key lever (confirmed in code):** every one of the 36,892 columns has an incoming
+  `COLUMN_LINEAGE` edge by definition — that is how it became a downstream result —
+  and that producing query carries a real `start_line`/`file_path`. Flipping the two
+  downstream `OPTIONAL MATCH` arrows from `(dst)-[dstedge]->()` to
+  `()-[dstedge]->(dst)` binds location from the producing query, turning ~81% of `?`
+  rows into a real `file:line`. Upstream stays on the outgoing edge unchanged.
+
+**Risk/reward.** Reward: HIGH — ~81% of downstream result rows flip from `?` to a
+real `file:line` on a corpus this shape. Effort: LOW — a ~2-line arrow flip in two
+downstream queries (primary + bare-name fallback), no schema/index/perf change, no
+parser change. Risk: LOW and bounded — only the downstream direction; upstream and
+the kind-filter (s18.3) untouched. The one trap: TC6 passes today on a located case,
+so it does **not** catch the regression — the ticket must add a guard asserting a
+**terminal sink** (no outgoing edge) renders a real `file:line`, not `?`.
+Plan stub drafted: [`fix_downstream_sink_location.md`](plan/fix_downstream_sink_location.md).
+Suggested release: patch (1.2.2) or fold into the next lineage minor.
+
+**RESOLVED — shipped in v1.2.2 (bundled with v1.2.1; see §18 bundled-release note).**
+Both downstream queries in [`analyze.py`](src/sqlcg/cli/commands/analyze.py) (primary
+L134, bare-name fallback L146) now bind location from the **incoming**
+`()-[dstedge:COLUMN_LINEAGE]->(dst)` edge — the producing query — so terminal sinks
+carry a real `file:line`. Upstream (L77/L89) keeps the outgoing-edge binding, unchanged.
+Guarded by the TC6b terminal-sink test in
+[`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py),
+demonstrably RED on master before the fix.
+
+### 19.3 Cross-finding note
+
+Both findings share the v1.2.1 root theme: the *graph store* is correct (edges intact,
+kinds mostly right); the defects live in the **graph→user presentation layer**
+(filter classification for 19.1, location binding for 19.2) — the same blind-spot
+class as #38/#40 where anchors traversing raw edges pass while the user-facing query
+path is wrong. Any guard for either must drive the **user-facing `analyze` path**,
+not raw `COLUMN_LINEAGE` traversal.
+
+### 19.4 [KEEP — LOW] TC6b guard reconstructs the query instead of running `analyze downstream`
+
+Raised by the plan-reviewer on the §19.2 sink fix. The TC6b terminal-sink guard's helper
+`_downstream_filtered_query()` in
+[`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py)
+**reconstructs the downstream Cypher query string** rather than invoking
+`analyze.downstream()` end-to-end. It therefore can drift from the production query if
+[`analyze.py`](src/sqlcg/cli/commands/analyze.py) changes and the helper is not updated in
+lockstep — exactly the §19.3 blind-spot (a guard not driving the true user-facing path).
+The fix held for v1.2.2 (the helper mirrors the shipped query), but the divergence risk is
+structural. **Future hardening:** replace the string-reconstruction helper with a
+`CliRunner`-based guard that runs the real `analyze downstream` command and asserts the
+rendered output. LOW priority; below §19.1 and the open §3.x items. No plan stub drafted.

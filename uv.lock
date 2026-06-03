@@ -2851,7 +2851,7 @@ wheels = [
 
 [[package]]
 name = "sql-code-graph"
-version = "1.2.0"
+version = "1.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "kuzu" },

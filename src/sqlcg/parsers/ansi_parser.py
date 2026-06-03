@@ -85,8 +85,8 @@ class AnsiParser(SqlParser):
                 the cross-file sources seeded into `sources_map` are filtered to only those
                 whose name is in the set. Pass-1 callers (and direct test callers) pass
                 `None` to disable filtering; pass-2 callers
-                (`CrossFileAggregator.resolve_pass2`) compute this from the pass-1
-                `ParsedFile.referenced_tables`.
+                (the `index_repo` pass-2 dispatch in `indexer.py`) compute this from
+                the pass-1 `ParsedFile.referenced_tables`.
             _precomputed_start_lines: optional list of 1-based start lines, one per
                 statement. When provided (e.g. by SnowflakeParser which computes the map
                 from the preprocessed SQL after ``_preprocess_snowflake_sql`` — which

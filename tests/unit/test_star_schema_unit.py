@@ -120,7 +120,7 @@ def test_star_source_rel_has_correct_properties():
 
 def test_star_metrics_in_info_output():
     """db info must print STAR_SOURCE edges and STAR_EXPANSION lineage edge counts."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     from typer.testing import CliRunner
 
@@ -128,30 +128,31 @@ def test_star_metrics_in_info_output():
 
     runner = CliRunner()
 
-    with patch("sqlcg.cli.commands.db.get_backend") as mock_get_backend:
-        mock_backend = MagicMock()
-        mock_backend.__enter__.return_value = mock_backend
-        mock_backend.__exit__.return_value = None
-        mock_backend.get_schema_version.return_value = "6"
+    # db info routes every Cypher read through run_read_routed (read_client), so
+    # the mock must target that function rather than a backend object.
+    def run_read_side_effect(query, _params):
+        if "v.version AS version" in query:
+            return [{"version": "6"}]
+        if "v.indexed_sha" in query:
+            return [{"sha": None}]
+        if "r.path AS path" in query:
+            # No repo path -> freshness block is skipped.
+            return []
+        if "STAR_SOURCE" in query and "COLUMN_LINEAGE" not in query:
+            return [{"n": 3}]
+        if "STAR_EXPANSION" in query:
+            return [{"n": 6}]
+        if "Repo" in query:
+            return [{"count": 1}]
+        if "SqlQuery" in query:
+            return [{"count": 10}]
+        if "SqlColumn" in query:
+            return [{"count": 50}]
+        if "COLUMN_LINEAGE" in query:
+            return [{"count": 25}]
+        return [{"count": 0}]
 
-        def run_read_side_effect(query, _params):
-            if "STAR_SOURCE" in query and "COLUMN_LINEAGE" not in query:
-                return [{"n": 3}]
-            if "STAR_EXPANSION" in query:
-                return [{"n": 6}]
-            if "Repo" in query:
-                return [{"count": 1}]
-            if "SqlQuery" in query:
-                return [{"count": 10}]
-            if "SqlColumn" in query:
-                return [{"count": 50}]
-            if "COLUMN_LINEAGE" in query:
-                return [{"count": 25}]
-            return [{"count": 0}]
-
-        mock_backend.run_read.side_effect = run_read_side_effect
-        mock_get_backend.return_value = mock_backend
-
+    with patch("sqlcg.cli.commands.db.run_read_routed", side_effect=run_read_side_effect):
         result = runner.invoke(app, ["info"])
 
     assert result.exit_code == 0

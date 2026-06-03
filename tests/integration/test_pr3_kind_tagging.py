@@ -129,8 +129,13 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
 
     from sqlcg.cli.commands.analyze import app
 
+    # dst has a DDL so it is a DDL-defined table (kind='table') and survives the filter.
+    # Without the DDL, Phase 2 would emit dst as kind='derived' (unresolved INSERT target)
+    # and the kind filter would suppress it — that is correct TC4 behaviour but not
+    # what this test guards (it guards CTE suppression, not synthetic-target suppression).
     sql = (
         "CREATE TABLE src (a INT);\n"
+        "CREATE TABLE dst (a INT);\n"
         "INSERT INTO dst\n"
         "WITH my_cte AS (SELECT a FROM src)\n"
         "SELECT a FROM my_cte;\n"
@@ -140,10 +145,12 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
 
     runner = CliRunner()
 
+    # Route run_read_routed to the in-memory db (v1.2.0: get_backend removed from analyze.py)
+    def _route_to_db(query, params):
+        return db.run_read(query, params)
+
     # Default: CTE should NOT appear in downstream
-    with patch("sqlcg.cli.commands.analyze.get_backend") as mock_get_backend:
-        mock_get_backend.return_value.__enter__.return_value = db
-        mock_get_backend.return_value.__exit__.return_value = False
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db):
         result_default = runner.invoke(app, ["downstream", "src.a", "--raw"])
 
     # CTE intermediate must be filtered by default
@@ -151,15 +158,13 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
         f"CTE 'my_cte' appeared in default downstream output (should be filtered).\n"
         f"Output: {result_default.output}"
     )
-    # Real destination table 'dst' must still appear
+    # Real destination table 'dst' (DDL-defined, kind='table') must still appear
     assert "dst" in result_default.output, (
         f"Destination 'dst' not in default downstream output.\nOutput: {result_default.output}"
     )
 
     # With --include-intermediate: CTE should appear
-    with patch("sqlcg.cli.commands.analyze.get_backend") as mock_get_backend:
-        mock_get_backend.return_value.__enter__.return_value = db
-        mock_get_backend.return_value.__exit__.return_value = False
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db):
         result_intermediate = runner.invoke(
             app, ["downstream", "src.a", "--raw", "--include-intermediate"]
         )
@@ -220,15 +225,17 @@ def test_scenario_d_impact_noise_filter_and_raw(db, tmp_path):
         schema_aliases={},
     )
 
+    # Route run_read_routed to the in-memory db (v1.2.0: get_backend removed from analyze.py)
+    def _route_to_db(query, params):
+        return db.run_read(query, params)
+
     with (
-        patch("sqlcg.cli.commands.analyze.get_backend") as mock_backend,
+        patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
         ),
     ):
-        mock_backend.return_value.__enter__.return_value = db
-        mock_backend.return_value.__exit__.return_value = False
         result_filtered = runner.invoke(app, ["impact", "src"])
 
     # Filtered: only real_dst query remains (bak_real_dst filtered out)
@@ -240,14 +247,12 @@ def test_scenario_d_impact_noise_filter_and_raw(db, tmp_path):
 
     # --raw: both queries must appear
     with (
-        patch("sqlcg.cli.commands.analyze.get_backend") as mock_backend,
+        patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
         ),
     ):
-        mock_backend.return_value.__enter__.return_value = db
-        mock_backend.return_value.__exit__.return_value = False
         result_raw = runner.invoke(app, ["impact", "src", "--raw"])
 
     assert result_raw.output.count("INSERT") == 2, (
@@ -289,15 +294,17 @@ def test_scenario_e_unused_noise_filter_and_raw(db, tmp_path):
         schema_aliases={},
     )
 
+    # Route run_read_routed to the in-memory db (v1.2.0: get_backend removed from analyze.py)
+    def _route_to_db(query, params):
+        return db.run_read(query, params)
+
     with (
-        patch("sqlcg.cli.commands.analyze.get_backend") as mock_backend,
+        patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
         ),
     ):
-        mock_backend.return_value.__enter__.return_value = db
-        mock_backend.return_value.__exit__.return_value = False
         result_filtered = runner.invoke(app, ["unused"])
 
     assert "bak_orphan" not in result_filtered.output, (
@@ -310,14 +317,12 @@ def test_scenario_e_unused_noise_filter_and_raw(db, tmp_path):
 
     # --raw: noise table must appear
     with (
-        patch("sqlcg.cli.commands.analyze.get_backend") as mock_backend,
+        patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
         ),
     ):
-        mock_backend.return_value.__enter__.return_value = db
-        mock_backend.return_value.__exit__.return_value = False
         result_raw = runner.invoke(app, ["unused", "--raw"])
 
     assert "bak_orphan" in result_raw.output, (
