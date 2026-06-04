@@ -3026,8 +3026,13 @@ Both are now load-bearing; recorded so a future refactor does not silently undo 
   re-verification (80→47 `cte_insert` islands) recorded in the plan; the surviving 47
   are likely legitimately source-less computed measures, not a regression. Shape B of
   the #40 guard now asserts a computed-measure projection so a real gap there reds the guard.
-- **#28 server read-only-by-default + reindex escalation** — out of 1.2.1; recommended
-  as a separate minor (1.3.0). The read half is already handled by the v1.2.0 routing proxy.
+- **#28 server read-only-by-default + reindex escalation** — **IMPLEMENTED in 1.3.0**
+  (#29 single-writer queue + RO→RW escalation; plan
+  [`fix_issue_29_single_writer_queue.md`](plan/fix_issue_29_single_writer_queue.md)).
+  The read half was already handled by the v1.2.0 routing proxy; 1.3.0 adds the write half:
+  the server serves RO after a startup RW schema-ensure window, and escalates RO→RW only for
+  the duration of a single-writer drain. See §20 for the compliance postmortem and two
+  accepted/flagged deviations.
 - **`connected_clients` fidelity** — best-effort `1` today; no real counter.
 
 ## 19. v1.2.1 live DWH re-verification — two residual findings (2026-06-02)
@@ -3145,3 +3150,129 @@ The fix held for v1.2.2 (the helper mirrors the shipped query), but the divergen
 structural. **Future hardening:** replace the string-reconstruction helper with a
 `CliRunner`-based guard that runs the real `analyze downstream` command and asserts the
 rendered output. LOW priority; below §19.1 and the open §3.x items. No plan stub drafted.
+
+## 20. v1.3.0 — Single-Writer Queue + RO→RW Escalation (#29 / #28) (2026-06-04)
+
+Implements the long-deferred §18.4 "#28 server read-only-by-default + reindex escalation"
+item. Plan: [`fix_issue_29_single_writer_queue.md`](plan/fix_issue_29_single_writer_queue.md).
+Branch `feat/fix-issue-29-single-writer-queue`, 8 commits (T-01…T-08). Test suite
+1009 passed / 7 skipped / 1 xfailed; pyright clean; ruff clean.
+
+### 20.1 What shipped (plan-compliance verdict)
+
+The five phases landed as planned. The hard invariants were honoured **in the
+control-socket / drain path**:
+
+- **B1 (no co-existence window)** — Steps 2.2 (drain task + escalation primitive) and 2.3
+  (retire the inline `reindex` op) landed in **one commit** (`62c19cd`). The `reindex` and
+  `index` socket-op handlers in [`server.py`](src/sqlcg/server/server.py) `_control_socket_task`
+  enqueue onto `WriterQueue` and never call `backend_ref()`; the drain task is the sole
+  backend consumer, resolving the backend under `backend_lock` via `escalate_to_rw`.
+- **B2 (shutdown vs. drain ordering)** — `_stop_watcher`
+  ([`server.py`](src/sqlcg/server/server.py) L394-410) sets `shutdown_requested` then
+  acquires `backend_lock` **before** `shutdown_backend()`; `de_escalate_to_ro`
+  ([`writer.py`](src/sqlcg/server/writer.py)) skips the RO reopen when the event is set.
+  Both guarantees (a)+(b) present.
+- **B3 (status framing atomic)** — server-side `status` framing (Step 4.1) and the CLI
+  recv-exactly parse (Step 4.2) shipped in one commit (`af2c85d`); `mcp_stop`'s
+  `s.recv(128)` and the unframed `stop` reply are untouched.
+- **W3 (`from=null`)** — the `reindex` op stores `from_sha=None`; the drain resolves the
+  stored SHA via `rw.get_indexed_sha()` and HEAD via `git rev-parse`, with an actionable
+  "no prior index" error on a never-indexed DB. The CLI refusal was removed.
+- **W5 (`done:true` sentinel)** — both server emit and CLI recv loops key off
+  `done == true`, not EOF; failure relays `ok:false, done:true, error:…`.
+- **W6 (`find_lock_holder` public)** — promoted in `kuzu_backend.py`, in-module call site
+  updated, imported by `writer.py`.
+- **W7 (drain exception handler)** — the drain's `except Exception` clears `_active`
+  (`mark_active_failed`), relays an `ok:false,done:true` terminal frame to waiters, and the
+  loop survives; `EscalationLockError` keeps its dedicated C3 path with the ERROR log.
+
+### 20.2 Deviation 1 — MCP `index_repo` tool inline escalation (FLAGGED — follow-up required)
+
+**What the developer added (not in the plan):** a `_serving_ro` flag +
+`_get_or_escalate_rw` / `_de_escalate_to_ro_from_tool` helpers in
+[`tools.py`](src/sqlcg/server/tools.py) so the MCP `index_repo` **tool** (invoked over the
+stdio transport, distinct from the CLI `index` socket op) escalates RO→RW inline when the
+server is serving RO.
+
+**Verdict: the intent is consistent with the single-writer model, but the implementation
+violates the plan's central invariant and leaks the write lock on failure. Track as a
+v1.3.x follow-up, not a release blocker (the happy path works and tests are green), but
+it must be fixed before it is relied on under concurrency.**
+
+Three concrete problems:
+
+1. **Escalation outside `backend_lock` (breaks B1/OD-7).** The plan's load-bearing invariant
+   is "once escalation exists, **no op may operate on a backend resolved outside
+   `backend_lock`**; the only backend consumer is the drain task." The MCP `index_repo` tool
+   escalates and writes with **no lock held** — a second path that can swap
+   `tools._backend` concurrently with a `query` op or a drain. This is exactly the class of
+   bug B1 was written to prevent.
+2. **RW-lock leak on the failure path.** `_de_escalate_to_ro_from_tool` is called only on the
+   success branch ([`tools.py`](src/sqlcg/server/tools.py) L613-614), **not in a `finally`**.
+   Any exception during `index_repo` / `upsert_node` / `run_read` / `upsert_edge` re-raises
+   (L634) with the backend still RW — the exclusive write lock stays held, blocking all
+   subsequent routed reads until the server is restarted. (Contrast the drain path, which
+   de-escalates in a `finally`.)
+3. **Dead `_set_backend_lock` / `_backend_lock`.** `_set_backend_lock`
+   ([`tools.py`](src/sqlcg/server/tools.py) L117) and the `_backend_lock` global are
+   **defined but never called** — a zero-value stub that looks like the intended lock plumbing
+   for the tool escalation but was never wired. This is the CLAUDE.md "every new method must
+   have a grep-confirmed call site" rule unmet, and the "function defined but never invoked"
+   smell.
+
+**Follow-up (recommended):** route the MCP `index_repo` tool write through the same
+`WriterQueue`/drain as the CLI `index` op (so there is genuinely one writer), or — minimally —
+acquire `backend_lock` for the escalation and move the de-escalation into a `finally`. There
+is **no test** for this path today (no test references `_get_or_escalate_rw` / `_serving_ro`),
+so the leak and the lock-bypass are unguarded. A regression test asserting (a) the tool
+escalates under the lock and (b) a raising `index_repo` de-escalates back to RO is required
+with the fix.
+
+### 20.3 Deviation 2 — Step 4.3 "queued behind N" display (ACCEPTED, minor)
+
+The plan's Step 4.3 specified that a client queued behind other work prints
+`queued behind: <op> (done/total files) — position N` before attaching to live progress.
+The developer implemented the `done:true` terminal sentinel and the progress-bar attach
+fully, but **omitted the "queued behind … position N" pre-active display**: the CLI receives
+the `{queued:true, position:N}` frame and the subsequent progress frames, but the queued
+frame is silently consumed (it carries no `files_total`, so the progress loop renders
+nothing for it) — see [`index.py`](src/sqlcg/cli/commands/index.py) L307-311.
+
+**Verdict: ACCEPTED as a cosmetic shortfall.** The functional contract (enqueue, attach,
+stream progress, terminate on `done:true`, exit non-zero on `ok:false`) is intact; only the
+human-readable "you are behind N others" hint is missing. The `position` is already on the
+wire, so completing it is a one-line render in the existing loop. Track as a polish item,
+not a correctness gap.
+
+### 20.4 Test-coverage gaps vs. the plan's Test Strategy (FLAGGED)
+
+The plan's Test Strategy enumerated several **deterministic** integration tests that were
+not implemented as test functions, even though
+[`test_single_writer_queue.py`](tests/integration/test_single_writer_queue.py)'s module
+docstring lists B2 / W3 among its coverage (the docstring overstates what is asserted):
+
+- **B2 stop-mid-drain** (in-flight write commits; `tools._backend is None` after shutdown,
+  no reopen-after-shutdown) — listed in the docstring, **no test function**.
+- **W3** arg-level assertion (`resync_changed(from=stored SHA, to=HEAD)`) and the
+  never-indexed "no prior index" error — **no test** (the drain code is present and exercised
+  indirectly by Scenario A, but the W3-specific arg/branch assertions are missing).
+- **W7** drain-body-raises → `_active` cleared + `ok:false,done:true` terminal frame + loop
+  survives — **no test**.
+- **Reads block during a drain** (OD-1, deterministic `anyio.Event` ordering) — **no test**.
+- **B1 structural guard** (the `reindex` op body contains no pre-lock `backend_ref()`,
+  mirroring the perf-invariant guard discipline) — **no test**.
+- **Escalation transition on real Kuzu** (second in-process RO holder forces
+  `EscalationLockError`) — **no test** (only the injected-`opener` unit tests cover retry).
+
+What **is** covered: fresh-DB init, stale-schema refusal (Step 1.4), `db reset` refusal
+(Step 3.4), framed `status` + `writer_queue` shape (Steps 4.1/4.2), metrics persisted +
+`SQLCG_METRICS=0` suppression (Step 4.5), the escalation retry/backoff + ERROR-log unit tests
+(Steps 1.2/4.4), the coalescing rules (Step 2.1), and the drain-runs-`resync_changed`-once
+invariant guard (Scenario A in `test_reindex_via_server.py`).
+
+**Verdict:** these are real plan deviations (the named deterministic guards were specified
+and not delivered), but the shipped behaviour is exercised indirectly and the suite is green,
+so they are **follow-up hardening**, not a ship blocker. They should be filed alongside the
+Deviation-1 fix — the B2/W7/reads-block tests in particular guard the exact concurrency
+contract that Deviation 1 currently bypasses.
