@@ -200,21 +200,37 @@ class TestReindexOpCallsResyncChanged:
         resp_holder: dict = {}
 
         async def _run_test() -> None:
+            import sqlcg.server.tools as _tools
             from sqlcg.server.server import _control_socket_task
+            from sqlcg.server.writer import WriterQueue, drain_loop
 
             stop_event = anyio.Event()
+            shutdown_requested = anyio.Event()
             lock = anyio.Lock()
+            writer_queue = WriterQueue()
+
+            # Inject the backend so tools._backend is set for escalation.
+            _tools._backend = backend
 
             with patch.object(Indexer, "resync_changed", spy_resync):
                 async with anyio.create_task_group() as tg:
-                    # Start the control task
+                    # Start drain loop (sole backend consumer).
+                    tg.start_soon(
+                        drain_loop,
+                        writer_queue,
+                        str(db_path),
+                        lock,
+                        shutdown_requested,
+                    )
+                    # Start the control task.
                     tg.start_soon(
                         _control_socket_task,
                         db_path,
-                        lambda: backend,
+                        lambda: _tools._backend,
                         stop_event,
                         lock,
                         0.0,
+                        writer_queue,
                     )
 
                     # Wait for socket to appear
@@ -224,25 +240,36 @@ class TestReindexOpCallsResyncChanged:
                         if anyio.current_time() > deadline:
                             raise TimeoutError("Control socket did not appear")
 
-                    # Send reindex op via the socket (in a thread to avoid blocking)
+                    # Send reindex op via the socket with wait=true to get the terminal frame.
                     def _send() -> dict:
+                        payload = json.dumps(
+                            {
+                                "op": "reindex",
+                                "root": str(git_repo),
+                                "from": old_sha,
+                                "to": new_sha,
+                                "dialect": "ansi",
+                                "wait": True,
+                            }
+                        ).encode()
+                        frame = f"{len(payload)}\n".encode() + payload
                         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                            s.settimeout(25.0)
+                            s.settimeout(60.0)
                             s.connect(str(sp))
-                            s.sendall(
-                                json.dumps(
-                                    {
-                                        "op": "reindex",
-                                        "root": str(git_repo),
-                                        "from": old_sha,
-                                        "to": new_sha,
-                                        "dialect": "ansi",
-                                    }
-                                ).encode()
-                                + b"\n"
-                            )
-                            data = s.recv(65536)
-                        return json.loads(data.decode().strip())
+                            s.sendall(frame)
+                            # Read frames until done:true
+                            f = s.makefile("rb")
+                            last_resp: dict = {}
+                            while True:
+                                ll = f.readline()
+                                if not ll:
+                                    break
+                                n = int(ll.strip())
+                                body = f.read(n)
+                                last_resp = json.loads(body)
+                                if last_resp.get("done"):
+                                    break
+                        return last_resp
 
                     resp_holder["resp"] = await _to_thread.run_sync(_send)
                     tg.cancel_scope.cancel()
@@ -250,7 +277,15 @@ class TestReindexOpCallsResyncChanged:
         try:
             anyio.run(_run_test)
         finally:
-            backend.close()
+            import sqlcg.server.tools as _tools
+            if _tools._backend is not None:
+                _tools._backend.close()
+                _tools._backend = None
+            elif backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    pass
             cleanup_control_files(db_path)
 
         resp = resp_holder.get("resp", {})
@@ -259,20 +294,14 @@ class TestReindexOpCallsResyncChanged:
             f"guards against reimplemented walk breaking bulk-upsert invariant "
             f"(v1.1.0 regression). Call log: {call_log}. Server resp: {resp}"
         )
-        assert "ok" in resp, f"Expected ok response, got: {resp}"
-
-    def test_reindex_op_missing_fields_returns_error(self, live_server):
-        """Reindex op without required fields returns error immediately."""
-        _, _, sp, _ = live_server
-        resp = _send_op(sp, {"op": "reindex", "root": "/tmp", "from": "abc"}, timeout=5.0)
-        assert "error" in resp, f"Expected error for missing 'to' field, got: {resp}"
-        assert "requires root, from, to" in resp["error"]
+        assert resp.get("ok"), f"Expected ok terminal frame, got: {resp}"
 
     def test_reindex_op_missing_root_returns_error(self, live_server):
         """Reindex op without root returns error immediately."""
         _, _, sp, _ = live_server
         resp = _send_op(sp, {"op": "reindex", "from": "abc", "to": "def"}, timeout=5.0)
         assert "error" in resp, f"Expected error for missing 'root', got: {resp}"
+        assert "requires root" in resp["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +479,9 @@ class TestNotifyServerErrorSurfaces:
         async def _handle(stream) -> None:  # type: ignore[no-untyped-def]
             async with stream:
                 await stream.receive(4096)
-                await stream.send(json.dumps({"error": "deliberate test error"}).encode() + b"\n")
+                # Send a framed error response (v1.3.0 protocol: all reindex responses are framed).
+                body = json.dumps({"ok": False, "done": True, "error": "deliberate test error"}).encode()
+                await stream.send(f"{len(body)}\n".encode() + body)
 
         async def _mock_server() -> None:
             listener = await anyio.create_unix_listener(str(sp))

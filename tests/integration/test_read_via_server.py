@@ -70,8 +70,14 @@ async def _serve_with_backend(db_path: Path, backend, do_requests):
     lock = anyio.Lock()
     result_holder: dict = {}
 
+    from sqlcg.server.writer import WriterQueue
+
+    writer_queue = WriterQueue()
+
     async with anyio.create_task_group() as tg:
-        tg.start_soon(_control_socket_task, db_path, lambda: backend, stop_event, lock, 0.0)
+        tg.start_soon(
+            _control_socket_task, db_path, lambda: backend, stop_event, lock, 0.0, writer_queue
+        )
 
         deadline = anyio.current_time() + 5.0
         while not sp.exists():

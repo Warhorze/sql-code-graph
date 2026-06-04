@@ -79,34 +79,46 @@ async def _control_socket_task(
     stop_event: "anyio.Event",
     backend_lock: "anyio.Lock",
     start_time: float,
+    writer_queue: "WriterQueue",
 ) -> None:
     """Accept control connections on ``<db>.sock`` and dispatch ops.
 
     Supported ops:
 
-    - ``{"op": "status"}`` → running state, pid, db_path, freshness, uptime.
-      Unframed (legacy single-recv protocol).
+    - ``{"op": "status"}`` → running state, pid, db_path, freshness, uptime,
+      writer_queue block.  **Length-prefixed framing** (v1.3.0, B3): the
+      response uses ``<decimal-byte-length>\\n<json-body>`` so large queue
+      payloads are read in full by the recv-exactly client.
     - ``{"op": "stop"}`` → sends ``{"ok": true}`` then signals stop via
-      *stop_event*.  Unframed.
-    - ``{"op": "reindex", "root", "from", "to", "dialect"}`` → runs
-      ``Indexer.resync_changed`` off the event-loop thread via
-      ``anyio.to_thread.run_sync``, serialised behind *backend_lock* (R1, R2).
-      Unframed.
+      *stop_event*.  Unframed (mcp_stop uses s.recv(128) — do NOT change).
+    - ``{"op": "index", "root", "dialect", "wait"}`` → enqueues a full index
+      onto *writer_queue* (rule 1 — supersedes all pending).  Supports
+      ``wait=true`` (stream progress frames + terminal ``done:true``) and
+      ``wait=false`` (immediate ``{ok, queued, position}``).
+    - ``{"op": "reindex", "root", "from", "to", "dialect", "wait"}`` →
+      enqueues an incremental resync (coalescing rules 2–3). ``from`` may be
+      ``null``/omitted to resolve at drain start (W3).  Same ``wait`` semantics
+      as ``index``.  The handler enqueues only — it never touches the backend
+      (B1 invariant: only the drain task resolves a backend, under backend_lock).
     - ``{"op": "query", "cypher": ..., "params": ...}`` → executes a
       read-only Cypher query on the single backend connection, serialised
       behind *backend_lock*.  **Length-prefixed framing** (v1.2.0):
       ``<decimal-byte-length>\\n<json-body>`` on both request and response.
 
-    Framing protocol (v1.2.0, ``query`` op only):
-      Request: ``b"<len>\\n" + json_body`` — server detects by sniffing the
-      first line; a bare decimal integer → framed.  Unframed requests always
-      start with ``{`` (never a digit), so the sniff is unambiguous.
-      Response: same ``<len>\\n<body>`` format for framed requests; unframed
-      response for unframed requests.  Old clients that use the unframed
-      ``s.recv(65536)`` + ``json.loads`` pattern will get a loud
-      ``json.JSONDecodeError`` if they accidentally receive a framed response —
-      NOT silent truncation.  Only the new ``read_client`` sends framed
-      requests, so this does not affect existing callers.
+    Framing protocol:
+      Requests: a bare decimal integer on the first line → framed.  Unframed
+      JSON always starts with ``{``, so the sniff is unambiguous.
+      Responses: framed (``<len>\\n<body>``) for ``query`` and ``status``;
+      unframed for ``stop``/``reindex``/``index`` (unless ``wait=true`` which
+      uses the multi-frame streaming protocol).
+
+    Multi-frame streaming protocol (``index``/``reindex`` with ``wait=true``):
+      The server sends a sequence of length-prefixed frames on the same
+      connection.  Progress frames carry ``{done: false, files_done, files_total}``.
+      The terminal frame carries ``{ok: true, done: true, summary: {...}}`` on
+      success or ``{ok: false, done: true, error: ...}`` on failure (W7).
+      The client reads frames in a loop and stops when it sees ``done == true``
+      — it does NOT rely on EOF as the terminator.
 
     R2 (single connection): all backend operations go through ``backend_lock``
     so concurrent calls never touch the single Kuzu connection simultaneously.
@@ -126,6 +138,7 @@ async def _control_socket_task(
     from anyio.streams.buffered import BufferedByteReceiveStream
 
     from sqlcg.core.config import get_db_path as _get_db_path
+    from sqlcg.server.writer import WriterRequest
 
     # Read-only keyword allow-list for the ``query`` op.  Only these leading
     # keywords are permitted — anything that starts with a write keyword is
@@ -211,7 +224,13 @@ async def _control_socket_task(
                         "stale_by_commits": stale,
                         "connected_clients": 1,  # stdio transport = 1 by design
                         "uptime": time.time() - start_time,
+                        "writer_queue": writer_queue.coalesce_view(),
                     }
+                    # status response is framed (B3, v1.3.0) — same framing as query
+                    # so recv-exactly clients read it in full regardless of payload size.
+                    resp_bytes = json.dumps(resp).encode()
+                    await stream.send(f"{len(resp_bytes)}\n".encode() + resp_bytes)
+                    return
 
                 elif op == "stop":
                     resp = {"ok": True}
@@ -222,35 +241,91 @@ async def _control_socket_task(
                     stop_event.set()
                     return
 
-                elif op == "reindex":
+                elif op == "index":
+                    # Step 3.1 — enqueue a full index; never touches the backend here (B1).
                     root = req.get("root")
-                    from_sha = req.get("from")
+                    dialect = req.get("dialect")
+                    wait = req.get("wait", False)
+                    requested_by = req.get("requested_by", "cli")
+                    if not root:
+                        resp = {"error": "index op requires root"}
+                        await stream.send(json.dumps(resp).encode() + b"\n")
+                        return
+
+                    writer_req = WriterRequest(
+                        op="index",
+                        root=root,
+                        dialect=dialect,
+                        from_sha=None,
+                        to_sha=None,
+                        requested_by=requested_by,
+                    )
+
+                    if wait:
+                        # Attach-and-wait: register a memory channel then stream frames.
+                        send_ch, recv_ch = anyio.create_memory_object_stream(max_buffer_size=64)
+                        writer_req._waiters.append(send_ch)
+                        position = await writer_queue.enqueue(writer_req)
+                        # Send the queued acknowledgement frame first.
+                        queued_frame = json.dumps(
+                            {"ok": True, "done": False, "queued": True, "position": position}
+                        ).encode()
+                        await stream.send(f"{len(queued_frame)}\n".encode() + queued_frame)
+                        # Stream progress frames until done:true terminal frame.
+                        async with recv_ch:
+                            async for terminal in recv_ch:
+                                frame_bytes = json.dumps(terminal).encode()
+                                await stream.send(f"{len(frame_bytes)}\n".encode() + frame_bytes)
+                                if terminal.get("done"):
+                                    break
+                    else:
+                        position = await writer_queue.enqueue(writer_req)
+                        resp = {"ok": True, "queued": True, "position": position}
+                        await stream.send(json.dumps(resp).encode() + b"\n")
+                    return
+
+                elif op == "reindex":
+                    # Step 2.3 (B1) — enqueue; the drain is the only backend consumer.
+                    # The handler NEVER calls backend_ref() (B1 invariant).
+                    root = req.get("root")
+                    from_sha = req.get("from")  # may be None (W3 — server resolves at drain)
                     to_sha = req.get("to")
                     dialect = req.get("dialect")
-                    if not root or not from_sha or not to_sha:
-                        resp = {"error": "reindex op requires root, from, to"}
+                    wait = req.get("wait", False)
+                    requested_by = req.get("requested_by", "cli")
+                    if not root:
+                        resp = {"error": "reindex op requires root"}
+                        await stream.send(json.dumps(resp).encode() + b"\n")
+                        return
+
+                    writer_req = WriterRequest(
+                        op="reindex",
+                        root=root,
+                        dialect=dialect,
+                        from_sha=from_sha,
+                        to_sha=to_sha,
+                        requested_by=requested_by,
+                    )
+
+                    if wait:
+                        send_ch, recv_ch = anyio.create_memory_object_stream(max_buffer_size=64)
+                        writer_req._waiters.append(send_ch)
+                        position = await writer_queue.enqueue(writer_req)
+                        queued_frame = json.dumps(
+                            {"ok": True, "done": False, "queued": True, "position": position}
+                        ).encode()
+                        await stream.send(f"{len(queued_frame)}\n".encode() + queued_frame)
+                        async with recv_ch:
+                            async for terminal in recv_ch:
+                                frame_bytes = json.dumps(terminal).encode()
+                                await stream.send(f"{len(frame_bytes)}\n".encode() + frame_bytes)
+                                if terminal.get("done"):
+                                    break
                     else:
-                        from sqlcg.indexer.indexer import Indexer
-
-                        db = backend_ref()
-                        if db is None:
-                            resp = {"error": "backend not available"}
-                        else:
-                            indexer = Indexer()
-
-                            def _do_reindex() -> dict:
-                                return indexer.resync_changed(
-                                    _Path(root),
-                                    from_sha,
-                                    to_sha,
-                                    db,
-                                    dialect,
-                                )
-
-                            async with backend_lock:
-                                # R1: run off event-loop thread; R2: lock serialises
-                                summary = await _to_thread.run_sync(_do_reindex)
-                            resp = {"ok": True, "summary": summary}
+                        position = await writer_queue.enqueue(writer_req)
+                        resp = {"ok": True, "queued": True, "position": position}
+                        await stream.send(json.dumps(resp).encode() + b"\n")
+                    return
 
                 elif op == "query":
                     # Framed op (v1.2.0): read-only Cypher query over the socket.
@@ -297,36 +372,37 @@ async def _control_socket_task(
 async def _stop_watcher(
     stop_event: "anyio.Event",
     db_path: "Path",
+    backend_lock: "anyio.Lock",
+    shutdown_requested: "anyio.Event",
 ) -> None:
     """Wait for stop_event then perform graceful shutdown.
 
-    When the control socket ``stop`` op fires ``stop_event``, this task:
-    1. Shuts down the backend (flush pending writes).
-    2. Removes the control files (.sock, .pid).
-    3. Calls ``os._exit(0)`` to terminate the process immediately.
+    B2 shutdown ordering:
+      1. Set shutdown_requested so the drain loop exits cleanly and
+         de_escalate_to_ro skips the RO reopen.
+      2. Acquire backend_lock — waits until any active drain has fully
+         de-escalated (so the in-flight RW write is committed, not torn).
+      3. Call shutdown_backend() under the lock.
+      4. Release backend_lock.
+      5. Remove control files.
+      6. Call os._exit(0).
 
-    We use ``os._exit(0)`` rather than a cancel-scope approach because the
-    MCP ``stdio_server`` runs stdin readline in a thread via
-    ``anyio.to_thread.run_sync`` with ``abandon_on_cancel=False`` (the
-    default).  When stdin is a pipe, the read-end cannot be closed from within
-    the subprocess to interrupt the blocking readline — the parent holds the
-    write end open.  ``os._exit`` bypasses the thread-drain wait entirely and
-    exits the process without calling ``atexit`` handlers or running
-    ``finally`` blocks in other tasks.
-
-    R8 ordering: backend is shut down HERE (before os._exit), not in main().
-    The ``finally`` block in ``main()`` will also try to shutdown/cleanup but
-    ``os._exit`` prevents it from running — so we do it explicitly here.
+    We use ``os._exit(0)`` because the MCP ``stdio_server`` blocks on a pipe
+    read (``anyio.to_thread.run_sync`` with ``abandon_on_cancel=False``).
+    We cannot interrupt it without killing the process.
     """
     import sqlcg.server.tools as _tools
     from sqlcg.server.control import cleanup_control_files
 
     await stop_event.wait()
-    # Graceful teardown before hard exit
-    try:
-        _tools.shutdown_backend()
-    except Exception:
-        pass
+    # B2(b): signal de_escalate_to_ro to skip the RO reopen.
+    shutdown_requested.set()
+    # B2(a): wait for any active drain to finish (acquires backend_lock).
+    async with backend_lock:
+        try:
+            _tools.shutdown_backend()
+        except Exception:
+            pass
     try:
         cleanup_control_files(db_path)
     except Exception:
@@ -355,9 +431,10 @@ async def _sigterm_watcher(
 async def _run_with_control(db_path: "Path", start_time: float) -> None:
     """Run the stdio MCP loop and the control-socket task in a shared TaskGroup.
 
-    Stop mechanism (R8 teardown ordering):
+    Stop mechanism (B2 teardown ordering):
     - Control socket ``stop`` op → ``stop_event.set()`` → ``_stop_watcher``
-      shuts down backend + removes control files + calls ``os._exit(0)``.
+      sets shutdown_requested, acquires backend_lock (waits for active drain),
+      shuts down backend, removes control files, calls ``os._exit(0)``.
     - External SIGTERM → ``_sigterm_watcher`` → same path via ``stop_event``.
     - Normal EOF on stdin (editor closes connection) → stdio loop returns →
       ``tg.cancel_scope.cancel()`` → tasks cancelled → ``main()`` finally
@@ -368,19 +445,35 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
     with ``abandon_on_cancel=False``).  We cannot interrupt it without
     killing the process; ``_stop_watcher`` does cleanup first.
 
-    ``backend_lock`` is created once here and passed into
-    ``_control_socket_task`` so concurrent control ops (reindex, query) are
-    serialised behind a single lock on the Kuzu connection (R2).
+    ``backend_lock`` is created once here and passed into both
+    ``_control_socket_task`` and the ``drain_loop`` task so that:
+    - concurrent control ops (reindex, query) are serialised (R2), and
+    - _stop_watcher can acquire the lock to wait for an active drain (B2).
     """
     import anyio
 
     import sqlcg.server.tools as _tools
+    from sqlcg.server.writer import WriterQueue, drain_loop
 
     stop_event = anyio.Event()
-    backend_lock = anyio.Lock()  # R2: serialise all backend ops (Kuzu not thread-safe)
+    shutdown_requested = anyio.Event()
+    backend_lock = anyio.Lock()  # R2 + B2: serialise all backend ops
+
+    # Inject metrics into the queue so coalesce/drain events are persisted.
+    writer_queue = WriterQueue(metrics=_tools._metrics)
+
+    db_path_str = str(db_path)
 
     async with anyio.create_task_group() as tg:
         if sys.platform != "win32":
+            # Drain task: consumes WriterQueue; sole backend consumer (B1).
+            tg.start_soon(
+                drain_loop,
+                writer_queue,
+                db_path_str,
+                backend_lock,
+                shutdown_requested,
+            )
             # Spawn control socket alongside the stdio loop.
             tg.start_soon(
                 _control_socket_task,
@@ -389,9 +482,10 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
                 stop_event,
                 backend_lock,
                 start_time,
+                writer_queue,
             )
             # Watch stop_event; shuts down and calls os._exit(0).
-            tg.start_soon(_stop_watcher, stop_event, db_path)
+            tg.start_soon(_stop_watcher, stop_event, db_path, backend_lock, shutdown_requested)
             # Watch for SIGTERM; fires stop_event for same clean path.
             tg.start_soon(_sigterm_watcher, stop_event)
 
@@ -457,5 +551,6 @@ if TYPE_CHECKING:
     import anyio
 
     from sqlcg.core.graph_db import GraphBackend
+    from sqlcg.server.writer import WriterQueue
 
 from sqlcg.server.control import sock_path  # noqa: E402  (used in _control_socket_task)
