@@ -33,7 +33,7 @@ _HOOKS: list[_HookSpec] = [
             '[ "$3" = "1" ] || exit 0\n'
             '{sqlcg_bin} reindex --from "$1" --to "$2"'
             ' "$(git rev-parse --show-toplevel)" --dialect auto --quiet --notify'
-            ' || echo "sqlcg: graph not updated (server busy/locked)'
+            ' || echo "sqlcg: graph not updated (reindex failed)'
             " -- run 'sqlcg mcp status'\" >&2\n"
         ),
     ),
@@ -50,10 +50,10 @@ PREV=$(git rev-parse --verify --quiet ORIG_HEAD)
 TOP=$(git rev-parse --show-toplevel)
 if [ -n "$PREV" ]; then
   {sqlcg_bin} reindex --from "$PREV" --to HEAD "$TOP" --dialect auto --quiet --notify \\
-    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+    || echo "sqlcg: graph not updated (reindex failed) -- run 'sqlcg mcp status'" >&2
 else
   {sqlcg_bin} reindex "$TOP" --dialect auto --quiet --notify \\
-    || echo "sqlcg: graph not updated (server busy/locked) -- run 'sqlcg mcp status'" >&2
+    || echo "sqlcg: graph not updated (reindex failed) -- run 'sqlcg mcp status'" >&2
 fi
 """,
     ),
@@ -101,7 +101,14 @@ def _install_single_hook(hooks_dir: Path, spec: _HookSpec, sqlcg_bin: str) -> No
     if hook_path.exists():
         existing_content = hook_path.read_text()
         if spec.sentinel in existing_content:
-            # Already installed — idempotent, skip silently
+            if existing_content == script:
+                # Byte-identical current template — true idempotency, silent skip.
+                return
+            # Sentinel present but content differs: sqlcg-owned but stale hook.
+            # Overwrite with the current rendered template and report the upgrade.
+            hook_path.write_text(script)
+            hook_path.chmod(0o755)
+            console.print(f"[green]Upgraded git hook:[/green] .git/hooks/{spec.filename}")
             return
         else:
             # Foreign hook without sqlcg sentinel

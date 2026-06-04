@@ -62,6 +62,13 @@ sqlcg index [OPTIONS] PATH
 
 Index SQL files in a directory.
 
+When a server is live on this DB, the index is routed through the server's
+control socket so the DB is never opened directly (avoids lock contention).
+Use --detach to enqueue and return immediately (fire-and-forget).
+
+With no server live, falls back to the direct-write path unchanged
+(zero-config small-repo invariant).
+
 Schema aliases (staging schema → canonical schema) can be configured in
 .sqlcg.toml under sqlcg.schema_aliases, e.g. da_tmp = "da".
 
@@ -80,6 +87,7 @@ Schema aliases (staging schema → canonical schema) can be configured in
 | --debug | BOOLEAN | No | No | False | Show detailed log output during indexing |
 | --profile / --no-profile | BOOLEAN | No | No | False | Emit per-stage timing after indexing |
 | --include-working-tree | BOOLEAN | No | No | False | Index the working tree including uncommitted changes. Marks freshness as 'indexed with working-tree changes'. |
+| --detach | BOOLEAN | No | No | False | When routing through a live server, return immediately after enqueueing (fire-and-forget). Default is to wait for the index to complete. |
 
 ## `sqlcg reindex`
 
@@ -548,7 +556,12 @@ sqlcg mcp status [OPTIONS]
 Print server status JSON (connects to control socket).
 
 Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
-stale_by_commits, connected_clients, uptime when a server is live.
+stale_by_commits, connected_clients, uptime, writer_queue when a server
+is live.
+
+The status response is length-prefixed framed (v1.3.0, B3) so large
+writer_queue payloads are received in full — the client uses the
+recv-exactly makefile+readline+read(n) pattern, NOT a single recv(4096).
 
 When no server is found: {"running": false}.
 When the PID file exists with a live process but the socket is unavailable:

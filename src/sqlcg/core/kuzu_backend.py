@@ -23,11 +23,14 @@ from sqlcg.utils.logging import getLogger
 logger = getLogger(__name__)
 
 
-def _find_lock_holder(db_path: str) -> str:
+def find_lock_holder(db_path: str) -> str:
     """Return a human-readable PID string for the process holding the DB lock.
 
     Uses lsof on Linux/macOS. Returns a descriptive fallback if lsof is
     unavailable or returns no results.
+
+    Public so server/writer.py can import it without crossing into a private.
+    Returns e.g. ``"PID 1234"`` or ``"PID unknown"``.
     """
     import shutil
     import subprocess
@@ -58,10 +61,11 @@ class KuzuBackend(GraphBackend):
         Args:
             db_path: Path to the KùzuDB database file (or ':memory:' for in-memory)
             buffer_pool_size_mb: Buffer pool size in MB (0 = use KuzuDB default)
-            read_only: Open in read-only mode.  Enables concurrent read-only
-                opens (reader/reader concurrency) by not taking the exclusive
-                write lock.  Does NOT allow reads while a read-write writer
-                holds the lock — KùzuDB's exclusive lock is process-level.
+            read_only: Open in read-only mode.  Takes a *shared* lock that
+                permits concurrent read-only opens (reader/reader concurrency)
+                but still **blocks any read-write open** (and a read-write open
+                blocks all opens, including read-only ones).  Kuzu 0.11.3 lock
+                matrix: RO+RO → ok; RO+RW → blocked; RW+anything → blocked.
 
         Raises:
             RuntimeError: If the database is locked or cannot be opened.
@@ -75,7 +79,7 @@ class KuzuBackend(GraphBackend):
         except RuntimeError as exc:
             if "Could not set lock" in str(exc) or "lock" in str(exc).lower():
                 # Attempt to find the holding PID via lsof
-                pid_hint = _find_lock_holder(db_path)
+                pid_hint = find_lock_holder(db_path)
                 pid_str = pid_hint.split()[-1] if pid_hint else "<PID>"
                 msg = (
                     f"Database is locked — another sqlcg process is running "

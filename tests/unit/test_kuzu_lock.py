@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend, _find_lock_holder
+from sqlcg.core.kuzu_backend import KuzuBackend, find_lock_holder
 
 
 class TestKuzuLockError:
@@ -19,7 +19,7 @@ class TestKuzuLockError:
             )
 
             # Patch _find_lock_holder to return a PID
-            with patch("sqlcg.core.kuzu_backend._find_lock_holder") as mock_find:
+            with patch("sqlcg.core.kuzu_backend.find_lock_holder") as mock_find:
                 mock_find.return_value = "PID 12345"
 
                 # Verify RuntimeError is raised with helpful message
@@ -55,7 +55,7 @@ class TestKuzuLockError:
         """Guard: _find_lock_holder returns graceful fallback without lsof."""
         # Patch shutil.which to indicate lsof is not available
         with patch("shutil.which", return_value=None):
-            result = _find_lock_holder("/tmp/test.db")
+            result = find_lock_holder("/tmp/test.db")
 
             assert "unknown" in result.lower(), (
                 f"Fallback message should indicate lsof unavailable. Got: {result}"
@@ -80,7 +80,7 @@ class TestKuzuLockErrorMessages:
             mock_db.side_effect = RuntimeError(error_message)
 
             with patch(
-                "sqlcg.core.kuzu_backend._find_lock_holder",
+                "sqlcg.core.kuzu_backend.find_lock_holder",
                 return_value="PID unknown",
             ):
                 with pytest.raises(RuntimeError) as exc_info:

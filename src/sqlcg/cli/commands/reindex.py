@@ -70,91 +70,36 @@ def reindex_cmd(  # noqa: B008
     Exits with an error if the database schema version does not match the current
     build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init.
     """
-    import json
-    import socket as _socket
-
     from sqlcg.core.config import config_file_present, get_backend, get_db_path, get_dialect
     from sqlcg.core.schema import SCHEMA_VERSION
     from sqlcg.indexer.indexer import Indexer
-    from sqlcg.server.control import sock_path
 
     # Resolve to absolute path so ignore-spec and git delta receive an absolute root
     path = path.resolve()
 
-    # --notify: if a server is live, route reindex through the socket (R3 fallback)
-    if notify:
-        sp = sock_path()
-        try:
-            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
-                s.settimeout(_NOTIFY_SOCKET_TIMEOUT_S)
-                s.connect(str(sp))
-                # Resolve SHAs before sending — standalone mode reads from DB via socket
-                effective_from = from_sha
-                if effective_from is None:
-                    # Standalone mode: we cannot read stored SHA here without opening the
-                    # DB (which would conflict with the running server).  If no --from is
-                    # given with --notify, we send from="stored" as a sentinel and fall
-                    # back to direct write; the caller should pass --from explicitly.
-                    raise OSError(  # noqa: TRY301
-                        "--notify without --from requires direct DB access; falling through"
-                    )
-                # Resolve symbolic refs (HEAD, branch names) to concrete 40-char SHAs
-                # before sending — prevents literal "HEAD" from being stored in the graph.
-                effective_from = _resolve_ref(path, effective_from)
-                effective_to = _resolve_ref(path, to_sha) if to_sha else _get_head(path)
-                payload = {
-                    "op": "reindex",
-                    "root": str(path),
-                    "from": effective_from,
-                    "to": effective_to,
-                    "dialect": dialect,
-                }
-                s.sendall(json.dumps(payload).encode() + b"\n")
-                data = s.recv(65536)
-            result = json.loads(data)
-            if "error" in result:
-                console.print(f"[red]Server reindex error: {result['error']}[/red]")
-                raise typer.Exit(1)
-            if not quiet:
-                srv_summary = result.get("summary", {})
-                console.print(
-                    f"[green]Resynced via server[/green] "
-                    f"+{srv_summary.get('added', 0)} added, "
-                    f"~{srv_summary.get('modified', 0)} modified, "
-                    f"-{srv_summary.get('deleted', 0)} deleted"
-                )
-            raise typer.Exit(0)
-        except TimeoutError:
-            # Bug 1 fix: server is alive and working (accepted the connection, holds the
-            # lock, will finish and persist).  Do NOT fall through to the direct-write
-            # path — that would hit the held lock and produce a false "Database is locked"
-            # error.  Exit 0 so the git hook stays non-fatal; the server will complete.
-            # (socket.timeout is an alias of TimeoutError, a subclass of OSError — this
-            # clause must be listed before the broad OSError clause below.)
-            import sys
-
-            print(
-                f"Server is still applying the reindex (timed out waiting after "
-                f"{_NOTIFY_SOCKET_TIMEOUT_S}s); the graph will update when it finishes "
-                f"— check 'sqlcg mcp status'.",
-                file=sys.stderr,
-            )
-            raise typer.Exit(0) from None
-        except (FileNotFoundError, ConnectionRefusedError, OSError):
-            # R3: no live server (stale socket, socket absent, fallback condition) —
-            # fall through to the existing direct-write path unchanged.
-            # NOTE: socket.timeout / TimeoutError is an OSError subclass, so the
-            # dedicated timeout clause above must be listed first (already is).
-            pass
-        except typer.Exit:
-            raise
-        except Exception as exc:
-            console.print(f"[red]--notify routing failed: {exc}[/red]")
-            raise typer.Exit(1) from exc
-
-    # Resolve dialect
+    # Resolve dialect before routing so the WriterRequest always carries a concrete
+    # dialect (never the literal sentinel "auto").  Bug A: the route call was before
+    # this resolution, causing the server to receive "auto" and fail with
+    # "Unknown dialect 'auto'" on every server-routed reindex.
     if dialect == "auto":
         dialect = get_dialect(path)
+
+    # Step 3.3 — route manual reindex through the socket when a server is live.
+    # The --notify flag is kept for backward compatibility but no longer required;
+    # manual reindex (no --notify) now also probes the socket by default.
+    # W3: from=null is sent when from_sha is None — the server resolves the stored
+    # SHA at drain start (no more "requires direct DB access" refusal).
+    _is_hook_path = notify  # hook path: fire-and-forget; manual path: wait by default
+    _routed = _try_route_reindex_via_server(
+        path=path,
+        from_sha=from_sha,
+        to_sha=to_sha,
+        dialect=dialect,
+        wait=not _is_hook_path,
+        quiet=quiet,
+    )
+    if _routed:
+        return
 
     if not quiet and not config_file_present(path):
         console.print(
@@ -246,6 +191,131 @@ def reindex_cmd(  # noqa: B008
                     f"-{summary['deleted']} deleted, "
                     f"{summary['closure_resolved']} closure files re-resolved"
                 )
+
+
+def _try_route_reindex_via_server(
+    *,
+    path: Path,
+    from_sha: str | None,
+    to_sha: str | None,
+    dialect: str | None,
+    wait: bool,
+    quiet: bool,
+) -> bool:
+    """Probe for a live server and route the reindex through the socket if found.
+
+    W3: ``from`` may be ``None`` — the server resolves the stored indexed SHA
+    at drain start.  Symbolic refs are resolved to concrete SHAs before sending
+    (prevents literal "HEAD" being stored in the graph).
+
+    Returns True if the reindex was handled via the server (caller should return).
+    Returns False if no server is live (caller should fall through to direct path).
+    """
+    import json
+    import socket as _socket
+
+    from sqlcg.server.control import sock_path
+
+    sp = sock_path()
+    if not sp.exists():
+        return False
+
+    # Resolve symbolic SHAs if provided (the hook path already resolves them).
+    effective_from = _resolve_ref(path, from_sha) if from_sha is not None else None
+    effective_to = _resolve_ref(path, to_sha) if to_sha is not None else None
+
+    payload = {
+        "op": "reindex",
+        "root": str(path),
+        "from": effective_from,  # None → server resolves at drain start (W3)
+        "to": effective_to,
+        "dialect": dialect,
+        "wait": wait,
+        "requested_by": "hook" if not wait else "cli",
+    }
+    payload_bytes = json.dumps(payload).encode()
+    frame = f"{len(payload_bytes)}\n".encode() + payload_bytes
+
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(_NOTIFY_SOCKET_TIMEOUT_S)
+            s.connect(str(sp))
+            s.sendall(frame)
+
+            f = s.makefile("rb")
+            if not wait:
+                # Fire-and-forget: read one framed acknowledgement.
+                length_line = f.readline()
+                if length_line:
+                    try:
+                        body_len = int(length_line.strip())
+                        resp_bytes = f.read(body_len)
+                        result = json.loads(resp_bytes)
+                        if "error" in result:
+                            console.print(f"[red]Server reindex error: {result['error']}[/red]")
+                            raise typer.Exit(1)
+                        if not quiet:
+                            pos = result.get("position", "?")
+                            console.print(
+                                f"[green]Reindex queued via server[/green] (position {pos})"
+                            )
+                    except (ValueError, json.JSONDecodeError):
+                        pass
+                return True
+
+            # wait=True: stream framed frames until done:true.
+            while True:
+                length_line = f.readline()
+                if not length_line:
+                    break
+                try:
+                    body_len = int(length_line.strip())
+                except ValueError:
+                    break
+                frame_bytes = f.read(body_len)
+                frame_resp = json.loads(frame_bytes)
+
+                if frame_resp.get("done"):
+                    if not frame_resp.get("ok"):
+                        err = frame_resp.get("error", "unknown error")
+                        console.print(f"[red]Server reindex error: {err}[/red]")
+                        raise typer.Exit(1)
+                    srv_summary = frame_resp.get("summary", {})
+                    if not quiet:
+                        if srv_summary.get("fell_back_to_full"):
+                            console.print(
+                                "[yellow]Closure exceeded depth cap — fell back to full index "
+                                "(via server).[/yellow]"
+                            )
+                        else:
+                            console.print(
+                                f"[green]Resynced via server[/green] "
+                                f"+{srv_summary.get('added', 0)} added, "
+                                f"~{srv_summary.get('modified', 0)} modified, "
+                                f"-{srv_summary.get('deleted', 0)} deleted"
+                            )
+                    break
+
+        return True
+
+    except TimeoutError:
+        import sys
+
+        print(
+            f"Server is still applying the reindex (timed out waiting after "
+            f"{_NOTIFY_SOCKET_TIMEOUT_S}s); the graph will update when it finishes "
+            "— check 'sqlcg mcp status'.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(0) from None
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        # No live server — fall through to direct path.
+        return False
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[red]Socket routing failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 def _resolve_ref(root: Path, ref: str) -> str:

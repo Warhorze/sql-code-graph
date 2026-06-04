@@ -78,7 +78,12 @@ def mcp_status() -> None:
     """Print server status JSON (connects to control socket).
 
     Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
-    stale_by_commits, connected_clients, uptime when a server is live.
+    stale_by_commits, connected_clients, uptime, writer_queue when a server
+    is live.
+
+    The status response is length-prefixed framed (v1.3.0, B3) so large
+    writer_queue payloads are received in full — the client uses the
+    recv-exactly makefile+readline+read(n) pattern, NOT a single recv(4096).
 
     When no server is found: {"running": false}.
     When the PID file exists with a live process but the socket is unavailable:
@@ -89,6 +94,7 @@ def mcp_status() -> None:
     to the PID-file probe — never hangs or errors on a dead socket.
     """
     import socket as _socket
+    from datetime import datetime
 
     from sqlcg.server.control import is_pid_alive, read_pid, sock_path
 
@@ -98,8 +104,69 @@ def mcp_status() -> None:
             s.settimeout(2)
             s.connect(str(sp))
             s.sendall(json.dumps({"op": "status"}).encode() + b"\n")
-            data = s.recv(4096)
-        console.print_json(data.decode())
+            # Framed recv-exactly (B3 / OD-4): read length line then exactly that many bytes.
+            # This replaces the old s.recv(4096) which would truncate large writer_queue payloads.
+            f = s.makefile("rb")
+            length_line = f.readline()
+            if length_line:
+                try:
+                    body_len = int(length_line.strip())
+                    data = f.read(body_len)
+                except (ValueError, OSError):
+                    data = length_line  # fallback: treat first line as body
+            else:
+                data = b""
+
+        status = json.loads(data.decode())
+
+        # Pretty-print the base fields.
+        console.print_json(json.dumps({k: v for k, v in status.items() if k != "writer_queue"}))
+
+        # Render the writer_queue block separately for readability.
+        wq = status.get("writer_queue")
+        if wq:
+            console.print("\n[bold]writer_queue[/bold]")
+            active = wq.get("active")
+            if active:
+                console.print(f"  active: op={active.get('op')!r} root={active.get('root')!r}")
+                prog = wq.get("active_progress", {})
+                if prog.get("state") == "running":
+                    files_done = prog.get("files_done", 0)
+                    files_total = prog.get("files_total")
+                    if files_total:
+                        console.print(f"    progress: {files_done}/{files_total} files")
+            else:
+                console.print("  active: none")
+
+            pending = wq.get("pending", [])
+            console.print(f"  pending: {len(pending)}")
+
+            total_coalesced = wq.get("coalesced_since_start", 0)
+            by_reason = wq.get("coalesced_by_reason", {})
+            if total_coalesced:
+                from sqlcg.server.writer import (
+                    COALESCE_COLLAPSED_INTO_PENDING_REINDEX,
+                    COALESCE_REINDEX_DROPPED_INDEX_PENDING,
+                    COALESCE_SUPERSEDED_BY_INDEX,
+                )
+
+                n_sup = by_reason.get(COALESCE_SUPERSEDED_BY_INDEX, 0)
+                n_col = by_reason.get(COALESCE_COLLAPSED_INTO_PENDING_REINDEX, 0)
+                n_drop = by_reason.get(COALESCE_REINDEX_DROPPED_INDEX_PENDING, 0)
+                console.print(
+                    f"  coalesced: {total_coalesced} "
+                    f"(superseded_by_index={n_sup}, "
+                    f"collapsed_into_pending_reindex={n_col}, "
+                    f"reindex_dropped_index_pending={n_drop})"
+                )
+                last_at = wq.get("last_coalesce_at")
+                last_reason = wq.get("last_coalesce_reason")
+                if last_at and last_reason:
+                    last_human = datetime.fromtimestamp(last_at).strftime("%Y-%m-%d %H:%M:%S")
+                    console.print(f"  last coalesce: {last_reason} at {last_human}")
+            else:
+                console.print("  coalesced: 0")
+
     except (FileNotFoundError, ConnectionRefusedError, OSError):
         # Socket unavailable — probe via PID file (R3: stale-socket fall-through)
         rec = read_pid()

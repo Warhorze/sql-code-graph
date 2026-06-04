@@ -51,12 +51,31 @@ def _wait_for_socket(sp: Path, timeout: float = 10.0) -> bool:
 
 
 def _send_op(sp: Path, op_dict: dict, timeout: float = 5.0) -> dict:
-    """Send a JSON op to the control socket and return the parsed response."""
+    """Send a JSON op to the control socket and return the parsed response.
+
+    For the 'status' op (v1.3.0 framed protocol): reads the length-prefixed
+    framed response via makefile+readline+read(n).
+    For all other ops (stop/reindex/unknown): uses legacy single recv.
+    """
+    op = op_dict.get("op")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect(str(sp))
         s.sendall(json.dumps(op_dict).encode() + b"\n")
-        data = s.recv(65536)
+        if op == "status":
+            # v1.3.0: status response is length-prefixed framed.
+            f = s.makefile("rb")
+            ll = f.readline()
+            if ll:
+                try:
+                    n = int(ll.strip())
+                    data = f.read(n)
+                    return json.loads(data)
+                except (ValueError, json.JSONDecodeError):
+                    pass
+            return {}
+        else:
+            data = s.recv(65536)
     return json.loads(data.decode().strip())
 
 
@@ -139,14 +158,15 @@ class TestMcpStatusLiveServer:
         resp = _send_op(sp, {"op": "status"})
         assert resp["db_path"] == str(db_path), f"Expected db_path={db_path}, got {resp['db_path']}"
 
-    def test_reindex_op_missing_fields_returns_error(self, live_server):
-        """Reindex op without required fields returns an error dict immediately."""
+    def test_reindex_op_missing_root_returns_error(self, live_server):
+        """Reindex op without root returns an error dict immediately."""
         _, _, sp = live_server
-        # Omit required 'to' field — server must return error without hanging
-        resp = _send_op(sp, {"op": "reindex", "root": "/tmp", "from": "abc"})
-        assert "error" in resp, f"Expected error for missing 'to' field, got: {resp}"
-        assert "requires root, from, to" in resp["error"], (
-            f"Error must mention required fields, got: {resp['error']}"
+        # Omit required 'root' field — server must return error without hanging.
+        # Note: from/to are optional (W3 — server resolves at drain time).
+        resp = _send_op(sp, {"op": "reindex", "from": "abc", "to": "def"})
+        assert "error" in resp, f"Expected error for missing 'root', got: {resp}"
+        assert "requires root" in resp["error"], (
+            f"Error must mention missing 'root', got: {resp['error']}"
         )
 
     def test_unknown_op_returns_error(self, live_server):
