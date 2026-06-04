@@ -141,3 +141,32 @@ def test_installed_post_merge_no_bare_or_true() -> None:
     """Installed post-merge script does not contain '|| true'."""
     content = _install_and_read("post-merge")
     assert "|| true" not in content
+
+
+# ---------------------------------------------------------------------------
+# Minor D guards — reworded fallback message (reindex failed, not server busy)
+# ---------------------------------------------------------------------------
+
+
+def test_no_template_contains_server_busy_locked() -> None:
+    """No hook template contains the old 'server busy/locked' message.
+
+    Minor D: reworded to '(reindex failed)' for failure-agnostic messaging.
+    """
+    for spec in _HOOKS:
+        assert "server busy/locked" not in spec.script_template, (
+            f"Hook template '{spec.filename}' still contains 'server busy/locked'. "
+            "Minor D: reword to '(reindex failed)'."
+        )
+
+
+def test_all_templates_contain_reindex_failed() -> None:
+    """All hook templates contain the new '(reindex failed)' fallback message.
+
+    Minor D: failure-agnostic wording replaces the old 'server busy/locked'.
+    """
+    for spec in _HOOKS:
+        assert "(reindex failed)" in spec.script_template, (
+            f"Hook template '{spec.filename}' does not contain '(reindex failed)'. "
+            "Minor D fix not yet applied."
+        )
