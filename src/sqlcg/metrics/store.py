@@ -117,6 +117,19 @@ class MetricsStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS writer_queue_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    op TEXT,
+                    reason TEXT,
+                    queue_depth INTEGER,
+                    duration_ms REAL
+                )
+                """
+            )
             self._conn.commit()
         except sqlite3.Error as e:
             logger.warning(f"Failed to initialize metrics schema: {e}")
@@ -227,6 +240,41 @@ class MetricsStore:
             self._conn.commit()
         except sqlite3.Error as e:
             logger.warning(f"Failed to record feedback: {e}")
+
+    def record_queue_event(
+        self,
+        event: str,
+        *,
+        op: str | None = None,
+        reason: str | None = None,
+        queue_depth: int | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        """Record a writer-queue lifecycle event.
+
+        Args:
+            event: One of ``"enqueued"``, ``"coalesced"``, ``"drained"``.
+            op: The write op type (``"index"`` or ``"reindex"``).
+            reason: Coalesce reason constant (set for ``"coalesced"`` events).
+            queue_depth: Pending-queue depth at event time.
+            duration_ms: Drain wall-clock duration (set for ``"drained"``).
+        """
+        if not self._enabled or self._conn is None:
+            return
+
+        try:
+            timestamp = datetime.now(UTC).isoformat()
+            self._conn.execute(
+                """
+                INSERT INTO writer_queue_events
+                (timestamp, event, op, reason, queue_depth, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (timestamp, event, op, reason, queue_depth, duration_ms),
+            )
+            self._conn.commit()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to record queue event: {e}")
 
     def execute_query(self, query: str, params: tuple | None = None) -> list[tuple]:
         """Execute a read-only query.
