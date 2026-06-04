@@ -45,6 +45,29 @@ def db_reset(  # noqa: B008
     repo: str | None = typer.Option(None, "--repo", help="Reset only this repo path"),  # noqa: B008
 ) -> None:
     """Wipe the database or a single repo's subgraph."""
+    import socket as _socket
+
+    from sqlcg.server.control import sock_path
+
+    # Step 3.4 (OD-3 / W2): refuse cleanly when a server is live — both the
+    # full reset and the --repo partial reset open the RW backend directly and
+    # would fight the server's lock.  Guard runs BEFORE either destructive branch.
+    sp = sock_path()
+    if sp.exists():
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(str(sp))
+            # Connection succeeded — a server is live.
+            console.print(
+                "[red]A server is running on this database; stop it first "
+                "('sqlcg mcp stop') before resetting the database.[/red]"
+            )
+            raise typer.Exit(1)
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            # No live server — fall through to destructive action.
+            pass
+
     if repo:
         # Delete all nodes for this repo (use run_write for mutation)
         with get_backend() as backend:

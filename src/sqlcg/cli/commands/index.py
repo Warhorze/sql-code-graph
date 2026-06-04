@@ -1,6 +1,8 @@
 """Index command for scanning and indexing SQL files."""
 
+import json
 import os
+import socket as _socket
 from pathlib import Path
 
 import typer
@@ -18,6 +20,10 @@ from sqlcg.core.config import KuzuConfig, config_file_present, get_backend, get_
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
+
+# Socket timeout for the index-via-server path.
+# Generous budget: full index of a large repo can take several minutes.
+_INDEX_SOCKET_TIMEOUT_S = 600
 
 
 def index_cmd(  # noqa: B008
@@ -71,8 +77,23 @@ def index_cmd(  # noqa: B008
             "Marks freshness as 'indexed with working-tree changes'."
         ),
     ),
+    detach: bool = typer.Option(  # noqa: B008
+        False,
+        "--detach",
+        help=(
+            "When routing through a live server, return immediately after enqueueing "
+            "(fire-and-forget). Default is to wait for the index to complete."
+        ),
+    ),
 ) -> None:
     """Index SQL files in a directory.
+
+    When a server is live on this DB, the index is routed through the server's
+    control socket so the DB is never opened directly (avoids lock contention).
+    Use --detach to enqueue and return immediately (fire-and-forget).
+
+    With no server live, falls back to the direct-write path unchanged
+    (zero-config small-repo invariant).
 
     Schema aliases (staging schema → canonical schema) can be configured in
     .sqlcg.toml under sqlcg.schema_aliases, e.g. da_tmp = "da".
@@ -84,6 +105,19 @@ def index_cmd(  # noqa: B008
     level = logging.DEBUG if debug else logging.CRITICAL
     logging.getLogger("sqlcg").setLevel(level)
     logging.getLogger("sqlglot").setLevel(level)
+
+    # Resolve path early so socket routing uses the absolute path.
+    path = path.resolve()
+
+    # Step 3.2 — probe for a live server and route through the socket if present.
+    _routed = _try_route_index_via_server(
+        path=path,
+        dialect=dialect,
+        wait=not detach,
+        quiet=quiet,
+    )
+    if _routed:
+        return
 
     # Route parse warnings to stderr (--verbose) or to the configured log file.
     sqlcg_log = logging.getLogger("sqlcg")
@@ -170,6 +204,132 @@ def index_cmd(  # noqa: B008
             f"[yellow]Parse warnings written to {_warn_log_path} "
             "— use --verbose to show here.[/yellow]"
         )
+
+
+def _try_route_index_via_server(
+    *,
+    path: Path,
+    dialect: str | None,
+    wait: bool,
+    quiet: bool,
+) -> bool:
+    """Probe for a live server and route the index through the socket if found.
+
+    Returns True if the index was handled via the server (caller should return).
+    Returns False if no server is live (caller should fall through to direct path).
+    """
+    from sqlcg.server.control import sock_path
+
+    sp = sock_path()
+    if not sp.exists():
+        return False
+
+    payload = {
+        "op": "index",
+        "root": str(path),
+        "dialect": dialect,
+        "wait": wait,
+        "requested_by": "cli",
+    }
+    payload_bytes = json.dumps(payload).encode()
+    frame = f"{len(payload_bytes)}\n".encode() + payload_bytes
+
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
+            s.settimeout(_INDEX_SOCKET_TIMEOUT_S)
+            s.connect(str(sp))
+            s.sendall(frame)
+
+            if not wait:
+                # Fire-and-forget: read one framed acknowledgement frame.
+                f = s.makefile("rb")
+                length_line = f.readline()
+                if length_line:
+                    try:
+                        body_len = int(length_line.strip())
+                        resp_bytes = f.read(body_len)
+                        resp = json.loads(resp_bytes)
+                        if "error" in resp:
+                            err = resp["error"]
+                            if "SQLCG_DB_PATH" in err or "write lock" in err:
+                                console.print(f"[red]{err}[/red]")
+                            else:
+                                console.print(f"[red]Server error: {err}[/red]")
+                            raise typer.Exit(1)
+                        if not quiet:
+                            pos = resp.get("position", "?")
+                            console.print(f"[green]Queued via server[/green] (position {pos})")
+                    except (ValueError, json.JSONDecodeError):
+                        pass
+                return True
+
+            # wait=True: stream framed frames until done:true.
+            f = s.makefile("rb")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                redirect_stderr=True,
+            ) as progress:
+                task = progress.add_task("Indexing via server", total=None)
+
+                while True:
+                    length_line = f.readline()
+                    if not length_line:
+                        break
+                    try:
+                        body_len = int(length_line.strip())
+                    except ValueError:
+                        break
+                    frame_bytes = f.read(body_len)
+                    frame_resp = json.loads(frame_bytes)
+
+                    if frame_resp.get("done"):
+                        if not frame_resp.get("ok"):
+                            err = frame_resp.get("error", "unknown error")
+                            if "SQLCG_DB_PATH" in err or "write lock" in err:
+                                console.print(f"[red]{err}[/red]")
+                            else:
+                                console.print(f"[red]Server index error: {err}[/red]")
+                            raise typer.Exit(1)
+                        srv_summary = frame_resp.get("summary", {})
+                        if not quiet:
+                            console.print(
+                                f"[green]Indexed via server[/green] "
+                                f"{srv_summary.get('files_parsed', '?')} files — "
+                                f"{srv_summary.get('tables_found', '?')} tables, "
+                                f"{srv_summary.get('lineage_edges_created', '?')} edges"
+                            )
+                        break
+                    # Progress frame
+                    files_done = frame_resp.get("files_done", 0)
+                    files_total = frame_resp.get("files_total")
+                    if files_total:
+                        progress.update(task, completed=files_done, total=files_total)
+
+        return True
+
+    except TimeoutError:
+        import sys as _sys
+
+        print(
+            f"Server is still applying the index (timed out waiting after "
+            f"{_INDEX_SOCKET_TIMEOUT_S}s); the graph will update when it finishes "
+            "— check 'sqlcg mcp status'.",
+            file=_sys.stderr,
+        )
+        raise typer.Exit(0) from None
+    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        # No live server — fall through to direct path.
+        return False
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[red]Socket routing failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 def _run_index(
