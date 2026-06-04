@@ -480,7 +480,8 @@ class TestNotifyServerErrorSurfaces:
             async with stream:
                 await stream.receive(4096)
                 # Send a framed error response (v1.3.0 protocol: all reindex responses are framed).
-                body = json.dumps({"ok": False, "done": True, "error": "deliberate test error"}).encode()
+                err_resp = {"ok": False, "done": True, "error": "deliberate test error"}
+                body = json.dumps(err_resp).encode()
                 await stream.send(f"{len(body)}\n".encode() + body)
 
         async def _mock_server() -> None:

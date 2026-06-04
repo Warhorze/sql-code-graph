@@ -6,6 +6,10 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import anyio
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.freshness import compute_freshness
@@ -100,6 +104,26 @@ _backend: GraphBackend | None = None
 # Module-level metrics store singleton
 _metrics: MetricsStore | None = None
 
+# Module-level backend lock — injected by server.py _run_with_control so that
+# MCP write tools (index_repo) share the same lock as the drain loop.
+# None when no server event-loop is running (unit tests, direct DB access).
+_backend_lock: "anyio.Lock | None" = None
+
+# True when init_backend has opened the backend in RO serving mode.
+# Checked by MCP write tools to decide whether to escalate.
+_serving_ro: bool = False
+
+
+def _set_backend_lock(lock: "anyio.Lock | None") -> None:
+    """Register the backend lock from the server's task group.
+
+    Called by server.py _run_with_control so MCP write tools use the same
+    lock as the drain loop — ensuring no concurrent RW access.
+    """
+    global _backend_lock
+    _backend_lock = lock
+
+
 
 def init_backend(db_path: str | None = None) -> None:
     """Initialize the module-level backend singleton.
@@ -123,7 +147,7 @@ def init_backend(db_path: str | None = None) -> None:
         RuntimeError: If backend initialization fails or schema version
             is stale (the caller must not swallow this — server must exit).
     """
-    global _backend, _metrics
+    global _backend, _metrics, _serving_ro
     path = db_path or str(get_db_path())
 
     # Step 1 — RW open + create schema if absent.
@@ -142,6 +166,7 @@ def init_backend(db_path: str | None = None) -> None:
 
     # Step 4 — reopen RO as the serving singleton.
     _backend = KuzuBackend(path, read_only=True)
+    _serving_ro = True
     logger.debug(f"Backend initialized (RO serving): {path}")
 
     # Initialize metrics store (best-effort, failures are logged as WARNING)
@@ -159,7 +184,7 @@ def shutdown_backend() -> None:
     Closes the database connection and clears the global reference.
     Safe to call multiple times.
     """
-    global _backend, _metrics
+    global _backend, _metrics, _serving_ro
     if _backend is not None:
         _backend.close()
         _backend = None
@@ -167,6 +192,7 @@ def shutdown_backend() -> None:
     if _metrics is not None:
         _metrics.close()
         _metrics = None
+    _serving_ro = False
 
 
 def _get_backend() -> GraphBackend:
@@ -178,6 +204,38 @@ def _get_backend() -> GraphBackend:
     if _backend is None:
         raise RuntimeError("Backend not initialized. Call init_backend() before using tools.")
     return _backend
+
+
+def _get_or_escalate_rw(db_path_str: str, should_escalate: bool) -> GraphBackend:
+    """Return the current backend for write use.
+
+    When the server has opened the backend RO (should_escalate=True), escalates
+    to RW using escalate_to_rw so the MCP write tool can write.  When the
+    backend is already RW (direct call in tests / non-server context),
+    returns it directly.
+
+    Args:
+        db_path_str: Path string for escalation.
+        should_escalate: True when the server has opened the backend RO.
+    """
+    if not should_escalate:
+        return _get_backend()
+    from sqlcg.server.writer import escalate_to_rw
+
+    return escalate_to_rw(db_path_str, current=_backend)
+
+
+def _de_escalate_to_ro_from_tool(db_path_str: str) -> None:
+    """De-escalate from RW back to RO after a MCP write tool finishes.
+
+    Best-effort: logs on failure but does not raise.
+    """
+    from sqlcg.server.writer import de_escalate_to_ro
+
+    try:
+        de_escalate_to_ro(db_path_str)
+    except Exception as exc:
+        logger.warning(f"de_escalate_to_ro failed in MCP write tool: {exc}")
 
 
 def _assert_schema_current(backend: GraphBackend, path: str) -> None:
@@ -510,19 +568,24 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
     success = True
 
     try:
-        db = _get_backend()
-        indexer = Indexer()
         path = Path(repo_path).resolve()
         if not path.exists():
             raise ValueError(f"Repository path does not exist: {repo_path}")
         if not path.is_dir():
             raise ValueError(f"Repository path is not a directory: {repo_path}")
 
+        # If the backend is in RO serving mode (set by init_backend), escalate
+        # to RW for the duration of this write op, then de-escalate after.
+        db_path_str = str(get_db_path())
+        is_ro = _serving_ro
+        rw_db = _get_or_escalate_rw(db_path_str, is_ro)
+
+        indexer = Indexer()
         # Ensure the Repo node exists for this repository
         from sqlcg.core.schema import NodeLabel, RelType
 
         abs_path = str(path)
-        db.upsert_node(
+        rw_db.upsert_node(
             NodeLabel.REPO,
             abs_path,
             {
@@ -532,14 +595,14 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         )
 
         # Index the repository (with absolute path)
-        result = indexer.index_repo(path, dialect, db)
+        result = indexer.index_repo(path, dialect, rw_db)
 
         # Create BELONGS_TO relationships from File nodes to Repo node
         # Query for all File nodes in this repo and link them to the Repo
         repo_prefix = abs_path.rstrip("/") + "/"
-        file_rows = db.run_read(INDEX_REPO_FILES_QUERY, {"repo_prefix": repo_prefix})
+        file_rows = rw_db.run_read(INDEX_REPO_FILES_QUERY, {"repo_prefix": repo_prefix})
         for row in file_rows:
-            db.upsert_edge(
+            rw_db.upsert_edge(
                 NodeLabel.FILE,
                 row["path"],
                 NodeLabel.REPO,
@@ -547,6 +610,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
                 RelType.BELONGS_TO,
                 {},
             )
+        if is_ro:
+            _de_escalate_to_ro_from_tool(db_path_str)
 
         logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
 
