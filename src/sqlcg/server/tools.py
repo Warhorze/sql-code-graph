@@ -104,22 +104,45 @@ _metrics: MetricsStore | None = None
 def init_backend(db_path: str | None = None) -> None:
     """Initialize the module-level backend singleton.
 
+    Startup sequence (OD-2 — measured on kuzu 0.11.3):
+      1. Open read-write → create schema if absent (init_schema is a no-op on
+         an already-initialized DB — it does NOT migrate).
+      2. Run the schema-version gate (Step 1.4): refuse non-zero if the stored
+         version differs from the current build's SCHEMA_VERSION.
+      3. Close the RW backend.
+      4. Reopen read-only and store as the serving singleton.
+
+    This ensures ``init_schema()`` — which issues DDL — never runs on the RO
+    connection (DDL raises on RO; ``Cannot create an empty database under READ
+    ONLY mode.`` is raised on a non-existent DB opened RO).
+
     Args:
         db_path: Path to KùzuDB database. If None, uses get_db_path().
 
     Raises:
-        RuntimeError: If backend initialization fails
+        RuntimeError: If backend initialization fails or schema version
+            is stale (the caller must not swallow this — server must exit).
     """
     global _backend, _metrics
     path = db_path or str(get_db_path())
-    backend = KuzuBackend(path)
+
+    # Step 1 — RW open + create schema if absent.
+    rw_backend = KuzuBackend(path, read_only=False)
     try:
-        backend.init_schema()
+        rw_backend.init_schema()
     except Exception as exc:
-        backend.close()
+        rw_backend.close()
         raise RuntimeError(f"Backend initialization failed: {exc}") from exc
-    _backend = backend
-    logger.debug(f"Backend initialized: {path}")
+
+    # Step 2 — schema-version gate (Step 1.4).
+    _assert_schema_current(rw_backend, path)
+
+    # Step 3 — close RW.
+    rw_backend.close()
+
+    # Step 4 — reopen RO as the serving singleton.
+    _backend = KuzuBackend(path, read_only=True)
+    logger.debug(f"Backend initialized (RO serving): {path}")
 
     # Initialize metrics store (best-effort, failures are logged as WARNING)
     try:
@@ -155,6 +178,31 @@ def _get_backend() -> GraphBackend:
     if _backend is None:
         raise RuntimeError("Backend not initialized. Call init_backend() before using tools.")
     return _backend
+
+
+def _assert_schema_current(backend: GraphBackend, path: str) -> None:
+    """Refuse to start when the stored schema version differs from the current build.
+
+    Called inside the RW-ensure window of init_backend (Step 1.4) after
+    init_schema() has run the create-if-absent step.
+
+    Args:
+        backend: An open (RW) backend to query.
+        path: The db_path string — included in the error message for context.
+
+    Raises:
+        RuntimeError: Stored version present and != current SCHEMA_VERSION.
+            Message names both versions and the sqlcg db reset remedy.
+    """
+    from sqlcg.core.schema import SCHEMA_VERSION
+
+    stored = backend.get_schema_version()
+    if stored is not None and stored != SCHEMA_VERSION:
+        msg = (
+            f"Database schema is v{stored}, but this build expects v{SCHEMA_VERSION} — "
+            f"run 'sqlcg db reset && sqlcg index <path>' to re-index."
+        )
+        raise RuntimeError(msg)
 
 
 @contextmanager
