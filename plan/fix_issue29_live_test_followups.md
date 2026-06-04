@@ -380,3 +380,63 @@ All three pre-implementation questions are resolved. None blocks implementation.
   `finally`), (c) the dead `_set_backend_lock` / `_backend_lock` stub — remains a tracked
   separate v1.3.x follow-up. The §20.2 cross-reference is retained in Non-Goals and
   Design — Bug B so the linkage is not lost.
+
+## Plan Compliance — 2026-06-04 — PASS
+
+Compliance check run by architect-planner against commits `8e1e09b` (Bug A),
+`45643c8` (Bug B), `29d21ee` (Bug C + Minor D), with test setup in `1d4db7a`.
+Diff base `daa7389..HEAD`, excluding plan-docs commits (`5dce5d4`, `05ac62d`,
+`7936818`).
+
+**Verdict: PASS — all steps implemented as planned; no deviations.**
+
+### Step-by-step verification
+
+- **Step 1.1 / 1.2 (Bug A)** — PASS. `if dialect == "auto": dialect = get_dialect(path)`
+  hoisted above the route call in both files; the duplicate lower resolution removed.
+  Grep confirms exactly one `auto` block per file, positioned before the route call
+  (`reindex.py:84`, `index.py:116`).
+- **Step 2.1 (Bug B globals)** — PASS. `_init_db_path: str | None = None` added; set in
+  `init_backend` (added to `global`, assigned after `path = db_path or str(get_db_path())`);
+  reset to `None` in `shutdown_backend` (added to `global`).
+- **Step 2.2 (Bug B accessor)** — PASS. `_escalation_db_path()` defined once, returns
+  `_init_db_path or str(get_db_path())`; called at exactly one site (`tools.py:607` in
+  `index_repo`), replacing `str(get_db_path())`. Grep-confirmed single call site.
+- **Step 3.1 (Minor D)** — PASS. All three template occurrences reworded to
+  `(reindex failed)`; zero `server busy/locked` remain in `git.py`.
+- **Step 3.2 (Bug C)** — PASS. Silent-skip branch replaced: identical rendered `script`
+  → silent return; sentinel-present + differing content → `write_text(script)` +
+  `chmod(0o755)` + `Upgraded git hook:` print. Comparison is against the fully rendered
+  `script` (binary path embedded), per D2. Foreign-hook warning path unchanged.
+- **Steps 4.1–4.4 (tests)** — PASS. All acceptance tests assert observable output, not
+  weakened:
+  - Bug A: asserts exact on-wire `payload["dialect"]` (`postgres` / `snowflake`) — non-vacuous.
+  - Bug B: raising-sentinel monkeypatch AND default-DB mtime/absence check, with
+    `shutdown_backend()` teardown to reset the global (per plan).
+  - Bug C: three cases (stale→upgrade+print, identical→silent+byte-unchanged,
+    foreign→warning+unchanged) assert file content + captured stdout.
+  - Minor D: negative (`no "server busy/locked"`) + positive (`"(reindex failed)"`)
+    assertions added in both `test_BugC_hook_upgrade.py` and `test_git_hooks_notify.py`.
+- **Step 4.5 (verification)** — PASS:
+  - Full suite (`--ignore=tests/benchmarks`): 1026 passed, 7 skipped, 3 xfailed, 0 failures.
+  - 9 acceptance tests: all green (2 Bug A + 2 Bug B + 5 Bug C/D).
+  - ruff: clean. pyright: 0 errors / 0 warnings.
+  - `bash scripts/generate_cli_docs.sh` → `docs/cli.md`: no diff.
+  - `git diff --stat`: `base.py` and `indexer.py` UNTOUCHED.
+
+### Resolved-decision verification
+
+- **D1 (version stays 1.3.0)** — HONORED. No diff to `pyproject.toml`,
+  `src/sqlcg/__init__.py`, or `uv.lock`.
+- **D2 (Bug C prints, not silent; idempotency stays silent)** — HONORED. Upgrade prints
+  `Upgraded git hook:`; identical rendered content is a silent skip.
+- **D3 (§20.2 remediation out of scope)** — HONORED. Bug B fix changes only the escalation
+  *path*; it does not move escalation under `backend_lock`, does not add a `finally`-based
+  de-escalation, and does not wire or remove the dead `_set_backend_lock` /
+  `_backend_lock` stub (still present, untouched).
+
+### Scope
+
+In-scope files only: `git.py`, `index.py`, `reindex.py`, `tools.py`, and tests
+(`test_dialect_auto_resolution.py`, `test_BugB_escalation_uses_init_path.py`,
+`test_BugC_hook_upgrade.py`, `test_git_hooks_notify.py`). No out-of-scope source touched.
