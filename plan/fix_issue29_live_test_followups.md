@@ -260,7 +260,11 @@ sentinel present and content differs → `write_text(script)` + `chmod(0o755)` +
 touch the default path.
 **Step 4.3**: Bug C/D tests — upgrade overwrites stale hook + prints; idempotent skip;
 foreign warning unchanged; new message present.
-**Step 4.4**: Update existing `test_git_hooks_notify.py` guards to the new message text.
+**Step 4.4**: In `test_git_hooks_notify.py`, add a new negative assertion that
+  `"server busy/locked"` does NOT appear in any hook template. No existing guard
+  asserts the old wording (current tests cover `--notify`, `>&2`, and `|| true`
+  absence only), so nothing needs updating — only the new negative assertion is added.
+  Also add a positive assertion that all templates contain `"(reindex failed)"`.
 **Step 4.5**: Run perf invariant guards + full suite + ruff + pyright; confirm
 `git diff --stat` excludes `base.py` and indexer hot paths; confirm
 `generate_cli_docs.sh` produces no `docs/cli.md` diff.
@@ -268,8 +272,9 @@ foreign warning unchanged; new message present.
 ## Test Strategy
 
 ### Unit tests
-- **Bug A** (`tests/unit/`, e.g. extend `test_git_hooks_notify.py` neighbour or a new
-  `test_reindex_dialect_resolution.py` / `test_index_dialect_resolution.py`): call
+- **Bug A** (`tests/integration/`, new file `test_dialect_auto_resolution.py` — these
+  tests require a live Unix-socket thread to capture the on-wire payload and belong in
+  `tests/integration/`, not `tests/unit/`): call
   `reindex_cmd(..., dialect="auto")` and `index_cmd(..., dialect="auto")` with a live
   fake socket server (reuse the in-process accept pattern from
   [`tests/integration/test_reindex_via_server.py`](tests/integration/test_reindex_via_server.py)
@@ -288,15 +293,22 @@ foreign warning unchanged; new message present.
      test → the raising sentinel is safe across the whole call.
   2. Record the default `~/.sqlcg/graph.db` mtime (or its non-existence) before and after;
      assert unchanged / still-absent. Guards the live-observed symptom directly.
-- **Bug C** (`tests/unit/test_git_hook_install.py` — existing): three cases —
+  **Teardown requirement**: call `shutdown_backend()` after `index_repo` returns (e.g.
+  in a `finally` block or pytest fixture teardown) so the `_init_db_path` module global
+  is reset between tests. Without this, a later `init_backend(None)` call in a subsequent
+  test inherits the stale path and produces a misleading pass.
+- **Bug C** (`tests/unit/test_git_hooks.py` — existing, extend it): three cases —
   (a) pre-write a stale sqlcg hook (sentinel + old "server busy/locked" text), run
   `install-hooks`, assert file now equals the current rendered template AND stdout contains
   `Upgraded git hook:`; (b) write the current rendered hook, run again, assert no output and
   byte-identical file (idempotency); (c) write a foreign hook (no sentinel), assert the
   warning path fires and the file is unchanged. **Observable: file content + captured stdout.**
-- **Minor D** (`tests/unit/test_git_hooks_notify.py` — existing): update the content
-  guard(s) asserting the fallback string to the new `(reindex failed)` wording; add an
-  explicit "no `server busy/locked` substring" assertion.
+- **Minor D** (`tests/unit/test_git_hooks_notify.py` — existing): add a new
+  negative assertion that no hook template contains `"server busy/locked"`. No
+  existing guard asserts the old wording (current tests only check `--notify`, `>&2`,
+  and absence of `|| true`), so nothing needs updating — only two assertions are added:
+  one asserting all templates contain `"(reindex failed)"` and one asserting none
+  contain `"server busy/locked"`.
 
 ### Integration / e2e
 - The existing [`tests/integration/test_reindex_via_server.py`](tests/integration/test_reindex_via_server.py)
