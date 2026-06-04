@@ -10,12 +10,12 @@ Source of findings: GitHub issue [#29](https://github.com/Warhorze/sql-code-grap
 live-test comment. Bug B is already documented as an architecture follow-up in
 `ARCHITECTURE_REVIEW.md` §20.2 ("Deviation 1 — MCP `index_repo` tool inline escalation").
 
-## Version note (confirm with maintainer)
+## Version note (RESOLVED — stays 1.3.0)
 These are bug fixes to code that has **not yet shipped** (PR #51 has no reviews and is
-not merged). Per CLAUDE.md SemVer, the version should stay **1.3.0** — there is no
-released 1.3.0 to patch against, so no `1.3.1`. Do **not** bump `pyproject.toml` /
-`__init__.py` / `uv.lock`. The plan assumes "fold into PR #51, version unchanged".
-**Blocking only if the maintainer wants a distinct version** — see Blocking Questions.
+not merged). Per CLAUDE.md SemVer, the version stays **1.3.0** — there is no released
+1.3.0 to patch against, so no `1.3.1`. Do **not** bump `pyproject.toml` / `__init__.py`
+/ `uv.lock`. Decision confirmed (see Resolved Decisions §D1): fold into PR #51, version
+unchanged.
 
 ## Scope
 
@@ -44,7 +44,7 @@ released 1.3.0 to patch against, so no `1.3.1`. Do **not** bump `pyproject.toml`
   `_backend_lock` stub). Bug B as scoped by the maintainer is *narrow*: "use the init
   path, audit `get_db_path`". §20.2 demands more. See "Design — Bug B" for the boundary
   and the explicit decision; the full §20.2 remediation is **out of scope here** and
-  remains a tracked v1.3.x follow-up unless the maintainer escalates it (Blocking Q3).
+  remains a tracked v1.3.x follow-up (resolved decision D3).
 - No version bump (see Version note).
 - **Performance invariants are untouched.** None of these fixes go near
   [`base.py`](src/sqlcg/parsers/base.py) or [`indexer.py`](src/sqlcg/indexer/indexer.py)
@@ -145,7 +145,7 @@ path is already correct because `db_path` is threaded as a parameter, not re-fet
 `index_repo` tool escalation. It does **not** move escalation under `backend_lock`, does
 **not** add a `finally`-based de-escalation, and does **not** wire/remove the dead
 `_set_backend_lock` / `_backend_lock` stub. Those are the §20.2 remediation, scoped out
-here (Blocking Q3). The Bug B fix makes the tool target the correct DB; it does not claim
+here (resolved decision D3). The Bug B fix makes the tool target the correct DB; it does not claim
 to make the tool concurrency-safe.
 
 ### Bug C — `install-hooks` silently refuses to upgrade old sqlcg hooks
@@ -338,7 +338,7 @@ foreign warning unchanged; new message present.
 ## Risks and Mitigations
 | Risk | Mitigation |
 |---|---|
-| Bug B fix mistaken for full §20.2 remediation | Plan explicitly scopes Bug B to "use init path + audit"; §20.2 lock/finally/stub work is out of scope (Blocking Q3). Acceptance criteria do not claim concurrency safety. |
+| Bug B fix mistaken for full §20.2 remediation | Plan explicitly scopes Bug B to "use init path + audit"; §20.2 lock/finally/stub work is out of scope (resolved decision D3). Acceptance criteria do not claim concurrency safety. |
 | Bug C upgrade compares raw template, not rendered → false "identical" or false "upgrade" | Step 3.2 + acceptance criterion mandate comparing the rendered `script`; binary path is embedded. |
 | Minor D text change unexpectedly fails existing hook-content tests | Step 4.4 updates `test_git_hooks_notify.py` deliberately; this is an intended text change, not a regression. |
 | Bug A: removing the second `auto` resolution leaves a stale path on a code path that bypasses routing | The route call returns early when handled; the direct path now relies on the hoisted resolution. Both reindex.py and index.py keep exactly one resolution that runs unconditionally before routing — verified the route call does not consume/clear `dialect`. |
@@ -352,16 +352,19 @@ foreign warning unchanged; new message present.
 - Rollback: revert the four commits; the v1.3.0 single-writer feature is unaffected
   (these are additive corrections).
 
-### Blocking Questions
-1. **Version**: confirm the version stays **1.3.0** (fold into PR #51, no bump). The plan
-   assumes yes. If the maintainer wants a distinct version note or a `1.3.1`, say so before
-   implementation.
-2. **Bug C upgrade silent-vs-loud**: the plan prints `Upgraded git hook: …` on overwrite.
-   Confirm a printed line (not silent) is desired — the live report wanted visibility, so
-   the plan prints. Confirm.
-3. **§20.2 scope**: the maintainer's Bug B is the path leak only. `ARCHITECTURE_REVIEW.md`
-   §20.2 also flags (a) escalation outside `backend_lock`, (b) RW-lock leak on the
-   `index_repo` failure path (no `finally`), (c) the dead `_set_backend_lock` /
-   `_backend_lock` stub. **Confirm these stay out of scope for this plan** (tracked as a
-   separate v1.3.x follow-up). If any must be pulled in, this plan needs a new phase before
-   implementation.
+### Resolved Decisions (2026-06-04 — shepherd, user-approved)
+All three pre-implementation questions are resolved. None blocks implementation.
+
+- **D1 — Version stays 1.3.0, no bump.** These fixes fold into the unreleased v1.3.0
+  PR #51 (no reviews yet). Do not touch `pyproject.toml` / `__init__.py` / `uv.lock`.
+  See Version note above.
+- **D2 — Bug C overwrite prints a line (not silent).** On the sentinel-present /
+  content-differs upgrade path, print `Upgraded git hook: .git/hooks/<name>`. Silent
+  upgrades of executable hooks are worse than one line of output. True idempotency
+  (identical rendered content) remains a silent skip.
+- **D3 — §20.2 escalation-architecture remediation stays OUT of scope.** This plan
+  covers bugs A-D only. The deeper `ARCHITECTURE_REVIEW.md` §20.2 work — (a) escalation
+  outside `backend_lock`, (b) RW-lock leak on the `index_repo` failure path (no
+  `finally`), (c) the dead `_set_backend_lock` / `_backend_lock` stub — remains a tracked
+  separate v1.3.x follow-up. The §20.2 cross-reference is retained in Non-Goals and
+  Design — Bug B so the linkage is not lost.
