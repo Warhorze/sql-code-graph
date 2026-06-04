@@ -113,6 +113,13 @@ _backend_lock: "anyio.Lock | None" = None
 # Checked by MCP write tools to decide whether to escalate.
 _serving_ro: bool = False
 
+# The path that init_backend() actually opened.  Captured at init time so
+# MCP write tools (index_repo escalation) use this path, not get_db_path()
+# which returns the default ~/.sqlcg/graph.db regardless of what was passed
+# to init_backend.  Bug B fix: without this, every escalation opened the real
+# live DB instead of the path the server (or test) configured.
+_init_db_path: str | None = None
+
 
 def _set_backend_lock(lock: "anyio.Lock | None") -> None:
     """Register the backend lock from the server's task group.
@@ -122,7 +129,6 @@ def _set_backend_lock(lock: "anyio.Lock | None") -> None:
     """
     global _backend_lock
     _backend_lock = lock
-
 
 
 def init_backend(db_path: str | None = None) -> None:
@@ -147,8 +153,9 @@ def init_backend(db_path: str | None = None) -> None:
         RuntimeError: If backend initialization fails or schema version
             is stale (the caller must not swallow this — server must exit).
     """
-    global _backend, _metrics, _serving_ro
+    global _backend, _metrics, _serving_ro, _init_db_path
     path = db_path or str(get_db_path())
+    _init_db_path = path
 
     # Step 1 — RW open + create schema if absent.
     rw_backend = KuzuBackend(path, read_only=False)
@@ -184,7 +191,7 @@ def shutdown_backend() -> None:
     Closes the database connection and clears the global reference.
     Safe to call multiple times.
     """
-    global _backend, _metrics, _serving_ro
+    global _backend, _metrics, _serving_ro, _init_db_path
     if _backend is not None:
         _backend.close()
         _backend = None
@@ -193,6 +200,7 @@ def shutdown_backend() -> None:
         _metrics.close()
         _metrics = None
     _serving_ro = False
+    _init_db_path = None
 
 
 def _get_backend() -> GraphBackend:
@@ -236,6 +244,23 @@ def _de_escalate_to_ro_from_tool(db_path_str: str) -> None:
         de_escalate_to_ro(db_path_str)
     except Exception as exc:
         logger.warning(f"de_escalate_to_ro failed in MCP write tool: {exc}")
+
+
+def _escalation_db_path() -> str:
+    """Return the DB path to use for RW escalation in MCP write tools.
+
+    When init_backend() was called with an explicit path, returns that path.
+    Falls back to get_db_path() only when init_backend has not been called
+    (e.g. direct invocation in tests that set up a backend themselves).
+
+    Bug B fix: index_repo previously called str(get_db_path()) directly,
+    which always returns the default ~/.sqlcg/graph.db regardless of the path
+    init_backend() was given.  This caused escalation to open the real live DB
+    even when init_backend was called with a tmp_path in tests.
+    """
+    if _init_db_path is not None:
+        return _init_db_path
+    return str(get_db_path())
 
 
 def _assert_schema_current(backend: GraphBackend, path: str) -> None:
@@ -576,7 +601,10 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
 
         # If the backend is in RO serving mode (set by init_backend), escalate
         # to RW for the duration of this write op, then de-escalate after.
-        db_path_str = str(get_db_path())
+        # Bug B fix: use _escalation_db_path() instead of str(get_db_path()) so
+        # that escalation targets the DB init_backend() actually opened, not the
+        # default ~/.sqlcg/graph.db.
+        db_path_str = _escalation_db_path()
         is_ro = _serving_ro
         rw_db = _get_or_escalate_rw(db_path_str, is_ro)
 
