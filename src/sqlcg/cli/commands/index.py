@@ -109,6 +109,13 @@ def index_cmd(  # noqa: B008
     # Resolve path early so socket routing uses the absolute path.
     path = path.resolve()
 
+    # Resolve dialect before routing so the WriterRequest always carries a concrete
+    # dialect (never the literal sentinel "auto").  Bug A: the route call was before
+    # this resolution, causing the server to receive "auto" and fail with
+    # "Unknown dialect 'auto'" on every server-routed index.
+    if dialect == "auto":
+        dialect = get_dialect(path)
+
     # Step 3.2 — probe for a live server and route through the socket if present.
     _routed = _try_route_index_via_server(
         path=path,
@@ -150,10 +157,6 @@ def index_cmd(  # noqa: B008
     # Set buffer pool size via env var if specified
     if buffer_pool_size > 0:
         os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
-
-    # Resolve dialect: 'auto' reads from .sqlcg.toml, otherwise use provided value
-    if dialect == "auto":
-        dialect = get_dialect(path)
 
     if not quiet and not config_file_present(path):
         console.print(

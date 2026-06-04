@@ -77,6 +77,13 @@ def reindex_cmd(  # noqa: B008
     # Resolve to absolute path so ignore-spec and git delta receive an absolute root
     path = path.resolve()
 
+    # Resolve dialect before routing so the WriterRequest always carries a concrete
+    # dialect (never the literal sentinel "auto").  Bug A: the route call was before
+    # this resolution, causing the server to receive "auto" and fail with
+    # "Unknown dialect 'auto'" on every server-routed reindex.
+    if dialect == "auto":
+        dialect = get_dialect(path)
+
     # Step 3.3 — route manual reindex through the socket when a server is live.
     # The --notify flag is kept for backward compatibility but no longer required;
     # manual reindex (no --notify) now also probes the socket by default.
@@ -93,10 +100,6 @@ def reindex_cmd(  # noqa: B008
     )
     if _routed:
         return
-
-    # Resolve dialect
-    if dialect == "auto":
-        dialect = get_dialect(path)
 
     if not quiet and not config_file_present(path):
         console.print(
