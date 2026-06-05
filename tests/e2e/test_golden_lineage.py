@@ -673,9 +673,9 @@ def test_is_dead_code_true_and_false():
 
 def test_hub_rank_most_referenced_first():
     """_hub_rank returns rank 1 for the most-referenced table in a fan-in fixture."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     # ba.hub is consumed by c1, c2, c3; ba.lonely is consumed by c1 only
     backend.init_schema()
 

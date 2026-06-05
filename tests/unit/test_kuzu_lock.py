@@ -1,10 +1,25 @@
-"""Unit tests for KuzuDB lock error handling."""
+"""Unit tests for KuzuDB lock error handling.
 
-from unittest.mock import patch
+These tests are Kuzu-specific: they test `find_lock_holder` and the lock-error
+re-raise logic that lives in kuzu_backend.py, which is scheduled for deletion
+in Phase 5 of the DuckDB migration (plan v4).  DuckDB uses a different locking
+model (single-writer MVCC; cross-process access is handled by the socket proxy)
+so these tests have no DuckDB equivalent.
+"""
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend, find_lock_holder
+pytest.skip(
+    reason="Kuzu-only: tests kuzu_backend.py lock-error handling; "
+    "kuzu_backend.py is deleted in Phase 5 of DuckDB migration (plan v4)",
+    allow_module_level=True,
+)
+
+# Unreachable at runtime (module-level skip above); kept for static analysis
+# until the file is deleted in Phase 5.
+from unittest.mock import patch  # noqa: E402
+
+from sqlcg.core.kuzu_backend import KuzuBackend, find_lock_holder  # noqa: E402
 
 
 class TestKuzuLockError:

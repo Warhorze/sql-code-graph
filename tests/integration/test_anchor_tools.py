@@ -7,11 +7,11 @@ output (specific names, counts, labels) — never just "no exception raised".
 """
 
 import sqlcg.server.tools as tools
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
-def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> KuzuBackend:
+def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> DuckDBBackend:
     """Write the given {filename: sql} fixtures, index them into a fresh
     in-memory graph, and wire it as the tools backend.
 
@@ -21,7 +21,7 @@ def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> KuzuBackend:
     for name, sql in files.items():
         (tmp_path / name).write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     # _assert_indexed() requires a Repo node; the Indexer alone does not create one.
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})

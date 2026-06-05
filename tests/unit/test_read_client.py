@@ -125,7 +125,7 @@ def test_query_via_server_framed_roundtrip(tmp_path: Path) -> None:
     # The request the server received carries the op/cypher/params verbatim.
     assert srv.received_request == {
         "op": "query",
-        "cypher": "MATCH (n:SqlTable) RETURN n.path AS path",
+        "sql": "MATCH (n:SqlTable) RETURN n.path AS path",
         "params": {"x": 1},
     }
 

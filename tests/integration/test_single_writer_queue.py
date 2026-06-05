@@ -126,7 +126,7 @@ def test_fresh_db_init_succeeds_and_server_serves_reads(tmp_path: Path) -> None:
         # A routed read on the fresh schema must return rows (zero count, not error).
         resp = _send_framed(
             sp,
-            {"op": "query", "cypher": "MATCH (r:Repo) RETURN count(r) AS n", "params": {}},
+            {"op": "query", "sql": 'SELECT count(*) AS n FROM "Repo"', "params": {}},
         )
         assert resp.get("ok"), f"Query failed: {resp}"
         rows = resp.get("rows", [])
@@ -147,19 +147,19 @@ def test_fresh_db_init_succeeds_and_server_serves_reads(tmp_path: Path) -> None:
 def test_stale_schema_refuses_to_start(tmp_path: Path) -> None:
     """Server against a DB with a stored SCHEMA_VERSION != current build's
     SCHEMA_VERSION exits non-zero with a message naming both versions."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
     from sqlcg.core.schema import SCHEMA_VERSION
 
     db_path = tmp_path / "stale.db"
 
     # Seed the DB with a different schema version.
-    backend = KuzuBackend(str(db_path))
+    backend = DuckDBBackend(str(db_path))
     backend.init_schema()
-    # SchemaVersion.version is the PK — must delete then insert to change it.
+    # SchemaVersion.version is the PK — overwrite with the stale version.
     fake_old_version = "5"  # one version behind current (which is "6")
-    backend.run_write("MATCH (v:SchemaVersion) DETACH DELETE v", {})
+    backend.run_write('DELETE FROM "SchemaVersion"', {})
     backend.run_write(
-        "CREATE (:SchemaVersion {version: $v})",
+        'INSERT INTO "SchemaVersion" (version, indexed_sha) VALUES (?, NULL)',
         {"v": fake_old_version},
     )
     backend.close()
@@ -224,7 +224,7 @@ def test_db_reset_refuses_when_server_is_live(tmp_path: Path) -> None:
         # DB must still be alive (not reset) — the server is still serving.
         query_resp = _send_framed(
             sp,
-            {"op": "query", "cypher": "MATCH (v:SchemaVersion) RETURN count(v) AS n", "params": {}},
+            {"op": "query", "sql": 'SELECT count(*) AS n FROM "SchemaVersion"', "params": {}},
         )
         assert query_resp.get("ok"), f"Server unreachable after refused reset: {query_resp}"
 
@@ -256,12 +256,20 @@ def test_metrics_writer_queue_events_persisted(tmp_path: Path) -> None:
 
     async def _run():
         req1 = WriterRequest(
-            op="reindex", root="/tmp/a", dialect=None,
-            from_sha="abc", to_sha="def", requested_by="cli"
+            op="reindex",
+            root="/tmp/a",
+            dialect=None,
+            from_sha="abc",
+            to_sha="def",
+            requested_by="cli",
         )
         req2 = WriterRequest(
-            op="reindex", root="/tmp/b", dialect=None,
-            from_sha="abc", to_sha="def", requested_by="cli"
+            op="reindex",
+            root="/tmp/b",
+            dialect=None,
+            from_sha="abc",
+            to_sha="def",
+            requested_by="cli",
         )
         await q.enqueue(req1)
         await q.enqueue(req2)  # triggers collapse
@@ -311,8 +319,12 @@ def test_sqlcg_metrics_0_suppresses_queue_events(tmp_path: Path, monkeypatch) ->
 
     async def _run():
         req = WriterRequest(
-            op="reindex", root="/tmp/a", dialect=None,
-            from_sha="abc", to_sha="def", requested_by="cli"
+            op="reindex",
+            root="/tmp/a",
+            dialect=None,
+            from_sha="abc",
+            to_sha="def",
+            requested_by="cli",
         )
         await q.enqueue(req)
 

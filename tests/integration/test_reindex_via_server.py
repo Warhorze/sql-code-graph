@@ -174,7 +174,7 @@ class TestReindexOpCallsResyncChanged:
         import anyio
         import anyio.to_thread as _to_thread
 
-        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.core.duckdb_backend import DuckDBBackend
         from sqlcg.indexer.indexer import Indexer
         from sqlcg.server.control import cleanup_control_files, sock_path
 
@@ -187,7 +187,7 @@ class TestReindexOpCallsResyncChanged:
         (git_repo / "dim_time.sql").write_text("CREATE TABLE DIM_TIME (time_key INT);\n")
         new_sha = _commit_all(git_repo, "add dim_time")
 
-        backend = KuzuBackend(str(db_path))
+        backend = DuckDBBackend(str(db_path))
         backend.init_schema()
 
         call_log: list = []
@@ -278,6 +278,7 @@ class TestReindexOpCallsResyncChanged:
             anyio.run(_run_test)
         finally:
             import sqlcg.server.tools as _tools
+
             if _tools._backend is not None:
                 _tools._backend.close()
                 _tools._backend = None
@@ -320,7 +321,7 @@ class TestNotifyFallbackNoServer:
         Asserts observable output: the graph is updated (no crash, no
         'Database is locked' error).
         """
-        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.core.duckdb_backend import DuckDBBackend
 
         db_path = tmp_path / "test.db"
         monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
@@ -333,7 +334,7 @@ class TestNotifyFallbackNoServer:
         )
         sha_a = _commit_all(git_repo, "add fact_sales")
 
-        backend = KuzuBackend(str(db_path))
+        backend = DuckDBBackend(str(db_path))
         backend.init_schema()
         indexer = Indexer()
         indexer.index_repo(git_repo, "ansi", backend)
@@ -388,7 +389,7 @@ class TestNotifyFallbackStaleSocket:
         self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """A stale .sock file (no server behind it) causes direct-write fallback."""
-        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.core.duckdb_backend import DuckDBBackend
 
         db_path = tmp_path / "test.db"
         monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
@@ -397,7 +398,7 @@ class TestNotifyFallbackStaleSocket:
         (git_repo / "orders.sql").write_text("CREATE TABLE ORDERS (order_id INT, total NUMERIC);\n")
         sha_a = _commit_all(git_repo, "add orders")
 
-        backend = KuzuBackend(str(db_path))
+        backend = DuckDBBackend(str(db_path))
         backend.init_schema()
         from sqlcg.indexer.indexer import Indexer as _Indexer
 
@@ -699,7 +700,7 @@ class TestNotifyGenuineNoServerFallthrough:
         self, git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """Scenario F1-B: no server → direct write → graph updated (exit 0)."""
-        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.core.duckdb_backend import DuckDBBackend
         from sqlcg.indexer.indexer import Indexer
 
         db_path = tmp_path / "test_f1b.db"
@@ -710,7 +711,7 @@ class TestNotifyGenuineNoServerFallthrough:
         )
         sha_a = _commit_all(git_repo, "f1b-add-orders")
 
-        backend = KuzuBackend(str(db_path))
+        backend = DuckDBBackend(str(db_path))
         backend.init_schema()
         indexer = Indexer()
         indexer.index_repo(git_repo, "ansi", backend)
@@ -764,7 +765,7 @@ class TestSymbolicRefResolution:
         before sending, server stores what the client sent) and the non-notify path.
         Asserting the stored SHA == git rev-parse HEAD verifies _resolve_ref fires.
         """
-        from sqlcg.core.kuzu_backend import KuzuBackend
+        from sqlcg.core.duckdb_backend import DuckDBBackend
         from sqlcg.indexer.indexer import Indexer
 
         db_path = tmp_path / "test_f2c.db"
@@ -775,7 +776,7 @@ class TestSymbolicRefResolution:
         (git_repo / "f2c_new.sql").write_text("CREATE TABLE F2C_NEW (val INT);\n")
         new_sha = _commit_all(git_repo, "f2c-new")  # this becomes HEAD
 
-        backend = KuzuBackend(str(db_path))
+        backend = DuckDBBackend(str(db_path))
         backend.init_schema()
         indexer = Indexer()
         indexer.index_repo(git_repo, "ansi", backend)
@@ -803,7 +804,7 @@ class TestSymbolicRefResolution:
         )
         assert result.returncode == 0, f"reindex failed: {result.stderr}"
 
-        check = KuzuBackend(str(db_path))
+        check = DuckDBBackend(str(db_path))
         check.init_schema()
         stored_sha = check.get_indexed_sha()
         check.close()

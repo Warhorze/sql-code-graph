@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.server.models import DbInfoResult
 from sqlcg.server.tools import db_info
 
@@ -55,16 +55,13 @@ def _head_sha(path: Path) -> str:
     return result.stdout.strip()
 
 
-def _setup_kuzu_with_repo(tmp_path: Path, git_root: Path, indexed_sha: str) -> KuzuBackend:
-    """Create an in-memory KuzuDB with schema init, a Repo node, and indexed_sha set."""
-    backend = KuzuBackend(":memory:")
+def _setup_kuzu_with_repo(tmp_path: Path, git_root: Path, indexed_sha: str) -> DuckDBBackend:
+    """Create an in-memory DuckDB with schema init, a Repo node, and indexed_sha set."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
     # Insert a Repo node so the freshness query finds a root path
-    backend.run_write(
-        "MERGE (r:Repo {path: $p, name: $n})",
-        {"p": str(git_root), "n": "test_repo"},
-    )
+    backend.upsert_node("Repo", str(git_root), {"path": str(git_root), "name": "test_repo"})
     backend.set_indexed_sha(indexed_sha)
     return backend
 
@@ -166,7 +163,7 @@ class TestDbInfoFreshnessIntegration:
         _commit_all(git_root, "commit A")
 
         # Backend with NO indexed_sha set
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
         try:
             with patch("sqlcg.server.tools._get_backend", return_value=backend):

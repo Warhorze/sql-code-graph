@@ -128,27 +128,27 @@ def test_star_metrics_in_info_output():
 
     runner = CliRunner()
 
-    # db info routes every Cypher read through run_read_routed (read_client), so
+    # db info routes every SQL read through run_read_routed (read_client), so
     # the mock must target that function rather than a backend object.
     def run_read_side_effect(query, _params):
-        if "v.version AS version" in query:
+        if "SchemaVersion" in query and "version" in query and "count" not in query.lower():
             return [{"version": "6"}]
-        if "v.indexed_sha" in query:
+        if "indexed_sha" in query:
             return [{"sha": None}]
-        if "r.path AS path" in query:
+        if '"Repo"' in query and "path" in query and "count" not in query.lower():
             # No repo path -> freshness block is skipped.
             return []
         if "STAR_SOURCE" in query and "COLUMN_LINEAGE" not in query:
             return [{"n": 3}]
         if "STAR_EXPANSION" in query:
             return [{"n": 6}]
-        if "Repo" in query:
+        if "Repo" in query and "count" in query.lower():
             return [{"count": 1}]
-        if "SqlQuery" in query:
+        if "SqlQuery" in query and "count" in query.lower():
             return [{"count": 10}]
-        if "SqlColumn" in query:
+        if "SqlColumn" in query and "count" in query.lower():
             return [{"count": 50}]
-        if "COLUMN_LINEAGE" in query:
+        if "COLUMN_LINEAGE" in query and "count" in query.lower():
             return [{"count": 25}]
         return [{"count": 0}]
 

@@ -16,7 +16,7 @@ These tests MUST FAIL until the developer implements:
 import pytest
 
 import sqlcg.server.tools as tools
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 # PresentationCandidate is introduced by #34 — import with skip guard so the
@@ -29,7 +29,7 @@ except ImportError:
     _PRESENTATION_CANDIDATE_AVAILABLE = False
 
 
-def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> KuzuBackend:
+def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> DuckDBBackend:
     """Write the given {filename: sql} fixtures, index them into a fresh
     in-memory graph, and wire it as the tools backend.
 
@@ -39,7 +39,7 @@ def _index_fixture(tmp_path, files: dict[str, str], monkeypatch) -> KuzuBackend:
     for name, sql in files.items():
         (tmp_path / name).write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})
     Indexer().index_repo(tmp_path, dialect=None, db=backend)

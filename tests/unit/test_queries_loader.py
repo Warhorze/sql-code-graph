@@ -1,8 +1,8 @@
-"""Unit tests for the Cypher query loader (queries.py / queries.cypher).
+"""Unit tests for the SQL query loader (queries.py / queries.sql).
 
-These tests verify that all named constants load from queries.cypher and
+These tests verify that all named constants load from queries.sql and
 that the loader contract is respected. They serve as a regression guard
-against accidental Cypher re-embedding in Python.
+against accidental SQL re-embedding in Python.
 """
 
 import pytest
@@ -13,7 +13,7 @@ import pytest
 
 
 def test_all_constants_load():
-    """Every named constant in queries.py must be a non-empty string containing Cypher."""
+    """Every named constant in queries.py must be a non-empty string containing SQL."""
     from sqlcg.core import queries
 
     constants = [
@@ -29,15 +29,14 @@ def test_all_constants_load():
         "SEARCH_SQL_PATTERN_QUERY",
         "LIST_DIALECTS_AND_REPOS_QUERY",
     ]
-    cypher_keywords = {"MATCH", "MERGE", "RETURN", "DELETE"}
+    sql_keywords = {"SELECT", "DELETE", "INSERT", "WITH"}
 
     for name in constants:
         value = getattr(queries, name, None)
         assert value is not None, f"queries.{name} is missing"
         assert isinstance(value, str) and value.strip(), f"queries.{name} is empty"
-        assert any(kw in value for kw in cypher_keywords), (
-            f"queries.{name} does not contain any Cypher keyword "
-            f"({cypher_keywords}). Got: {value[:80]!r}"
+        assert any(kw in value for kw in sql_keywords), (
+            f"queries.{name} does not contain any SQL keyword ({sql_keywords}). Got: {value[:80]!r}"
         )
 
 
@@ -49,35 +48,34 @@ def test_missing_block_raises_key_error():
         _ = _Q["NONEXISTENT_BLOCK_NAME_XYZ"]
 
 
-def test_queries_cypher_file_exists():
-    """queries.cypher must exist alongside queries.py (no Cypher embedded in Python)."""
+def test_queries_sql_file_exists():
+    """queries.sql must exist alongside queries.py (no SQL embedded in Python)."""
     from pathlib import Path
 
     import sqlcg.core.queries as _qmod
 
-    cypher_path = Path(_qmod.__file__).parent / "queries.cypher"
-    assert cypher_path.exists(), (
-        f"queries.cypher not found at {cypher_path}. All Cypher must live in queries.cypher."
+    sql_path = Path(_qmod.__file__).parent / "queries.sql"
+    assert sql_path.exists(), (
+        f"queries.sql not found at {sql_path}. All SQL must live in queries.sql."
     )
 
 
-def test_no_raw_cypher_in_queries_py():
-    """queries.py must not contain embedded Cypher strings."""
+def test_no_raw_sql_in_queries_py():
+    """queries.py must not contain embedded SQL strings."""
     from pathlib import Path
 
     import sqlcg.core.queries as _qmod
 
     source = Path(_qmod.__file__).read_text(encoding="utf-8")
-    cypher_keywords = ["MATCH (", "MERGE (", "DETACH DELETE", "RETURN count"]
-    for kw in cypher_keywords:
+    embedded_sql_patterns = ["SELECT * FROM", "INSERT INTO (", "DETACH DELETE"]
+    for kw in embedded_sql_patterns:
         assert kw not in source, (
-            f"Found embedded Cypher keyword '{kw}' in queries.py. "
-            "All Cypher must live in queries.cypher."
+            f"Found embedded SQL pattern '{kw}' in queries.py. All SQL must live in queries.sql."
         )
 
 
 def test_sprint05_query_constants_load():
-    """Star expansion query constants must also load from queries.cypher."""
+    """Star expansion query constants must also load from queries.sql."""
     from sqlcg.core import queries
 
     sprint05_constants = [
@@ -87,21 +85,21 @@ def test_sprint05_query_constants_load():
     ]
     for name in sprint05_constants:
         value = getattr(queries, name, None)
-        assert value is not None, f"queries.{name} is missing — not yet added to queries.cypher"
+        assert value is not None, f"queries.{name} is missing — not yet added to queries.sql"
         assert isinstance(value, str) and value.strip(), f"queries.{name} is empty"
 
 
 def test_loader_block_count():
-    """queries.cypher must contain at least 12 named blocks (the original set)."""
+    """queries.sql must contain at least 12 named blocks (the original set)."""
     import re
     from pathlib import Path
 
     import sqlcg.core.queries as _qmod
 
-    cypher_path = Path(_qmod.__file__).parent / "queries.cypher"
-    text = cypher_path.read_text(encoding="utf-8")
+    sql_path = Path(_qmod.__file__).parent / "queries.sql"
+    text = sql_path.read_text(encoding="utf-8")
     block_headers = re.findall(r"^--\s+[A-Z][A-Z0-9_]*\s*$", text, flags=re.MULTILINE)
     assert len(block_headers) >= 12, (
-        f"queries.cypher must have at least 12 named blocks. Found {len(block_headers)}: "
+        f"queries.sql must have at least 12 named blocks. Found {len(block_headers)}: "
         f"{block_headers}"
     )

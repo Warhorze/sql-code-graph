@@ -1,21 +1,21 @@
-"""Unit tests for KuzuBackend."""
+"""Unit tests for DuckDBBackend (migrated from KuzuBackend — Phase 4 DuckDB migration)."""
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.schema import NODE_COLUMN, NODE_FILE, NODE_QUERY, NODE_TABLE
 
 
 @pytest.fixture
 def backend():
-    """Create an in-memory KuzuBackend for testing."""
-    backend = KuzuBackend(":memory:")
+    """Create an in-memory DuckDBBackend for testing."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
 
 
-class TestKuzuBackendUpsert:
+class TestDuckDBBackendUpsert:
     """Test idempotent upsert operations."""
 
     def test_upsert_node_idempotent(self, backend):
@@ -25,7 +25,7 @@ class TestKuzuBackendUpsert:
 
         # Query to verify it exists
         result = backend.run_read(
-            f"MATCH (n:{NODE_TABLE} {{qualified: $id}}) RETURN n.name as name",
+            f'SELECT name FROM "{NODE_TABLE}" WHERE qualified = ?',
             {"id": "test.table"},
         )
         assert len(result) == 1
@@ -36,7 +36,7 @@ class TestKuzuBackendUpsert:
 
         # Query again
         result = backend.run_read(
-            f"MATCH (n:{NODE_TABLE} {{qualified: $id}}) RETURN n.name as name",
+            f'SELECT name FROM "{NODE_TABLE}" WHERE qualified = ?',
             {"id": "test.table"},
         )
         assert len(result) == 1
@@ -59,12 +59,10 @@ class TestKuzuBackendUpsert:
         )
 
         # Query to verify the edge exists
-        _edge_q = (
-            f"MATCH (q:{NODE_QUERY} {{id: $src}})"
-            f"-[r:SELECTS_FROM]->(t:{NODE_TABLE} {{qualified: $dst}})"
-            " RETURN COUNT(*) as count"
+        result = backend.run_read(
+            'SELECT COUNT(*) AS count FROM "SELECTS_FROM" WHERE src_key = ? AND dst_key = ?',
+            {"src": "query1", "dst": "table1"},
         )
-        result = backend.run_read(_edge_q, {"src": "query1", "dst": "table1"})
         assert len(result) == 1
         assert result[0]["count"] == 1
 
@@ -79,12 +77,15 @@ class TestKuzuBackendUpsert:
         )
 
         # Query again to make sure still only one edge
-        result = backend.run_read(_edge_q, {"src": "query1", "dst": "table1"})
+        result = backend.run_read(
+            'SELECT COUNT(*) AS count FROM "SELECTS_FROM" WHERE src_key = ? AND dst_key = ?',
+            {"src": "query1", "dst": "table1"},
+        )
         assert len(result) == 1
         assert result[0]["count"] == 1
 
 
-class TestKuzuBackendTransaction:
+class TestDuckDBBackendTransaction:
     """Test transaction support."""
 
     def test_transaction_commit(self, backend):
@@ -94,7 +95,7 @@ class TestKuzuBackendTransaction:
 
         # Verify the node exists
         result = backend.run_read(
-            f"MATCH (n:{NODE_TABLE} {{qualified: $id}}) RETURN COUNT(*) as count",
+            f'SELECT COUNT(*) AS count FROM "{NODE_TABLE}" WHERE qualified = ?',
             {"id": "table1"},
         )
         assert result[0]["count"] == 1
@@ -114,22 +115,27 @@ class TestKuzuBackendTransaction:
 
         # Verify the original value is still there
         result = backend.run_read(
-            f"MATCH (n:{NODE_TABLE} {{qualified: $id}}) RETURN n.name as name",
+            f'SELECT name FROM "{NODE_TABLE}" WHERE qualified = ?',
             {"id": "table1"},
         )
         assert result[0]["name"] == "original"
 
     def test_transaction_rollback_upsert(self):
         """Test rollback on upsert failure within a transaction."""
-        # Create an in-memory backend and initialize schema
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
 
-        # Upsert a node and record the count
+        # Upsert a node and record the total row count
         backend.upsert_node(NODE_TABLE, "table1", {"qualified": "table1"})
 
-        result = backend.run_read("MATCH (n) RETURN COUNT(n) AS count", {})
-        count_before = result[0]["count"]
+        def _total_nodes():
+            total = 0
+            for tbl in ("Repo", "File", "SqlTable", "SqlColumn", "SqlQuery", "ExternalConsumer"):
+                rows = backend.run_read(f'SELECT COUNT(*) AS n FROM "{tbl}"', {})
+                total += rows[0]["n"]
+            return total
+
+        count_before = _total_nodes()
 
         # Open a transaction, upsert a node, and raise an exception
         try:
@@ -140,8 +146,7 @@ class TestKuzuBackendTransaction:
             pass
 
         # Verify the node count is unchanged (rollback occurred)
-        result = backend.run_read("MATCH (n) RETURN COUNT(n) AS count", {})
-        count_after = result[0]["count"]
+        count_after = _total_nodes()
 
         assert count_after == count_before, (
             f"Expected count to remain {count_before}, but got {count_after} after rollback"
@@ -149,7 +154,7 @@ class TestKuzuBackendTransaction:
         backend.close()
 
 
-class TestKuzuBackendDeleteFile:
+class TestDuckDBBackendDeleteFile:
     """Test delete_nodes_for_file."""
 
     def test_delete_nodes_for_file(self, backend):
@@ -170,20 +175,31 @@ class TestKuzuBackendDeleteFile:
         backend.upsert_edge(NODE_QUERY, "query1", NODE_FILE, "/test.sql", "QUERY_DEFINED_IN", {})
 
         # Verify all nodes exist
-        _q = (
-            "MATCH (n) WHERE n.qualified = 'table1'"
-            " OR n.id = 'table1.col1' OR n.id = 'query1'"
-            " RETURN COUNT(*) as count"
+        t_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_TABLE}" WHERE qualified = ?', {"q": "table1"}
         )
-        result = backend.run_read(_q, {})
-        assert result[0]["count"] == 3
+        c_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_COLUMN}" WHERE id = ?', {"q": "table1.col1"}
+        )
+        q_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_QUERY}" WHERE id = ?', {"q": "query1"}
+        )
+        assert t_count[0]["n"] + c_count[0]["n"] + q_count[0]["n"] == 3
 
         # Delete nodes for the file
         backend.delete_nodes_for_file("/test.sql")
 
         # Verify all nodes are gone
-        result = backend.run_read(_q, {})
-        assert result[0]["count"] == 0
+        t_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_TABLE}" WHERE qualified = ?', {"q": "table1"}
+        )
+        c_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_COLUMN}" WHERE id = ?', {"q": "table1.col1"}
+        )
+        q_count = backend.run_read(
+            f'SELECT COUNT(*) AS n FROM "{NODE_QUERY}" WHERE id = ?', {"q": "query1"}
+        )
+        assert t_count[0]["n"] + c_count[0]["n"] + q_count[0]["n"] == 0
 
     def test_delete_nodes_for_file_cleans_columns(self, backend):
         """Test that delete_nodes_for_file cleans up Column nodes."""
@@ -200,12 +216,12 @@ class TestKuzuBackendDeleteFile:
         backend.upsert_edge(NODE_TABLE, "table1", NODE_COLUMN, "table1.col2", "HAS_COLUMN", {})
 
         # Verify columns exist
-        result = backend.run_read(f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {})
+        result = backend.run_read(f'SELECT COUNT(*) AS count FROM "{NODE_COLUMN}"', {})
         assert result[0]["count"] == 2
 
         # Delete the file
         backend.delete_nodes_for_file("/test.sql")
 
         # Verify columns are deleted
-        result = backend.run_read(f"MATCH (c:{NODE_COLUMN}) RETURN COUNT(*) as count", {})
+        result = backend.run_read(f'SELECT COUNT(*) AS count FROM "{NODE_COLUMN}"', {})
         assert result[0]["count"] == 0

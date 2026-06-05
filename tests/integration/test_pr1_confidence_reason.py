@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import TRACE_COLUMN_LINEAGE_QUERY
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.server.tools import _reason_for
@@ -25,7 +25,7 @@ from sqlcg.server.tools import _reason_for
 @pytest.fixture
 def db():
     """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -166,7 +166,7 @@ def test_scenario_c_schema_miss_integration(db, tmp_path):
 
     # Look for any COLUMN_LINEAGE edge with confidence < 0.9 (schema-miss, scripting, etc.)
     rows = db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE]->() RETURN r.transform AS transform, r.confidence AS conf",
+        'SELECT transform, confidence AS conf FROM "COLUMN_LINEAGE"',
         {},
     )
     schema_miss_rows = [r for r in rows if r.get("conf") is not None and r.get("conf") < 0.9]
