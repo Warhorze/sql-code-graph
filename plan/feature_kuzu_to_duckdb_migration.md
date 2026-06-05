@@ -1,6 +1,6 @@
 # Feature Plan: Migrate graph store KuzuDB → DuckDB
 
-> **Status:** **Ready for developer** (v3 — FINALIZED, 2026-06-05). Branch
+> **Status:** **Ready for developer** (v4 — FINALIZED, 2026-06-05; plan-reviewer fixes applied). Branch
 > `feat/duckdb-migration` off `master` (v1.3.0). Phase 0 feasibility gate (C1–C8)
 > **PASSED** on the real DWH corpus — treat as a cleared gate, do not redo.
 > The rebuild-and-swap approach (symlink `.A`/`.B`, `recover_on_open`) is replaced:
@@ -18,9 +18,17 @@
 > pinned `_pk_field` to `graph_db.py:193` (ABC static method — inherited free); added a
 > **newly-found, previously-missing Phase 5 item**: `uninstall.py` deletes the DB with
 > `shutil.rmtree` because Kuzu is a *directory* — DuckDB is a *single file*, so this must
-> become `Path.unlink` (+ `.wal`); corrected the scope/watch path (there is **no
-> `watcher.py`** — the watch path is `jobs.py` → `reindex_file`). See **§ Drift found**
-> at the end.
+> become `Path.unlink` (+ `.wal`). See **§ Drift found** at the end.
+>
+> **v4 changes (architect-planner, 2026-06-05, plan-reviewer round):** corrected the **wrong**
+> D7 "there is no `watcher.py`" claim — `indexer/watcher.py` **does** exist (245 LOC:
+> `SqlFileEventHandler`, `BranchMonitor`), imported by `watch.py:13`; the real path is
+> `watch.py → watcher.py (SqlFileEventHandler) → jobs.py (WatchJobManager._run_job) →
+> indexer.reindex_file`. Added the **double-reindex no-crash + lineage-parity** test (user's
+> top acceptance criterion) and a real-corpus perf check to the Phase 5 exit gate. Added the
+> two `--buffer-pool-size` CLI flags (`db.py`, `index.py`) to the removal inventory. Added a
+> **Kuzu reference-fixture extraction** step at the START of Phase 3 (no parity fixture exists
+> yet) and made Phase 5 Kuzu deletion blocked on it.
 
 ## Summary
 
@@ -165,8 +173,12 @@ fallback while this is hardened.
 - Port query layer (`server/tools.py`, `cli/commands/{analyze,find,db,gain}.py`,
   `indexer/indexer.py`) from Cypher to SQL.
 - Consolidate writes into the server process; rewire the `writer.py` drain body and the
-  `jobs.py` watch-reindex path to transaction-based reindex. (**There is no `watcher.py`** —
-  the watch path is `core/jobs.py` → `reindex_file`.)
+  watch-reindex path to transaction-based reindex. The watch path is
+  `watch.py → indexer/watcher.py (`SqlFileEventHandler`) → core/jobs.py
+  (`WatchJobManager._run_job`) → indexer.reindex_file`. `watcher.py` is backend-agnostic
+  (it dispatches file events and calls `db.delete_nodes_for_file` / `indexer.resync_changed`
+  through the `GraphBackend` ABC) — **no DuckDB-specific change is needed inside it**; only
+  the downstream reindex sink (Phase 2) and the drain body (Phase 4) change.
 - Config: `KuzuConfig` → backend-neutral config; default DB path stays a single file.
 - Delete `kuzu_backend.py` and all Kuzu deps from `pyproject.toml`; `uv lock`.
 - Delete `neo4j_backend.py` + `Neo4jConfig` + `SQLCG_BACKEND` dispatch → single backend
@@ -285,6 +297,20 @@ DWH-scale row set and assert node/edge counts match the Kuzu reference.
 
 ### Phase 3 — Query port + parity gate (the parity-risk phase)
 
+**STEP 0 (DO THIS FIRST — blocks everything else in Phase 3 and gates Phase 5):**
+**Extract and commit the Kuzu reference outputs as a test fixture BEFORE writing any SQL
+ports.** No parity fixture exists in `tests/` today — the spike's numbers lived in a throwaway
+`/tmp/feasibility.py`. From the **live Kuzu DB** on the DWH corpus, capture and commit (e.g.
+`tests/fixtures/duckdb_parity/kuzu_reference.json`): node counts per label, edge counts per
+type, `COLUMN_LINEAGE` traversal reached-sets (upstream + downstream for a fixed seed set),
+hub ranking top-k (C7), backfill reachability closure, a table-level edge query result,
+star-source result, and the cyclic-lineage reached-set (C8). The Phase 3 parity gate diffs the
+DuckDB ports against this committed fixture.
+**ORDERING CONSTRAINT:** Kuzu (`core/kuzu_backend.py` + dep) is deleted in **Phase 5**, which
+runs *after* Phase 3 — so the reference **must be captured and committed while Kuzu still
+exists.** **Phase 5's Kuzu deletion is BLOCKED until this fixture is committed.** If the fixture
+is missing, do not start Phase 5.
+
 **Deliverables:** translate every Cypher read site (per the surface table) to recursive-CTE
 SQL. Port order: `tools.py` → `analyze.py` → `db.py` → `find.py` → `server.py`.
 - Recursive lineage CTEs carry a **cycle guard** (visited-set / depth cap) and bounded
@@ -295,11 +321,14 @@ SQL. Port order: `tools.py` → `analyze.py` → `db.py` → `find.py` → `serv
   guard) in `tools.py`, `skill.py`, and the `gain.py` metric (Tier 2).
 
 **Files:** `server/tools.py`, `server/skill.py`, `cli/commands/{analyze,db,find,gain}.py`,
-`server/server.py`; `tests/.../test_duckdb_parity.py` (new, extends the spike harness).
+`server/server.py`; `tests/fixtures/duckdb_parity/kuzu_reference.json` (new, committed in
+STEP 0 from the live Kuzu DB); `tests/.../test_duckdb_parity.py` (new, diffs ports vs the
+committed reference).
 **Exit gate — PARITY GATE (hard):** for the DWH fixture, every ported query returns
-**identical rows** vs a captured Kuzu reference dump: node/edge counts, traversal
-reached-sets (`COLUMN_LINEAGE` upstream + downstream), hub ranking (C7), backfill closure,
-table-level edges, star-source, and a cyclic-lineage case (C8). A row diff fails the gate.
+**identical rows** vs the **committed Kuzu reference fixture (STEP 0)**: node/edge counts,
+traversal reached-sets (`COLUMN_LINEAGE` upstream + downstream), hub ranking (C7), backfill
+closure, table-level edges, star-source, and a cyclic-lineage case (C8). A row diff fails the
+gate. **The committed fixture must exist before this gate can run.**
 
 ### Phase 4 — Reindex path = full-rebuild-in-transaction (delete the swap)
 
@@ -313,17 +342,42 @@ table-level edges, star-source, and a cyclic-lineage case (C8). A row diff fails
 - Server (`server.py`/`tools.py`): hold **one R/W handle for the process lifetime** instead
   of RO-open-then-escalate. Simplify the B2 shutdown plumbing (server.py:381–399) — the
   `de_escalate_to_ro`-skip reason disappears; the close path stays.
-- Watch path: `jobs.py` calls `reindex_file` (there is **no `watcher.py`**). Under
-  full-rebuild Option 1 its body routes through the same transactional rebuild.
+- Watch path: `watch.py → indexer/watcher.py (`SqlFileEventHandler`) → core/jobs.py
+  (`WatchJobManager._run_job`) → indexer.reindex_file`. `watcher.py` itself dispatches
+  file-system events and calls through the `GraphBackend` ABC
+  (`db.delete_nodes_for_file`, `indexer.resync_changed`) — **it needs no DuckDB-specific
+  change**; only the downstream `reindex_file` sink (Phase 2) and the drain body route through
+  the transactional rebuild.
+- **Watch ⊥ live server — DELIBERATE DECISION (no change, accept current behavior):**
+  `watch.py:29` opens the DB **directly** via `get_backend()` with **no server-live check**
+  and holds it for the watch session's lifetime. Under DuckDB's cross-process exclusive lock
+  (C4), this makes `sqlcg watch` **mutually exclusive** with a live MCP server: whichever
+  starts second fails to open the file. **We KEEP this as-is** — `watch` is an interactive,
+  foreground, long-running session a user starts deliberately on a dev machine; it is not a
+  routed command and there is no use case for running it concurrently with a server on the
+  same DB. We do **not** add a `db reset`-style live-server guard to `watch.py` in this
+  feature (it would only convert a clear OS-level lock error into a different error). If the
+  raw lock IOException proves too opaque in practice, a friendlier pre-check is a trivial
+  follow-up — explicitly out of scope here. **Files-touched note:** `watch.py` and
+  `indexer/watcher.py` are therefore in the Phase 4 files list for *audit only* (confirm no
+  Cypher, confirm the ABC calls are backend-neutral); the only edit either may need is if
+  `get_backend()`'s signature changes when RO/escalation is removed.
 - Verify concurrent reads during a rebuild see the OLD snapshot then flip on COMMIT (C3).
 
-**Files:** `server/writer.py`, `server/tools.py`, `server/server.py`, `core/jobs.py`.
+**Files:** `server/writer.py`, `server/tools.py`, `server/server.py`, `core/jobs.py`,
+`indexer/watcher.py` (audit — backend-neutral, no change expected),
+`cli/commands/watch.py` (audit — direct `get_backend()` open, watch⊥server decision above).
 **Exit gate:** a long write transaction + concurrent reads observe a consistent snapshot
 and flip atomically on COMMIT (C3 as an integration test); a forced mid-rebuild raise
 leaves the prior graph intact (C6). Single-writer queue + coalescing + drain shape
 unchanged (Tier 3 KEEP).
 
 ### Phase 5 — Cutover + cleanup + perf measurement
+
+**ORDERING PRECONDITION (blocks this phase):** Kuzu may only be deleted **after** the Phase 3
+STEP 0 reference fixture (`tests/fixtures/duckdb_parity/kuzu_reference.json`) is committed —
+once Kuzu is gone there is no way to regenerate it. If that fixture is not in git, **stop and
+go back to Phase 3 STEP 0** before deleting anything below.
 
 **Deliverables:**
 - Delete `core/kuzu_backend.py` (449 LOC) and `core/neo4j_backend.py` (233 LOC).
@@ -332,6 +386,15 @@ unchanged (Tier 3 KEEP).
   directly. Rename `KuzuConfig` → neutral `DbConfig`, drop `buffer_pool_size_mb`
   (config.py:18,39); keep `get_db_path()` and the `~/.sqlcg/graph.db` default
   (config.py:17,38) — **path/constant fallbacks must match the renamed config** (CLAUDE.md).
+- **`buffer_pool_size_mb` removal is NOT just the config field — two CLI flags expose it and
+  would silently become dead env-sets after the field is deleted (plan-reviewer catch):**
+  - `cli/commands/db.py` (`db_init`, lines ~24–33): remove the `--buffer-pool-size`
+    `typer.Option`, the `os.environ["SQLCG_BUFFER_POOL_MB"] = ...` set (line ~32–33), and the
+    `"KuzuDB buffer pool size in MB"` help text.
+  - `cli/commands/index.py` (`index_cmd`, lines ~40–45 + ~158–159): remove the same
+    `--buffer-pool-size` `typer.Option`, the `SQLCG_BUFFER_POOL_MB` env set (line ~158–159),
+    and the same help text. (Note: `index.py:51` `--batch-size` help text also says
+    "Files per **KuzuDB** transaction" — reword to "per DuckDB transaction" while here.)
 - `uninstall.py`: **(newly-found item)** replace `shutil.rmtree(db_path)`
   (uninstall.py:131, "Delete the database directory") with single-file deletion —
   `Path(db_path).unlink()` plus the DuckDB `.wal` sibling — because **DuckDB is one file,
@@ -350,11 +413,33 @@ unchanged (Tier 3 KEEP).
   (~210–256 s, see MEMORY indexer-perf-baseline) is a release blocker.
 
 **Files:** `core/kuzu_backend.py` (del), `core/neo4j_backend.py` (del), `core/config.py`,
-`cli/commands/uninstall.py`, `tests/integration/test_freshness_mcp.py`, `pyproject.toml`,
-`uv.lock`, `src/sqlcg/__init__.py`.
-**Exit gate:** `grep -rn <symbol> src tests` returns zero surviving callers for each
-deleted symbol; full test suite green; perf figure recorded under budget; `db info` and a
-fresh `index` → `analyze` round-trip work on a clean machine (re-index is the migration).
+`cli/commands/uninstall.py`, `cli/commands/db.py` (remove `--buffer-pool-size` flag + env set
++ help), `cli/commands/index.py` (remove `--buffer-pool-size` flag + env set + help; reword
+`--batch-size` help "KuzuDB" → "DuckDB"), `tests/integration/test_freshness_mcp.py`,
+`pyproject.toml`, `uv.lock`, `src/sqlcg/__init__.py`.
+**Exit gate (ALL must be green):**
+1. **Symbol-deletion gate:** `grep -rn <symbol> src tests` returns zero surviving callers for
+   each deleted symbol; full test suite green.
+2. **DOUBLE-REINDEX NO-CRASH + LINEAGE PARITY (user's top acceptance criterion):** run
+   `sqlcg index <DWH corpus>`, then `sqlcg reindex` **TWICE consecutively**. Assert **no
+   crash** on either reindex — Kuzu raised `KU_UNREACHABLE` on the 2nd consecutive reindex
+   (see MEMORY: kuzu-upgrade-dead-end / issue29-dwh-test-findings); **DuckDB must fix this.**
+   Then assert `sqlcg analyze` **column-trace lineage is identical after the 2nd reindex as
+   after the initial index** (same reached-sets, same edge counts — re-indexing the same
+   corpus is idempotent). This is the headline reason the migration exists; it gates the
+   release.
+3. **FULL-INDEX PERF CHECK:** a real parse-and-index of the full **~1,600-file** corpus with
+   `DuckDBBackend` completes in **< 5 min** on a laptop (CLAUDE.md budget). Baseline to beat /
+   not regress: Kuzu ~210–256 s (MEMORY: indexer-perf-baseline). Record the wall-clock figure
+   **and** the batch size in the postmortem; a regression vs the Kuzu baseline is a release
+   blocker. (This is the D10 real-corpus measurement — the Phase 0 spike's 10.6 s timed only a
+   load of an already-extracted graph, not a parse.)
+4. **COLUMN-TRACE SANITY / PARITY:** a fresh `index` → `analyze` column-trace on the DWH
+   corpus returns the **same lineage reached-set as the committed Kuzu reference fixture**
+   (the fixture extracted at the start of Phase 3). Not just "no exception" — assert the
+   observable reached-set rows.
+5. **Clean-machine round-trip:** `db info` and a fresh `index` → `analyze` round-trip work on
+   a clean machine (re-index is the migration path).
 
 ## Removal inventory (grep-verified — deletion is where migrations rot)
 
@@ -370,7 +455,7 @@ checked for call sites confined to the to-be-removed set.
 | Kuzu dep in `pyproject.toml` + `uv.lock` | follows file deletion; `uv lock` | — |
 | **Escalation machinery**: `escalate_to_rw`, `de_escalate_to_ro` (`writer.py:312,410`); `_get_or_escalate_rw`, `_de_escalate_to_ro_from_tool`, `_escalation_db_path` (`tools.py:217,236,249`) | exists only because Kuzu can't read+write on one handle; DuckDB's single RW handle + MVCC removes the entire RO→RW→RO dance. Call sites are all inside the drain/write path being rewritten | ~150 |
 | B2 "skip RO reopen on shutdown" plumbing (`server.py:382,398`) tied to `de_escalate_to_ro` | the *reason* (RO reopen after escalation) disappears; shutdown-close logic stays but simplifies | ~20 |
-| `buffer_pool_size_mb` field + env (`config.py:18,39`) | Kuzu-specific knob; DuckDB sizes differently | ~5 |
+| `buffer_pool_size_mb` field + env (`config.py:18,39`) **AND its two CLI flags** — `--buffer-pool-size` in `db.py` (`db_init`, ~24–33: flag + `SQLCG_BUFFER_POOL_MB` env set + "KuzuDB buffer pool size in MB" help) and `index.py` (`index_cmd`, ~40–45 flag/help + ~158–159 env set) | Kuzu-specific knob; DuckDB sizes differently. **The flags must die with the field or they become dead env-sets** (plan-reviewer catch). | ~5 + flags |
 
 ### Tier 2 — RESOLVED 2026-06-05 → both now DELETE/rename (DuckDB-only)
 
@@ -417,6 +502,10 @@ src tests` returns zero surviving callers outside the removed set (CLAUDE.md rul
   reference (node/edge counts, traversal reached-sets, hub ranking, backfill order).
 - Concurrency test: long write transaction + concurrent reads see a consistent snapshot
   and flip atomically on commit.
+- **Double-reindex idempotence (top acceptance criterion):** `index` → `reindex` → `reindex`
+  on the DWH corpus must not crash (Kuzu's 2nd-reindex `KU_UNREACHABLE` must be gone) and the
+  `analyze` column-trace lineage after the 2nd reindex must equal the post-initial-index
+  lineage. Gated in Phase 5.
 - Keep all existing parser-side perf invariants (CLAUDE.md) — they are backend-agnostic
   (`test_upsert_batch_invariant.py`, `test_bulk_upsert_invariant.py`,
   `test_perf_scaling_guard.py`, `test_T09_01_qualify_once.py` stay green untouched).
@@ -433,12 +522,20 @@ All named call sites in the draft **exist** in live code. Corrections applied:
 | D4 | Cypher surface "~80 lines, analyze.py heaviest" | Live grep: `tools.py` ~37 lines is highest *volume*; `analyze.py` ~36 (9 routed sites) is highest *parity risk*. Counts are mixed (routing/comments/strings). | Replaced table with live counts + "order-of-magnitude guide" caveat; port order now `tools.py` first. |
 | D5 | `skill.py:85,112` listed only in narrative | They are the **skill-manifest tool name + description** — must be in the rename set. | Promoted into the rename inventory + Phase 3. |
 | D6 | gain.py `execute_cypher` — "leave OR rename" (undecided) | It's a SQLite metric (`tool_name='execute_cypher'` filter + ratio vars + label). Leaving it un-renamed silently breaks the usage metric after the tool rename. | **Decided: rename** for metric continuity. |
-| D7 | Scope names `watcher.py` | **No `watcher.py` exists.** Watch path is `core/jobs.py` → `reindex_file`. | Corrected scope + Phase 4. |
+| D7 | ~~v3 claimed "no `watcher.py` exists"~~ — **v3 WAS WRONG (caught by plan-reviewer).** | `indexer/watcher.py` **does** exist (245 LOC: `SqlFileEventHandler`, `BranchMonitor`), imported by `watch.py:13`. Real path: `watch.py → watcher.py (`SqlFileEventHandler`) → jobs.py (`WatchJobManager._run_job`) → indexer.reindex_file`. | **v4 fix:** corrected Scope + Phase 4 to name `watcher.py`; added it to Phase 4 files (audit only — backend-neutral via the ABC, no DuckDB change needed); recorded the deliberate watch⊥live-server decision (keep current direct-open behavior under the C4 lock, no new guard). |
 | D8 | **(MISSED entirely by the draft)** uninstall deletion | `uninstall.py:131` uses `shutil.rmtree` because **Kuzu is a directory**; DuckDB is a **single file** → `rmtree` is wrong. `_is_kuzu_backend` (99/231) becomes vacuous. | Added as a Phase 5 deliverable + Tier 2 row. **This is the most consequential drift** — a missed cutover step that would leave a broken `uninstall`. |
 | D9 | Schema "etc." edge list | Full set is 7 node + 12 edge labels (pinned from `schema.py`). `_pk_field` is an **ABC static method (graph_db.py:193)** — inherited, cannot drift. | Pinned the full list + PK source. |
 | D10 | Perf budget | Spike timed extracted-graph load (10.6 s), **not** a real parse-and-index. | Phase 5 now mandates a real end-to-end perf measurement as a release gate. |
+| D11 | **(v4)** `buffer_pool_size_mb` removal scoped only to the config field | Two CLI flags expose it: `db.py` `db_init` (~24–33) and `index.py` `index_cmd` (~40–45, ~158–159), each setting `SQLCG_BUFFER_POOL_MB`. Deleting the field alone leaves dead env-sets + stale "KuzuDB buffer pool" help. | Added both files + flags to the Phase 5 deliverables, files list, and Tier 1 inventory; also reword `index.py` `--batch-size` "KuzuDB" → "DuckDB". |
+| D12 | **(v4)** Phase 3 parity gate referenced a Kuzu reference dump that **doesn't exist** | No parity fixture in `tests/`; spike numbers were in throwaway `/tmp/feasibility.py`. Kuzu is deleted in Phase 5, after Phase 3. | Added Phase 3 STEP 0: extract + commit the Kuzu reference fixture **before** any SQL port; made Phase 5 Kuzu deletion **blocked** on that fixture existing. |
+| D13 | **(v4, non-blocking confirmation)** `db.py` full-reset deletion under DuckDB | `db.py:84–92` already dispatches on `target.is_dir()` → `rmtree` else `unlink`, and already drops the `.wal` sidecar — **so it is already DuckDB-correct.** Only `uninstall.py` (D8) hardcodes `shutil.rmtree` and still needs the fix. | No change to `db.py` reset needed; noted here so the developer does not "fix" something already correct. |
 
-**Verdict: ready to hand to the developer.** Phase 0 gate is cleared; Phases 1–5 have
-concrete deliverables, exact files, and hard exit gates; the removal inventory is
-grep-accurate; the one missing cutover step (D8) is now captured. The single unmeasured
-risk (real-corpus index perf, D10) is explicitly gated in Phase 5, not hand-waved.
+**Verdict: ready to hand to the developer (v4, plan-reviewer fixes applied).** Phase 0 gate
+is cleared; Phases 1–5 have concrete deliverables, exact files, and hard exit gates; the
+removal inventory is grep-accurate (incl. the two `--buffer-pool-size` flags, D11); the
+cutover deletion step (D8 uninstall) is captured, with `db.py` reset confirmed already-correct
+(D13); the watch path is correctly described (`watcher.py` exists, D7-corrected) with a
+deliberate watch⊥live-server decision; the parity fixture must be committed before any port
+and gates Kuzu deletion (D12). The user's top acceptance criterion — **double-reindex no-crash
++ lineage parity** — plus the real-corpus perf check (D10) are now explicit Phase 5 exit
+gates.
