@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.parsers.base import ParsedFile, QueryNode, TableRef
@@ -123,7 +123,7 @@ def test_T02_pass2_skipped_in_summary(tmp_path):
     (tmp_path / "a.sql").write_text("CREATE VIEW a AS SELECT 1 AS x;", encoding="utf-8")
     (tmp_path / "b.sql").write_text("CREATE VIEW b AS SELECT 2 AS y;", encoding="utf-8")
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     summary = Indexer().index_repo(tmp_path, "snowflake", db, use_git=False)
     db.close()

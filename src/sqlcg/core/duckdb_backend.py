@@ -388,6 +388,21 @@ class DuckDBBackend(GraphBackend):
         if cols is None:
             raise ValueError(f"Unknown node label: {label!r}")
 
+        # Require homogeneous rows including the primary key — a heterogeneous
+        # batch signals an upstream bug (the row builder dropped/added a field).
+        pk_field = self._pk_field(label)
+        keys = set(rows[0].keys())
+        if pk_field not in keys:
+            raise ValueError(
+                f"upsert_nodes_bulk({label}): every row must include primary key '{pk_field}'"
+            )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != keys:
+                raise ValueError(
+                    f"upsert_nodes_bulk({label}): row {i} has property keys "
+                    f"{sorted(row.keys())}, expected {sorted(keys)}"
+                )
+
         # Build column arrays from the row list (None for missing fields).
         # DuckDB: INSERT OR REPLACE via unnest(?::VARCHAR[]) — one execute() per label
         # per batch (CLAUDE.md perf invariant: _flush_row_batch calls each bulk once).
@@ -415,6 +430,23 @@ class DuckDBBackend(GraphBackend):
         for row in rows:
             props = {k: v for k, v in row.items() if k not in ("src_key", "dst_key")}
             self._validate_props(props)
+
+        # Every edge row must carry src_key and dst_key, and the batch must be
+        # homogeneous — guards against a malformed row reaching the NOT NULL
+        # constraint as an opaque ConstraintException.
+        keys = set(rows[0].keys())
+        for required in ("src_key", "dst_key"):
+            if required not in keys:
+                raise ValueError(
+                    f"upsert_edges_bulk({src_label}->{rel_type}->{dst_label}): "
+                    f"every row must include '{required}'"
+                )
+        for i, row in enumerate(rows[1:], 1):
+            if set(row.keys()) != keys:
+                raise ValueError(
+                    f"upsert_edges_bulk: row {i} has property keys {sorted(row.keys())}, "
+                    f"expected {sorted(keys)}"
+                )
 
         extra = _EDGE_EXTRA_COLUMNS.get(rel_type, [])
         all_cols = ["src_key", "dst_key"] + extra
@@ -472,7 +504,7 @@ class DuckDBBackend(GraphBackend):
     def delete_nodes_for_file(self, file_path: str) -> None:
         """Delete all nodes and edges for *file_path*.
 
-        Deletion order (mirrors kuzu_backend.py):
+        Deletion order:
           A. SqlColumn nodes for tables DEFINED_IN this file
           B. SqlQuery nodes QUERY_DEFINED_IN this file (all their edges via cascades
              implemented as explicit DELETE on each edge table)

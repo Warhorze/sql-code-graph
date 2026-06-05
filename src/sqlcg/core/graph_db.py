@@ -77,7 +77,7 @@ class GraphBackend(ABC):
 
         Each row dict must contain the primary-key field for `label` (see _pk_field)
         plus any other properties to SET. All rows must share the same property-key
-        set; backends MAY raise if rows are heterogeneous (KuzuBackend does).
+        set; backends MAY raise if rows are heterogeneous (DuckDBBackend does).
 
         Idempotent MERGE semantics, identical to upsert_node per row.
 

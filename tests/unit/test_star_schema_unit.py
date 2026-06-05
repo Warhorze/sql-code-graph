@@ -5,7 +5,7 @@ These tests verify schema.py enum values, schema.cypher DDL, and db info output.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 
 # ---------------------------------------------------------------------------
 # T-02 — SCHEMA_VERSION bump and RelType.STAR_SOURCE enum
@@ -46,13 +46,16 @@ def test_star_source_rel_table_in_schema_cypher():
 
 def test_star_source_table_created_in_fresh_db():
     """init_schema() on a fresh in-memory DB must create the STAR_SOURCE REL TABLE."""
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     try:
         db.init_schema()
-        rows = db.run_read("CALL show_tables() RETURN *", {})
+        rows = db.run_read(
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'main'",
+            {},
+        )
         table_names = [r["name"] for r in rows]
         assert "STAR_SOURCE" in table_names, (
-            f"STAR_SOURCE not in show_tables() output. Found: {table_names}"
+            f"STAR_SOURCE not in schema tables. Found: {table_names}"
         )
     finally:
         db.close()
@@ -60,7 +63,7 @@ def test_star_source_table_created_in_fresh_db():
 
 def test_star_source_rel_has_correct_properties():
     """The STAR_SOURCE REL TABLE must accept qualifier, target_table, confidence writes."""
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     try:
         db.init_schema()
         # Create source nodes for the edge
@@ -101,8 +104,7 @@ def test_star_source_rel_has_correct_properties():
             {"qualifier": "<unqualified>", "target_table": "BA.tgt", "confidence": 0.8},
         )
         rows = db.run_read(
-            "MATCH ()-[r:STAR_SOURCE]->() "
-            "RETURN r.qualifier AS q, r.target_table AS tgt, r.confidence AS c",
+            'SELECT qualifier AS q, target_table AS tgt, confidence AS c FROM "STAR_SOURCE"',
             {},
         )
         assert len(rows) == 1

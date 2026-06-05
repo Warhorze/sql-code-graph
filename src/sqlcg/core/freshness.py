@@ -74,7 +74,7 @@ def compute_freshness(root: Path, indexed_sha: str | None) -> Freshness:
     Args:
         root: Filesystem path used as the ``cwd`` for git commands.  This is
             typically the ``r.path`` value read from the ``Repo`` graph node.
-        indexed_sha: The SHA recorded by ``KuzuBackend.get_indexed_sha()``.
+        indexed_sha: The SHA recorded by ``DuckDBBackend.get_indexed_sha()``.
             May be ``None`` when the graph was never indexed, or a sentinel
             like ``"<head>+dirty"`` written by ``index --include-working-tree``.
     """

@@ -6,7 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 runner = CliRunner()
@@ -26,7 +26,7 @@ class TestProgressCallbackUnit:
         def track_callback(n: int, total: int) -> None:
             calls.append((n, total))
 
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
         indexer.index_repo(
@@ -56,7 +56,7 @@ class TestProgressCallbackUnit:
         def track_callback(n: int, total: int) -> None:
             calls.append((n, total))
 
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
         indexer = Indexer()
         indexer.index_repo(

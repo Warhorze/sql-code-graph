@@ -3,7 +3,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -24,7 +24,7 @@ class TestPerFileCommitBoundary:
             sql_file.write_text("SELECT 1;")
 
         # Mock db.transaction to count invocations
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
 
         transaction_count = 0
@@ -62,7 +62,7 @@ class TestPerFileCommitBoundary:
             sql_file = tmp_path / f"file_{i:02d}.sql"
             sql_file.write_text("SELECT 1;")
 
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
 
         # Mock _build_file_rows to raise on 3rd call
@@ -93,20 +93,3 @@ class TestPerFileCommitBoundary:
             f"At least 4 files should parse successfully (5 total - 1 failure). "
             f"Got {summary['files_parsed']}"
         )
-
-    def test_buffer_pool_size_passed_to_kuzu(self, tmp_path: Path):
-        """Guard: --buffer-pool-size is passed to KuzuDB."""
-        import os
-
-        # Set env var
-        os.environ["SQLCG_BUFFER_POOL_MB"] = "256"
-
-        from sqlcg.core.config import KuzuConfig
-
-        config = KuzuConfig.from_env()
-        assert config.buffer_pool_size_mb == 256, (
-            f"Expected buffer_pool_size_mb=256, got {config.buffer_pool_size_mb}"
-        )
-
-        # Clean up
-        del os.environ["SQLCG_BUFFER_POOL_MB"]

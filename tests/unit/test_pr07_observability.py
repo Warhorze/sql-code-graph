@@ -3,7 +3,7 @@
 Covers:
 - Scenario A: pool-path timeout and skipped:poison both reach "timeout" bucket
 - Scenario B: _timeout_file now emits "timeout:Ns" format (not the old "timeout file=...")
-- Scenario C: log file written to KuzuConfig.log_path (not a hardcoded path)
+- Scenario C: log file written to DbConfig.log_path (not a hardcoded path)
 - Scenario D: SQLCG_LOG_PATH env var overrides default log_path
 """
 
@@ -92,7 +92,7 @@ def test_scenario_b_old_format_no_longer_emitted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scenario C — log file is written to KuzuConfig.log_path (not hardcoded)
+# Scenario C — log file is written to DbConfig.log_path (not hardcoded)
 # ---------------------------------------------------------------------------
 
 
@@ -107,7 +107,7 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
     from typer.testing import CliRunner
 
     from sqlcg.cli.main import app
-    from sqlcg.core.config import KuzuConfig
+    from sqlcg.core.config import DbConfig as KuzuConfig
 
     log_file = tmp_path / "custom_index.log"
     mock_config = KuzuConfig(
@@ -140,7 +140,7 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
     )
 
     with (
-        patch("sqlcg.cli.commands.index.KuzuConfig.from_env", return_value=mock_config),
+        patch("sqlcg.cli.commands.index.DbConfig.from_env", return_value=mock_config),
         patch("sqlcg.cli.commands.index.get_backend", return_value=backend),
         patch(
             "sqlcg.cli.commands.index.get_db_path",
@@ -172,7 +172,7 @@ def test_scenario_d_env_var_overrides_log_path(tmp_path: Path) -> None:
     import os
     from unittest.mock import patch
 
-    from sqlcg.core.config import KuzuConfig
+    from sqlcg.core.config import DbConfig as KuzuConfig
 
     custom_log = tmp_path / "custom.log"
 
@@ -190,7 +190,7 @@ def test_scenario_d_default_log_path_without_env_var() -> None:
     import os
     from unittest.mock import patch
 
-    from sqlcg.core.config import KuzuConfig
+    from sqlcg.core.config import DbConfig as KuzuConfig
 
     # Remove SQLCG_LOG_PATH if set
     env = {k: v for k, v in os.environ.items() if k != "SQLCG_LOG_PATH"}

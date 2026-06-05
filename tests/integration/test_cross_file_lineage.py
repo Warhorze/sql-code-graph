@@ -9,16 +9,15 @@ ParsedFile internal state.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
-from sqlcg.core.schema import RelType
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.lineage.aggregator import CrossFileAggregator
 
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB backend."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -45,7 +44,7 @@ def test_cross_file_view_resolution(db, tmp_path):
 
     # At minimum, the view must exist as a table node
     rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: $q}) RETURN t.qualified AS q",
+        'SELECT qualified AS q FROM "SqlTable" WHERE qualified = ?',
         {"q": "customer_orders"},
     )
     assert rows, (
@@ -74,9 +73,10 @@ def test_view_pass2_emits_column_lineage_edges(db, tmp_path):
 
     # COLUMN_LINEAGE edges into customer_orders.* must exist
     rows = db.run_read(
-        f"MATCH (src:SqlColumn)-[:{RelType.COLUMN_LINEAGE}]->(dst:SqlColumn) "
-        "WHERE dst.table_qualified = 'customer_orders' "
-        "RETURN src.id AS src, dst.id AS dst LIMIT 20",
+        'SELECT src.id AS src, dst.id AS dst FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" src ON cl.src_key = src.id '
+        'JOIN "SqlColumn" dst ON cl.dst_key = dst.id '
+        "WHERE dst.table_qualified = 'customer_orders' LIMIT 20",
         {},
     )
     assert rows, (
@@ -115,7 +115,7 @@ def test_cross_file_lineage_deleted_file(tmp_path):
     # Delete the reference file before indexing
     ref_file.unlink()
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     try:
         summary = Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)

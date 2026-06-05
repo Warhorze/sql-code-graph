@@ -9,7 +9,7 @@ and that a missing file during index_repo does not crash (see test_deleted_file_
 
 import logging
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.lineage.aggregator import CrossFileAggregator
 from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -57,7 +57,7 @@ class TestResolvePass2DeletedFile:
         sql_ref.unlink()
 
         # index_repo must complete without raising even with the deleted file
-        db = KuzuBackend(":memory:")
+        db = DuckDBBackend(":memory:")
         db.init_schema()
         try:
             summary = Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)

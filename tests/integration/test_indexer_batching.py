@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -34,30 +34,28 @@ def test_batch_size_equivalence_1_vs_50(tmp_path):
     _write_test_corpus(corpus_path, num_files=12)
 
     # Index with batch_size=1
-    db1 = KuzuBackend(":memory:")
+    db1 = DuckDBBackend(":memory:")
     db1.init_schema()
     summary1 = Indexer().index_repo(corpus_path, "snowflake", db1, use_git=False, batch_size=1)
 
     state1 = {
-        "tables": sorted(
-            r["q"] for r in db1.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {})
-        ),
-        "edges": db1.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"],
-        "columns": db1.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"],
+        "tables": sorted(r["q"] for r in db1.run_read('SELECT qualified AS q FROM "SqlTable"', {})),
+        "edges": db1.run_read('SELECT count(*) AS n FROM "COLUMN_LINEAGE"', {})[0]["n"],
+        "columns": db1.run_read('SELECT count(*) AS n FROM "SqlColumn"', {})[0]["n"],
     }
     db1.close()
 
     # Index with batch_size=50
-    db50 = KuzuBackend(":memory:")
+    db50 = DuckDBBackend(":memory:")
     db50.init_schema()
     summary50 = Indexer().index_repo(corpus_path, "snowflake", db50, use_git=False, batch_size=50)
 
     state50 = {
         "tables": sorted(
-            r["q"] for r in db50.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {})
+            r["q"] for r in db50.run_read('SELECT qualified AS q FROM "SqlTable"', {})
         ),
-        "edges": db50.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"],
-        "columns": db50.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"],
+        "edges": db50.run_read('SELECT count(*) AS n FROM "COLUMN_LINEAGE"', {})[0]["n"],
+        "columns": db50.run_read('SELECT count(*) AS n FROM "SqlColumn"', {})[0]["n"],
     }
     db50.close()
 
@@ -79,7 +77,7 @@ def test_batch_size_partial_batch_flushed(tmp_path):
     corpus_path = tmp_path / "corpus"
     _write_test_corpus(corpus_path, num_files=5)
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     summary = Indexer().index_repo(corpus_path, "snowflake", db, use_git=False, batch_size=1000)
 
@@ -87,7 +85,7 @@ def test_batch_size_partial_batch_flushed(tmp_path):
     assert summary["tables_found"] >= 5
 
     # Verify all 5 files were indexed
-    file_count = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})[0]["n"]
+    file_count = db.run_read('SELECT count(*) AS n FROM "File"', {})[0]["n"]
     assert file_count == 5, (
         f"Expected 5 File nodes; final partial batch flush may have failed. "
         f"Got {file_count} files, summary={summary}"
@@ -100,7 +98,7 @@ def test_batch_size_zero_raises_valueerror(tmp_path):
     corpus_path = tmp_path / "corpus"
     _write_test_corpus(corpus_path, num_files=2)
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
 
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
@@ -122,7 +120,7 @@ def test_batch_size_one_bad_file_does_not_abort_peers(tmp_path, monkeypatch):
     (corpus_path / "good1.sql").write_text("CREATE VIEW good1 AS SELECT a FROM src;")
     (corpus_path / "good2.sql").write_text("CREATE VIEW good2 AS SELECT b FROM src;")
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
 
     # Index normally first
@@ -134,7 +132,7 @@ def test_batch_size_one_bad_file_does_not_abort_peers(tmp_path, monkeypatch):
 
     # Verify both views exist in the graph
     tables = db.run_read(
-        "MATCH (t:SqlTable) WHERE t.name IN ['good1', 'good2'] RETURN t.name AS name ORDER BY name",
+        "SELECT name FROM \"SqlTable\" WHERE name IN ('good1', 'good2') ORDER BY name",
         {},
     )
     table_names = [r["name"] for r in tables]
@@ -149,7 +147,7 @@ def test_batch_size_observable_in_return_dict(tmp_path):
     corpus_path = tmp_path / "corpus"
     _write_test_corpus(corpus_path, num_files=3)
 
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
 
     for batch_size_value in [1, 7, 50, 100]:
@@ -205,7 +203,7 @@ def _write_shared_dim_corpus(corpus_path: Path) -> None:
     )
 
 
-def _get_graph_state_with_properties(db: KuzuBackend) -> dict:
+def _get_graph_state_with_properties(db: DuckDBBackend) -> dict:
     """Query the graph for counts AND properties needed to prove F1-AC4.
 
     Returns a dict with:
@@ -214,14 +212,14 @@ def _get_graph_state_with_properties(db: KuzuBackend) -> dict:
       - COLUMN_LINEAGE edge property sets (query_id, transform, confidence) sorted
         for deterministic comparison
     """
-    tables = sorted(r["q"] for r in db.run_read("MATCH (t:SqlTable) RETURN t.qualified AS q", {}))
-    edge_count = db.run_read("MATCH ()-[e:COLUMN_LINEAGE]->() RETURN count(e) AS n", {})[0]["n"]
-    col_count = db.run_read("MATCH (c:SqlColumn) RETURN count(c) AS n", {})[0]["n"]
+    tables = sorted(r["q"] for r in db.run_read('SELECT qualified AS q FROM "SqlTable"', {}))
+    edge_count = db.run_read('SELECT count(*) AS n FROM "COLUMN_LINEAGE"', {})[0]["n"]
+    col_count = db.run_read('SELECT count(*) AS n FROM "SqlColumn"', {})[0]["n"]
 
     # defined_in_file provenance for the shared dim_customer table
     dim_rows = db.run_read(
-        "MATCH (t:SqlTable) WHERE t.name = 'dim_customer' RETURN t.defined_in_file AS dif",
-        {},
+        'SELECT defined_in_file AS dif FROM "SqlTable" WHERE name = ?',
+        {"name": "dim_customer"},
     )
     dim_defined_in_file = dim_rows[0]["dif"] if dim_rows else None
 
@@ -229,10 +227,9 @@ def _get_graph_state_with_properties(db: KuzuBackend) -> dict:
     edge_props = sorted(
         (r["src"], r["dst"], r["transform"], r["confidence"], r["query_id"])
         for r in db.run_read(
-            "MATCH (src:SqlColumn)-[e:COLUMN_LINEAGE]->(dst:SqlColumn) "
-            "RETURN src.id AS src, dst.id AS dst, "
-            "e.transform AS transform, e.confidence AS confidence, "
-            "e.query_id AS query_id",
+            "SELECT cl.src_key AS src, cl.dst_key AS dst, "
+            "cl.transform AS transform, cl.confidence AS confidence, "
+            'cl.query_id AS query_id FROM "COLUMN_LINEAGE" cl',
             {},
         )
     )
@@ -264,14 +261,14 @@ def test_shared_dim_batch_vs_per_file_properties_identical(tmp_path):
     _write_shared_dim_corpus(corpus_path)
 
     # Index with batch_size=1 (per-file flush — the reference path)
-    db1 = KuzuBackend(":memory:")
+    db1 = DuckDBBackend(":memory:")
     db1.init_schema()
     Indexer().index_repo(corpus_path, "snowflake", db1, use_git=False, batch_size=1)
     state1 = _get_graph_state_with_properties(db1)
     db1.close()
 
     # Index with batch_size=50 (all 4 files in one batch — exercises cross-file dedup)
-    db50 = KuzuBackend(":memory:")
+    db50 = DuckDBBackend(":memory:")
     db50.init_schema()
     Indexer().index_repo(corpus_path, "snowflake", db50, use_git=False, batch_size=50)
     state50 = _get_graph_state_with_properties(db50)

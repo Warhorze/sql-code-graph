@@ -45,7 +45,7 @@ class TestMCPEntryRemoval:
 
 
 class TestGetDbPath:
-    """Test _get_db_path function deriving fallback from KuzuConfig."""
+    """Test _get_db_path function deriving fallback from DbConfig."""
 
     def test_scenario_graph_db_exists_when_no_env_var(self, tmp_path, monkeypatch):
         """Guard: _get_db_path returns graph.db (not kuzu.db) when no env var is set."""
@@ -93,26 +93,22 @@ class TestDatabaseDeletion:
     """Test database deletion logic."""
 
     def test_scenario_c_keep_db_flag(self, tmp_path):
-        """Scenario C: --keep-db flag skips database deletion."""
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        (db_dir / "test.file").write_text("test")
+        """Scenario C: user declines prompt — database is kept."""
+        db_file = tmp_path / "graph.db"
+        db_file.write_text("fake-db")
 
-        with patch.object(uninstall, "_get_db_path", return_value=str(db_dir)):
-            with patch.object(uninstall, "_is_kuzu_backend", return_value=True):
-                # When force=False and --keep-db is not set, it will prompt
-                # We mock typer.confirm to return False so it doesn't delete
-                with patch("typer.confirm", return_value=False):
-                    uninstall._step2_delete_database(force=False)
+        with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
+            # When force=False, it will prompt; user declines
+            with patch("typer.confirm", return_value=False):
+                uninstall._step2_delete_database(force=False)
 
-        # The directory should still exist because we declined deletion
-        assert db_dir.exists()
+        # The file should still exist because we declined deletion
+        assert db_file.exists()
 
     def test_scenario_d_force_flag(self, tmp_path, monkeypatch):
         """Scenario D: --force flag deletes without prompting."""
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
-        (db_dir / "test.file").write_text("test")
+        db_file = tmp_path / "graph.db"
+        db_file.write_text("fake-db")
 
         # Mock home directory for metrics.db location
         fake_home = tmp_path / "home"
@@ -124,25 +120,29 @@ class TestDatabaseDeletion:
 
         monkeypatch.setenv("HOME", str(fake_home))
 
-        with patch.object(uninstall, "_get_db_path", return_value=str(db_dir)):
-            with patch.object(uninstall, "_is_kuzu_backend", return_value=True):
-                uninstall._step2_delete_database(force=True)
+        with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
+            uninstall._step2_delete_database(force=True)
 
-        # Verify both database and metrics were deleted
-        assert not db_dir.exists()
+        # Verify database file and metrics were deleted
+        assert not db_file.exists()
         assert not metrics_file.exists()
 
-    def test_database_not_kuzu(self, tmp_path):
-        """Test that non-kuzu backends are skipped."""
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
+    def test_scenario_d_force_flag_also_deletes_wal(self, tmp_path, monkeypatch):
+        """Scenario D+: --force flag also deletes the .wal sibling if present."""
+        db_file = tmp_path / "graph.db"
+        db_file.write_text("fake-db")
+        wal_file = tmp_path / "graph.db.wal"
+        wal_file.write_text("fake-wal")
 
-        with patch.object(uninstall, "_get_db_path", return_value=str(db_dir)):
-            with patch.object(uninstall, "_is_kuzu_backend", return_value=False):
-                uninstall._step2_delete_database(force=False)
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
 
-        # Database should still exist
-        assert db_dir.exists()
+        with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
+            uninstall._step2_delete_database(force=True)
+
+        assert not db_file.exists(), "DuckDB file must be deleted"
+        assert not wal_file.exists(), ".wal sibling must also be deleted"
 
 
 class TestGitHookRemoval:
@@ -224,9 +224,8 @@ class TestUninstallCmdFunction:
         # Patch paths and environment
         with patch.object(uninstall, "_SETTINGS_PATH", settings_file):
             with patch.object(uninstall, "_get_db_path", return_value=None):
-                with patch.object(uninstall, "_is_kuzu_backend", return_value=True):
-                    # Call the function directly
-                    uninstall.uninstall_cmd(keep_db=False, force=False, repo=tmp_path)
+                # Call the function directly
+                uninstall.uninstall_cmd(keep_db=False, force=False, repo=tmp_path)
 
         # Verify MCP entry was removed
         result = json.loads(settings_file.read_text())
@@ -240,15 +239,14 @@ class TestUninstallCmdFunction:
         }
         settings_file.write_text(json.dumps(settings_data))
 
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
+        db_file = tmp_path / "graph.db"
+        db_file.write_text("fake-db")
 
         with patch.object(uninstall, "_SETTINGS_PATH", settings_file):
-            with patch.object(uninstall, "_get_db_path", return_value=str(db_dir)):
-                with patch.object(uninstall, "_is_kuzu_backend", return_value=True):
-                    uninstall.uninstall_cmd(keep_db=True, force=False, repo=tmp_path)
+            with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
+                uninstall.uninstall_cmd(keep_db=True, force=False, repo=tmp_path)
 
-        assert db_dir.exists()  # Database should be kept
+        assert db_file.exists()  # Database should be kept
 
     def test_uninstall_cmd_with_force_flag(self, tmp_path):
         """Test uninstall with --force flag."""
@@ -258,12 +256,11 @@ class TestUninstallCmdFunction:
         }
         settings_file.write_text(json.dumps(settings_data))
 
-        db_dir = tmp_path / "db"
-        db_dir.mkdir()
+        db_file = tmp_path / "graph.db"
+        db_file.write_text("fake-db")
 
         with patch.object(uninstall, "_SETTINGS_PATH", settings_file):
-            with patch.object(uninstall, "_get_db_path", return_value=str(db_dir)):
-                with patch.object(uninstall, "_is_kuzu_backend", return_value=True):
-                    uninstall.uninstall_cmd(keep_db=False, force=True, repo=tmp_path)
+            with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
+                uninstall.uninstall_cmd(keep_db=False, force=True, repo=tmp_path)
 
-        assert not db_dir.exists()  # Database should be deleted
+        assert not db_file.exists()  # Database should be deleted

@@ -78,9 +78,9 @@ def _open_db():
             "no pre-built graph: set SQLCG_DB_PATH to a graph built with `sqlcg index` "
             "(this harness scores an existing graph; it does not index)"
         )
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    return KuzuBackend(db_path)
+    return DuckDBBackend(db_path)
 
 
 def _reachable_physical_leaves(db, col_id: str, max_nodes: int = 5000) -> set[str]:
@@ -95,8 +95,7 @@ def _reachable_physical_leaves(db, col_id: str, max_nodes: int = 5000) -> set[st
             continue
         seen.add(cid)
         rows = db.run_read(
-            "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
-            "WHERE d.id = $cid RETURN DISTINCT s.id AS sid",
+            'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
             {"cid": cid},
         )
         if not rows:
@@ -111,8 +110,7 @@ def _reachable_physical_leaves(db, col_id: str, max_nodes: int = 5000) -> set[st
 def _direct_sources(db, col_id: str) -> set[str]:
     """One-hop physical sources feeding this column directly."""
     rows = db.run_read(
-        "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
-        "WHERE d.id = $cid RETURN DISTINCT s.id AS sid",
+        'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
         {"cid": col_id},
     )
     return {r["sid"] for r in rows if "." in _table_of(r["sid"])}
@@ -132,7 +130,7 @@ def _table_is_noise(table_qualified: str, patterns: list[str]) -> bool:
 def _columns_of(db, table_qualified: str) -> list[str]:
     """All column ids belonging to a table via HAS_COLUMN."""
     rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: $tq})-[:HAS_COLUMN]->(c:SqlColumn) RETURN c.id AS cid",
+        'SELECT dst_key AS cid FROM "HAS_COLUMN" WHERE src_key = ?',
         {"tq": table_qualified},
     )
     return [r["cid"] for r in rows]
@@ -154,8 +152,7 @@ def _table_blast_radius(
             continue
         seen.add(cid)
         rows = db.run_read(
-            "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
-            "WHERE s.id = $cid RETURN DISTINCT d.id AS did",
+            'SELECT DISTINCT dst_key AS did FROM "COLUMN_LINEAGE" WHERE src_key = ?',
             {"cid": cid},
         )
         for r in rows:
@@ -183,8 +180,7 @@ def _upstream_tables(
             continue
         seen.add(cid)
         rows = db.run_read(
-            "MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn) "
-            "WHERE d.id = $cid RETURN DISTINCT s.id AS sid",
+            'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
             {"cid": cid},
         )
         for r in rows:
@@ -229,10 +225,10 @@ def _downstream_count(db, table_qualified: str) -> int:
 def _is_dead_code(db, table_qualified: str) -> bool:
     """Return True when table_qualified has no within-corpus SELECTS_FROM consumers.
 
-    One Cypher read — mirrors the ANALYZE_UNUSED_TABLES predicate.
+    One read — mirrors the ANALYZE_UNUSED_TABLES predicate.
     """
     rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: $tq})<-[:SELECTS_FROM]-() RETURN count(*) AS n",
+        'SELECT count(*) AS n FROM "SELECTS_FROM" WHERE dst_key = ?',
         {"tq": table_qualified},
     )
     n = rows[0]["n"] if rows else 0
@@ -520,9 +516,9 @@ def _mk_chain(backend, tables: list[str]) -> None:
 
 def test_table_blast_radius_nonempty():
     """Scenario A — blast radius reaches the downstream tables."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _mk_chain(backend, ["ba.source", "ba.etl", "ba.mart"])
 
     result = _table_blast_radius(backend, "ba.source")
@@ -534,9 +530,9 @@ def test_table_blast_radius_nonempty():
 
 def test_table_blast_radius_excludes_noise():
     """Scenario B — backup tables are excluded from the blast radius."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _mk_chain(backend, ["ba.source", "ba.source_bck", "ba.mart"])
 
     result = _table_blast_radius(backend, "ba.source")
@@ -550,10 +546,10 @@ def test_evaluate_handles_missing_downstream_key(tmp_path, monkeypatch):
     expected_downstream_tables key (the new code path must not error)."""
     import sys
 
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
     db_path = str(tmp_path / "graph.db")
-    backend = KuzuBackend(db_path)
+    backend = DuckDBBackend(db_path)
     _mk_chain(backend, ["ba.source", "ba.etl"])
     backend.close()
 
@@ -646,9 +642,9 @@ def _mk_selects_from_chain(backend, tables: list[str]) -> None:
 
 def test_downstream_count_exact():
     """_downstream_count returns the exact integer for a 3-table chain."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _mk_selects_from_chain(backend, ["ba.src", "ba.etl", "ba.mart"])
 
     count = _downstream_count(backend, "ba.src")
@@ -658,9 +654,9 @@ def test_downstream_count_exact():
 
 def test_is_dead_code_true_and_false():
     """_is_dead_code returns True for no-consumer table, False for consumed table."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _mk_selects_from_chain(backend, ["ba.src", "ba.etl"])
 
     # ba.src has no SELECTS_FROM incoming (nothing selects from it in this fixture);
@@ -741,10 +737,10 @@ def test_evaluate_handles_missing_answer_keys(tmp_path, monkeypatch):
     are absent from an entry (backward compat for existing golden files)."""
     import sys
 
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
     db_path = str(tmp_path / "graph.db")
-    backend = KuzuBackend(db_path)
+    backend = DuckDBBackend(db_path)
     _mk_chain(backend, ["ba.source", "ba.etl"])
     backend.close()
 

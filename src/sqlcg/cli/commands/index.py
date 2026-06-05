@@ -1,7 +1,6 @@
 """Index command for scanning and indexing SQL files."""
 
 import json
-import os
 import socket as _socket
 from pathlib import Path
 
@@ -16,7 +15,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from sqlcg.core.config import KuzuConfig, config_file_present, get_backend, get_db_path, get_dialect
+from sqlcg.core.config import DbConfig, config_file_present, get_backend, get_db_path, get_dialect
 from sqlcg.indexer.indexer import Indexer
 
 console = Console()
@@ -37,17 +36,11 @@ def index_cmd(  # noqa: B008
     timeout_per_file: int = typer.Option(  # noqa: B008
         10, "--timeout-per-file", help="Timeout per file in seconds"
     ),
-    buffer_pool_size: int = typer.Option(  # noqa: B008
-        0,
-        "--buffer-pool-size",
-        help="KuzuDB buffer pool size in MB (0 = default). "
-        "Set to 256-512 on memory-constrained machines.",
-    ),
     batch_size: int = typer.Option(  # noqa: B008
         50,
         "--batch-size",
         help=(
-            "Files per KuzuDB transaction in the upsert pass. "
+            "Files per DuckDB transaction in the upsert pass. "
             "Default 50 balances commit-overhead reduction (vs. legacy per-file commits) "
             "against per-batch memory cost. Lower values are safer for memory-constrained "
             "machines; higher values give marginal speedup at the cost of larger working sets. "
@@ -148,15 +141,11 @@ def index_cmd(  # noqa: B008
         sqlcg_log.addHandler(_warn_handler)
         _warn_log_path = None
     else:
-        _warn_log_path = KuzuConfig.from_env().log_path
+        _warn_log_path = DbConfig.from_env().log_path
         _warn_log_path.parent.mkdir(parents=True, exist_ok=True)
         _warn_handler = logging.FileHandler(_warn_log_path)
         _warn_handler.setLevel(logging.WARNING)
         sqlcg_log.addHandler(_warn_handler)
-
-    # Set buffer pool size via env var if specified
-    if buffer_pool_size > 0:
-        os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
 
     if not quiet and not config_file_present(path):
         console.print(
@@ -181,7 +170,7 @@ def index_cmd(  # noqa: B008
         )
     except KeyboardInterrupt:
         # The backend context manager (inside _run_index) has already closed the
-        # KuzuDB connection and released the lock by the time we get here.
+        # DuckDB connection and released the lock by the time we get here.
         console.print("\n[yellow]Interrupted — no partial graph written. Re-run to index.[/yellow]")
         raise typer.Exit(130) from None
     finally:

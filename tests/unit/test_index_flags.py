@@ -63,7 +63,6 @@ def test_index_quiet_flag_suppresses_summary():
                     dialect=None,
                     dbt_manifest=None,
                     timeout_per_file=30,
-                    buffer_pool_size=0,
                     no_ddl=False,
                     quiet=True,
                 )
@@ -79,7 +78,6 @@ def test_index_quiet_flag_suppresses_summary():
                     dialect=None,
                     dbt_manifest=None,
                     timeout_per_file=30,
-                    buffer_pool_size=0,
                     no_ddl=False,
                     quiet=False,
                 )
@@ -114,7 +112,6 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
             dialect=None,
             dbt_manifest=None,
             timeout_per_file=30,
-            buffer_pool_size=0,
             no_ddl=False,
             quiet=True,
         )

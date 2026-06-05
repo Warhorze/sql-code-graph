@@ -8,7 +8,7 @@ via SELECT within the INSERT statement.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -16,7 +16,7 @@ from sqlcg.indexer.indexer import Indexer
 def indexed_db(tmp_path):
     """Create an indexed database with a simple INSERT-SELECT scenario."""
     # Initialize a test database
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
 
     # Create a SQL file with INSERT-SELECT
@@ -48,9 +48,11 @@ class TestInsertSelectEdges:
         accessed by an INSERT query.
         """
         rows = indexed_db.run_read(
-            "MATCH (q:SqlQuery)-[:SELECTS_FROM]->(t:SqlTable) "
-            "WHERE t.qualified CONTAINS 'source_table' "
-            "RETURN q.kind AS kind",
+            "SELECT q.kind AS kind "
+            'FROM "SELECTS_FROM" e '
+            'JOIN "SqlQuery" q ON e.src_key = q.id '
+            'JOIN "SqlTable" t ON e.dst_key = t.qualified '
+            "WHERE t.qualified LIKE '%source_table%'",
             {},
         )
         assert len(rows) >= 1, "Expected at least one query selecting from source_table"
@@ -59,8 +61,7 @@ class TestInsertSelectEdges:
     def test_insert_target_created_as_node(self, indexed_db):
         """Verify INSERT target table is created as a node."""
         rows = indexed_db.run_read(
-            "MATCH (t:SqlTable) WHERE t.qualified CONTAINS 'target_table' "
-            "RETURN t.qualified AS qualified",
+            "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%target_table%'",
             {},
         )
         assert len(rows) >= 1, "Expected target_table to be created as a node"

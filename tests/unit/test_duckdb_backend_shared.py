@@ -1,4 +1,4 @@
-"""Unit tests for DuckDBBackend (migrated from KuzuBackend — Phase 4 DuckDB migration)."""
+"""Shared DuckDBBackend unit tests (upsert, transaction, delete — migrated from Kuzu in Phase 4)."""
 
 import pytest
 

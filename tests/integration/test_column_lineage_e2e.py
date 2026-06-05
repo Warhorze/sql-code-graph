@@ -1,7 +1,7 @@
 """End-to-end regression guard for column lineage — guards against the v0.3.0 regression
 where column_lineage was always 0 due to two wiring gaps (ARCHITECTURE_REVIEW §11.2)."""
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -15,13 +15,13 @@ def test_column_lineage_edges_nonzero_after_index(tmp_path):
     sql = "CREATE VIEW revenue AS SELECT amount, customer_id FROM orders;"
     (tmp_path / "views.sql").write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     indexer = Indexer()
     summary = indexer.index_repo(tmp_path, dialect=None, db=backend)
 
     rows = backend.run_read(
-        "MATCH (s:SqlColumn)-[e:COLUMN_LINEAGE]->(d:SqlColumn) RETURN COUNT(e) AS cnt",
+        'SELECT COUNT(*) AS cnt FROM "COLUMN_LINEAGE"',
         {},
     )
     assert rows[0]["cnt"] > 0, (

@@ -26,7 +26,7 @@ def uninstall_cmd(  # noqa: B008
     """Uninstall sqlcg from Claude Code and optionally clean up resources.
 
     Step 1: Remove MCP registration from ~/.claude/settings.json
-    Step 2: Optionally delete the KùzuDB graph database
+    Step 2: Optionally delete the DuckDB graph database
     Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
     Step 4: Remove sqlcg skill directory from ~/.claude/skills/sqlcg/ and
             <repo>/.claude/skills/sqlcg/
@@ -34,7 +34,7 @@ def uninstall_cmd(  # noqa: B008
     # Step 1: Remove MCP entry from settings.json
     _step1_remove_mcp_entry()
 
-    # Step 2: Offer to delete the KùzuDB (unless --keep-db flag is set)
+    # Step 2: Offer to delete the database (unless --keep-db flag is set)
     if not keep_db:
         _step2_delete_database(force)
     else:
@@ -84,7 +84,7 @@ def _step1_remove_mcp_entry() -> None:
 
 
 def _step2_delete_database(force: bool) -> None:
-    """Offer to delete the KùzuDB graph database."""
+    """Offer to delete the DuckDB graph database."""
     db_path = _get_db_path()
 
     if not db_path:
@@ -92,13 +92,6 @@ def _step2_delete_database(force: bool) -> None:
         return
 
     db_path_obj = Path(db_path)
-
-    # Check if it's a kuzu backend (not Neo4j)
-    # If db_path is a directory or ends with standard kuzu patterns, it's likely kuzu
-    # For now, we'll assume anything in .sqlcg/kuzu is kuzu
-    if not _is_kuzu_backend(db_path):
-        console.print("[dim]Database is not KùzuDB — skipping deletion[/dim]")
-        return
 
     if not db_path_obj.exists():
         console.print(f"[dim]Database not found at {db_path}[/dim]")
@@ -117,9 +110,11 @@ def _step2_delete_database(force: bool) -> None:
         console.print("[dim]Keeping database[/dim]")
         return
 
-    # Delete the database directory
+    # DuckDB is a single file (+ optional .wal sibling); delete both.
     try:
-        shutil.rmtree(db_path_obj, ignore_errors=True)
+        for target in (db_path_obj, db_path_obj.with_name(db_path_obj.name + ".wal")):
+            if target.exists():
+                target.unlink()
         console.print(f"[green]Deleted graph database at {db_path}[/green]")
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Failed to delete database: {e}")
@@ -222,16 +217,10 @@ def _step3_remove_git_hook(repo_path: Path) -> None:
 
 def _get_db_path() -> str | None:
     """Get the configured database path from environment or default."""
-    from sqlcg.core.config import KuzuConfig
+    from sqlcg.core.config import DbConfig
 
-    db_path = str(KuzuConfig.from_env().db_path)
+    db_path = str(DbConfig.from_env().db_path)
     return db_path if Path(db_path).exists() else None
-
-
-def _is_kuzu_backend(db_path: str) -> bool:
-    """Check if the database is a KùzuDB backend (not Neo4j)."""
-    backend = os.getenv("SQLCG_BACKEND", "kuzu").lower()
-    return backend in ("kuzu", "")  # Default to kuzu if unset
 
 
 # Candidate skill directory locations to remove (global first, then project-relative)

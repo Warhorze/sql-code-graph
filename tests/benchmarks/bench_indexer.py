@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 TPCH_DIR = Path(__file__).parent / "tpch"
@@ -22,8 +22,8 @@ SYNTHETIC_DIR = Path(__file__).parent.parent / "fixtures" / "synthetic"
 
 @pytest.fixture
 def tmp_db(tmp_path):
-    """Temporary KùzuDB instance for benchmarking."""
-    db = KuzuBackend(str(tmp_path / "bench.db"))
+    """Temporary DuckDB instance for benchmarking."""
+    db = DuckDBBackend(str(tmp_path / "bench.db"))
     db.init_schema()
     yield db
     db.close()

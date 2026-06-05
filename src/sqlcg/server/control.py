@@ -3,7 +3,7 @@
 Manages the ``.pid`` and ``.sock`` files that allow a second CLI process to
 discover, query, and stop the running MCP server.
 
-All paths are derived from ``get_db_path()`` (i.e. ``KuzuConfig.from_env().db_path``)
+All paths are derived from ``get_db_path()`` (i.e. ``DbConfig.from_env().db_path``)
 so that two servers on two different databases do not collide on a single control
 file.  Callers may pass an explicit ``db_path`` to override the default; this also
 makes unit tests straightforward (set ``SQLCG_DB_PATH=/tmp/test.db``, assert paths

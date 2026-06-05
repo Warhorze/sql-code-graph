@@ -4,15 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.utils.ignore import load_ignore_spec
 
 
 @pytest.fixture
 def temp_db():
-    """Create a temporary in-memory KuzuDB."""
-    db = KuzuBackend(":memory:")
+    """Create a temporary in-memory DuckDB backend."""
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     yield db
     db.close()
@@ -44,6 +44,15 @@ def test_index_synthetic_fixtures(temp_db):
     assert result["tables_found"] > 0
 
 
+def _total_node_count(db: DuckDBBackend) -> int:
+    """Count rows across all node tables."""
+    total = 0
+    for tbl in ("Repo", "File", "SqlTable", "SqlColumn", "SqlQuery", "ExternalConsumer"):
+        rows = db.run_read(f'SELECT COUNT(*) AS n FROM "{tbl}"', {})
+        total += rows[0]["n"]
+    return total
+
+
 def test_reindex_file_rollback_on_error(temp_db):
     """Test that reindex_file rolls back on injected error."""
     fixtures_path = Path(__file__).parent.parent / "fixtures" / "synthetic"
@@ -63,8 +72,7 @@ def test_reindex_file_rollback_on_error(temp_db):
     file_path = str(sql_files[0])
 
     # Get node count before re-index
-    result = temp_db.run_read("MATCH (n) RETURN COUNT(*) as count", {})
-    count_before = result[0]["count"]
+    count_before = _total_node_count(temp_db)
 
     # Simulate reindex with rollback (delete the file to trigger error on re-read)
     original_path = Path(file_path)
@@ -81,8 +89,7 @@ def test_reindex_file_rollback_on_error(temp_db):
     original_path.write_text(original_content)
 
     # Node count should be unchanged (rollback)
-    result = temp_db.run_read("MATCH (n) RETURN COUNT(*) as count", {})
-    count_after = result[0]["count"]
+    count_after = _total_node_count(temp_db)
 
     # Count should be the same (transaction rolled back)
     assert count_before == count_after
@@ -136,5 +143,5 @@ def test_sigint_during_index_aborts_without_partial_write(temp_db):
     # No indexed content should have been written: no partial flush on interrupt.
     # (init_schema seeds a schema-version metadata node, so assert on File nodes,
     # which only the upsert pass — skipped on interrupt — creates.)
-    result = temp_db.run_read("MATCH (f:File) RETURN COUNT(*) as count", {})
+    result = temp_db.run_read('SELECT COUNT(*) AS count FROM "File"', {})
     assert result[0]["count"] == 0

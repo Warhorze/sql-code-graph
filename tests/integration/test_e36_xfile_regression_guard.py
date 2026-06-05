@@ -1,6 +1,6 @@
 """Integration regression guard for E36 cross-file temp table resolution."""
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -28,7 +28,7 @@ def test_e36_xfile_regression_guard(tmp_path):
     file_b.write_text("INSERT INTO dst SELECT a FROM t;")
 
     # Index the directory
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     indexer = Indexer()
     result = indexer.index_repo(sql_dir, "snowflake", db)
@@ -37,12 +37,12 @@ def test_e36_xfile_regression_guard(tmp_path):
     assert result["files_parsed"] == 2, f"Expected 2 files parsed, got {result}"
 
     # Query the database for COLUMN_LINEAGE edges into the dst table
-    query = """
-    MATCH (s:SqlColumn)-[:COLUMN_LINEAGE]->(d:SqlColumn)
-    WHERE d.table_qualified CONTAINS 'dst'
-    RETURN count(*) as cnt
-    """
-    rows = db.run_read(query, {})
+    rows = db.run_read(
+        'SELECT count(*) AS cnt FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" d ON d.id = cl.dst_key '
+        "WHERE d.table_qualified LIKE '%dst%'",
+        {},
+    )
     edge_count = rows[0]["cnt"] if rows else 0
 
     assert edge_count >= 1, (

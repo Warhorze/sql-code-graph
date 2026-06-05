@@ -1,7 +1,7 @@
 """Live end-to-end anchor tests.
 
 Indexes the synthetic anchor fixtures from tests/snowflake/anchors/ into a real
-in-memory KuzuBackend and asserts the anchor columns appear in the graph with the
+in-memory DuckDB backend and asserts the anchor columns appear in the graph with the
 expected edges. Complements the parser-only tests in tests/snowflake/anchors/ by
 covering the parser → aggregator → indexer → graph path end-to-end.
 
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 ANCHOR_FIXTURES_DIR = Path(__file__).parent.parent / "snowflake" / "anchors"
@@ -34,8 +34,8 @@ def _stage_anchor_corpus(tmp_path: Path, fixture_names: list[str]) -> Path:
     return corpus
 
 
-def _index(corpus: Path) -> tuple[KuzuBackend, dict]:
-    backend = KuzuBackend(":memory:")
+def _index(corpus: Path) -> tuple[DuckDBBackend, dict]:
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     summary = Indexer().index_repo(
         corpus,
@@ -60,10 +60,12 @@ def test_live_anchor_omloopsnelheid_has_column_lineage_edges(tmp_path):
     backend, summary = _index(corpus)
 
     rows = backend.run_read(
-        "MATCH (s:SqlColumn)-[e:COLUMN_LINEAGE]->(d:SqlColumn) "
-        "WHERE LOWER(d.col_name) = 'omloopsnelheid' "
-        "RETURN s.table_name AS s_t, s.col_name AS s_c, "
-        "       d.table_name AS d_t, d.col_name AS d_c",
+        "SELECT src.table_name AS s_t, src.col_name AS s_c, "
+        "dst.table_name AS d_t, dst.col_name AS d_c "
+        'FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" src ON src.id = cl.src_key '
+        'JOIN "SqlColumn" dst ON dst.id = cl.dst_key '
+        "WHERE LOWER(dst.col_name) = 'omloopsnelheid'",
         {},
     )
     assert len(rows) >= 1, (
@@ -88,8 +90,8 @@ def test_live_anchor_ma_target_column_exists_in_graph(tmp_path):
     backend, summary = _index(corpus)
 
     rows = backend.run_read(
-        "MATCH (c:SqlColumn) WHERE LOWER(c.col_name) = 'ma_aantal_op_order' RETURN c.id AS id",
-        {},
+        'SELECT id FROM "SqlColumn" WHERE LOWER(col_name) = ?',
+        {"col": "ma_aantal_op_order"},
     )
     assert len(rows) >= 1, (
         "MA_AANTAL_OP_ORDER target column must exist as a SqlColumn node. "
@@ -111,12 +113,13 @@ def test_live_anchor_ma_chain_has_at_least_one_lineage_edge(tmp_path):
     backend, _summary = _index(corpus)
 
     rows = backend.run_read(
-        "MATCH (s:SqlColumn)-[e:COLUMN_LINEAGE]->(d:SqlColumn) "
-        "WHERE (LOWER(d.table_name) = 'wtfs_openstaande_orders' "
-        "       AND LOWER(d.col_name) = 'ma_aantal_op_order') "
-        "   OR (LOWER(s.table_name) = 'source_facts' "
-        "       AND LOWER(s.col_name) = 'ma_order_aantal') "
-        "RETURN count(e) AS n",
+        'SELECT count(*) AS n FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" src ON src.id = cl.src_key '
+        'JOIN "SqlColumn" dst ON dst.id = cl.dst_key '
+        "WHERE (LOWER(dst.table_name) = 'wtfs_openstaande_orders' "
+        "       AND LOWER(dst.col_name) = 'ma_aantal_op_order') "
+        "   OR (LOWER(src.table_name) = 'source_facts' "
+        "       AND LOWER(src.col_name) = 'ma_order_aantal')",
         {},
     )
     assert rows[0]["n"] >= 1

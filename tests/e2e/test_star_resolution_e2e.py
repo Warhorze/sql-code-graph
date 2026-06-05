@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 STAR_CORPUS = Path(__file__).parent.parent / "fixtures" / "star_corpus"
@@ -21,7 +21,7 @@ def indexed_star_corpus(tmp_path_factory):
         pytest.skip("tests/fixtures/star_corpus/ not found — create it as part of the sprint")
 
     db_dir = tmp_path_factory.mktemp("star_corpus_db")
-    db = KuzuBackend(str(db_dir / "star.db"))
+    db = DuckDBBackend(str(db_dir / "star.db"))
     db.init_schema()
 
     indexer = Indexer()
@@ -44,8 +44,8 @@ def test_dwh_corpus_emits_star_expanded_edges(indexed_star_corpus):
     )
 
     rows = db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
-        {},
+        'SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE transform = ?',
+        {"t": "STAR_EXPANSION"},
     )
     expanded_count = rows[0]["n"]
     assert expanded_count >= 3, (
@@ -61,7 +61,7 @@ def test_total_lineage_exceeds_baseline(indexed_star_corpus):
     """
     db, result = indexed_star_corpus
 
-    rows = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN count(r) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "COLUMN_LINEAGE"', {})
     total = rows[0]["n"]
     # star_corpus has 3 columns per target table (col1, col2, col3) and 2 targets
     # = 6 STAR_EXPANSION edges. The test confirms we got at least some edges.
@@ -72,7 +72,7 @@ def test_star_source_edges_visible_in_corpus(indexed_star_corpus):
     """star_corpus must have STAR_SOURCE edges visible in the graph after indexing."""
     db, _result = indexed_star_corpus
 
-    rows = db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "STAR_SOURCE"', {})
     assert rows[0]["n"] >= 1, (
         "No STAR_SOURCE edges found. Parser must emit StarSource markers "
         "and indexer must upsert them."
@@ -84,8 +84,8 @@ def test_expansion_edges_have_correct_confidence(indexed_star_corpus):
     db, _result = indexed_star_corpus
 
     rows = db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN r.confidence AS c",
-        {},
+        'SELECT confidence AS c FROM "COLUMN_LINEAGE" WHERE transform = ?',
+        {"t": "STAR_EXPANSION"},
     )
     assert len(rows) > 0
     for row in rows:
@@ -98,8 +98,8 @@ def test_ddl_columns_persisted_in_corpus(indexed_star_corpus):
     """star_corpus DDL files must produce HAS_COLUMN edges in the graph."""
     db, _result = indexed_star_corpus
 
-    rows = db.run_read("MATCH (:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn) RETURN count(c) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "HAS_COLUMN"', {})
     assert rows[0]["n"] >= 3, (
-        f"Expected >= 3 SqlColumn nodes (one per DDL column). Got {rows[0]['n']}. "
+        f"Expected >= 3 HAS_COLUMN edges (one per DDL column). Got {rows[0]['n']}. "
         "DDL column extraction must be wired into _upsert_parsed_file."
     )

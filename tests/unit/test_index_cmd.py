@@ -62,7 +62,6 @@ def test_zero_edges_warning_appears_in_output():
                 dialect=None,
                 dbt_manifest=None,
                 timeout_per_file=30,
-                buffer_pool_size=0,
                 no_ddl=False,
                 quiet=False,
             )
@@ -125,7 +124,6 @@ def test_no_warning_when_edges_exist():
                 dialect=None,
                 dbt_manifest=None,
                 timeout_per_file=30,
-                buffer_pool_size=0,
                 no_ddl=False,
                 quiet=False,
             )

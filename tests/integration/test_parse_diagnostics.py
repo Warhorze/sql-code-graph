@@ -8,14 +8,14 @@ profile dict while profile=False omits it entirely.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
 @pytest.fixture
 def fresh_db():
-    """In-memory KuzuDB with schema v3 initialised."""
-    db = KuzuBackend(":memory:")
+    """In-memory DuckDB backend with schema initialised."""
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     yield db
     db.close()
@@ -45,7 +45,7 @@ def test_clean_file_has_empty_cause(fresh_db, tmp_path):
 
     path_str = str(sql_file)
     rows = fresh_db.run_read(
-        "MATCH (f:File {path: $p}) RETURN f.parse_failed AS failed, f.parse_cause AS cause",
+        'SELECT parse_failed AS failed, parse_cause AS cause FROM "File" WHERE path = ?',
         {"p": path_str},
     )
     assert len(rows) == 1, f"Expected 1 File node for {path_str}, got {len(rows)}"
@@ -78,7 +78,7 @@ def test_failing_file_has_correct_cause(fresh_db, tmp_path):
 
     path_str = str(sql_file)
     rows = fresh_db.run_read(
-        "MATCH (f:File {path: $p}) RETURN f.parse_failed AS failed, f.parse_cause AS cause",
+        'SELECT parse_failed AS failed, parse_cause AS cause FROM "File" WHERE path = ?',
         {"p": path_str},
     )
     assert len(rows) == 1, f"Expected 1 File node for {path_str}, got {len(rows)}"
@@ -93,14 +93,14 @@ def test_failing_file_has_correct_cause(fresh_db, tmp_path):
 
 
 def test_parse_cause_column_queryable_after_init(fresh_db):
-    """Cypher query against f.parse_cause on a fresh schema must not raise.
+    """SQL query against File.parse_cause on a fresh schema must not raise.
 
     This verifies that 'parse_cause' and 'parse_failed' columns exist on the
-    File node in schema v3 (they were absent in v2).
+    File table in the current schema (they were absent in v2).
     """
     # Should return an empty result set, not raise a 'no such property' error.
     rows = fresh_db.run_read(
-        "MATCH (f:File) RETURN f.parse_cause AS cause, f.parse_failed AS failed",
+        'SELECT parse_cause AS cause, parse_failed AS failed FROM "File"',
         {},
     )
     # No nodes yet — empty is the expected result; the key test is no exception.
