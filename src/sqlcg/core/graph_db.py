@@ -249,7 +249,14 @@ class GraphBackend(ABC):
         """Delete all node and edge rows, preserving the schema structure.
 
         Used by the server drain body for the full-rebuild-in-transaction
-        reindex path (DuckDB migration Phase 4). Only DuckDBBackend
-        implements this; legacy backends are deleted in Phase 5.
+        reindex path. Concrete backends must override this.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support clear_all_tables")
+
+    def expand_star_sources(self) -> int:
+        """Expand SELECT * lineage into per-column STAR_EXPANSION edges.
+
+        Runs once per index after ingestion. Concrete backends must override
+        this; returns the total STAR_EXPANSION edge count.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support expand_star_sources")

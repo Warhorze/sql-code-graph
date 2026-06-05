@@ -1379,48 +1379,13 @@ class Indexer:
     def _expand_star_sources(self, db: GraphBackend) -> int:
         """Run the post-ingestion star expansion.
 
-        For DuckDBBackend: calls the three-step DML expand_star_sources() method
-        which returns the total STAR_EXPANSION edge count.
+        Calls the three-step DML expand_star_sources() method which returns the
+        total STAR_EXPANSION edge count.
 
         Returns:
             Number of COLUMN_LINEAGE STAR_EXPANSION edges after expansion.
         """
-        from sqlcg.core.duckdb_backend import DuckDBBackend as _DuckDBBackend
-
-        if isinstance(db, _DuckDBBackend):
-            return db.expand_star_sources()
-
-        # Fallback path for Kuzu legacy backend — retained during Phase 2-4 transition.
-        # Uses inline Cypher strings (queries.py now loads from queries.sql; Kuzu needs Cypher).
-        _KUZU_COUNT = (
-            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n"
-        )
-        _KUZU_EXPAND = (
-            "MATCH (q:SqlQuery)-[s:STAR_SOURCE]->(t:SqlTable)-[:HAS_COLUMN]->(c:SqlColumn)\n"
-            "WHERE q.target_table <> ''\n"
-            "MATCH (tgt:SqlTable {qualified: q.target_table})\n"
-            "MERGE (dst:SqlColumn {id: q.target_table + '.' + c.col_name})\n"
-            "  ON CREATE SET dst.col_name = c.col_name,\n"
-            "                dst.table_qualified = q.target_table,\n"
-            "                dst.catalog = tgt.catalog,\n"
-            "                dst.db = tgt.db,\n"
-            "                dst.table_name = tgt.name\n"
-            "MERGE (tgt)-[:HAS_COLUMN]->(dst)\n"
-            "MERGE (c)-[r:COLUMN_LINEAGE]->(dst)\n"
-            "  ON CREATE SET r.transform = 'STAR_EXPANSION',\n"
-            "                r.confidence = 0.8,\n"
-            "                r.query_id = q.id\n"
-            "RETURN count(r) AS edges_created"
-        )
-        before = db.run_read(_KUZU_COUNT, {})
-        before_count = before[0]["n"] if before else 0
-        try:
-            db.run_read(_KUZU_EXPAND, {})
-        except Exception:
-            pass  # Kuzu MERGE may no-op or fail silently on in-memory backends
-        after = db.run_read(_KUZU_COUNT, {})
-        after_count = after[0]["n"] if after else 0
-        return max(0, after_count - before_count)
+        return db.expand_star_sources()
 
     def _ingest_external_consumers(self, db: GraphBackend, path: Path) -> dict:
         """Ingest declared external downstream consumers from .sqlcg.toml.
