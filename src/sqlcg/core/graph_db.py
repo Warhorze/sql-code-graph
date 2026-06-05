@@ -244,3 +244,12 @@ class GraphBackend(ABC):
             yield self
         except Exception:
             raise
+
+    def clear_all_tables(self) -> None:
+        """Delete all node and edge rows, preserving the schema structure.
+
+        Used by the server drain body for the full-rebuild-in-transaction
+        reindex path (DuckDB migration Phase 4). Only DuckDBBackend
+        implements this; legacy backends are deleted in Phase 5.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support clear_all_tables")

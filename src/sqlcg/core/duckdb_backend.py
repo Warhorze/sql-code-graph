@@ -280,9 +280,17 @@ class DuckDBBackend(GraphBackend):
             duckdb.IOException: If the file is already held by another process.
         """
         self._db_path = db_path
+        self._txn_depth = 0
         try:
             self._conn = duckdb.connect(db_path)
         except duckdb.IOException as exc:
+            exc_str = str(exc)
+            if "No such file or directory" in exc_str or "cannot open" in exc_str.lower():
+                # Parent directory does not exist — database was never initialized.
+                raise RuntimeError(
+                    f"Database path does not exist: {db_path}. "
+                    f"Run 'sqlcg db init' then 'sqlcg index <path>' to initialize."
+                ) from exc
             msg = (
                 f"Database is locked — another sqlcg process is running. "
                 f"Wait for it to finish or stop it with: sqlcg mcp stop\n"
@@ -492,50 +500,59 @@ class DuckDBBackend(GraphBackend):
             )
 
             # B: query edges + query nodes
-            # Remove edges where queries from this file are src or dst
-            for edge_table in (
-                "SELECTS_FROM",
-                "INSERTS_INTO",
-                "DELETES_FROM",
-                "UPDATES",
-                "DECLARES",
-                "STAR_SOURCE",
-                "QUERY_DEFINED_IN",
-            ):
+            # Collect all query IDs for this file (via file_path column or QUERY_DEFINED_IN edge).
+            query_ids_result = self._conn.execute(
+                'SELECT id FROM "SqlQuery" WHERE file_path = ?'
+                "  UNION"
+                '  SELECT src_key FROM "QUERY_DEFINED_IN" WHERE dst_key = ?',
+                [file_path, file_path],
+            )
+            query_ids = [row[0] for row in query_ids_result.fetchall()]
+
+            if query_ids:
+                placeholders = ", ".join("?" * len(query_ids))
+                for edge_table in (
+                    "SELECTS_FROM",
+                    "INSERTS_INTO",
+                    "DELETES_FROM",
+                    "UPDATES",
+                    "DECLARES",
+                    "STAR_SOURCE",
+                ):
+                    self._conn.execute(
+                        f'DELETE FROM "{edge_table}" WHERE src_key IN ({placeholders})',
+                        query_ids,
+                    )
+                # COLUMN_LINEAGE edges referencing queries from this file
                 self._conn.execute(
-                    f'DELETE FROM "{edge_table}" WHERE src_key IN ('
-                    f'  SELECT id FROM "SqlQuery" WHERE file_path = ?'
-                    f")",
-                    [file_path],
+                    f'DELETE FROM "COLUMN_LINEAGE" WHERE query_id IN ({placeholders})',
+                    query_ids,
                 )
-            # COLUMN_LINEAGE edges referencing queries from this file
+            # Remove QUERY_DEFINED_IN edges for this file
             self._conn.execute(
-                'DELETE FROM "COLUMN_LINEAGE" WHERE query_id IN ('
-                '  SELECT id FROM "SqlQuery" WHERE file_path = ?'
-                ")",
+                'DELETE FROM "QUERY_DEFINED_IN" WHERE dst_key = ?',
                 [file_path],
             )
             # Delete query nodes
-            self._conn.execute(
-                'DELETE FROM "SqlQuery" WHERE file_path = ?',
-                [file_path],
-            )
+            if query_ids:
+                self._conn.execute(
+                    f'DELETE FROM "SqlQuery" WHERE id IN ({placeholders})',
+                    query_ids,
+                )
 
             # C: table nodes + their DEFINED_IN edges
-            self._conn.execute(
-                'DELETE FROM "DEFINED_IN" WHERE dst_key = ?',
-                [file_path],
-            )
-            # Note: SqlTable nodes that are NOT defined in other files should be removed.
-            # We only remove tables whose ONLY definition is this file. Tables referenced
-            # from other files but defined here: we remove the DEFINED_IN edge above, which
-            # clears the DDL provenance. The SqlTable node stays for cross-file references.
-            # This mirrors Kuzu's DETACH DELETE semantics on the DEFINED_IN match.
+            # Remove SqlTable nodes that are defined in (or linked via DEFINED_IN to) this file.
+            # We look at both the DEFINED_IN edge table and the defined_in_file column.
             self._conn.execute(
                 'DELETE FROM "SqlTable" WHERE qualified IN ('
-                '  SELECT t.qualified FROM "SqlTable" t '
-                "  WHERE t.defined_in_file = ?"
+                '  SELECT src_key FROM "DEFINED_IN" WHERE dst_key = ?'
+                "  UNION"
+                '  SELECT qualified FROM "SqlTable" WHERE defined_in_file = ?'
                 ")",
+                [file_path, file_path],
+            )
+            self._conn.execute(
+                'DELETE FROM "DEFINED_IN" WHERE dst_key = ?',
                 [file_path],
             )
 
@@ -614,6 +631,47 @@ class DuckDBBackend(GraphBackend):
         return int(row[0]) if row else 0
 
     # ------------------------------------------------------------------
+    # Full-rebuild helpers
+    # ------------------------------------------------------------------
+
+    def clear_all_tables(self) -> None:
+        """Delete all node and edge rows, preserving the schema structure.
+
+        Used by the reindex drain body (Phase 4): called inside a transaction
+        before re-inserting all rows so readers on MVCC snapshots see the old
+        graph until COMMIT flips to the new one atomically.
+
+        ``SchemaVersion`` is preserved (its ``indexed_sha`` is updated by the
+        indexer after the rebuild; its ``version`` row keeps the schema gate
+        intact across re-opens).  All other node and edge tables are truncated.
+        """
+        node_tables = [
+            "Repo",
+            "File",
+            "SqlTable",
+            "SqlColumn",
+            "SqlQuery",
+            "ExternalConsumer",
+        ]
+        edge_tables = [
+            "BELONGS_TO",
+            "DEFINED_IN",
+            "QUERY_DEFINED_IN",
+            "HAS_COLUMN",
+            "SELECTS_FROM",
+            "INSERTS_INTO",
+            "DELETES_FROM",
+            "UPDATES",
+            "COLUMN_LINEAGE",
+            "DECLARES",
+            "STAR_SOURCE",
+            "CONSUMED_BY",
+        ]
+        for tbl in edge_tables + node_tables:
+            self._conn.execute(f'DELETE FROM "{tbl}"')
+        logger.debug("DuckDBBackend: all node/edge tables cleared")
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -637,8 +695,24 @@ class DuckDBBackend(GraphBackend):
         Overrides the ABC no-op (ARCHITECTURE_REVIEW §3.1, HIGH).
         DuckDB DDL is transactional so schema creation in init_schema
         is also covered.
+
+        Reentrant: DuckDB rejects ``BEGIN`` inside an open transaction, so a
+        nested call is a no-op that joins the outer transaction — the
+        outermost level owns COMMIT/ROLLBACK.  This lets the drain body wrap
+        ``clear_all_tables()`` + ``index_repo()`` (which opens its own
+        per-batch transactions) in one atomic rebuild (Phase 4, C3/C6).
         """
+        if self._txn_depth > 0:
+            # Joined the outer transaction — an exception propagates out and
+            # the outermost level rolls everything back.
+            self._txn_depth += 1
+            try:
+                yield self
+            finally:
+                self._txn_depth -= 1
+            return
         self._conn.execute("BEGIN")
+        self._txn_depth = 1
         try:
             yield self
             self._conn.execute("COMMIT")
@@ -648,3 +722,5 @@ class DuckDBBackend(GraphBackend):
             except Exception as rb_err:
                 logger.debug("ROLLBACK failed: %s", rb_err)
             raise
+        finally:
+            self._txn_depth = 0

@@ -1,11 +1,10 @@
-"""Single-writer queue, escalation primitive, and drain task for the MCP server.
+"""Single-writer queue and drain task for the MCP server.
 
-Owns the RO→RW escalation (close the read-only backend, reopen read-write for
-the duration of a drain, then de-escalate back to read-only) and the
-coalescing WriterQueue that serialises all write ops through the server.
-
-Constants below are server-side transport/escalation parameters — NOT
-KuzuConfig values.  Same convention as _NOTIFY_SOCKET_TIMEOUT_S in reindex.py.
+DuckDB runs with a single R/W handle for the server process lifetime.
+The drain task acquires backend_lock and runs the indexer op directly against
+the live backend — no RO→RW escalation needed.  Atomic visibility is provided
+by DuckDB's transaction (BEGIN … COMMIT): readers on MVCC snapshots see the
+old graph until COMMIT, then atomically the new one.
 """
 
 from __future__ import annotations
@@ -19,21 +18,9 @@ from sqlcg.utils.logging import getLogger
 if TYPE_CHECKING:
     import anyio
 
-    from sqlcg.core.graph_db import GraphBackend
     from sqlcg.metrics.store import MetricsStore
 
 logger = getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Escalation constants — not config-owned
-# ---------------------------------------------------------------------------
-
-# Total retry budget for RW reopen on lock error.
-_ESCALATION_RETRY_BUDGET_S = 5.0
-# Initial backoff in seconds; doubles each attempt, capped at _BACKOFF_CAP_S.
-_BACKOFF_START_S = 0.02
-_BACKOFF_FACTOR = 2.0
-_BACKOFF_CAP_S = 0.5
 
 # ---------------------------------------------------------------------------
 # Coalesce reason constants — single source of truth for status, logs, metrics
@@ -42,18 +29,6 @@ _BACKOFF_CAP_S = 0.5
 COALESCE_SUPERSEDED_BY_INDEX = "superseded_by_index"
 COALESCE_COLLAPSED_INTO_PENDING_REINDEX = "collapsed_into_pending_reindex"
 COALESCE_REINDEX_DROPPED_INDEX_PENDING = "reindex_dropped_index_pending"
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class EscalationLockError(RuntimeError):
-    """Raised when escalate_to_rw exhausts its retry budget.
-
-    The C3 message names the PID hint and the SQLCG_DB_PATH side-DB workaround.
-    """
 
 
 # ---------------------------------------------------------------------------
@@ -305,184 +280,35 @@ class WriterQueue:
 
 
 # ---------------------------------------------------------------------------
-# Escalation primitive
-# ---------------------------------------------------------------------------
-
-
-def escalate_to_rw(
-    db_path: str,
-    *,
-    current: GraphBackend | None = None,
-    opener=None,
-    retry_budget_s: float = _ESCALATION_RETRY_BUDGET_S,
-) -> GraphBackend:
-    """Close *current* RO backend and reopen read-write with bounded retry.
-
-    This is the single RO→RW escalation path — reused by both the startup
-    schema-ensure window (Step 1.3) and every drain (Phase 2).
-
-    Args:
-        db_path: Path to the KùzuDB database file.
-        current: The currently-open backend to close before reopening RW.
-            Pass ``None`` when no handle exists yet (startup path).
-        opener: Callable ``(path: str, read_only: bool) -> GraphBackend``.
-            Defaults to ``KuzuBackend``.  Tests inject a fake opener to
-            exercise retry/backoff deterministically without real lock races
-            — never patch a module global (parallel-test-safe).
-        retry_budget_s: Total retry budget in seconds.  Default is the
-            module constant.  Override via this parameter in tests — never
-            via a global patch.
-
-    Returns:
-        A new read-write ``GraphBackend`` stored in ``tools._backend``.
-
-    Raises:
-        EscalationLockError: Budget exhausted — the C3 message names the
-            PID hint and the ``SQLCG_DB_PATH`` side-DB workaround.
-        RuntimeError: Non-lock error from the opener (non-retryable).
-    """
-    import random
-
-    import sqlcg.server.tools as _tools
-    from sqlcg.core.kuzu_backend import KuzuBackend, find_lock_holder
-
-    if opener is None:
-        opener = KuzuBackend
-
-    # Close the current backend (if any) before attempting RW open.
-    if current is not None:
-        try:
-            current.close()
-        except Exception:
-            pass
-        # Ensure the module singleton no longer points at the closed handle.
-        if _tools._backend is current:
-            _tools._backend = None
-
-    deadline = time.monotonic() + retry_budget_s
-    backoff = _BACKOFF_START_S
-    attempts = 0
-
-    while True:
-        attempts += 1
-        try:
-            rw_backend = opener(db_path, read_only=False)
-            _tools._backend = rw_backend
-            logger.debug(f"escalated to RW db_path={db_path!r} attempts={attempts}")
-            return rw_backend
-        except RuntimeError as exc:
-            exc_str = str(exc)
-            is_lock = "Could not set lock" in exc_str or "lock" in exc_str.lower()
-            if not is_lock:
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # Budget exhausted — emit ERROR log then raise C3.
-                pid_hint = find_lock_holder(db_path)
-                logger.error(
-                    f"escalation failed: attempts={attempts} "
-                    f"budget={retry_budget_s:.1f}s db_path={db_path!r} "
-                    f"holder={pid_hint}"
-                )
-                # Reopen RO so the server keeps serving reads.
-                try:
-                    ro = opener(db_path, read_only=True)
-                    _tools._backend = ro
-                except Exception:
-                    pass
-                msg = (
-                    f"Could not acquire the write lock to reindex after "
-                    f"{retry_budget_s:.1f}s — another process is holding the "
-                    f"database ({pid_hint}). The graph was not updated. "
-                    f"To run a one-off index without the server, point at a side DB:\n"
-                    f"    SQLCG_DB_PATH=/tmp/sqlcg-cli/graph.db sqlcg index <path>\n"
-                    f"or stop the server first ('sqlcg mcp stop')."
-                )
-                raise EscalationLockError(msg) from exc
-
-            # Exponential backoff with jitter, capped at _BACKOFF_CAP_S.
-            jitter = random.uniform(0, backoff * 0.1)
-            sleep_for = min(backoff + jitter, min(remaining, _BACKOFF_CAP_S))
-            time.sleep(sleep_for)
-            backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_CAP_S)
-
-
-def de_escalate_to_ro(
-    db_path: str,
-    *,
-    shutdown_requested: anyio.Event | None = None,
-    opener=None,
-) -> None:
-    """Close the current RW backend and reopen read-only.
-
-    Always runs in the drain's ``finally`` block.  When *shutdown_requested*
-    is set, skips the RO reopen and leaves ``tools._backend = None`` so
-    ``shutdown_backend()`` can finish teardown cleanly (B2 guard).
-
-    Args:
-        db_path: Path to the KùzuDB database file.
-        shutdown_requested: An ``anyio.Event`` that, when set, tells this
-            function to skip the RO reopen (B2 shutdown ordering).
-        opener: Injectable backend constructor (default ``KuzuBackend``).
-    """
-    import sqlcg.server.tools as _tools
-    from sqlcg.core.kuzu_backend import KuzuBackend
-
-    if opener is None:
-        opener = KuzuBackend
-
-    current = _tools._backend
-    if current is not None:
-        try:
-            current.close()
-        except Exception:
-            pass
-        _tools._backend = None
-
-    if shutdown_requested is not None and shutdown_requested.is_set():
-        # B2: shutdown in progress — do not reopen RO; leave _backend = None
-        # so shutdown_backend() finds a clean state.
-        logger.debug("de_escalate_to_ro: shutdown requested — skipping RO reopen")
-        return
-
-    try:
-        ro = opener(db_path, read_only=True)
-        _tools._backend = ro
-        logger.debug(f"de-escalated to RO db_path={db_path!r}")
-    except Exception as exc:
-        logger.error(f"de_escalate_to_ro: failed to reopen RO: {exc}")
-
-
-# ---------------------------------------------------------------------------
 # Drain task
 # ---------------------------------------------------------------------------
 
 
 async def drain_loop(
     queue: WriterQueue,
-    db_path: str,
+    db_path: str,  # kept for call-site compatibility; not used (backend from tools._backend)
     backend_lock: anyio.Lock,
     shutdown_requested: anyio.Event,
-    opener=None,
+    opener=None,  # kept for call-site compatibility; not used (no escalation)
 ) -> None:
     """Consume WriterQueue requests one at a time under backend_lock.
 
-    This is the sole backend consumer — no other code path resolves or
-    touches the backend while a drain holds backend_lock.
+    DuckDB model: the server holds one R/W connection for its lifetime.
+    The drain task uses tools._backend directly — no RO→RW escalation.
+    Each full rebuild wraps all table-clearing + bulk inserts in a single
+    transaction so MVCC readers see the old graph until COMMIT (C3).
 
     The drain task:
       1. Waits on queue._wake.
       2. Pops the next request.
       3. Acquires backend_lock.
-      4. Escalates RO→RW (escalate_to_rw).
+      4. Gets the current R/W backend from tools._backend.
       5. Runs the indexer op off the event-loop thread.
-      6. De-escalates RW→RO in a finally (de_escalate_to_ro).
-      7. Clears queue._active; records drain metrics.
-      8. Repeats until shutdown_requested is set.
+      6. Clears queue._active; records drain metrics.
+      7. Repeats until shutdown_requested is set.
 
-    W7 — drain body exception: non-EscalationLockError exceptions are caught,
-    logged at ERROR, and the loop continues so one bad request cannot kill the
-    drain task.
+    W7 — drain body exception: exceptions are caught, logged at ERROR, and
+    the loop continues so one bad request cannot kill the drain task.
     """
     import anyio.to_thread as _to_thread
 
@@ -506,18 +332,14 @@ async def drain_loop(
 
             import sqlcg.server.tools as _tools
 
-            try:
-                rw = escalate_to_rw(
-                    db_path,
-                    current=_tools._backend,
-                    opener=opener,
-                )
-            except EscalationLockError as exc:
-                # C3: escalation failed — notify waiters and continue.
-                queue.mark_active_failed(str(exc))
+            db = _tools._backend
+            if db is None:
+                err = "backend not available — skipping drain"
+                logger.error(err)
+                queue.mark_active_failed(err)
                 for ch in req._waiters:
                     try:
-                        await ch.send({"ok": False, "done": True, "error": str(exc)})
+                        await ch.send({"ok": False, "done": True, "error": err})
                     except Exception:
                         pass
                 continue
@@ -528,16 +350,24 @@ async def drain_loop(
                 if req.op == "index":
                     # Capture loop vars by value to satisfy B023.
                     _req = req
-                    _rw = rw
+                    _db = db
                     _idx = indexer
 
-                    def _do_index(_r=_req, _b=_rw, _q=queue, _P=_Path, _i=_idx) -> dict:
-                        return _i.index_repo(
-                            _P(_r.root),
-                            _r.dialect,
-                            _b,
-                            progress_callback=_q.update_progress,
-                        )
+                    def _do_index(_r=_req, _b=_db, _q=queue, _P=_Path, _i=_idx) -> dict:
+                        # Phase 4 (C3/C6): full rebuild in ONE transaction —
+                        # clear all graph tables, then re-index. Readers on MVCC
+                        # snapshots see the old graph until COMMIT flips it
+                        # atomically; a mid-rebuild raise rolls back to the old
+                        # graph. transaction() is reentrant, so index_repo's
+                        # internal per-batch transactions join this outer one.
+                        with _b.transaction():
+                            _b.clear_all_tables()
+                            return _i.index_repo(
+                                _P(_r.root),
+                                _r.dialect,
+                                _b,
+                                progress_callback=_q.update_progress,
+                            )
 
                     summary = await _to_thread.run_sync(_do_index)
                 elif req.op == "reindex":
@@ -548,7 +378,7 @@ async def drain_loop(
                     if effective_from is None:
                         # Standalone mode — resolve stored SHA.
                         try:
-                            effective_from = rw.get_indexed_sha()
+                            effective_from = db.get_indexed_sha()
                         except Exception:
                             effective_from = None
                         if effective_from is None:
@@ -588,12 +418,12 @@ async def drain_loop(
 
                     # Capture loop vars by value to satisfy B023.
                     _req2 = req
-                    _rw2 = rw
+                    _db2 = db
                     _ef = effective_from
                     _et = effective_to
                     _idx2 = indexer
 
-                    def _do_reindex(_r=_req2, _b=_rw2, _f=_ef, _t=_et, _P=_Path, _i=_idx2) -> dict:
+                    def _do_reindex(_r=_req2, _b=_db2, _f=_ef, _t=_et, _P=_Path, _i=_idx2) -> dict:
                         return _i.resync_changed(
                             _P(_r.root),
                             _f,
@@ -615,7 +445,7 @@ async def drain_loop(
                         pass
 
             except Exception as exc:
-                # W7 — non-escalation failure: clear active, relay terminal frame.
+                # W7 — failure: clear active, relay terminal frame.
                 err_str = str(exc)
                 logger.error(f"drain body raised: {err_str}")
                 queue.mark_active_failed(err_str)
@@ -625,10 +455,5 @@ async def drain_loop(
                     except Exception:
                         pass
             finally:
-                de_escalate_to_ro(
-                    db_path,
-                    shutdown_requested=shutdown_requested,
-                    opener=opener,
-                )
                 duration_ms = (time.monotonic() - drain_start) * 1000
                 queue.record_drained(req.op, duration_ms)

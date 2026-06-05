@@ -98,7 +98,7 @@ from sqlcg.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger(__name__)
 
-# Module-level singleton backend (KùzuDB single-writer model)
+# Module-level singleton backend (DuckDB single R/W handle for the process lifetime)
 _backend: GraphBackend | None = None
 
 # Module-level metrics store singleton
@@ -109,15 +109,9 @@ _metrics: MetricsStore | None = None
 # None when no server event-loop is running (unit tests, direct DB access).
 _backend_lock: "anyio.Lock | None" = None
 
-# True when init_backend has opened the backend in RO serving mode.
-# Checked by MCP write tools to decide whether to escalate.
-_serving_ro: bool = False
-
 # The path that init_backend() actually opened.  Captured at init time so
-# MCP write tools (index_repo escalation) use this path, not get_db_path()
-# which returns the default ~/.sqlcg/graph.db regardless of what was passed
-# to init_backend.  Bug B fix: without this, every escalation opened the real
-# live DB instead of the path the server (or test) configured.
+# MCP write tools use this path, not get_db_path() which returns the default
+# ~/.sqlcg/graph.db regardless of what was passed to init_backend.
 _init_db_path: str | None = None
 
 
@@ -153,7 +147,7 @@ def init_backend(db_path: str | None = None) -> None:
         RuntimeError: If backend initialization fails or schema version
             is stale (the caller must not swallow this — server must exit).
     """
-    global _backend, _metrics, _serving_ro, _init_db_path
+    global _backend, _metrics, _init_db_path
     path = db_path or str(get_db_path())
     _init_db_path = path
 
@@ -170,9 +164,7 @@ def init_backend(db_path: str | None = None) -> None:
     _assert_schema_current(rw_backend, path)
 
     # DuckDB: the same handle is used for reads and writes (MVCC).
-    # No separate RO reopen needed.
     _backend = rw_backend
-    _serving_ro = False  # DuckDB: no escalation needed; single R/W handle
     logger.debug(f"Backend initialized (DuckDB R/W): {path}")
 
     # Initialize metrics store (best-effort, failures are logged as WARNING)
@@ -190,7 +182,7 @@ def shutdown_backend() -> None:
     Closes the database connection and clears the global reference.
     Safe to call multiple times.
     """
-    global _backend, _metrics, _serving_ro, _init_db_path
+    global _backend, _metrics, _init_db_path
     if _backend is not None:
         _backend.close()
         _backend = None
@@ -198,7 +190,6 @@ def shutdown_backend() -> None:
     if _metrics is not None:
         _metrics.close()
         _metrics = None
-    _serving_ro = False
     _init_db_path = None
 
 
@@ -211,55 +202,6 @@ def _get_backend() -> GraphBackend:
     if _backend is None:
         raise RuntimeError("Backend not initialized. Call init_backend() before using tools.")
     return _backend
-
-
-def _get_or_escalate_rw(db_path_str: str, should_escalate: bool) -> GraphBackend:
-    """Return the current backend for write use.
-
-    When the server has opened the backend RO (should_escalate=True), escalates
-    to RW using escalate_to_rw so the MCP write tool can write.  When the
-    backend is already RW (direct call in tests / non-server context),
-    returns it directly.
-
-    Args:
-        db_path_str: Path string for escalation.
-        should_escalate: True when the server has opened the backend RO.
-    """
-    if not should_escalate:
-        return _get_backend()
-    from sqlcg.server.writer import escalate_to_rw
-
-    return escalate_to_rw(db_path_str, current=_backend)
-
-
-def _de_escalate_to_ro_from_tool(db_path_str: str) -> None:
-    """De-escalate from RW back to RO after a MCP write tool finishes.
-
-    Best-effort: logs on failure but does not raise.
-    """
-    from sqlcg.server.writer import de_escalate_to_ro
-
-    try:
-        de_escalate_to_ro(db_path_str)
-    except Exception as exc:
-        logger.warning(f"de_escalate_to_ro failed in MCP write tool: {exc}")
-
-
-def _escalation_db_path() -> str:
-    """Return the DB path to use for RW escalation in MCP write tools.
-
-    When init_backend() was called with an explicit path, returns that path.
-    Falls back to get_db_path() only when init_backend has not been called
-    (e.g. direct invocation in tests that set up a backend themselves).
-
-    Bug B fix: index_repo previously called str(get_db_path()) directly,
-    which always returns the default ~/.sqlcg/graph.db regardless of the path
-    init_backend() was given.  This caused escalation to open the real live DB
-    even when init_backend was called with a tmp_path in tests.
-    """
-    if _init_db_path is not None:
-        return _init_db_path
-    return str(get_db_path())
 
 
 def _assert_schema_current(backend: GraphBackend, path: str) -> None:
@@ -494,7 +436,10 @@ def _kahn_topological_sort(affected_tables: list[str], db: GraphBackend) -> tupl
     indegree: dict[str, int] = {t: 0 for t in affected_tables}
 
     for table in affected_tables:
-        rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": table})
+        rows = db.run_read(
+            GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+            {"table_qualified": table, "table_qualified2": table},
+        )
         for row in rows:
             src = row["upstream_table"]
             if src in table_set and src != table and table not in successors[src]:
@@ -598,14 +543,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         if not path.is_dir():
             raise ValueError(f"Repository path is not a directory: {repo_path}")
 
-        # If the backend is in RO serving mode (set by init_backend), escalate
-        # to RW for the duration of this write op, then de-escalate after.
-        # Bug B fix: use _escalation_db_path() instead of str(get_db_path()) so
-        # that escalation targets the DB init_backend() actually opened, not the
-        # default ~/.sqlcg/graph.db.
-        db_path_str = _escalation_db_path()
-        is_ro = _serving_ro
-        rw_db = _get_or_escalate_rw(db_path_str, is_ro)
+        # DuckDB: single R/W handle for the process lifetime — use directly.
+        rw_db = _get_backend()
 
         indexer = Indexer()
         # Ensure the Repo node exists for this repository
@@ -637,9 +576,6 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
                 RelType.BELONGS_TO,
                 {},
             )
-        if is_ro:
-            _de_escalate_to_ro_from_tool(db_path_str)
-
         logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
 
         # Record metrics
@@ -971,7 +907,10 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
         defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
 
-        up_rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": target})
+        up_rows = db.run_read(
+            GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+            {"table_qualified": target, "table_qualified2": target},
+        )
         upstream_raw = _dedup_preserve_order(
             [r["upstream_table"] for r in up_rows if r["upstream_table"]]
         )

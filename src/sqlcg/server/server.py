@@ -378,11 +378,11 @@ async def _stop_watcher(
 ) -> None:
     """Wait for stop_event then perform graceful shutdown.
 
-    B2 shutdown ordering:
-      1. Set shutdown_requested so the drain loop exits cleanly and
-         de_escalate_to_ro skips the RO reopen.
-      2. Acquire backend_lock — waits until any active drain has fully
-         de-escalated (so the in-flight RW write is committed, not torn).
+    Shutdown ordering:
+      1. Set shutdown_requested so the drain loop exits cleanly after its
+         current drain completes (no new drains start once this is set).
+      2. Acquire backend_lock — waits until any active drain has finished
+         (committed its transaction).
       3. Call shutdown_backend() under the lock.
       4. Release backend_lock.
       5. Remove control files.
@@ -396,9 +396,9 @@ async def _stop_watcher(
     from sqlcg.server.control import cleanup_control_files
 
     await stop_event.wait()
-    # B2(b): signal de_escalate_to_ro to skip the RO reopen.
+    # Signal drain loop to stop after current drain completes.
     shutdown_requested.set()
-    # B2(a): wait for any active drain to finish (acquires backend_lock).
+    # Wait for any active drain to finish before closing the backend.
     async with backend_lock:
         try:
             _tools.shutdown_backend()
