@@ -1,20 +1,35 @@
-"""Cypher query loader. All query strings live in queries.cypher."""
+"""SQL query loader. All query strings live in queries.sql."""
 
 import re
 from pathlib import Path
 
-_CYPHER_FILE = Path(__file__).parent / "queries.cypher"
+_SQL_FILE = Path(__file__).parent / "queries.sql"
 
 
 def _load() -> dict[str, str]:
-    """Load named Cypher blocks from queries.cypher.
+    """Load named SQL blocks from queries.sql.
 
     Format: blocks are separated by lines matching "-- BLOCK_NAME" at the start.
-    Each block name becomes a key in the returned dict.
+    Each block name becomes a key in the returned dict.  Comment lines that start
+    with "-- " followed by lowercase words (e.g. "-- params: ...") are included in
+    the block text so the regex split is only on UPPER_SNAKE_CASE block headers.
     """
-    text = _CYPHER_FILE.read_text(encoding="utf-8")
-    blocks = re.split(r"^--\s+(\w+)\s*$", text, flags=re.MULTILINE)
-    return {blocks[i]: blocks[i + 1].strip() for i in range(1, len(blocks), 2)}
+    text = _SQL_FILE.read_text(encoding="utf-8")
+    # Split on lines like "-- BLOCK_NAME" (all-caps with underscores, start of line)
+    blocks = re.split(r"^--\s+([A-Z][A-Z0-9_]+)\s*$", text, flags=re.MULTILINE)
+    result: dict[str, str] = {}
+    for i in range(1, len(blocks), 2):
+        name = blocks[i]
+        body = blocks[i + 1].strip()
+        # Strip leading comment lines (-- params: ...) from block body
+        body_lines = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("--"):
+                continue
+            body_lines.append(line)
+        result[name] = "\n".join(body_lines).strip()
+    return result
 
 
 _Q = _load()
@@ -30,7 +45,11 @@ GET_DOWNSTREAM_DEPENDENCIES_QUERY = _Q["GET_DOWNSTREAM_DEPENDENCIES"]
 GET_UPSTREAM_DEPENDENCIES_QUERY = _Q["GET_UPSTREAM_DEPENDENCIES"]
 SEARCH_SQL_PATTERN_QUERY = _Q["SEARCH_SQL_PATTERN"]
 LIST_DIALECTS_AND_REPOS_QUERY = _Q["LIST_DIALECTS_AND_REPOS"]
+# EXPAND_STAR_SOURCES is implemented as three DML steps in DuckDBBackend.expand_star_sources()
+# rather than a single query (DuckDB cannot do MERGE in the Cypher sense).
 EXPAND_STAR_SOURCES_QUERY = _Q["EXPAND_STAR_SOURCES"]
+EXPAND_STAR_SOURCES_HAS_COLUMN_QUERY = _Q["EXPAND_STAR_SOURCES_HAS_COLUMN"]
+EXPAND_STAR_SOURCES_LINEAGE_QUERY = _Q["EXPAND_STAR_SOURCES_LINEAGE"]
 COUNT_STAR_SOURCES_QUERY = _Q["COUNT_STAR_SOURCES"]
 COUNT_STAR_EXPANSIONS_QUERY = _Q["COUNT_STAR_EXPANSIONS"]
 FIND_DEFINITION_QUERY = _Q["FIND_DEFINITION"]

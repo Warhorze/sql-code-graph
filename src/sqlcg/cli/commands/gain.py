@@ -112,13 +112,11 @@ def gain_cmd(
             """
         )
 
-        # Section E: execute_cypher ratio
-        cypher_query = "SELECT COUNT(*) as count FROM tool_calls WHERE tool_name = 'execute_cypher'"
-        execute_cypher_count_result = metrics.execute_query(cypher_query)
-        execute_cypher_count = (
-            execute_cypher_count_result[0][0] if execute_cypher_count_result else 0
-        )
-        execute_cypher_ratio = execute_cypher_count / total_calls if total_calls > 0 else 0
+        # Section E: execute_sql ratio
+        sql_query = "SELECT COUNT(*) as count FROM tool_calls WHERE tool_name = 'execute_sql'"
+        execute_sql_count_result = metrics.execute_query(sql_query)
+        execute_sql_count = execute_sql_count_result[0][0] if execute_sql_count_result else 0
+        execute_sql_ratio = execute_sql_count / total_calls if total_calls > 0 else 0
 
         # Section F: parse quality from graph.
         # run_read_routed raises typer.Exit (Exception-derived, NOT SystemExit) on
@@ -127,8 +125,8 @@ def gain_cmd(
         parse_quality: dict[str, int] | None = None
         try:
             mode_rows = run_read_routed(
-                "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode,"
-                " COUNT(q) AS cnt ORDER BY cnt DESC",
+                'SELECT parsing_mode AS mode, count(*) AS cnt FROM "SqlQuery"'
+                " GROUP BY parsing_mode ORDER BY cnt DESC",
                 {},
             )
             if mode_rows and "mode" in mode_rows[0]:
@@ -144,7 +142,7 @@ def gain_cmd(
                 "feedback_tp": tp_count,
                 "feedback_total": fb_total,
                 "top_tools": [{"name": row[0], "count": row[1]} for row in top_tools],
-                "execute_cypher_ratio": round(execute_cypher_ratio, 2),
+                "execute_sql_ratio": round(execute_sql_ratio, 2),
             }
             if parse_quality is not None:
                 payload["parse_quality"] = parse_quality
@@ -191,14 +189,14 @@ def gain_cmd(
                     console.print(f"  {i}. {name}: {count}")
             console.print()
 
-            # Section E: execute_cypher ratio
-            console.print("[bold cyan]E. Raw Cypher Usage[/bold cyan]")
-            ratio_pct = execute_cypher_ratio * 100
-            if execute_cypher_ratio > 0.3:
-                msg = f"  [yellow]execute_cypher: {ratio_pct:.1f}% (high raw-Cypher usage)[/yellow]"
+            # Section E: execute_sql ratio
+            console.print("[bold cyan]E. Raw SQL Usage[/bold cyan]")
+            ratio_pct = execute_sql_ratio * 100
+            if execute_sql_ratio > 0.3:
+                msg = f"  [yellow]execute_sql: {ratio_pct:.1f}% (high raw-SQL usage)[/yellow]"
                 console.print(msg)
             else:
-                console.print(f"  execute_cypher: {ratio_pct:.1f}%")
+                console.print(f"  execute_sql: {ratio_pct:.1f}%")
             console.print()
 
             # Section F: parse quality from graph

@@ -92,7 +92,7 @@ def query_via_server(
     if not sp.exists():
         return None
 
-    req = {"op": "query", "cypher": cypher, "params": params}
+    req = {"op": "query", "sql": cypher, "params": params}  # "sql" is the canonical key
     req_bytes = json.dumps(req).encode()
     frame = f"{len(req_bytes)}\n".encode() + req_bytes
 

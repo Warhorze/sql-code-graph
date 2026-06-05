@@ -582,6 +582,38 @@ class DuckDBBackend(GraphBackend):
             return None
 
     # ------------------------------------------------------------------
+    # Star expansion (replaces Cypher MERGE-based EXPAND_STAR_SOURCES)
+    # ------------------------------------------------------------------
+
+    def expand_star_sources(self) -> int:
+        """Run the post-ingestion star expansion in three DML steps.
+
+        Replaces the single Kuzu EXPAND_STAR_SOURCES Cypher query which used
+        MERGE.  DuckDB uses INSERT OR REPLACE (idempotent) across three steps:
+          1. Upsert destination SqlColumn nodes.
+          2. Upsert HAS_COLUMN edges for the destination columns.
+          3. Upsert COLUMN_LINEAGE edges with transform='STAR_EXPANSION'.
+
+        Returns:
+            Number of COLUMN_LINEAGE STAR_EXPANSION edges present after expansion.
+        """
+        from sqlcg.core.queries import (
+            EXPAND_STAR_SOURCES_HAS_COLUMN_QUERY,
+            EXPAND_STAR_SOURCES_LINEAGE_QUERY,
+            EXPAND_STAR_SOURCES_QUERY,
+        )
+
+        self._conn.execute(EXPAND_STAR_SOURCES_QUERY)
+        self._conn.execute(EXPAND_STAR_SOURCES_HAS_COLUMN_QUERY)
+        self._conn.execute(EXPAND_STAR_SOURCES_LINEAGE_QUERY)
+        result = self._conn.execute(
+            'SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE transform = ?',
+            ["STAR_EXPANSION"],
+        )
+        row = result.fetchone()
+        return int(row[0]) if row else 0
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 

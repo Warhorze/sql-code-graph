@@ -12,9 +12,9 @@ if TYPE_CHECKING:
     import anyio
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.freshness import compute_freshness
 from sqlcg.core.graph_db import GraphBackend
-from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
     ANALYZE_UNUSED_TABLES_QUERY,
     FIND_DEFINITION_QUERY,
@@ -157,8 +157,9 @@ def init_backend(db_path: str | None = None) -> None:
     path = db_path or str(get_db_path())
     _init_db_path = path
 
-    # Step 1 — RW open + create schema if absent.
-    rw_backend = KuzuBackend(path, read_only=False)
+    # DuckDB: single R/W handle for the process lifetime — no RO/RW escalation.
+    # init_schema is idempotent; transaction() wraps the DDL in one commit.
+    rw_backend = DuckDBBackend(path)
     try:
         rw_backend.init_schema()
     except Exception as exc:
@@ -168,13 +169,11 @@ def init_backend(db_path: str | None = None) -> None:
     # Step 2 — schema-version gate (Step 1.4).
     _assert_schema_current(rw_backend, path)
 
-    # Step 3 — close RW.
-    rw_backend.close()
-
-    # Step 4 — reopen RO as the serving singleton.
-    _backend = KuzuBackend(path, read_only=True)
-    _serving_ro = True
-    logger.debug(f"Backend initialized (RO serving): {path}")
+    # DuckDB: the same handle is used for reads and writes (MVCC).
+    # No separate RO reopen needed.
+    _backend = rw_backend
+    _serving_ro = False  # DuckDB: no escalation needed; single R/W handle
+    logger.debug(f"Backend initialized (DuckDB R/W): {path}")
 
     # Initialize metrics store (best-effort, failures are logged as WARNING)
     try:
@@ -314,11 +313,11 @@ def _assert_indexed(db: GraphBackend) -> None:
     Raises:
         NotIndexedError: If no repos or files have been indexed
     """
-    rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "Repo"', {})
     if rows and rows[0]["n"] > 0:
         return
     # Fallback: accept a graph with File nodes but no Repo (test-only or partial state).
-    file_rows = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})
+    file_rows = db.run_read('SELECT count(*) AS n FROM "File"', {})
     if file_rows and file_rows[0]["n"] > 0:
         logger.debug(
             "File nodes present but no Repo node — accepting as test-only/partial graph; "
@@ -345,7 +344,7 @@ def _indexed_root(db: GraphBackend) -> Path | None:
         Absolute Path of the indexed root, or None if unavailable.
     """
     try:
-        rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
         if rows and rows[0].get("path"):
             return Path(rows[0]["path"])
     except Exception:
@@ -1605,14 +1604,15 @@ def db_info() -> DbInfoResult:
 
     node_counts: dict[str, int] = {}
     for label in NodeLabel:
-        result = db.run_read(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
+        result = db.run_read(f'SELECT count(*) AS count FROM "{label}"', {})
         node_counts[str(label)] = result[0]["count"] if result else 0
 
-    edges_result = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {})
+    edges_result = db.run_read('SELECT count(*) AS count FROM "COLUMN_LINEAGE"', {})
     column_lineage_edges = edges_result[0]["count"] if edges_result else 0
 
     mode_rows = db.run_read(
-        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC",
+        'SELECT parsing_mode AS mode, count(*) AS cnt FROM "SqlQuery" '
+        "GROUP BY parsing_mode ORDER BY cnt DESC",
         {},
     )
     parse_quality: dict[str, int] = {}
@@ -1644,7 +1644,7 @@ def db_info() -> DbInfoResult:
     _freshness_kwargs: dict = {}
     try:
         _indexed_sha = db.get_indexed_sha()
-        _repo_rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        _repo_rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
         if _repo_rows and _indexed_sha is not None and _repo_rows[0].get("path"):
             _root = Path(_repo_rows[0]["path"])
             _f = compute_freshness(_root, _indexed_sha)
@@ -1674,11 +1674,11 @@ def db_info() -> DbInfoResult:
 
 
 @mcp.tool()
-@_timed_tool("execute_cypher")
-def execute_cypher(query: str) -> list[dict]:
-    """Execute a read-only Cypher query against the graph.
+@_timed_tool("execute_sql")
+def execute_sql(query: str) -> list[dict]:
+    """Execute a read-only SQL query against the graph (DuckDB).
 
-    This tool allows direct Cypher queries for advanced users. It enforces
+    This tool allows direct SQL queries for advanced users. It enforces
     read-only mode by stripping quoted literals and checking for write
     operation keywords. A LIMIT clause is automatically appended if missing.
 
@@ -1689,31 +1689,29 @@ def execute_cypher(query: str) -> list[dict]:
     that contains such keywords.
 
     Args:
-        query: Cypher query string (read-only)
+        query: DuckDB SQL query string (read-only SELECT only)
 
     Returns:
         List of result dictionaries from the query
 
     Raises:
-        ValueError: If the query contains write operations (CREATE, MERGE,
-                   DELETE, SET, REMOVE, DROP, TRUNCATE)
+        ValueError: If the query contains write operations (INSERT, UPDATE,
+                   DELETE, CREATE, DROP, TRUNCATE, MERGE)
     """
     db = _get_backend()
 
     # Strip quoted string literals before blocklist check
-    # This prevents mutation commands hiding inside strings from triggering the blocker
-    # Handle escaped quotes: '' in single quotes, "" in double quotes
     stripped = re.sub(r"'(?:''|[^'])*'", "", query)
     stripped = re.sub(r'"(?:""|[^"])*"', "", stripped)
 
     # Check for write operations (case-insensitive)
     if re.search(
-        r"\b(CREATE|MERGE|DELETE|SET|REMOVE|DROP|TRUNCATE)\b",
+        r"\b(INSERT|UPDATE|DELETE|CREATE|MERGE|DROP|TRUNCATE)\b",
         stripped,
         re.IGNORECASE,
     ):
         raise ValueError(
-            "Write operations are not permitted via execute_cypher. "
+            "Write operations are not permitted via execute_sql. "
             "Use the CLI or dedicated tools instead."
         )
 
@@ -1721,13 +1719,13 @@ def execute_cypher(query: str) -> list[dict]:
     q = query.rstrip()
     if q.endswith(";"):
         q = q[:-1].rstrip()
-    if "limit" not in stripped.lower():  # use stripped, not q.lower()
+    if "limit" not in stripped.lower():
         q = q + " LIMIT 500"
 
     try:
         return db.run_read(q, {})
     except Exception as e:
-        logger.error(f"Cypher execution failed: {e}")
+        logger.error(f"SQL execution failed: {e}")
         raise
 
 
@@ -1818,7 +1816,7 @@ def analyze_unused() -> UnusedTablesResult:
 
         # Single aggregation — no Python per-row graph traversal.
         unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
-        total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+        total_rows = db.run_read('SELECT count(*) AS n FROM "SqlTable"', {})
         total_tables_scanned = total_rows[0]["n"] if total_rows else 0
 
         prefixes = get_presentation_prefixes(root)

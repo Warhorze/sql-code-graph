@@ -400,10 +400,10 @@ def _run_index(
             )
 
         # Connect files to repo
+        from sqlcg.core.queries import INDEX_REPO_FILES_QUERY
         from sqlcg.core.schema import RelType
 
-        files_query = "MATCH (f:File) WHERE f.path STARTS WITH $repo_prefix RETURN f.path AS path"
-        file_rows = backend.run_read(files_query, {"repo_prefix": abs_path})
+        file_rows = backend.run_read(INDEX_REPO_FILES_QUERY, {"repo_prefix": abs_path})
         for row in file_rows:
             backend.upsert_edge(
                 NodeLabel.FILE,

@@ -82,7 +82,7 @@ _WORKFLOWS = """\
 TOOL_RETURN_MODELS: dict[str, type[BaseModel]] = {
     # Operational tools — return plain dict, no Judgement
     "index_repo": BaseModel,
-    "execute_cypher": BaseModel,
+    "execute_sql": BaseModel,
     "submit_feedback": BaseModel,
     # Lineage / dependency facts
     "trace_column_lineage": LineageResult,
@@ -109,7 +109,7 @@ TOOL_RETURN_MODELS: dict[str, type[BaseModel]] = {
 
 _TOOL_PURPOSE: dict[str, str] = {
     "index_repo": "Index a SQL repository into the graph",
-    "execute_cypher": "Execute a read-only Cypher query against the graph",
+    "execute_sql": "Execute a read-only SQL query against the graph (DuckDB)",
     "submit_feedback": "Submit feedback (TP/FP/FN) on a tool result",
     "trace_column_lineage": "Trace upstream column lineage to its source",
     "find_table_usages": "Find all queries that consume a given table",

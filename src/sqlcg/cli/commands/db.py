@@ -1,6 +1,5 @@
 """Database management commands."""
 
-import os
 import shutil
 from pathlib import Path
 
@@ -20,18 +19,8 @@ console = Console()
 
 
 @app.command("init")
-def db_init(
-    buffer_pool_size: int = typer.Option(
-        0,
-        "--buffer-pool-size",
-        help="KuzuDB buffer pool size in MB (0 = default). "
-        "Set to 256-512 on memory-constrained machines.",
-    ),
-) -> None:
+def db_init() -> None:
     """Initialise the graph database (idempotent)."""
-    if buffer_pool_size > 0:
-        os.environ["SQLCG_BUFFER_POOL_MB"] = str(buffer_pool_size)
-
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with get_backend() as backend:
@@ -49,38 +38,36 @@ def db_reset(  # noqa: B008
 
     from sqlcg.server.control import sock_path
 
-    # Step 3.4 (OD-3 / W2): refuse cleanly when a server is live — both the
-    # full reset and the --repo partial reset open the RW backend directly and
-    # would fight the server's lock.  Guard runs BEFORE either destructive branch.
+    # Refuse cleanly when a server is live.
     sp = sock_path()
     if sp.exists():
         try:
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
                 s.settimeout(1)
                 s.connect(str(sp))
-            # Connection succeeded — a server is live.
             console.print(
                 "[red]A server is running on this database; stop it first "
                 "('sqlcg mcp stop') before resetting the database.[/red]"
             )
             raise typer.Exit(1)
         except (FileNotFoundError, ConnectionRefusedError, OSError):
-            # No live server — fall through to destructive action.
             pass
 
     if repo:
-        # Delete all nodes for this repo (use run_write for mutation)
+        # Delete all nodes for this repo: delete File nodes (cascades to all
+        # related nodes via delete_nodes_for_file) and the Repo node itself.
         with get_backend() as backend:
-            backend.run_write(
-                "MATCH (r:Repo {path: $p}) DETACH DELETE r",
-                {"p": repo},
+            # Get all files for this repo
+            file_rows = backend.run_read(
+                'SELECT path FROM "File" WHERE repo_path = ?',
+                {"repo_path": repo},
             )
+            for fr in file_rows:
+                backend.delete_nodes_for_file(fr["path"])
+            backend.run_write('DELETE FROM "Repo" WHERE path = ?', {"p": repo})
         console.print(f"[yellow]Reset repo[/yellow] {repo}")
     else:
-        # Full reset — delete the DB. Kuzu may store it as a single file (current,
-        # e.g. 0.11.x) or a directory (older versions); also drop the .wal sidecar.
-        # shutil.rmtree silently no-ops on a regular file (NotADirectoryError +
-        # ignore_errors), so dispatch on the actual filesystem type.
+        # Full reset — delete the DuckDB file (single file, not a directory).
         db_path = get_db_path()
         removed = False
         for target in (db_path, db_path.with_name(db_path.name + ".wal")):
@@ -99,56 +86,46 @@ def db_reset(  # noqa: B008
 @app.command("info")
 def db_info() -> None:
     """Show database stats."""
-    # db info is a read-only command.  All Cypher reads route through the live
-    # server (run_read_routed) to avoid "Database is locked" while the MCP server
-    # holds the write lock.  get_schema_version / get_indexed_sha are inlined as
-    # run_read_routed calls using their known Cypher so they too route through the
-    # socket when a server is live; this avoids a direct-open that would hit the lock.
+    # db info routes through the live server (run_read_routed) to avoid holding
+    # the DuckDB file lock when the MCP server is running.
 
     # Schema version
-    schema_rows = run_read_routed("MATCH (v:SchemaVersion) RETURN v.version AS version LIMIT 1", {})
+    schema_rows = run_read_routed('SELECT version FROM "SchemaVersion" LIMIT 1', {})
     version = (schema_rows[0]["version"] if schema_rows else None) or "unknown"
     console.print(f"Schema version: {version}")
 
-    # Freshness block — only shown when the DB has been indexed from a git repo
+    # Freshness block
     try:
-        sha_rows = run_read_routed(
-            "MATCH (v:SchemaVersion) RETURN v.indexed_sha AS sha LIMIT 1", {}
-        )
+        sha_rows = run_read_routed('SELECT indexed_sha AS sha FROM "SchemaVersion" LIMIT 1', {})
         indexed_sha = sha_rows[0]["sha"] if sha_rows else None
-        repo_rows = run_read_routed("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        repo_rows = run_read_routed('SELECT path FROM "Repo" LIMIT 1', {})
         if repo_rows and indexed_sha is not None and repo_rows[0].get("path"):
             repo_root = Path(repo_rows[0]["path"])
             f = compute_freshness(repo_root, indexed_sha)
             console.print(render_freshness_line(f))
-    except NotImplementedError:
-        # Neo4j backend raises NotImplementedError for get_indexed_sha — skip silently
-        pass
     except Exception as e:
-        # Any unexpected error in the freshness block must not crash db info
         logger.debug(f"Freshness check skipped: {e}")
 
-    # Show node counts for all labels
+    # Node counts
     for label in NodeLabel:
         try:
-            result = run_read_routed(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
+            result = run_read_routed(f'SELECT count(*) AS count FROM "{label}"', {})
             count = result[0]["count"] if result else 0
             console.print(f"  {label}: {count}")
         except Exception as e:
-            # Log unexpected exceptions instead of silently skipping
             logger.error(f"Error getting count for {label}: {e}")
             console.print(f"  [red]{label}: error[/red]")
 
-    # Health check section
-    repo_count_result = run_read_routed("MATCH (n:Repo) RETURN COUNT(n) AS count", {})
+    # Health check
+    repo_count_result = run_read_routed('SELECT count(*) AS count FROM "Repo"', {})
     repo_count = repo_count_result[0]["count"] if repo_count_result else 0
 
     if repo_count == 0:
-        console.print(  # noqa: E501
+        console.print(
             "[red]Database is empty. Run 'sqlcg db init' and 'sqlcg index <path>' first.[/red]"
         )
     else:
-        query_count_result = run_read_routed("MATCH (n:SqlQuery) RETURN COUNT(n) AS count", {})
+        query_count_result = run_read_routed('SELECT count(*) AS count FROM "SqlQuery"', {})
         query_count = query_count_result[0]["count"] if query_count_result else 0
 
         if query_count == 0:
@@ -157,7 +134,7 @@ def db_info() -> None:
                 "the graph.[/yellow]"
             )
         else:
-            col_count_result = run_read_routed("MATCH (n:SqlColumn) RETURN COUNT(n) AS count", {})
+            col_count_result = run_read_routed('SELECT count(*) AS count FROM "SqlColumn"', {})
             col_count = col_count_result[0]["count"] if col_count_result else 0
 
             if col_count == 0:
@@ -167,12 +144,10 @@ def db_info() -> None:
                     "will return empty results.[/yellow]"
                 )
 
-    # Print COLUMN_LINEAGE edges count
-    edges_result = run_read_routed("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {})
+    edges_result = run_read_routed('SELECT count(*) AS count FROM "COLUMN_LINEAGE"', {})
     edges_count = edges_result[0]["count"] if edges_result else 0
     console.print(f"  COLUMN_LINEAGE edges: {edges_count}")
 
-    # Print star resolution metrics (T-07)
     from sqlcg.core.queries import COUNT_STAR_EXPANSIONS_QUERY, COUNT_STAR_SOURCES_QUERY
 
     star_source_result = run_read_routed(COUNT_STAR_SOURCES_QUERY, {})
@@ -183,11 +158,11 @@ def db_info() -> None:
     star_expansion_count = star_expansion_result[0]["n"] if star_expansion_result else 0
     console.print(f"  STAR_EXPANSION lineage edges: {star_expansion_count}")
 
-    # Print parsing mode distribution
-    mode_query = (
-        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC"
+    mode_rows = run_read_routed(
+        'SELECT parsing_mode AS mode, count(*) AS cnt FROM "SqlQuery"'
+        " GROUP BY parsing_mode ORDER BY cnt DESC",
+        {},
     )
-    mode_rows = run_read_routed(mode_query, {})
     if mode_rows and "mode" in mode_rows[0]:
         console.print("\n  Parsing mode distribution:")
         for row in mode_rows:
@@ -197,7 +172,7 @@ def db_info() -> None:
 @app.command("list-repos")
 def list_repos() -> None:
     """List all indexed repositories."""
-    result = run_read_routed("MATCH (r:Repo) RETURN r.path AS path, r.name AS name", {})
+    result = run_read_routed('SELECT path, name FROM "Repo"', {})
 
     if not result:
         console.print("[yellow]No repositories indexed[/yellow]")

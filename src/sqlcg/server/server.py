@@ -140,17 +140,17 @@ async def _control_socket_task(
     from sqlcg.core.config import get_db_path as _get_db_path
     from sqlcg.server.writer import WriterRequest
 
-    # Read-only keyword allow-list for the ``query`` op.  Only these leading
-    # keywords are permitted — anything that starts with a write keyword is
-    # rejected before execution.  This is a guard against accidental mutation,
+    # Read-only keyword allow-list for the ``query`` op.  Only SELECT and WITH
+    # (CTE preamble) are permitted — anything that starts with a write keyword
+    # is rejected before execution.  This is a guard against accidental mutation,
     # not a security boundary (the socket is already 0o600 / owner-only).
-    _QUERY_ALLOWED_KEYWORDS = frozenset({"MATCH", "RETURN", "WITH", "CALL", "UNWIND", "OPTIONAL"})
+    _QUERY_ALLOWED_KEYWORDS = frozenset({"SELECT", "WITH", "VALUES", "TABLE"})
 
-    def _is_read_only_cypher(cypher: str) -> bool:
+    def _is_read_only_sql(sql: str) -> bool:
         """Return True iff the leading keyword is in the read-only allow-list."""
         import re
 
-        m = re.match(r"\s*(?:--[^\n]*)?\s*(\w+)", cypher, re.IGNORECASE)
+        m = re.match(r"\s*(?:--[^\n]*)?\s*(\w+)", sql, re.IGNORECASE)
         if not m:
             return False
         return m.group(1).upper() in _QUERY_ALLOWED_KEYWORDS
@@ -205,7 +205,7 @@ async def _control_socket_task(
                         if indexed_sha is not None:
                             try:
                                 rows = db.run_read(
-                                    "MATCH (r:Repo) RETURN r.path AS path LIMIT 1",
+                                    'SELECT path FROM "Repo" LIMIT 1',
                                     {},
                                 )
                                 if rows:
@@ -328,11 +328,12 @@ async def _control_socket_task(
                     return
 
                 elif op == "query":
-                    # Framed op (v1.2.0): read-only Cypher query over the socket.
+                    # Framed op (v1.2.0): read-only SQL query over the socket.
                     # Must only be called with a framed request (sniff above sets framed=True).
-                    cypher = req.get("cypher", "")
+                    # Accept both "cypher" (legacy field name) and "sql" keys.
+                    sql = req.get("sql") or req.get("cypher", "")
                     params = req.get("params") or {}
-                    if not _is_read_only_cypher(cypher):
+                    if not _is_read_only_sql(sql):
                         resp = {"error": "query op is read-only"}
                     else:
                         db = backend_ref()
@@ -341,11 +342,11 @@ async def _control_socket_task(
                         else:
 
                             def _do_query() -> list:
-                                return db.run_read(cypher, params)
+                                return db.run_read(sql, params)
 
                             async with backend_lock:
                                 # R1: run off event-loop thread; R2: lock serialises
-                                # reads and writes on the single Kuzu connection.
+                                # reads and writes on the single DuckDB connection.
                                 rows = await _to_thread.run_sync(_do_query)
                             resp = {"ok": True, "rows": rows}
 

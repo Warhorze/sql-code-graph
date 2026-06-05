@@ -40,9 +40,8 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.cli.commands.analyze import _kind_filter
-from sqlcg.core.kuzu_backend import KuzuBackend
-from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.cli.commands.analyze import _upstream_sql
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 # ---------------------------------------------------------------------------
@@ -52,8 +51,8 @@ from sqlcg.indexer.indexer import Indexer
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB with schema initialised (ported from KuzuDB in Phase 3)."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -112,16 +111,11 @@ SELECT val FROM unioned;
 
 
 def _upstream_query(depth: int = 5) -> str:
-    """CLI-filtered upstream query — same pattern as test_cte_recall_guard.py."""
-    kind_filter = _kind_filter("src", include_intermediate=False)
-    return (
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kind_filter}"
-        f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-        "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100"
-    )
+    """CLI-filtered upstream SQL query — same pattern as test_cte_recall_guard.py.
+
+    Uses production _upstream_sql() so filter regressions in analyze.py red these tests.
+    """
+    return _upstream_sql(depth, include_intermediate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +142,8 @@ def test_union_star_cte_gets_incoming_edges(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
     q = (
-        f"MATCH (s:{NodeLabel.COLUMN})-[:{RelType.COLUMN_LINEAGE}]->"
-        f"(c:{NodeLabel.COLUMN} {{id: 'cte_union.total_amt'}}) RETURN s.id AS id"
+        'SELECT cl.src_key AS id FROM "COLUMN_LINEAGE" cl '
+        "WHERE cl.dst_key = 'cte_union.total_amt'"
     )
     rows = db.run_read(q, {})
     incoming_ids = {r["id"] for r in rows}
@@ -188,9 +182,9 @@ def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
     q = (
-        f"MATCH (s:{NodeLabel.COLUMN})-[r:{RelType.COLUMN_LINEAGE}]->"
-        f"(c:{NodeLabel.COLUMN} {{id: 'cte_union.total_amt'}}) "
-        "RETURN s.id AS id, r.transform AS transform"
+        "SELECT cl.src_key AS id, cl.transform AS transform "
+        'FROM "COLUMN_LINEAGE" cl '
+        "WHERE cl.dst_key = 'cte_union.total_amt'"
     )
     rows = db.run_read(q, {})
 
@@ -308,11 +302,9 @@ def test_explicit_column_union_still_traces(db, tmp_path):
     (tmp_path / "explicit.sql").write_text(_EXPLICIT_UNION_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
-    q = (
-        f"MATCH (s:{NodeLabel.COLUMN})-[:{RelType.COLUMN_LINEAGE}*1..5]->"
-        f"(c:{NodeLabel.COLUMN} {{id: 'mart.union_explicit_dst.val'}}) RETURN s.id AS id"
-    )
-    rows = db.run_read(q, {})
+    # Multi-hop upstream via recursive CTE (DuckDB SQL).
+    q = _upstream_sql(5, include_intermediate=True)
+    rows = db.run_read(q, {"ref": "mart.union_explicit_dst.val"})
     found = {r["id"] for r in rows}
 
     assert "staging.src_a.val" in found, (

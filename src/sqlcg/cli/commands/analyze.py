@@ -9,7 +9,6 @@ from rich.console import Console
 from rich.table import Table
 
 from sqlcg.core.queries import GET_TABLE_EXTERNAL_CONSUMERS_QUERY
-from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.server.read_client import run_read_routed
 
 if TYPE_CHECKING:
@@ -19,37 +18,111 @@ app = typer.Typer(help="Lineage analysis")
 console = Console()
 
 
-def _kind_filter(node_alias: str, *, include_intermediate: bool) -> str:
-    """Build the SqlTable kind-filter clause for upstream/downstream queries.
+def _upstream_sql(depth: int, include_intermediate: bool) -> str:
+    """Build the upstream recursive-CTE SQL query.
 
-    Uses an OPTIONAL MATCH + explicit ``WITH … WHERE t.kind IS NULL OR …`` form
-    (Half B of the #38/#39 fix) so that a node-less physical source — one whose
-    SqlTable node is absent because it was only seen inside a CTE body before
-    re-index — is KEPT, not dropped.  CTE/derived intermediates carry
-    ``kind='cte'`` or ``kind='derived'`` and are excluded by the
-    ``kind IN [...]`` guard; ``IS NULL`` matches the absent-node case (t = NULL
-    → t.kind = NULL → IS NULL is TRUE).
-
-    The ``WITH {node_alias}, t WHERE`` clause is required: an OPTIONAL MATCH
-    WHERE clause in KuzuDB applies to the match attempt and does not filter the
-    surrounding row.  The subsequent WITH … WHERE is the actual row filter.
-
-    Args:
-        node_alias: The Cypher alias for the column node whose table is filtered
-                    (``"src"`` for upstream, ``"dst"`` for downstream).
-        include_intermediate: When True, return an empty string (no filtering);
-                              all intermediates including CTE nodes are kept.
-
-    Returns:
-        A Cypher fragment string (with trailing space) to embed directly in the
-        query, or an empty string when include_intermediate is True.
+    Traverses COLUMN_LINEAGE edges from dst→src (upstream direction).
+    Applies kind-filter (LEFT JOIN SqlTable) to exclude CTE/derived intermediates
+    unless include_intermediate=True.  The kind-guard mirrors the Cypher
+    OPTIONAL MATCH + WITH … WHERE t.kind IS NULL OR t.kind IN ['table','external']
+    semantics (#38/#40/19.2).
     """
-    if include_intermediate:
-        return ""
-    return (
-        f"OPTIONAL MATCH (t:SqlTable {{qualified: {node_alias}.table_qualified}}) "
-        f"WITH {node_alias}, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    kind_filter = (
+        ""
+        if include_intermediate
+        else (
+            '  LEFT JOIN "SqlTable" t ON t.qualified = dr.table_qualified\n'
+            "  WHERE t.kind IS NULL OR t.kind IN ('table', 'external')\n"
+        )
     )
+    return f"""
+WITH RECURSIVE reach(id, table_qualified, depth, path) AS (
+  SELECT
+    cl.src_key AS id,
+    c_src.table_qualified,
+    1 AS depth,
+    ARRAY[cl.dst_key, cl.src_key] AS path
+  FROM "COLUMN_LINEAGE" cl
+  JOIN "SqlColumn" c_src ON c_src.id = cl.src_key
+  WHERE cl.dst_key = ?
+  UNION ALL
+  SELECT
+    cl2.src_key,
+    c2.table_qualified,
+    reach.depth + 1,
+    array_append(reach.path, cl2.src_key)
+  FROM reach
+  JOIN "COLUMN_LINEAGE" cl2 ON cl2.dst_key = reach.id
+  JOIN "SqlColumn" c2 ON c2.id = cl2.src_key
+  WHERE reach.depth < {depth}
+    AND NOT cl2.src_key = ANY(reach.path)
+),
+distinct_reach AS (
+  SELECT DISTINCT id, table_qualified FROM reach
+)
+SELECT
+  dr.id,
+  dr.table_qualified,
+  min(q.file_path) AS file,
+  min(q.start_line) AS line
+FROM distinct_reach dr
+LEFT JOIN "COLUMN_LINEAGE" src_edge ON src_edge.src_key = dr.id
+LEFT JOIN "SqlQuery" q ON q.id = src_edge.query_id
+{kind_filter}GROUP BY dr.id, dr.table_qualified
+LIMIT 100
+"""
+
+
+def _downstream_sql(depth: int, include_intermediate: bool) -> str:
+    """Build the downstream recursive-CTE SQL query.
+
+    Traverses COLUMN_LINEAGE edges from src→dst (downstream direction).
+    Kind-filter mirrors upstream: LEFT JOIN SqlTable + IS NULL OR 'table'/'external'.
+    """
+    kind_filter = (
+        ""
+        if include_intermediate
+        else (
+            '  LEFT JOIN "SqlTable" t ON t.qualified = dr.table_qualified\n'
+            "  WHERE t.kind IS NULL OR t.kind IN ('table', 'external')\n"
+        )
+    )
+    return f"""
+WITH RECURSIVE reach(id, table_qualified, depth, path) AS (
+  SELECT
+    cl.dst_key AS id,
+    c_dst.table_qualified,
+    1 AS depth,
+    ARRAY[cl.src_key, cl.dst_key] AS path
+  FROM "COLUMN_LINEAGE" cl
+  JOIN "SqlColumn" c_dst ON c_dst.id = cl.dst_key
+  WHERE cl.src_key = ?
+  UNION ALL
+  SELECT
+    cl2.dst_key,
+    c2.table_qualified,
+    reach.depth + 1,
+    array_append(reach.path, cl2.dst_key)
+  FROM reach
+  JOIN "COLUMN_LINEAGE" cl2 ON cl2.src_key = reach.id
+  JOIN "SqlColumn" c2 ON c2.id = cl2.dst_key
+  WHERE reach.depth < {depth}
+    AND NOT cl2.dst_key = ANY(reach.path)
+),
+distinct_reach AS (
+  SELECT DISTINCT id, table_qualified FROM reach
+)
+SELECT
+  dr.id,
+  dr.table_qualified,
+  min(q.file_path) AS file,
+  min(q.start_line) AS line
+FROM distinct_reach dr
+LEFT JOIN "COLUMN_LINEAGE" dst_edge ON dst_edge.dst_key = dr.id
+LEFT JOIN "SqlQuery" q ON q.id = dst_edge.query_id
+{kind_filter}GROUP BY dr.id, dr.table_qualified
+LIMIT 100
+"""
 
 
 @app.command("upstream")
@@ -62,36 +135,15 @@ def upstream(  # noqa: B008
     ),
 ) -> None:
     """Trace upstream column lineage."""
-    # Bounds check for depth to prevent performance DoS
     if depth < 1 or depth > 100:
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kf = _kind_filter("src", include_intermediate=include_intermediate)
-
-    results = run_read_routed(
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kf}"
-        f"OPTIONAL MATCH (src)-[srcedge:{RelType.COLUMN_LINEAGE}]->() "
-        "OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id}) "
-        "WITH src, min(q.start_line) AS line, min(q.file_path) AS file "
-        "RETURN src.id AS id, file AS file, line AS line LIMIT 100",
-        {"ref": ref},
-    )
+    sql = _upstream_sql(depth, include_intermediate)
+    results = run_read_routed(sql, {"ref": ref})
     if not results and len(ref.split(".")) >= 3:
         bare = _bare_ref(ref)
-        fallback_results = run_read_routed(
-            f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
-            f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-            f"{kf}"
-            f"OPTIONAL MATCH (src)-[srcedge:{RelType.COLUMN_LINEAGE}]->() "
-            "OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id}) "
-            "WITH src, min(q.start_line) AS line, min(q.file_path) AS file "
-            "RETURN src.id AS id, file AS file, line AS line LIMIT 100",
-            {"bare": bare},
-        )
+        fallback_results = run_read_routed(sql, {"bare": bare})
         if fallback_results:
             console.print(
                 f"[yellow]Hint:[/yellow] No results for '{ref}'. "
@@ -104,7 +156,7 @@ def upstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+        nf = NoiseFilter.from_config()
         results = _filter_column_results(results, nf)
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
@@ -119,36 +171,15 @@ def downstream(  # noqa: B008
     ),
 ) -> None:
     """Trace downstream column lineage."""
-    # Bounds check for depth to prevent performance DoS
     if depth < 1 or depth > 100:
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # By default, filter out CTE/derived intermediate nodes; --include-intermediate restores them
-    kf = _kind_filter("dst", include_intermediate=include_intermediate)
-
-    results = run_read_routed(
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-        f"{kf}"
-        f"OPTIONAL MATCH ()-[dstedge:{RelType.COLUMN_LINEAGE}]->(dst) "
-        "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
-        "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
-        "RETURN dst.id AS id, file AS file, line AS line LIMIT 100",
-        {"ref": ref},
-    )
+    sql = _downstream_sql(depth, include_intermediate)
+    results = run_read_routed(sql, {"ref": ref})
     if not results and len(ref.split(".")) >= 3:
         bare = _bare_ref(ref)
-        fallback_results = run_read_routed(
-            f"MATCH (c:{NodeLabel.COLUMN} {{id: $bare}})"
-            f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-            f"{kf}"
-            f"OPTIONAL MATCH ()-[dstedge:{RelType.COLUMN_LINEAGE}]->(dst) "
-            "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
-            "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
-            "RETURN dst.id AS id, file AS file, line AS line LIMIT 100",
-            {"bare": bare},
-        )
+        fallback_results = run_read_routed(sql, {"bare": bare})
         if fallback_results:
             console.print(
                 f"[yellow]Hint:[/yellow] No results for '{ref}'. "
@@ -161,18 +192,16 @@ def downstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()  # repo_root=None → falls back to Path.cwd()
+        nf = NoiseFilter.from_config()
         results = _filter_column_results(results, nf)
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
     # Append external consumer rows for terminal tables (scalar query, one per terminal).
-    # Resolve terminal tables from the column results; fall back to the root column's table.
     terminal_tables: set[str] = set()
     for r in results:
         tbl = _col_id_to_table(r["id"])
         if tbl:
             terminal_tables.add(tbl)
-    # Also check the root column's table (in case no downstream columns were found).
     root_parts = ref.rsplit(".", 1)
     if len(root_parts) == 2:
         terminal_tables.add(root_parts[0])
@@ -197,9 +226,11 @@ def impact(  # noqa: B008
 ) -> None:
     """Show all queries impacted by a table."""
     results = run_read_routed(
-        f"MATCH (t:{NodeLabel.TABLE} {{qualified: $t}})"
-        f"<-[:{RelType.SELECTS_FROM}]-(q:{NodeLabel.QUERY}) "
-        "RETURN DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target LIMIT 100",
+        "SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target"
+        ' FROM "SqlTable" t'
+        ' JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified'
+        ' JOIN "SqlQuery" q ON q.id = sf.src_key'
+        " WHERE t.qualified = ? LIMIT 100",
         {"t": table},
     )
     if not raw:
@@ -222,22 +253,20 @@ def failures(
     ),
     limit: int = typer.Option(100, "--limit", help="Maximum rows to return"),  # noqa: B008
 ) -> None:
-    """List files that failed to parse, with their dominant cause (E-code bucket).
-
-    Valid --cause buckets (from highest to lowest severity):
-    timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip.
-
-    Requires a graph indexed with sqlcg >= v3 (schema version 3). Re-index
-    with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
-    an earlier version.
-    """
-    cypher = (
-        f"MATCH (f:{NodeLabel.FILE}) WHERE f.parse_failed = true "
-        "AND ($cause IS NULL OR f.parse_cause = $cause) "
-        "RETURN f.path AS path, f.parse_cause AS cause "
-        f"ORDER BY f.parse_cause LIMIT {limit}"
-    )
-    rows = run_read_routed(cypher, {"cause": cause})
+    """List files that failed to parse, with their dominant cause (E-code bucket)."""
+    if cause is not None:
+        rows = run_read_routed(
+            'SELECT path, parse_cause AS cause FROM "File"'
+            " WHERE parse_failed = true AND parse_cause = ?"
+            f" ORDER BY parse_cause LIMIT {limit}",
+            {"cause": cause},
+        )
+    else:
+        rows = run_read_routed(
+            'SELECT path, parse_cause AS cause FROM "File"'
+            f" WHERE parse_failed = true ORDER BY parse_cause LIMIT {limit}",
+            {},
+        )
     _print_table(rows, ["path", "cause"])
 
 
@@ -248,8 +277,9 @@ def unused(
 ) -> None:
     """Find tables with no query references."""
     results = run_read_routed(
-        f"MATCH (t:{NodeLabel.TABLE}) WHERE NOT (t)<-[:{RelType.SELECTS_FROM}]-() "
-        "RETURN DISTINCT t.qualified AS qualified LIMIT 100",
+        'SELECT DISTINCT qualified FROM "SqlTable"'
+        ' WHERE qualified NOT IN (SELECT DISTINCT dst_key FROM "SELECTS_FROM")'
+        " LIMIT 100",
         {},
     )
     if not raw:
@@ -261,30 +291,15 @@ def unused(
 
 
 def _bare_ref(ref: str) -> str:
-    """Strip schema prefix from a ref string, keeping table.column.
-
-    For a 3-part ref ("mart.fact_t.amount") this returns "fact_t.amount".
-    For a 2-part ref ("fact_t.amount") this returns the ref unchanged.
-    Never uses rsplit — that would yield only the column name for 3-part refs.
-    """
+    """Strip schema prefix from a ref string, keeping table.column."""
     parts = ref.split(".")
     if len(parts) >= 3:
-        return ".".join(parts[1:])  # drop schema, keep table.column
-    return ref  # already bare (no schema prefix)
+        return ".".join(parts[1:])
+    return ref
 
 
 def _col_id_to_table(col_id: str) -> str:
-    """Extract the table-qualified part from a column ID (schema.table.col → schema.table).
-
-    Column IDs follow the format: schema.table.column or table.column.
-    The table part is everything except the last component.
-
-    Args:
-        col_id: A column ID string from the graph.
-
-    Returns:
-        The table-qualified portion (all but the last dotted component).
-    """
+    """Extract the table-qualified part from a column ID."""
     parts = col_id.rsplit(".", 1)
     return parts[0] if len(parts) == 2 else col_id
 
@@ -293,16 +308,12 @@ def _filter_column_results(
     results: list[dict],
     nf: NoiseFilter,  # type: ignore[name-defined]
 ) -> list[dict]:
-    """Filter column-ID result rows by NoiseFilter, dropping rows whose table is noise."""
+    """Filter column-ID result rows by NoiseFilter."""
     return [r for r in results if not nf.is_noise(_col_id_to_table(r["id"]))]
 
 
 def _add_file_line_col(rows: list[dict]) -> list[dict]:
-    """Add a 'file:line' composite column from 'file' and 'line' fields.
-
-    Formats as 'path/to/file.sql:N' when both are present, or '?' when either
-    is absent (multi-hop upstream where file/line is not available).
-    """
+    """Add a 'file:line' composite column from 'file' and 'line' fields."""
     result = []
     for row in rows:
         new_row = dict(row)

@@ -29,10 +29,9 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.cli.commands.analyze import _kind_filter
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.cli.commands.analyze import _upstream_sql
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import GET_UPSTREAM_DEPENDENCIES_QUERY, TRACE_COLUMN_LINEAGE_QUERY
-from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.indexer import Indexer
 
 # ---------------------------------------------------------------------------
@@ -42,8 +41,8 @@ from sqlcg.indexer.indexer import Indexer
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB with schema initialised (ported from KuzuDB in Phase 3)."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -84,20 +83,12 @@ SELECT val FROM unioned;
 
 
 def _upstream_filtered_query(depth: int = 5) -> str:
-    """Build the exact upstream query analyze.py constructs with kind_filter ON.
+    """Build the exact upstream SQL query analyze.py constructs with kind_filter ON.
 
-    The filter clause is imported from production (``analyze._kind_filter``), not
-    mirrored here, so reverting Half B in analyze.py reds the tests that use it.
+    Uses production _upstream_sql() so reverting the kind filter in analyze.py reds
+    these tests (replaces the old _kind_filter() Cypher helper, Phase 3 port).
     """
-    kind_filter = _kind_filter("src", include_intermediate=False)
-    return (
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kind_filter}"
-        f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-        "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100"
-    )
+    return _upstream_sql(depth, include_intermediate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -154,16 +145,25 @@ def test_half_b_keeps_node_less_physical_source(db, tmp_path):
 
     # Precondition: Half A created the SqlTable node (non-vacuous — proves we exercise
     # the node-removal path rather than asserting on an already-absent node).
-    before = db.run_read("MATCH (t:SqlTable {qualified: 'staging.src_a'}) RETURN count(t) AS n", {})
+    before = db.run_read(
+        'SELECT count(*) AS n FROM "SqlTable" WHERE qualified = ?', {"q": "staging.src_a"}
+    )
     assert before[0]["n"] == 1, "Precondition failed: Half A did not emit staging.src_a node"
 
     # Recreate the pre-#39 broken state: source column exists + edges exist, but the
-    # SqlTable node is gone.
-    db.run_write("MATCH (t:SqlTable {qualified: 'staging.src_a'}) DETACH DELETE t", {})
-    after = db.run_read("MATCH (t:SqlTable {qualified: 'staging.src_a'}) RETURN count(t) AS n", {})
+    # SqlTable node is gone.  DuckDB has no DETACH DELETE — delete related edges first.
+    db.run_write('DELETE FROM "DEFINED_IN" WHERE src_key = ?', {"k": "staging.src_a"})
+    db.run_write('DELETE FROM "HAS_COLUMN" WHERE src_key = ?', {"k": "staging.src_a"})
+    db.run_write('DELETE FROM "SELECTS_FROM" WHERE dst_key = ?', {"k": "staging.src_a"})
+    db.run_write('DELETE FROM "SqlTable" WHERE qualified = ?', {"k": "staging.src_a"})
+    after = db.run_read(
+        'SELECT count(*) AS n FROM "SqlTable" WHERE qualified = ?', {"q": "staging.src_a"}
+    )
     assert after[0]["n"] == 0, "Node-less precondition not established"
     # The source COLUMN must still exist (only the SqlTable node was removed).
-    col = db.run_read("MATCH (c:SqlColumn {id: 'staging.src_a.col_a'}) RETURN count(c) AS n", {})
+    col = db.run_read(
+        'SELECT count(*) AS n FROM "SqlColumn" WHERE id = ?', {"id": "staging.src_a.col_a"}
+    )
     assert col[0]["n"] == 1, "Source SqlColumn unexpectedly removed — fixture invalid"
 
     rows = db.run_read(_upstream_filtered_query(), {"ref": "mart.dst.col_a"})

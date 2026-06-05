@@ -347,58 +347,29 @@ def get_external_consumers(path: Path) -> list[ExternalConsumerSpec]:
 
 
 def get_backend(read_only: bool = False) -> "GraphBackend":
-    """Get a graph backend instance respecting the SQLCG_BACKEND env var.
+    """Get a DuckDBBackend instance.
+
+    The ``read_only`` parameter is accepted for API compatibility but is
+    ignored — DuckDB uses a single R/W handle for the process lifetime.
+    Concurrent read safety is provided by DuckDB's MVCC (readers see a
+    consistent snapshot during an in-flight write transaction).
+
+    Cross-process access: whichever process opens the DuckDB file first holds
+    an exclusive lock; other processes cannot open it at all (even read-only).
+    CLI read commands therefore route through the live MCP server via
+    ``read_client.run_read_routed`` (v1.2.0) when a server is live, and open
+    the file directly only when no server is running.
 
     Args:
-        read_only: Open the database in read-only mode. For KuzuBackend this
-            enables multiple concurrent read-only opens (reader/reader
-            concurrency), but does NOT allow reads while a read-write writer
-            holds the exclusive process lock — that requires routing through the
-            live MCP server via ``read_client.run_read_routed`` (v1.2.0).
-            Ignored for Neo4jBackend (Neo4j has no single-writer process lock;
-            the flag is a no-op and the normal connection is opened).
-            All writer call sites (index, reindex, db init/reset, server
-            init_backend) use the default ``False``.
+        read_only: Ignored for DuckDB. Accepted for API compatibility.
 
     Returns:
-        A GraphBackend instance (KuzuBackend by default, or Neo4jBackend)
+        A DuckDBBackend instance.
 
     Raises:
-        ValueError: If backend type is not recognized
-
-    Note:
-        CLI read commands (find, analyze, db info, gain) route through a live
-        MCP server via ``read_client.run_read_routed`` (v1.2.0) when a server
-        is live, falling back to ``get_backend(read_only=True)`` when no server
-        is present. The fallback path still contends for the process lock under
-        an active writer (Windows / no-server fallback only).
+        duckdb.IOException: If the file is locked by another process.
     """
-    backend_type = os.getenv("SQLCG_BACKEND", "kuzu")
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
-    if backend_type == "kuzu":
-        from sqlcg.core.kuzu_backend import KuzuBackend
-
-        kuzu_cfg = KuzuConfig.from_env()
-        try:
-            return KuzuBackend(
-                str(kuzu_cfg.db_path),
-                buffer_pool_size_mb=kuzu_cfg.buffer_pool_size_mb,
-                read_only=read_only,
-            )
-        except RuntimeError as exc:
-            if read_only and "READ ONLY" in str(exc):
-                # KùzuDB refuses to open a non-existent or empty DB in read-only
-                # mode ("Cannot create an empty database under READ ONLY mode").
-                # Surface the same empty-DB guidance the user sees from `db info`.
-                raise RuntimeError(
-                    "Database not initialised — run 'sqlcg db init' and 'sqlcg index <path>' first."
-                ) from exc
-            raise
-    elif backend_type == "neo4j":
-        from sqlcg.core.neo4j_backend import Neo4jBackend
-
-        neo4j_cfg = Neo4jConfig.from_env()
-        # read_only is ignored for Neo4j — no single-writer process lock.
-        return Neo4jBackend(neo4j_cfg.uri, neo4j_cfg.user, neo4j_cfg.password)
-    else:
-        raise ValueError(f"Unknown backend type: {backend_type}")
+    cfg = KuzuConfig.from_env()
+    return DuckDBBackend(str(cfg.db_path))

@@ -1,0 +1,249 @@
+-- DuckDB SQL query library.
+-- Format identical to queries.cypher: blocks separated by "-- BLOCK_NAME" lines.
+-- All queries use ? positional parameters (list order matches the named params below).
+-- Named params in comments are for documentation — callers pass values as a list.
+
+-- DELETE_COLUMNS_FOR_FILE
+-- params: [path, path]
+DELETE FROM "SqlColumn" WHERE id IN (
+  SELECT hc.dst_key FROM "HAS_COLUMN" hc
+  WHERE hc.src_key IN (
+    SELECT di.src_key FROM "DEFINED_IN" di WHERE di.dst_key = ?
+  )
+)
+
+-- DELETE_QUERIES_FOR_FILE
+-- params: [path]
+DELETE FROM "SqlQuery" WHERE file_path = ?
+
+-- DELETE_TABLES_FOR_FILE
+-- params: [path, path]
+DELETE FROM "SqlTable" WHERE qualified IN (
+  SELECT di.src_key FROM "DEFINED_IN" di WHERE di.dst_key = ?
+)
+
+-- DELETE_FILE
+-- params: [path]
+DELETE FROM "File" WHERE path = ?
+
+-- INDEX_REPO_FILES
+-- params: [repo_prefix]
+SELECT path FROM "File" WHERE path LIKE ? || '%'
+
+-- TRACE_COLUMN_LINEAGE
+-- params: [id]
+SELECT
+  src.id         AS id,
+  src.col_name   AS col_name,
+  src.table_qualified AS table_qualified,
+  cl.transform   AS transform,
+  cl.confidence  AS confidence,
+  q.file_path    AS file,
+  q.start_line   AS line,
+  q.sql          AS expression,
+  t.kind         AS table_kind
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" src ON src.id = cl.src_key
+LEFT JOIN "SqlQuery" q ON q.id = cl.query_id
+LEFT JOIN "SqlTable" t ON t.qualified = src.table_qualified
+WHERE cl.dst_key = ?
+
+-- FIND_TABLE_USAGES
+-- params: [name]
+SELECT f.path AS file, q.sql AS sql, q.kind AS kind
+FROM "SqlTable" t
+JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified
+JOIN "SqlQuery" q ON q.id = sf.src_key
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+JOIN "File" f ON f.path = qdi.dst_key
+WHERE t.name = ?
+
+-- GET_DOWNSTREAM_DEPENDENCIES
+-- params: [id]
+SELECT dst.id AS id, dst.col_name AS col_name, dst.table_qualified AS table_qualified
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" dst ON dst.id = cl.dst_key
+WHERE cl.src_key = ?
+
+-- GET_UPSTREAM_DEPENDENCIES
+-- params: [id]
+SELECT src.id AS id, src.col_name AS col_name, src.table_qualified AS table_qualified
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" src ON src.id = cl.src_key
+WHERE cl.dst_key = ?
+
+-- SEARCH_SQL_PATTERN
+-- params: [query, limit]
+SELECT f.path AS file, q.sql AS sql, q.kind AS kind
+FROM "SqlQuery" q
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+JOIN "File" f ON f.path = qdi.dst_key
+WHERE q.sql LIKE '%' || ? || '%'
+LIMIT ?
+
+-- LIST_DIALECTS_AND_REPOS
+-- params: []
+SELECT r.path AS path, r.name AS name,
+       list(DISTINCT f.dialect) AS dialects
+FROM "Repo" r
+JOIN "BELONGS_TO" bt ON bt.dst_key = r.path
+JOIN "File" f ON f.path = bt.src_key
+GROUP BY r.path, r.name
+
+-- EXPAND_STAR_SOURCES
+-- Inserts new SqlColumn destination nodes and COLUMN_LINEAGE edges from STAR_SOURCE.
+-- Returns count of new edges created.
+-- params: []
+INSERT OR REPLACE INTO "SqlColumn" (id, col_name, table_qualified, catalog, db, table_name)
+SELECT DISTINCT
+  q.target_table || '.' || c.col_name AS id,
+  c.col_name,
+  q.target_table AS table_qualified,
+  tgt.catalog,
+  tgt.db,
+  tgt.name AS table_name
+FROM "STAR_SOURCE" ss
+JOIN "SqlQuery" q ON q.id = ss.src_key
+JOIN "SqlTable" t ON t.qualified = ss.dst_key
+JOIN "HAS_COLUMN" hc ON hc.src_key = t.qualified
+JOIN "SqlColumn" c ON c.id = hc.dst_key
+JOIN "SqlTable" tgt ON tgt.qualified = q.target_table
+WHERE q.target_table <> ''
+  AND q.target_table <> t.qualified
+
+-- EXPAND_STAR_SOURCES_HAS_COLUMN
+-- Insert HAS_COLUMN edges for the new destination columns.
+-- params: []
+INSERT OR REPLACE INTO "HAS_COLUMN" (src_key, dst_key, source)
+SELECT DISTINCT
+  q.target_table AS src_key,
+  q.target_table || '.' || c.col_name AS dst_key,
+  'star_expansion' AS source
+FROM "STAR_SOURCE" ss
+JOIN "SqlQuery" q ON q.id = ss.src_key
+JOIN "SqlTable" t ON t.qualified = ss.dst_key
+JOIN "HAS_COLUMN" hc ON hc.src_key = t.qualified
+JOIN "SqlColumn" c ON c.id = hc.dst_key
+JOIN "SqlTable" tgt ON tgt.qualified = q.target_table
+WHERE q.target_table <> ''
+  AND q.target_table <> t.qualified
+
+-- EXPAND_STAR_SOURCES_LINEAGE
+-- Insert COLUMN_LINEAGE edges for the star expansion.
+-- params: []
+INSERT OR REPLACE INTO "COLUMN_LINEAGE" (src_key, dst_key, transform, confidence, query_id)
+SELECT DISTINCT
+  c.id AS src_key,
+  q.target_table || '.' || c.col_name AS dst_key,
+  'STAR_EXPANSION' AS transform,
+  0.8 AS confidence,
+  q.id AS query_id
+FROM "STAR_SOURCE" ss
+JOIN "SqlQuery" q ON q.id = ss.src_key
+JOIN "SqlTable" t ON t.qualified = ss.dst_key
+JOIN "HAS_COLUMN" hc ON hc.src_key = t.qualified
+JOIN "SqlColumn" c ON c.id = hc.dst_key
+JOIN "SqlTable" tgt ON tgt.qualified = q.target_table
+WHERE q.target_table <> ''
+  AND q.target_table <> t.qualified
+
+-- COUNT_STAR_SOURCES
+-- params: []
+SELECT count(*) AS n FROM "STAR_SOURCE"
+
+-- COUNT_STAR_EXPANSIONS
+-- params: []
+SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE transform = 'STAR_EXPANSION'
+
+-- FIND_DEFINITION
+-- params: [table_qualified]
+SELECT t.qualified AS table_qualified, t.kind AS kind,
+       t.defined_in_file AS defined_in_file, f.path AS file_path
+FROM "SqlTable" t
+JOIN "DEFINED_IN" di ON di.src_key = t.qualified
+JOIN "File" f ON f.path = di.dst_key
+WHERE t.qualified = ?
+
+-- GET_TABLE_DEFINING_FILES
+-- params: [table_qualified]
+SELECT f.path AS file_path, t.kind AS kind
+FROM "SqlTable" t
+JOIN "DEFINED_IN" di ON di.src_key = t.qualified
+JOIN "File" f ON f.path = di.dst_key
+WHERE t.qualified = ?
+
+-- GET_TABLE_DIRECT_UPSTREAMS
+-- params: [table_qualified, table_qualified]
+SELECT DISTINCT src.qualified AS upstream_table, f.path AS in_file
+FROM "SqlQuery" q
+JOIN "SELECTS_FROM" sf ON sf.src_key = q.id
+JOIN "SqlTable" src ON src.qualified = sf.dst_key
+LEFT JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+LEFT JOIN "File" f ON f.path = qdi.dst_key
+WHERE q.target_table = ?
+  AND src.qualified <> ?
+
+-- GET_COLUMNS_FOR_TABLE
+-- params: [table_qualified]
+SELECT c.id AS col_id, c.col_name AS col_name
+FROM "SqlTable" t
+JOIN "HAS_COLUMN" hc ON hc.src_key = t.qualified
+JOIN "SqlColumn" c ON c.id = hc.dst_key
+WHERE t.qualified = ?
+
+-- GET_TABLES_DEFINED_IN_FILE
+-- params: [file_path]
+SELECT t.qualified AS table_qualified
+FROM "SqlTable" t
+JOIN "DEFINED_IN" di ON di.src_key = t.qualified
+WHERE di.dst_key = ?
+
+-- ANALYZE_UNUSED_TABLES
+-- params: []
+SELECT t.qualified AS table_qualified
+FROM "SqlTable" t
+WHERE t.qualified NOT IN (SELECT DISTINCT dst_key FROM "SELECTS_FROM")
+ORDER BY t.qualified
+
+-- HUB_RANKING
+-- params: [k]
+SELECT t.qualified AS table_qualified,
+       count(DISTINCT q.target_table) AS downstream_dependents
+FROM "SqlTable" t
+JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified
+JOIN "SqlQuery" q ON q.id = sf.src_key
+WHERE q.target_table <> ''
+  AND q.target_table <> t.qualified
+GROUP BY t.qualified
+ORDER BY downstream_dependents DESC, t.qualified
+LIMIT ?
+
+-- DEPENDENT_FILES_OF_TABLES
+-- params: [tables]  (list — caller must expand with unnest or IN clause)
+SELECT DISTINCT f.path AS path
+FROM "SqlTable" t
+JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified
+JOIN "SqlQuery" q ON q.id = sf.src_key
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+JOIN "File" f ON f.path = qdi.dst_key
+WHERE t.qualified = ANY(?)
+
+-- GET_TABLE_EXTERNAL_CONSUMERS
+-- params: [table_qualified]
+SELECT e.name AS name, e.consumer_type AS consumer_type
+FROM "SqlTable" t
+JOIN "CONSUMED_BY" cb ON cb.src_key = t.qualified
+JOIN "ExternalConsumer" e ON e.name = cb.dst_key
+WHERE t.qualified = ?
+
+-- GET_TABLES_EXTERNAL_CONSUMERS_BATCH
+-- params: [table_qualifieds]  (list)
+SELECT t.qualified AS table_qualified, e.name AS name, e.consumer_type AS consumer_type
+FROM "SqlTable" t
+JOIN "CONSUMED_BY" cb ON cb.src_key = t.qualified
+JOIN "ExternalConsumer" e ON e.name = cb.dst_key
+WHERE t.qualified = ANY(?)
+
+-- COUNT_EXTERNAL_CONSUMERS
+-- params: []
+SELECT count(*) AS n FROM "CONSUMED_BY"
