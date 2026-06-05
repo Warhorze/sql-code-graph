@@ -1,0 +1,146 @@
+{
+  "corpus": "airbnb+star_corpus fixtures (tests/fixtures/airbnb/ + tests/fixtures/star_corpus/)",
+  "dialect": "snowflake",
+  "node_counts": {
+    "Repo": 0,
+    "File": 14,
+    "SqlTable": 13,
+    "SqlColumn": 76,
+    "SqlQuery": 14,
+    "SchemaVersion": 1
+  },
+  "edge_counts": {
+    "BELONGS_TO": 0,
+    "DEFINED_IN": 13,
+    "QUERY_DEFINED_IN": 14,
+    "HAS_COLUMN": 28,
+    "SELECTS_FROM": 11,
+    "COLUMN_LINEAGE": 54,
+    "STAR_SOURCE": 2
+  },
+  "traversal_seeds": [
+    "fct_reviews.comments",
+    "fct_reviews.date",
+    "fct_reviews.reviewer_name",
+    "fct_reviews.listing_id",
+    "fct_reviews.sentiment"
+  ],
+  "traversal_results": {
+    "fct_reviews.comments": {
+      "upstream": [
+        "raw_reviews.comments"
+      ],
+      "downstream": []
+    },
+    "fct_reviews.date": {
+      "upstream": [
+        "raw_reviews.date"
+      ],
+      "downstream": []
+    },
+    "fct_reviews.reviewer_name": {
+      "upstream": [
+        "raw_reviews.reviewer_name"
+      ],
+      "downstream": []
+    },
+    "fct_reviews.listing_id": {
+      "upstream": [
+        "raw_reviews.listing_id"
+      ],
+      "downstream": []
+    },
+    "fct_reviews.sentiment": {
+      "upstream": [
+        "raw_reviews.sentiment"
+      ],
+      "downstream": []
+    }
+  },
+  "hub_ranking_top10": [
+    {
+      "table_qualified": "ba.src_table",
+      "usage_count": 2
+    },
+    {
+      "table_qualified": "src_hosts",
+      "usage_count": 2
+    },
+    {
+      "table_qualified": "dim_listings_cleansed",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "fct_reviews",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "raw_hosts",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "raw_listings",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "raw_reviews",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "src_listings",
+      "usage_count": 1
+    },
+    {
+      "table_qualified": "src_reviews",
+      "usage_count": 1
+    }
+  ],
+  "star_source_count": 2,
+  "star_expansion_count": 6,
+  "table_level_edges_sample": [
+    {
+      "query_target": "fct_reviews",
+      "source_table": "dim_listings_cleansed"
+    },
+    {
+      "query_target": "fct_reviews",
+      "source_table": "src_reviews"
+    },
+    {
+      "query_target": "dim_hosts_cleansed",
+      "source_table": "src_hosts"
+    },
+    {
+      "query_target": "src_listings",
+      "source_table": "raw_listings"
+    },
+    {
+      "query_target": "src_hosts",
+      "source_table": "raw_hosts"
+    },
+    {
+      "query_target": "src_reviews",
+      "source_table": "raw_reviews"
+    },
+    {
+      "query_target": "mart_fullmoon_reviews",
+      "source_table": "fct_reviews"
+    },
+    {
+      "query_target": "dim_listings_cleansed",
+      "source_table": "src_hosts"
+    },
+    {
+      "query_target": "dim_listings_cleansed",
+      "source_table": "src_listings"
+    },
+    {
+      "query_target": "ba.tgt_table",
+      "source_table": "ba.src_table"
+    },
+    {
+      "query_target": "ba.tgt_alias",
+      "source_table": "ba.src_table"
+    }
+  ]
+}
