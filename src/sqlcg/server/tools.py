@@ -141,7 +141,7 @@ def init_backend(db_path: str | None = None) -> None:
     ONLY mode.`` is raised on a non-existent DB opened RO).
 
     Args:
-        db_path: Path to KùzuDB database. If None, uses get_db_path().
+        db_path: Path to DuckDB database. If None, uses get_db_path().
 
     Raises:
         RuntimeError: If backend initialization fails or schema version

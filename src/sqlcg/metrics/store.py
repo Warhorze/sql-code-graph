@@ -1,6 +1,6 @@
 """SQLite-based metrics storage for SQL Code Graph.
 
-Importable without KùzuDB. All writes are wrapped in try/except with
+Importable without a graph backend. All writes are wrapped in try/except with
 WARNING-level logging on failure. Opt-out via SQLCG_METRICS=0.
 """
 

@@ -118,7 +118,7 @@ class GraphBackend(ABC):
         """Execute a read-only query and return results.
 
         Args:
-            query: Query string (Cypher for KùzuDB/Neo4j)
+            query: Query string (SQL)
             params: Parameters to bind in the query
 
         Returns:
@@ -130,7 +130,7 @@ class GraphBackend(ABC):
         """Execute a write query (mutation).
 
         Args:
-            query: Query string (Cypher for KùzuDB/Neo4j)
+            query: Query string (SQL)
             params: Parameters to bind in the query
         """
 
@@ -213,7 +213,7 @@ class GraphBackend(ABC):
     def _validate_props(properties: dict[str, Any]) -> None:
         """Validate that all property keys are safe identifiers.
 
-        Guards against Cypher injection via property key interpolation.
+        Guards against SQL injection via property key interpolation.
 
         Args:
             properties: Dictionary of properties to validate

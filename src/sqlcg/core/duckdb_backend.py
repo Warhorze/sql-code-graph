@@ -7,8 +7,14 @@ corpus (Phase 0, 2026-06-05).
 
 Concurrency contract (DuckDB single-process MVCC):
   - One R/W connection held for the process lifetime (no RO/RW escalation needed).
-  - Readers see a consistent snapshot of committed data (MVCC) — never blocked by
-    an in-flight write transaction.
+  - DuckDB MVCC guarantees no torn reads: a read never observes a partially-applied
+    rebuild — it sees either the prior committed graph or the post-COMMIT graph.
+  - NOTE: in the server, reads and the write drain are serialized through a single
+    ``backend_lock`` on the shared connection (server.py / writer.py), so a read
+    issued *during* a rebuild waits for that rebuild to finish rather than being
+    served the old snapshot concurrently. The reindex path is fast (seconds); a
+    full re-index blocks reads for its duration. A cursor-per-read path to deliver
+    true non-blocking reads during a rebuild is a tracked follow-up (v1.4.x).
   - Cross-process: whichever process opens the file first holds an exclusive lock;
     other processes cannot open it at all (even read-only). This is handled by the
     existing socket-routing layer (read_client.py / server.py).

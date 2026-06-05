@@ -101,8 +101,10 @@ async def _control_socket_task(
       as ``index``.  The handler enqueues only — it never touches the backend
       (B1 invariant: only the drain task resolves a backend, under backend_lock).
     - ``{"op": "query", "cypher": ..., "params": ...}`` → executes a
-      read-only Cypher query on the single backend connection, serialised
-      behind *backend_lock*.  **Length-prefixed framing** (v1.2.0):
+      read-only SQL query on the single backend connection, serialised
+      behind *backend_lock*.  (The ``cypher`` field name is a legacy wire-key
+      retained for protocol compatibility; the value is SQL.)
+      **Length-prefixed framing** (v1.2.0):
       ``<decimal-byte-length>\\n<json-body>`` on both request and response.
 
     Framing protocol:
@@ -121,7 +123,7 @@ async def _control_socket_task(
       — it does NOT rely on EOF as the terminator.
 
     R2 (single connection): all backend operations go through ``backend_lock``
-    so concurrent calls never touch the single Kuzu connection simultaneously.
+    so concurrent calls never touch the single DuckDB connection simultaneously.
 
     R8 teardown ordering: the caller must cancel this task BEFORE calling
     ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
@@ -499,7 +501,7 @@ def main(db_path: str | None = None) -> None:
     """Start the MCP server.
 
     Args:
-        db_path: Path to KùzuDB database. If None, uses SQLCG_DB_PATH env var
+        db_path: Path to DuckDB database. If None, uses SQLCG_DB_PATH env var
                 or ~/.sqlcg/graph.db (via get_db_path in tools module).
     """
     import time
