@@ -9,8 +9,13 @@ Guard 1 — Surface-recall (CLI + MCP filtered surface, kind-filter ON):
   ``table_kind IN ('table', 'external', None)``.  Fixtures include:
     (a) a ≥2-CTE-hop chain (staging.src_a → a → u → j → mart.fact_kpi.measure)
     (b) a UNION-ALL branch CTE (both src_a and src_b feed u)
-  Asserts both physical sources are present on BOTH surfaces; a reintroduced
-  #38 (inner-join kind filter) reds at least this guard.
+  Asserts both physical sources are present on BOTH surfaces, i.e. a recall
+  regression that drops physical sources from the filtered surface reds this
+  guard.  (The specific #38 inner-join revert is a no-op against this fixture —
+  Half A guarantees src_a/src_b carry kind='table' SqlTable nodes, so they
+  survive an inner join.  The #38-class red-check is carried by Guard 4
+  (WHERE kind-filter removal leaks CTE rows) and Guard 2 (Half-A revert);
+  see their docstrings.)
 
   MCP parity note: ``TRACE_COLUMN_LINEAGE`` / ``GET_UPSTREAM_DEPENDENCIES``
   are raw (no kind IN filter).  Guard 1 post-filters the raw MCP rows
@@ -152,14 +157,17 @@ def test_g1_cli_filtered_upstream_recalls_physical_sources(indexed_db):
     """CLI filtered upstream returns both physical sources through ≥2-CTE-hop chain.
 
     Shape A + B: 4-hop chain (j←u←a←staging.src_a), UNION ALL branch (b←staging.src_b).
-    Reverting the kind-filter from OPTIONAL JOIN to inner JOIN reds this test.
+    Reds when a recall regression drops a physical source from the filtered
+    surface (e.g. a #49-class edge drop). The #38 inner-join revert specifically
+    does NOT red this fixture (Half A keeps src_a/src_b's SqlTable nodes); that
+    case is covered by Guard 4 and Guard 2.
     """
     db, _ = indexed_db
     ids = _cli_upstream_ids(db, "mart.fact_kpi.measure")
 
     assert ids, (
         "CLI filtered upstream returned no results for mart.fact_kpi.measure — "
-        "kind filter may have been reverted to inner-join (regression #38)."
+        "a filter-layer recall regression dropped the physical sources."
     )
     assert "staging.src_a.x" in ids, (
         f"staging.src_a.x not in CLI filtered upstream.\nReturned: {sorted(ids)}"
