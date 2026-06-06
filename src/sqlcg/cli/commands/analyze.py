@@ -139,6 +139,7 @@ def upstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
+    ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
     sql = _upstream_sql(depth, include_intermediate)
     results = run_read_routed(sql, {"ref": ref})
     if not results and len(ref.split(".")) >= 3:
@@ -175,6 +176,7 @@ def downstream(  # noqa: B008
         console.print("[red]Error: --depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
+    ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
     sql = _downstream_sql(depth, include_intermediate)
     results = run_read_routed(sql, {"ref": ref})
     if not results and len(ref.split(".")) >= 3:
@@ -291,7 +293,12 @@ def unused(
 
 
 def _bare_ref(ref: str) -> str:
-    """Strip schema prefix from a ref string, keeping table.column."""
+    """Strip schema prefix from a ref string, keeping table.column.
+
+    Lowercases defensively so this is safe to call even if the caller did not
+    first fold the ref — graph keys are lowercased at index time (C2 normalization).
+    """
+    ref = ref.lower()
     parts = ref.split(".")
     if len(parts) >= 3:
         return ".".join(parts[1:])
