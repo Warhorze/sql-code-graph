@@ -79,8 +79,7 @@ Schema aliases (staging schema → canonical schema) can be configured in
 | --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
 | --timeout-per-file | INTEGER | No | No | 10 | Timeout per file in seconds |
-| --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
-| --batch-size | INTEGER | No | No | 50 | Files per KuzuDB transaction in the upsert pass. Default 50 balances commit-overhead reduction (vs. legacy per-file commits) against per-batch memory cost. Lower values are safer for memory-constrained machines; higher values give marginal speedup at the cost of larger working sets. Set to 1 to reproduce legacy per-file commit behaviour. |
+| --batch-size | INTEGER | No | No | 50 | Files per DuckDB transaction in the upsert pass. Default 50 balances commit-overhead reduction (vs. legacy per-file commits) against per-batch memory cost. Lower values are safer for memory-constrained machines; higher values give marginal speedup at the cost of larger working sets. Set to 1 to reproduce legacy per-file commit behaviour. |
 | --no-ddl | BOOLEAN | No | No | False | Skip table-node upserts for DDL-only files |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary console output |
 | --verbose, -v | BOOLEAN | No | No | False | Print parse warnings to stderr instead of log file |
@@ -219,7 +218,7 @@ sqlcg uninstall [OPTIONS]
 Uninstall sqlcg from Claude Code and optionally clean up resources.
 
 Step 1: Remove MCP registration from ~/.claude/settings.json
-Step 2: Optionally delete the KùzuDB graph database
+Step 2: Optionally delete the DuckDB graph database
 Step 3: Remove git hook sentinel block from .git/hooks/post-checkout
 Step 4: Remove sqlcg skill directory from ~/.claude/skills/sqlcg/ and
         <repo>/.claude/skills/sqlcg/
@@ -275,7 +274,7 @@ Initialise the graph database (idempotent).
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --buffer-pool-size | INTEGER | No | No | 0 | KuzuDB buffer pool size in MB (0 = default). Set to 256-512 on memory-constrained machines. |
+| _none_ |  |  |  |  |  |
 
 ## `sqlcg db reset`
 
@@ -448,13 +447,6 @@ sqlcg analyze failures [OPTIONS]
 ```
 
 List files that failed to parse, with their dominant cause (E-code bucket).
-
-Valid --cause buckets (from highest to lowest severity):
-timeout, E8, E3, E2, E5, E1, qualify_failed, func_fallback, pure_ddl_skip.
-
-Requires a graph indexed with sqlcg >= v3 (schema version 3). Re-index
-with 'sqlcg db reset && sqlcg index <path>' if the graph was built with
-an earlier version.
 
 ### Options
 
