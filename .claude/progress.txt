@@ -1,10 +1,46 @@
-## Current State — developer: kuzu-to-duckdb-migration [2026-06-05]
+## Current State — developer: v1.4.1-lineage-bugfix PR-2 [2026-06-06]
 
 ACTIVE AGENT: developer
-FEATURE: kuzu-to-duckdb-migration
-BRANCH: feat/duckdb-migration
-PLAN: plan/feature_kuzu_to_duckdb_migration.md
-STATUS: IN PROGRESS — Phase 1 starting
+FEATURE: v1.4.1-lineage-bugfix PR-2 (#50 case-fold analyze anchor)
+BRANCH: fix/issue-50-analyze-case-fold
+PLAN: plan/v1.4.1_lineage_bugfix.md (read from plan/v1.4.1-lineage-bugfix branch)
+STATUS: PR opened — ready for architect-planner compliance check
+
+ENTRY-POINT PARITY AUDIT RESULT:
+  - CLI analyze.py upstream/downstream: FIXED (ref.lower() added to both)
+  - CLI analyze.py _bare_ref: defensive ref.lower() added
+  - MCP tools.py: already folded (col_ref.lower() ~323, direct .lower() ~798/845/902/978/1725)
+  - CLI find.py: already folded (lines 19 and 41)
+  - CLI analyze.py impact: table-only, out of #50 scope — noted in PR body
+
+NEW FILES:
+  - src/sqlcg/cli/commands/analyze.py (ref.lower() + _bare_ref defensive lower)
+  - tests/unit/test_analyze_case_fold.py — 8 unit tests (Typer runner + mock, upstream+downstream)
+  - tests/integration/test_analyze_case_fold.py — 6 integration tests (real DuckDB + _bare_ref)
+
+ALL GATES GREEN: 879 passed, 4 skipped, 1 xfailed (159s)
+
+---
+
+## Handoff — developer: v1.4.1-lineage-bugfix PR-1 [2026-06-06]
+
+ACTIVE AGENT: developer
+FEATURE: v1.4.1-lineage-bugfix PR-1 (#40 surface guards — test-infra only)
+BRANCH: test/v1.4.1-surface-guards
+PLAN: plan/v1.4.1_lineage_bugfix.md (read from plan/v1.4.1-lineage-bugfix branch)
+STATUS: PR opened — ready for architect-planner compliance check
+
+NEW TEST FILES:
+  - tests/integration/test_v141_surface_guards.py — Guard 1 (CLI+MCP surface recall, ≥2-CTE-hop + UNION-ALL) + Guard 4 (cte-leak / kind-suppression, #45 folded guard)
+  - tests/unit/test_graph_completeness_invariant.py — Guard 2 (SqlTable node existence invariant)
+  - tests/integration/test_cte_schema_alias_guard.py — Guard 3 (schema_alias filtered-surface, extended to assert filtered upstream ids)
+
+ALL GATES GREEN: 865 passed, 4 skipped, 1 xfailed (165s)
+REINTRODUCED-#38 CHECK: confirmed — reverting LEFT JOIN to INNER JOIN on the recursive CTE
+  first hop drops j.m2/j.d (kind='cte' nodes) so recursion never reaches staging.src_a;
+  test_g1_cli_filtered_upstream_recalls_physical_sources would go red.
+
+---
 
 ---
 
