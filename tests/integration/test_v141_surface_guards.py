@@ -367,3 +367,124 @@ def test_g4_cte_kind_nodes_absent_from_filtered_downstream(indexed_db):
         f"Terminal sink mart.fact_kpi.measure not in downstream output.\n"
         f"Returned: {sorted(cli_ids)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Guard 5 — #49 bare-column mis-bind override (PR-3 regression guard)
+#
+# This fixture pins the base.py CTE-projection override so a future revert of
+# the PR-3 change reds this guard.  The exact repro is from V1.4.0_BUG_VERIFICATION.md.
+# ---------------------------------------------------------------------------
+
+_DDL_G5 = """\
+CREATE TABLE staging.src_events (d VARCHAR, amount NUMBER);
+CREATE TABLE mart.fact_daily (d VARCHAR, m NUMBER);
+CREATE TABLE mart.dim_time (d VARCHAR, dayname VARCHAR);
+CREATE TABLE mart.fact_enriched (d VARCHAR, m NUMBER);
+"""
+
+_FACT_DAILY_G5 = """\
+INSERT INTO mart.fact_daily (d, m)
+SELECT s.d AS d, SUM(s.amount) AS m FROM staging.src_events s GROUP BY ALL;
+"""
+
+_ENRICHED_G5 = """\
+INSERT INTO mart.fact_enriched (d, m)
+WITH base AS (
+    SELECT f.d AS d,
+           SUM(CASE WHEN dt.dayname = 'sunday' THEN m ELSE 0 END) AS m
+    FROM mart.fact_daily f
+    JOIN mart.dim_time dt ON dt.d = f.d
+    GROUP BY ALL
+)
+SELECT d, m FROM base;
+"""
+
+
+@pytest.fixture
+def g5_db():
+    """Fresh in-memory DuckDB backend for Guard 5."""
+    backend = DuckDBBackend(":memory:")
+    backend.init_schema()
+    yield backend
+    backend.close()
+
+
+@pytest.fixture
+def g5_indexed(g5_db, tmp_path):
+    """Index the #49 repro corpus; return (db, tmp_path)."""
+    (tmp_path / "00_ddl.sql").write_text(_DDL_G5)
+    (tmp_path / "01_fact_daily.sql").write_text(_FACT_DAILY_G5)
+    (tmp_path / "02_enriched.sql").write_text(_ENRICHED_G5)
+    Indexer().index_repo(tmp_path, dialect=None, db=g5_db, use_git=False)
+    return g5_db, tmp_path
+
+
+def test_g5_wrong_misbind_edge_is_absent(g5_indexed):
+    """Guard 5: the wrong mis-bound edge mart.dim_time.dayname -> base.m MUST NOT exist.
+
+    Reverting the PR-3 base.py change reintroduces this edge and reds this guard.
+    """
+    db, _ = g5_indexed
+    edges = db.run_read(
+        'SELECT src_key, dst_key, transform FROM "COLUMN_LINEAGE"',
+        {},
+    )
+    wrong_edges = [
+        e for e in edges if e["src_key"] == "mart.dim_time.dayname" and e["dst_key"] == "base.m"
+    ]
+    assert not wrong_edges, (
+        f"WRONG mis-bound edge 'mart.dim_time.dayname -> base.m' is PRESENT "
+        f"— the #49 override was reverted or is not active.\n"
+        f"All edges: {[(e['src_key'], e['dst_key'], e['transform']) for e in edges]}"
+    )
+
+
+def test_g5_correct_source_edge_is_present(g5_indexed):
+    """Guard 5: the correct source mart.fact_daily.m -> base.m MUST exist.
+
+    This edge was absent in v1.4.0 (the bug). Reverting PR-3 removes it again.
+    """
+    db, _ = g5_indexed
+    edges = db.run_read(
+        'SELECT src_key, dst_key, transform, confidence FROM "COLUMN_LINEAGE"',
+        {},
+    )
+    correct_edges = [
+        e for e in edges if e["src_key"] == "mart.fact_daily.m" and e["dst_key"] == "base.m"
+    ]
+    assert correct_edges, (
+        f"Correct edge 'mart.fact_daily.m -> base.m' is ABSENT.\n"
+        f"All edges: {[(e['src_key'], e['dst_key'], e['transform']) for e in edges]}"
+    )
+    edge = correct_edges[0]
+    assert edge["transform"] == "CTE_PROJECTION_AMBIGUOUS", (
+        f"Expected transform='CTE_PROJECTION_AMBIGUOUS', got '{edge['transform']}'"
+    )
+
+
+def test_g5_filtered_upstream_reaches_src_events_not_dim_time(g5_indexed):
+    """Guard 5: filtered upstream of mart.fact_enriched.m reaches src_events, not dim_time.
+
+    In v1.4.0 the chain was wrong: fact_enriched.m <- base.m <- dim_time.dayname.
+    After PR-3: the chain resolves through fact_daily to staging.src_events.amount.
+    """
+    db, _ = g5_indexed
+    query = _upstream_sql(5, include_intermediate=False)
+    rows = db.run_read(query, {"ref": "mart.fact_enriched.m"})
+    ids = {r["id"] for r in rows}
+
+    assert ids, (
+        "Filtered upstream of mart.fact_enriched.m returned no results.\n"
+        "Guard 5 requires a non-empty result — the override may have dropped edges."
+    )
+    dim_time_wrong = {rid for rid in ids if "dim_time" in rid and "dayname" in rid}
+    assert not dim_time_wrong, (
+        f"mart.dim_time.dayname in filtered upstream — mis-bind not suppressed.\n"
+        f"Returned: {sorted(ids)}"
+    )
+    src_events_ids = {rid for rid in ids if "src_events" in rid}
+    assert src_events_ids, (
+        f"staging.src_events.* NOT in filtered upstream of mart.fact_enriched.m.\n"
+        f"Returned: {sorted(ids)}"
+    )

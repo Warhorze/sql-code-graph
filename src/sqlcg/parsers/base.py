@@ -515,6 +515,32 @@ class SqlParser(ABC):
         _walk(root)
         return edges
 
+    def _table_node_to_ref(self, table_node: Any) -> "TableRef | None":
+        """Convert a sqlglot exp.Table AST node to a TableRef.
+
+        Used by the #49 mis-bind override to enumerate candidate source tables
+        from a CTE body's FROM/JOIN once per CTE body (before the per-projection
+        loop).  Does NOT call qualify/build_scope — preserves the O(1)-per-body
+        perf invariant.
+
+        Schema aliases are applied via _apply_table_alias so the emitted edges
+        carry the canonical (post-alias) table identity.
+
+        Args:
+            table_node: sqlglot.expressions.Table AST node
+
+        Returns:
+            TableRef with catalog/db/name extracted and alias-resolved, or None
+            if the alias resolution returns None (treated as an unresolvable ref).
+        """
+        return self._apply_table_alias(
+            TableRef(
+                catalog=table_node.catalog if table_node.catalog else None,
+                db=table_node.db if table_node.db else None,
+                name=table_node.name if table_node.name else str(table_node),
+            )
+        )
+
     def _lineage_node_to_table_ref(self, node: Any) -> "TableRef | None":
         """Extract a TableRef from a sqlglot LineageNode's source attribute.
 
@@ -987,6 +1013,20 @@ class SqlParser(ABC):
                             # string for every column rather than re-serializing O(N_cols) times.
                             cte_body_sql = cte_body.sql(dialect=self.DIALECT)
 
+                            # Compute the candidate source-table set ONCE per CTE body
+                            # (before the per-projection loop) — never inside it.
+                            # Uses find_all(exp.Table) on the already-built AST; does NOT
+                            # call qualify/build_scope, preserving O(1) per CTE body.
+                            # This set is reused across all projections to detect ambiguity
+                            # (#49 mis-bind override).
+                            cte_source_tables: list[TableRef] = [
+                                ref
+                                for t in cte_body.find_all(exp.Table)
+                                if t.name  # skip anonymous / subquery placeholders
+                                for ref in (self._table_node_to_ref(t),)
+                                if ref is not None
+                            ]
+
                             # For each projection in the CTE, extract lineage.
                             # Only iterate projections from left branch for column names, but pass
                             # entire Union body to sg_lineage so sqlglot resolves both branches.
@@ -1010,6 +1050,48 @@ class SqlParser(ABC):
                                 )
                                 if not cte_col_name or cte_col_name == "*":
                                     continue
+
+                                # #49 mis-bind override: detect bare (unqualified) columns
+                                # in a ≥2-table CTE body.
+                                #
+                                # sqlglot's sg_lineage (called with no schema and no scope)
+                                # re-qualifies the CTE body internally and mis-binds bare
+                                # columns to the last-joined table — emitting a confident
+                                # WRONG edge (confirmed live: bare `m` from fact_daily was
+                                # bound to dim_time). This is not a missing edge; it is an
+                                # incorrect one.
+                                #
+                                # Override: when any bare column appears inside the projection
+                                # expression AND the CTE body has ≥2 source tables, skip
+                                # sg_lineage for this projection and instead emit one
+                                # CTE_PROJECTION_AMBIGUOUS edge per candidate source table
+                                # (confidence=0.5). Over-attribution is the safe failure mode
+                                # for impact analysis; a wrong single edge is not acceptable.
+                                #
+                                # Single-table bodies: no ambiguity; existing path unchanged.
+                                # Qualified columns in any body: no bare columns; existing path.
+                                bare_cols_in_expr = [
+                                    c
+                                    for c in cte_col_expr.find_all(exp.Column)
+                                    if not c.table  # bare = no qualifier
+                                ]
+                                if bare_cols_in_expr and len(cte_source_tables) >= 2:
+                                    # Emit one ambiguous edge per candidate source table.
+                                    # bare_col.name is the column name to attribute;
+                                    # for aggregates/CASE the bare col name is the leaf.
+                                    bare_col_name = bare_cols_in_expr[0].name or cte_col_name
+                                    dst_col_ref = ColumnRef(cte_dst_table, cte_col_name)
+                                    for src_tbl in cte_source_tables:
+                                        edges.append(
+                                            LineageEdge(
+                                                src=ColumnRef(src_tbl, bare_col_name),
+                                                dst=dst_col_ref,
+                                                transform="CTE_PROJECTION_AMBIGUOUS",
+                                                confidence=0.5,
+                                            )
+                                        )
+                                    continue  # skip sg_lineage for this projection
+
                                 try:
                                     # No schema: resolver.as_dict() {table:[cols]} triggers
                                     # sqlglot nesting-level errors on fresh string parses.
