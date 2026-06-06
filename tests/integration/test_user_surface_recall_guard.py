@@ -23,10 +23,9 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.cli.commands.analyze import _kind_filter
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.cli.commands.analyze import _downstream_sql, _upstream_sql
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import TRACE_COLUMN_LINEAGE_QUERY
-from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.indexer import Indexer
 
 # ---------------------------------------------------------------------------
@@ -60,8 +59,8 @@ SELECT m2, d FROM j;
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB with schema initialised (ported from KuzuDB in Phase 3)."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -82,20 +81,12 @@ def indexed_db(db, tmp_path):
 
 
 def _upstream_filtered_query(depth: int = 5) -> str:
-    """Build the exact upstream query analyze.py constructs with kind_filter ON.
+    """Build the exact upstream SQL query analyze.py constructs with kind_filter ON.
 
-    Imports _kind_filter from production so any regression there reds these tests.
+    Uses production _upstream_sql() so any regression in analyze.py reds these tests
+    (Phase 3 port: replaces the old Cypher _kind_filter() helper).
     """
-    kf = _kind_filter("src", include_intermediate=False)
-    return (
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kf}"
-        f"OPTIONAL MATCH (src)-[srcedge:{RelType.COLUMN_LINEAGE}]->() "
-        "OPTIONAL MATCH (q:SqlQuery {id: srcedge.query_id}) "
-        "WITH src, min(q.start_line) AS line, min(q.file_path) AS file "
-        "RETURN src.id AS id, file AS file, line AS line LIMIT 100"
-    )
+    return _upstream_sql(depth, include_intermediate=False)
 
 
 def _mcp_upstream_ids(db, col_id: str, depth: int = 10) -> set[str]:
@@ -344,7 +335,7 @@ def test_tc7_cte_only_source_is_findable(indexed_db):
 
     # Check SqlTable node exists for the CTE-only source
     rows = db.run_read(
-        f"MATCH (t:{NodeLabel.TABLE} {{qualified: $q}}) RETURN t.qualified AS q, t.kind AS kind",
+        'SELECT qualified AS q, kind FROM "SqlTable" WHERE qualified = ?',
         {"q": "staging.src_a"},
     )
     assert rows, (
@@ -362,9 +353,9 @@ def test_tc7_cte_only_source_is_findable(indexed_db):
     # Verify staging.src_a is reachable via COLUMN_LINEAGE traversal
     # (confirms the #39 node is connected to the lineage graph)
     lineage_rows = db.run_read(
-        f"MATCH (src:{NodeLabel.COLUMN})-[:{RelType.COLUMN_LINEAGE}]->() "
-        "WHERE src.table_qualified = 'staging.src_a' "
-        "RETURN src.id AS id LIMIT 5",
+        'SELECT c.id AS id FROM "SqlColumn" c '
+        'JOIN "COLUMN_LINEAGE" cl ON cl.src_key = c.id '
+        "WHERE c.table_qualified = 'staging.src_a' LIMIT 5",
         {},
     )
     assert lineage_rows, (
@@ -379,23 +370,12 @@ def test_tc7_cte_only_source_is_findable(indexed_db):
 
 
 def _downstream_filtered_query(depth: int = 5) -> str:
-    """Build the exact downstream query analyze.py constructs with kind_filter ON.
+    """Build the exact downstream SQL query analyze.py constructs with kind_filter ON.
 
-    Uses the production _kind_filter("dst", ...) so any regression there reds
-    this test — mirrors the upstream helper above, direction reversed.
-    Drives the user-facing analyze downstream path, not raw COLUMN_LINEAGE
-    traversal (ARCHITECTURE_REVIEW.md §19.3).
+    Uses production _downstream_sql() so any regression in analyze.py reds this test
+    (Phase 3 port: replaces the old Cypher _kind_filter("dst", ...) helper).
     """
-    kf = _kind_filter("dst", include_intermediate=False)
-    return (
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"-[:{RelType.COLUMN_LINEAGE}*1..{depth}]->(dst:{NodeLabel.COLUMN}) "
-        f"{kf}"
-        f"OPTIONAL MATCH ()-[dstedge:{RelType.COLUMN_LINEAGE}]->(dst) "
-        "OPTIONAL MATCH (q:SqlQuery {id: dstedge.query_id}) "
-        "WITH dst, min(q.start_line) AS line, min(q.file_path) AS file "
-        "RETURN dst.id AS id, file AS file, line AS line LIMIT 100"
-    )
+    return _downstream_sql(depth, include_intermediate=False)
 
 
 def test_tc6b_downstream_sink_location_present(indexed_db):
@@ -419,8 +399,7 @@ def test_tc6b_downstream_sink_location_present(indexed_db):
     # First confirm mart.fact_kpi.measure has zero outgoing COLUMN_LINEAGE edges —
     # if this assertion fails, the fixture changed and the sink choice is wrong.
     outgoing_count = db.run_read(
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $id}})-[:{RelType.COLUMN_LINEAGE}]->() "
-        "RETURN count(*) AS n",
+        'SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE src_key = ?',
         {"id": "mart.fact_kpi.measure"},
     )
     sink_outgoing = outgoing_count[0]["n"] if outgoing_count else 0

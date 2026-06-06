@@ -773,9 +773,13 @@ class Indexer:
         for cl_path in closure_files:
             try:
                 cl_rows = db.run_read(
-                    "MATCH (f:File {path: $path})<-[:QUERY_DEFINED_IN]-(q:SqlQuery) "
-                    "MATCH (q)-[:SELECTS_FROM]->(t:SqlTable) "
-                    "RETURN DISTINCT t.name AS name",
+                    "SELECT DISTINCT t.name AS name"
+                    ' FROM "File" f'
+                    ' JOIN "QUERY_DEFINED_IN" qdi ON qdi.dst_key = f.path'
+                    ' JOIN "SqlQuery" q ON q.id = qdi.src_key'
+                    ' JOIN "SELECTS_FROM" sf ON sf.src_key = q.id'
+                    ' JOIN "SqlTable" t ON t.qualified = sf.dst_key'
+                    " WHERE f.path = ?",
                     {"path": cl_path},
                 )
                 for row in cl_rows:
@@ -794,17 +798,21 @@ class Indexer:
             # first, but we do a broader search since the table might be qualified differently.
             try:
                 def_rows = db.run_read(
-                    "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
-                    "WHERE t.name = $name "
-                    "RETURN DISTINCT f.path AS file_path",
-                    {"name": bare_name.upper()},
+                    "SELECT DISTINCT f.path AS file_path"
+                    ' FROM "SqlTable" t'
+                    ' JOIN "DEFINED_IN" di ON di.src_key = t.qualified'
+                    ' JOIN "File" f ON f.path = di.dst_key'
+                    " WHERE upper(t.name) = upper(?)",
+                    {"name": bare_name},
                 )
                 if not def_rows:
-                    # Try lowercase match
+                    # Try bare lowercase match
                     def_rows = db.run_read(
-                        "MATCH (t:SqlTable)-[:DEFINED_IN]->(f:File) "
-                        "WHERE t.name = $name "
-                        "RETURN DISTINCT f.path AS file_path",
+                        "SELECT DISTINCT f.path AS file_path"
+                        ' FROM "SqlTable" t'
+                        ' JOIN "DEFINED_IN" di ON di.src_key = t.qualified'
+                        ' JOIN "File" f ON f.path = di.dst_key'
+                        " WHERE lower(t.name) = lower(?)",
                         {"name": bare_name},
                     )
                 for row in def_rows:
@@ -1369,32 +1377,15 @@ class Indexer:
         return file_rows.counts
 
     def _expand_star_sources(self, db: GraphBackend) -> int:
-        """Run the post-ingestion star expansion query.
+        """Run the post-ingestion star expansion.
+
+        Calls the three-step DML expand_star_sources() method which returns the
+        total STAR_EXPANSION edge count.
 
         Returns:
-            Number of COLUMN_LINEAGE edges created by the expansion
+            Number of COLUMN_LINEAGE STAR_EXPANSION edges after expansion.
         """
-        from sqlcg.core.queries import EXPAND_STAR_SOURCES_QUERY
-
-        # Count COLUMN_LINEAGE edges before expansion
-        before = db.run_read(
-            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
-            {},
-        )
-        before_count = before[0]["n"] if before else 0
-
-        # Run the expansion query (without explicit transaction, as caller may already be in one)
-        db.run_read(EXPAND_STAR_SOURCES_QUERY, {})
-
-        # Count COLUMN_LINEAGE edges after expansion
-        after = db.run_read(
-            "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
-            {},
-        )
-        after_count = after[0]["n"] if after else 0
-
-        # Return the number of new edges created
-        return max(0, after_count - before_count)
+        return db.expand_star_sources()
 
     def _ingest_external_consumers(self, db: GraphBackend, path: Path) -> dict:
         """Ingest declared external downstream consumers from .sqlcg.toml.
@@ -1417,10 +1408,10 @@ class Indexer:
         for spec in specs:
             all_targets.extend(spec.consumes)
 
-        # Single UNWIND round-trip to check which targets exist as SqlTable nodes
+        # Single round-trip to check which targets exist as SqlTable nodes
         if all_targets:
             existing_rows = db.run_read(
-                "UNWIND $names AS n MATCH (t:SqlTable {qualified: n}) RETURN n AS qualified",
+                'SELECT qualified FROM "SqlTable" WHERE qualified = ANY(?)',
                 {"names": all_targets},
             )
             existing_tables: set[str] = {row["qualified"] for row in existing_rows}

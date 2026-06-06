@@ -15,7 +15,7 @@ from sqlcg.core.config import (
 class NoiseFilter:
     """Config-driven filter for backup tables and schema-alias mirrors.
 
-    Loaded once per tool call from KuzuConfig.from_env().db_path parent dir
+    Loaded once per tool call from DbConfig.from_env().db_path parent dir
     (falls back to cwd). All methods are pure — no graph calls.
     """
 

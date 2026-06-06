@@ -7,7 +7,7 @@ import pytest
 
 from sqlcg.server.exceptions import NotIndexedError
 from sqlcg.server.tools import (
-    execute_cypher,
+    execute_sql,
     find_table_usages,
     get_downstream_dependencies,
     get_upstream_dependencies,
@@ -212,87 +212,82 @@ class TestListDialectsAndRepos:
         assert isinstance(result.repos, list)
 
 
-class TestExecuteCypher:
-    """Tests for execute_cypher tool."""
+class TestExecuteSql:
+    """Tests for execute_sql tool (renamed from execute_cypher, Phase 3 DuckDB port)."""
 
-    def test_execute_cypher_read_only_query_succeeds(self, indexed_graph):
-        """Test that execute_cypher executes read-only queries."""
-        result = execute_cypher("MATCH (n:Repo) RETURN n.path AS path LIMIT 10")
+    def test_execute_sql_read_only_query_succeeds(self, indexed_graph):
+        """Test that execute_sql executes read-only SQL queries."""
+        result = execute_sql('SELECT path FROM "Repo" LIMIT 10')
         assert isinstance(result, list)
 
-    def test_execute_cypher_blocklist_rejects_create(self, tmp_path):
-        """Test that execute_cypher rejects CREATE operations."""
+    def test_execute_sql_blocklist_rejects_create(self, tmp_path):
+        """Test that execute_sql rejects CREATE operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("CREATE NODE TABLE Test (id STRING PRIMARY KEY)")
+            execute_sql("CREATE TABLE Test (id VARCHAR PRIMARY KEY)")
 
-    def test_execute_cypher_blocklist_rejects_merge(self, tmp_path):
-        """Test that execute_cypher rejects MERGE operations."""
+    def test_execute_sql_blocklist_rejects_merge(self, tmp_path):
+        """Test that execute_sql rejects MERGE operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("MERGE (n:Test {id: 1})")
+            execute_sql("MERGE INTO Test USING (SELECT 1 AS id) src ON Test.id = src.id")
 
-    def test_execute_cypher_blocklist_rejects_delete(self, tmp_path):
-        """Test that execute_cypher rejects DELETE operations."""
+    def test_execute_sql_blocklist_rejects_delete(self, tmp_path):
+        """Test that execute_sql rejects DELETE operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("MATCH (n:Test) DELETE n")
+            execute_sql('DELETE FROM "Repo" WHERE path = ?')
 
-    def test_execute_cypher_blocklist_rejects_set(self, tmp_path):
-        """Test that execute_cypher rejects SET operations."""
+    def test_execute_sql_blocklist_rejects_insert(self, tmp_path):
+        """Test that execute_sql rejects INSERT operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("MATCH (n:Test) SET n.field = 'value'")
+            execute_sql("INSERT INTO \"Repo\" (path) VALUES ('x')")
 
-    def test_execute_cypher_blocklist_rejects_drop(self, tmp_path):
-        """Test that execute_cypher rejects DROP operations."""
+    def test_execute_sql_blocklist_rejects_drop(self, tmp_path):
+        """Test that execute_sql rejects DROP operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("DROP TABLE Test")
+            execute_sql('DROP TABLE "Repo"')
 
-    def test_execute_cypher_blocklist_rejects_truncate(self, tmp_path):
-        """Test that execute_cypher rejects TRUNCATE operations."""
+    def test_execute_sql_blocklist_rejects_truncate(self, tmp_path):
+        """Test that execute_sql rejects TRUNCATE operations."""
         db_path = str(tmp_path / "test.db")
         init_backend(db_path)
         with pytest.raises(ValueError, match="Write operations are not permitted"):
-            execute_cypher("TRUNCATE TABLE Test")
+            execute_sql('TRUNCATE TABLE "Repo"')
 
-    def test_execute_cypher_string_literal_bypasses_blocklist(self, indexed_graph):
+    def test_execute_sql_string_literal_bypasses_blocklist(self, indexed_graph):
         """Test that mutation keywords inside string literals are stripped.
 
         A query with 'DROP TABLE' in a string literal should succeed
         because the blocklist check strips string literals first.
         """
-        # This query looks for nodes where the property contains DROP TABLE
-        result = execute_cypher(
-            "MATCH (n:SqlQuery) WHERE contains(n.sql, 'DROP TABLE') RETURN n LIMIT 1"
-        )
+        result = execute_sql("SELECT id FROM \"SqlQuery\" WHERE sql LIKE '%DROP TABLE%' LIMIT 1")
         assert isinstance(result, list)
 
-    def test_execute_cypher_auto_limit_appended(self, indexed_graph):
+    def test_execute_sql_auto_limit_appended(self, indexed_graph):
         """Test that LIMIT is auto-appended if missing."""
-        # This should not raise even though there's no LIMIT
-        result = execute_cypher("MATCH (n:Repo) RETURN n")
+        result = execute_sql('SELECT path FROM "Repo"')
         assert isinstance(result, list)
-        # Result should be limited to 500
         assert len(result) <= 500
 
-    def test_execute_cypher_existing_limit_not_duplicated(self, indexed_graph):
+    def test_execute_sql_existing_limit_not_duplicated(self, indexed_graph):
         """Test that existing LIMIT is not duplicated."""
-        result = execute_cypher("MATCH (n:Repo) RETURN n LIMIT 5")
+        result = execute_sql('SELECT path FROM "Repo" LIMIT 5')
         assert isinstance(result, list)
         assert len(result) <= 5
 
-    def test_execute_cypher_limit_not_fooled_by_string_literal(self, indexed_graph):
+    def test_execute_sql_limit_not_fooled_by_string_literal(self, indexed_graph):
         """Query with 'limit' in a string literal should still get LIMIT 500 appended.
 
         Regression test for C1: the LIMIT check must use stripped query, not original.
         A query like WHERE x = 'limit test' should still get LIMIT 500 appended.
         """
-        result = execute_cypher("MATCH (n:SqlQuery) WHERE contains(n.sql, 'limit test') RETURN n")
+        result = execute_sql("SELECT id FROM \"SqlQuery\" WHERE sql LIKE '%limit test%'")
         assert isinstance(result, list)

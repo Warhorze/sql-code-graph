@@ -21,7 +21,7 @@ console = Console()
 # Client-side socket timeout for the --notify control-socket path.
 # A real DWH server-side resync_changed measured ~89 s (41 changed files + closure);
 # 300 s covers that with headroom while keeping the wait bounded on a wedged server.
-# This is a CLI transport bound, NOT a KuzuConfig/indexer constant.
+# This is a CLI transport bound, NOT a DbConfig/indexer constant.
 _NOTIFY_SOCKET_TIMEOUT_S = 300
 
 

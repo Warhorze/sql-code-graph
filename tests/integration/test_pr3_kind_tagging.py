@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import TRACE_COLUMN_LINEAGE_QUERY
 from sqlcg.indexer.indexer import Indexer
 
@@ -29,7 +29,7 @@ from sqlcg.indexer.indexer import Indexer
 @pytest.fixture
 def db():
     """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -57,7 +57,7 @@ def test_scenario_a_cte_node_has_kind_cte(db, tmp_path):
 
     # Query all SqlTable nodes and their kinds
     rows = db.run_read(
-        "MATCH (t:SqlTable) RETURN t.qualified AS qualified, t.kind AS kind",
+        'SELECT qualified, kind FROM "SqlTable"',
         {},
     )
     table_by_qualified = {r["qualified"]: r["kind"] for r in rows}
@@ -98,7 +98,7 @@ def test_scenario_b_output_sink_not_in_graph(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
     rows = db.run_read(
-        "MATCH (t:SqlTable) WHERE t.qualified = '<output>' RETURN t.qualified AS qualified",
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified = '<output>'",
         {},
     )
     assert len(rows) == 0, (
@@ -208,8 +208,10 @@ def test_scenario_d_impact_noise_filter_and_raw(db, tmp_path):
 
     # Verify both queries exist in the graph before filtering
     all_impact = db.run_read(
-        "MATCH (t:SqlTable {qualified: 'src'})<-[:SELECTS_FROM]-(q:SqlQuery) "
-        "RETURN DISTINCT q.id AS id, q.target_table AS target LIMIT 100",
+        "SELECT DISTINCT q.id AS id, q.target_table AS target "
+        'FROM "SqlQuery" q '
+        'JOIN "SELECTS_FROM" sf ON sf.src_key = q.id '
+        "WHERE sf.dst_key = 'src' LIMIT 100",
         {},
     )
     assert len(all_impact) == 2, (

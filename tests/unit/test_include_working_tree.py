@@ -167,7 +167,6 @@ def _call_index_cmd(
             dialect=None,
             dbt_manifest=None,
             timeout_per_file=30,
-            buffer_pool_size=0,
             no_ddl=False,
             quiet=True,
             include_working_tree=include_working_tree,

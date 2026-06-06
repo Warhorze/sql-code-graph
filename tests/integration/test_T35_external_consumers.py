@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import sqlcg.server.tools as tools
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 # Symbols introduced by #35 — skip guard so suite stays runnable before the feature lands.
@@ -83,13 +83,13 @@ def _index_fixture(
     tmp_path: Path,
     extra_files: dict[str, str],
     monkeypatch,
-) -> KuzuBackend:
+) -> DuckDBBackend:
     """Write fixtures, index into fresh in-memory graph, wire as tools backend."""
     files = {**_FIXTURE_SQL, **extra_files}
     for name, sql in files.items():
         (tmp_path / name).write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})
     Indexer().index_repo(tmp_path, dialect=None, db=backend)
@@ -162,10 +162,10 @@ def test_T35_init_schema_creates_external_consumer_table(tmp_path):
     if not _SCHEMA_AVAILABLE:
         pytest.skip("NodeLabel.EXTERNAL_CONSUMER not yet implemented (#35 PR-1)")
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
-    rows = backend.run_read("MATCH (e:ExternalConsumer) RETURN count(e) AS n", {})
+    rows = backend.run_read('SELECT count(*) AS n FROM "ExternalConsumer"', {})
     count = rows[0]["n"] if rows else None
     assert count == 0, (
         f"ExternalConsumer table must exist and be empty post-init; got count={count}"
@@ -199,7 +199,7 @@ def test_T35_upsert_nodes_bulk_external_consumer_uses_name_pk(tmp_path):
 
     from sqlcg.core.schema import NodeLabel
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
     backend.upsert_nodes_bulk(
@@ -208,7 +208,8 @@ def test_T35_upsert_nodes_bulk_external_consumer_uses_name_pk(tmp_path):
     )
 
     rows = backend.run_read(
-        "MATCH (e:ExternalConsumer {name: 'Tableau: Sales'}) RETURN e.consumer_type AS ct", {}
+        'SELECT consumer_type AS ct FROM "ExternalConsumer" WHERE name = ?',
+        {"name": "Tableau: Sales"},
     )
     assert len(rows) == 1, f"Expected 1 ExternalConsumer row; got {len(rows)}"
     assert rows[0]["ct"] == "tableau", f"consumer_type must be 'tableau'; got {rows[0]['ct']!r}"
@@ -232,14 +233,12 @@ def test_T35_IDX_1_ingestion_persists_consumers_and_edges(tmp_path, monkeypatch)
         monkeypatch,
     )
 
-    consumer_rows = backend.run_read(
-        "MATCH (e:ExternalConsumer) RETURN e.name AS name, e.consumer_type AS ct", {}
-    )
+    consumer_rows = backend.run_read('SELECT name, consumer_type AS ct FROM "ExternalConsumer"', {})
     assert len(consumer_rows) == 2, (
         f"Expected 2 ExternalConsumer nodes; got {len(consumer_rows)}: {consumer_rows}"
     )
 
-    edge_rows = backend.run_read("MATCH ()-[r:CONSUMED_BY]->() RETURN count(r) AS n", {})
+    edge_rows = backend.run_read('SELECT count(*) AS n FROM "CONSUMED_BY"', {})
     edge_count = edge_rows[0]["n"] if edge_rows else 0
     assert edge_count >= 3, (  # fct_orders + dim_customer + audience_export
         f"Expected ≥3 CONSUMED_BY edges; got {edge_count}"
@@ -256,7 +255,7 @@ def test_T35_IDX_1_index_repo_return_dict_reports_counts(tmp_path, monkeypatch):
     for name, sql in {**_FIXTURE_SQL, ".sqlcg.toml": _MANIFEST_TWO_CONSUMERS}.items():
         (tmp_path / name).write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})
     result = Indexer().index_repo(tmp_path, dialect=None, db=backend)
@@ -283,11 +282,11 @@ def test_T35_IDX_2_no_manifest_zero_external_nodes(tmp_path, monkeypatch):
 
     backend = _index_fixture(tmp_path, {}, monkeypatch)  # no .sqlcg.toml
 
-    consumer_rows = backend.run_read("MATCH (e:ExternalConsumer) RETURN count(e) AS n", {})
+    consumer_rows = backend.run_read('SELECT count(*) AS n FROM "ExternalConsumer"', {})
     count = consumer_rows[0]["n"] if consumer_rows else 0
     assert count == 0, f"ExternalConsumer count must be 0 with no manifest; got {count}"
 
-    edge_rows = backend.run_read("MATCH ()-[r:CONSUMED_BY]->() RETURN count(r) AS n", {})
+    edge_rows = backend.run_read('SELECT count(*) AS n FROM "CONSUMED_BY"', {})
     edge_count = edge_rows[0]["n"] if edge_rows else 0
     assert edge_count == 0, f"CONSUMED_BY count must be 0 with no manifest; got {edge_count}"
 
@@ -301,7 +300,7 @@ def test_T35_IDX_2_no_manifest_table_count_unchanged(tmp_path, monkeypatch):
     tmp_no_manifest = tmp_path / "no_manifest"
     tmp_no_manifest.mkdir()
     backend_no = _index_fixture(tmp_no_manifest, {}, monkeypatch)
-    rows_no = backend_no.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+    rows_no = backend_no.run_read('SELECT count(*) AS n FROM "SqlTable"', {})
     count_no = rows_no[0]["n"] if rows_no else 0
 
     # Index with manifest (in a separate tmp dir to avoid state bleed)
@@ -310,11 +309,11 @@ def test_T35_IDX_2_no_manifest_table_count_unchanged(tmp_path, monkeypatch):
     for name, sql in _FIXTURE_SQL.items():
         (tmp_with / name).write_text(sql)
     (tmp_with / ".sqlcg.toml").write_text(_MANIFEST_TWO_CONSUMERS)
-    backend_with = KuzuBackend(":memory:")
+    backend_with = DuckDBBackend(":memory:")
     backend_with.init_schema()
     backend_with.upsert_node("Repo", str(tmp_with), {"path": str(tmp_with), "name": "with"})
     Indexer().index_repo(tmp_with, dialect=None, db=backend_with)
-    rows_with = backend_with.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+    rows_with = backend_with.run_read('SELECT count(*) AS n FROM "SqlTable"', {})
     count_with = rows_with[0]["n"] if rows_with else 0
 
     assert count_no == count_with, (
@@ -345,12 +344,12 @@ def test_T35_IDX_3_unmatched_target_warning_and_partial_edges(tmp_path, monkeypa
         (tmp_path / name).write_text(sql)
     (tmp_path / ".sqlcg.toml").write_text(manifest)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})
     result = Indexer().index_repo(tmp_path, dialect=None, db=backend)
 
-    edge_rows = backend.run_read("MATCH ()-[r:CONSUMED_BY]->() RETURN count(r) AS n", {})
+    edge_rows = backend.run_read('SELECT count(*) AS n FROM "CONSUMED_BY"', {})
     edge_count = edge_rows[0]["n"] if edge_rows else 0
     assert edge_count >= 1, (
         f"At least 1 CONSUMED_BY edge must be created for the valid target; got {edge_count}"
@@ -380,7 +379,7 @@ def test_T35_PERF_ingestion_uses_bulk_upsert_only(tmp_path, monkeypatch):
     bulk_node_calls: list[str] = []
     bulk_edge_calls: list[str] = []
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     backend.upsert_node("Repo", str(tmp_path), {"path": str(tmp_path), "name": tmp_path.name})
 

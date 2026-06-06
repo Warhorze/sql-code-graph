@@ -45,7 +45,7 @@ import typer
 
 # Client-side socket timeout for the query control-socket path.
 # Sized to cover the longest in-flight reindex (~89 s DWH resync_changed)
-# with headroom.  This is a CLI transport constant, NOT a KuzuConfig value —
+# with headroom.  This is a CLI transport constant, NOT a DbConfig value —
 # same convention as _NOTIFY_SOCKET_TIMEOUT_S in reindex.py.
 _QUERY_SOCKET_TIMEOUT_S = 300
 
@@ -92,7 +92,7 @@ def query_via_server(
     if not sp.exists():
         return None
 
-    req = {"op": "query", "cypher": cypher, "params": params}
+    req = {"op": "query", "sql": cypher, "params": params}  # "sql" is the canonical key
     req_bytes = json.dumps(req).encode()
     frame = f"{len(req_bytes)}\n".encode() + req_bytes
 

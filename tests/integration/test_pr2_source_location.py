@@ -26,7 +26,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import TRACE_COLUMN_LINEAGE_QUERY
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.parsers.ansi_parser import AnsiParser
@@ -40,7 +40,7 @@ from sqlcg.parsers.snowflake_parser import SnowflakeParser
 @pytest.fixture
 def db():
     """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -102,9 +102,8 @@ def test_scenario_b_start_line_persisted(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
     rows = db.run_read(
-        "MATCH (q:SqlQuery {file_path: $path}) "
-        "RETURN q.statement_index AS idx, q.start_line AS line "
-        "ORDER BY q.statement_index",
+        'SELECT statement_index AS idx, start_line AS line FROM "SqlQuery" '
+        "WHERE file_path = ? ORDER BY statement_index",
         {"path": str(fixture)},
     )
     assert len(rows) >= 2, f"Expected at least 2 SqlQuery nodes, got {len(rows)}"
@@ -187,9 +186,10 @@ def test_regression_guard_trace_returns_source_location(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
     rows = db.run_read(
-        "MATCH (dst:SqlColumn {id: $id})<-[r:COLUMN_LINEAGE]-(src:SqlColumn) "
-        "OPTIONAL MATCH (q:SqlQuery {id: r.query_id}) "
-        "RETURN q.file_path AS file, q.start_line AS line",
+        "SELECT q.file_path AS file, q.start_line AS line "
+        'FROM "COLUMN_LINEAGE" r '
+        'JOIN "SqlQuery" q ON q.id = r.query_id '
+        "WHERE r.dst_key = ?",
         {"id": "dst.x"},
     )
     assert len(rows) >= 1, (
@@ -219,7 +219,7 @@ def test_scenario_d_schema_version_mismatch_exits(tmp_path):
     from sqlcg.core.schema import SCHEMA_VERSION
 
     # Create a backend that returns "4" to simulate an old graph
-    db_v4 = KuzuBackend(":memory:")
+    db_v4 = DuckDBBackend(":memory:")
     db_v4.init_schema()
 
     # Patch the stored schema version to simulate v4
@@ -482,7 +482,7 @@ def test_scenario_g_scripting_fallback_start_line_zero(db, tmp_path):
     Indexer().index_repo(tmp_path, dialect="snowflake", db=db, use_git=False)
 
     rows = db.run_read(
-        "MATCH (q:SqlQuery {file_path: $path}) RETURN q.start_line AS line",
+        'SELECT start_line AS line FROM "SqlQuery" WHERE file_path = ?',
         {"path": str(fixture)},
     )
     # If no statements were indexed (scripting block had no DML), skip gracefully
@@ -511,10 +511,10 @@ def test_scenario_g_scripting_fallback_trace_shows_line_none(db, tmp_path):
 
     # Query directly for scripting-path edges
     rows = db.run_read(
-        "MATCH (dst:SqlColumn {id: $id})<-[r:COLUMN_LINEAGE]-(src:SqlColumn) "
-        "OPTIONAL MATCH (q:SqlQuery {id: r.query_id}) "
-        "WHERE q.parsing_mode = 'scripting' "
-        "RETURN q.start_line AS raw_line",
+        "SELECT q.start_line AS raw_line "
+        'FROM "COLUMN_LINEAGE" r '
+        'JOIN "SqlQuery" q ON q.id = r.query_id '
+        "WHERE r.dst_key = ? AND q.parsing_mode = 'scripting'",
         {"id": "dst.x"},
     )
     if not rows:

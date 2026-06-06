@@ -1,6 +1,6 @@
 """Integration tests for Indexer.resync_changed (F1 — living-codebase resync).
 
-All tests use real in-memory KuzuDB and a real temp git repo to simulate
+All tests use real in-memory DuckDB and a real temp git repo to simulate
 branch changes. Observable output is asserted — not "no exception raised".
 """
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 # ---------------------------------------------------------------------------
@@ -19,8 +19,8 @@ from sqlcg.indexer.indexer import Indexer
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB with schema initialised."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -61,28 +61,27 @@ def _get_head(repo: Path) -> str:
     return result.stdout.strip()
 
 
-def _count_edges(db: KuzuBackend) -> int:
+def _count_edges(db: DuckDBBackend) -> int:
     """Count all COLUMN_LINEAGE edges in the graph."""
-    rows = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN count(r) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "COLUMN_LINEAGE"', {})
     return rows[0]["n"] if rows else 0
 
 
-def _count_selects_from(db: KuzuBackend) -> int:
+def _count_selects_from(db: DuckDBBackend) -> int:
     """Count all SELECTS_FROM edges in the graph."""
-    rows = db.run_read("MATCH ()-[r:SELECTS_FROM]->() RETURN count(r) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "SELECTS_FROM"', {})
     return rows[0]["n"] if rows else 0
 
 
-def _file_node_exists(db: KuzuBackend, path: str) -> bool:
-    rows = db.run_read("MATCH (f:File {path: $p}) RETURN f.path AS p", {"p": path})
+def _file_node_exists(db: DuckDBBackend, path: str) -> bool:
+    rows = db.run_read('SELECT path FROM "File" WHERE path = ?', {"p": path})
     return bool(rows)
 
 
-def _get_column_lineage_edges(db: KuzuBackend) -> list[tuple[str, str]]:
+def _get_column_lineage_edges(db: DuckDBBackend) -> list[tuple[str, str]]:
     """Return all (src_id, dst_id) pairs of COLUMN_LINEAGE edges."""
     rows = db.run_read(
-        "MATCH (src:SqlColumn)-[:COLUMN_LINEAGE]->(dst:SqlColumn) "
-        "RETURN src.id AS src, dst.id AS dst",
+        'SELECT src_key AS src, dst_key AS dst FROM "COLUMN_LINEAGE"',
         {},
     )
     return [(r["src"], r["dst"]) for r in rows]
@@ -202,9 +201,11 @@ def test_resync_closure_dependent_re_resolved_on_upstream_change(git_repo, db):
     indexer = Indexer()
     indexer.index_repo(git_repo, dialect=None, db=db)
 
-    # Count SELECTS_FROM edges for downstream before resync
+    # Count query nodes for downstream before resync
     rows_before = db.run_read(
-        "MATCH (f:File {path: $p})<-[:QUERY_DEFINED_IN]-(q:SqlQuery) RETURN count(q) AS n",
+        'SELECT count(*) AS n FROM "QUERY_DEFINED_IN" qdi '
+        'JOIN "SqlQuery" q ON qdi.src_key = q.id '
+        "WHERE qdi.dst_key = ?",
         {"p": str((git_repo / "downstream.sql").resolve())},
     )
     queries_before = rows_before[0]["n"] if rows_before else 0
@@ -251,7 +252,7 @@ def test_resync_delete_propagates_to_dependents(git_repo, db):
     # Observable: the downstream file's query node still exists
     d_path = str((git_repo / "downstream.sql").resolve())
     d_rows = db.run_read(
-        "MATCH (f:File {path: $p})<-[:QUERY_DEFINED_IN]-(q:SqlQuery) RETURN count(q) AS n",
+        'SELECT count(*) AS n FROM "QUERY_DEFINED_IN" WHERE dst_key = ?',
         {"p": d_path},
     )
     assert d_rows[0]["n"] >= 0  # file still indexable (could be 0 if resolved to nothing)

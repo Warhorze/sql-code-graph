@@ -23,8 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
-from sqlcg.core.schema import NodeLabel, RelType
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 # ---------------------------------------------------------------------------
@@ -43,8 +42,8 @@ _ALIAS_SQL = (
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB backend with schema initialised."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -71,9 +70,8 @@ def test_schema_alias_src_table_qualified_matches_column(db, tmp_path):
 
     # The SqlTable node for the source must use the canonical schema ('staging')
     table_rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: 'staging.src_alias'}) "
-        "RETURN t.qualified AS qualified, t.kind AS kind",
-        {},
+        'SELECT qualified, kind FROM "SqlTable" WHERE qualified = ?',
+        {"q": "staging.src_alias"},
     )
     assert table_rows, (
         "SqlTable node 'staging.src_alias' not found after indexing with schema alias.\n"
@@ -86,9 +84,8 @@ def test_schema_alias_src_table_qualified_matches_column(db, tmp_path):
 
     # The SqlColumn node's table_qualified must match the SqlTable's qualified
     col_rows = db.run_read(
-        "MATCH (c:SqlColumn) WHERE c.table_qualified = 'staging.src_alias' "
-        "RETURN c.id AS id, c.table_qualified AS tq LIMIT 1",
-        {},
+        'SELECT id, table_qualified AS tq FROM "SqlColumn" WHERE table_qualified = ? LIMIT 1',
+        {"tq": "staging.src_alias"},
     )
     assert col_rows, (
         "SqlColumn with table_qualified='staging.src_alias' not found.\n"
@@ -104,8 +101,8 @@ def test_schema_alias_src_table_qualified_matches_column(db, tmp_path):
 
     # Confirm no unaliased node exists (staging_tmp.src_alias must not appear)
     unaliased_rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: 'staging_tmp.src_alias'}) RETURN t.qualified AS qualified",
-        {},
+        'SELECT qualified FROM "SqlTable" WHERE qualified = ?',
+        {"q": "staging_tmp.src_alias"},
     )
     assert not unaliased_rows, (
         "Found unaliased SqlTable node 'staging_tmp.src_alias' — alias was not applied.\n"
@@ -150,23 +147,19 @@ def test_schema_alias_filtered_upstream_returns_canonical_source(db, tmp_path):
     (tmp_path / "fixture.sql").write_text(_ALIAS_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
-    # Build the exact query analyze.py constructs with kind-filter ON (default).
-    # Mirror of _upstream_filtered_query() in test_cte_recall_guard.py.
-    depth = 5
-    kind_filter = (
-        f"OPTIONAL MATCH (t:{NodeLabel.TABLE} {{qualified: src.table_qualified}}) "
-        f"WITH c, src, t WHERE t.kind IS NULL OR t.kind IN ['table', 'external'] "
+    # Use the DuckDB TRACE_COLUMN_LINEAGE query (single-hop direct join).
+    # The fixture is a single-hop scenario: CTE body -> source table -> column lineage.
+    rows = db.run_read(
+        "SELECT src.id AS id, src.table_qualified AS table_qualified, "
+        "src.col_name AS col_name, t.kind AS table_kind "
+        'FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" src ON src.id = cl.src_key '
+        'LEFT JOIN "SqlTable" t ON t.qualified = src.table_qualified '
+        "WHERE cl.dst_key = ? "
+        "AND (t.kind IS NULL OR t.kind IN ('table', 'external')) "
+        "LIMIT 100",
+        {"ref": "mart.alias_dst.val"},
     )
-    query = (
-        f"MATCH (c:{NodeLabel.COLUMN} {{id: $ref}})"
-        f"<-[:{RelType.COLUMN_LINEAGE}*1..{depth}]-(src:{NodeLabel.COLUMN}) "
-        f"{kind_filter}"
-        f"OPTIONAL MATCH (src)-[direct:{RelType.COLUMN_LINEAGE}]->(c) "
-        "OPTIONAL MATCH (q:SqlQuery {id: direct.query_id}) "
-        "RETURN src.id AS id, q.file_path AS file, q.start_line AS line LIMIT 100"
-    )
-
-    rows = db.run_read(query, {"ref": "mart.alias_dst.val"})
     returned_ids = {r["id"] for r in rows}
 
     # Observable output: result set must be non-empty.

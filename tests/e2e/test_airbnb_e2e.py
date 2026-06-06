@@ -6,10 +6,10 @@ import pytest
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.server.exceptions import NotIndexedError
 from sqlcg.server.tools import (
-    execute_cypher,
+    execute_sql,
     find_table_usages,
     init_backend,
     list_dialects_and_repos,
@@ -46,21 +46,19 @@ def airbnb_indexed(tmp_path_factory):
     )
 
     # Open the backend and query for actual metrics
-    backend = KuzuBackend(db_path)
+    backend = DuckDBBackend(db_path)
     try:
         # Count tables (includes views)
-        tables_result = backend.run_read("MATCH (t:SqlTable) RETURN count(t) AS count", {})
+        tables_result = backend.run_read('SELECT count(*) AS count FROM "SqlTable"', {})
         tables_found = tables_result[0]["count"] if tables_result else 0
 
         # Count lineage edges
-        edges_result = backend.run_read(
-            "MATCH ()-[r:SELECTS_FROM]->() RETURN count(r) AS count", {}
-        )
+        edges_result = backend.run_read('SELECT count(*) AS count FROM "SELECTS_FROM"', {})
         lineage_edges_created = edges_result[0]["count"] if edges_result else 0
 
         # Count parse errors (QueryNode with parse_failed=true)
         errors_result = backend.run_read(
-            "MATCH (q:SqlQuery {parse_failed: true}) RETURN count(q) AS count", {}
+            'SELECT count(*) AS count FROM "SqlQuery" WHERE parse_failed = true', {}
         )
         parse_errors = errors_result[0]["count"] if errors_result else 0
 
@@ -192,12 +190,10 @@ class TestAirbnbMCPTools:
             f"Expected 'snowflake' in dialects, found {all_dialects}"
         )
 
-    def test_execute_cypher_returns_raw_listings(self, mcp_backend):
-        """Test that execute_cypher can find raw_listings table."""
-        result = execute_cypher(
-            "MATCH (t:SqlTable) WHERE t.name = 'raw_listings' RETURN t.name AS name LIMIT 1"
-        )
-        assert isinstance(result, list), "execute_cypher should return list"
+    def test_execute_sql_returns_raw_listings(self, mcp_backend):
+        """Test that execute_sql can find raw_listings table."""
+        result = execute_sql("SELECT name FROM \"SqlTable\" WHERE name = 'raw_listings' LIMIT 1")
+        assert isinstance(result, list), "execute_sql should return list"
         assert len(result) > 0, "Expected to find raw_listings"
         assert result[0].get("name") == "raw_listings"
 
@@ -228,7 +224,9 @@ class TestAirbnbParseReport:
             return None
 
         db_path, summary = airbnb_indexed
-        backend = KuzuBackend(db_path)
+        from sqlcg.core.duckdb_backend import DuckDBBackend as _DuckDBBackend
+
+        backend = _DuckDBBackend(db_path)
 
         try:
             # Organize files by layer (prefix)
@@ -240,9 +238,7 @@ class TestAirbnbParseReport:
             }
 
             # Get all files from the graph
-            files_result = backend.run_read(
-                "MATCH (f:File) RETURN f.path AS path, f.dialect AS dialect", {}
-            )
+            files_result = backend.run_read('SELECT path, dialect FROM "File"', {})
 
             for file_row in files_result or []:
                 path = file_row.get("path", "")
@@ -265,7 +261,8 @@ class TestAirbnbParseReport:
 
             # Get parsing mode distribution
             parsing_modes_result = backend.run_read(
-                "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, count(q) AS count",
+                'SELECT parsing_mode AS mode, count(*) AS count FROM "SqlQuery"'
+                " GROUP BY parsing_mode",
                 {},
             )
 
@@ -277,8 +274,10 @@ class TestAirbnbParseReport:
 
             # Get errored files (with parse_failed=true in queries)
             errors_result = backend.run_read(
-                "MATCH (q:SqlQuery {parse_failed: true})-[:QUERY_DEFINED_IN]->(f:File) "
-                "RETURN DISTINCT f.path AS path",
+                'SELECT DISTINCT f.path AS path FROM "SqlQuery" q'
+                ' JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id'
+                ' JOIN "File" f ON f.path = qdi.dst_key'
+                " WHERE q.parse_failed = true",
                 {},
             )
 

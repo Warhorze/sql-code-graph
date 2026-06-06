@@ -1,21 +1,20 @@
 """Integration tests for freshness fields in the MCP db_info tool.
 
-Uses real in-memory KuzuDB + a real temp git repo.  The backend singleton
+Uses a real in-memory DuckDB backend + a real temp git repo.  The backend singleton
 (``_backend`` in tools.py) is patched to inject the real backend so db_info()
 exercises the full code path including the new freshness fields.
 
-Scenarios from sprint_12_v1.1.0.md PR-A:
+Scenarios:
     E — db_info MCP returns stale_by_commits == 1 after HEAD advances
-    F — Neo4j guard: get_indexed_sha raises NotImplementedError → indexed_sha is None, no crash
 """
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.server.models import DbInfoResult
 from sqlcg.server.tools import db_info
 
@@ -55,16 +54,13 @@ def _head_sha(path: Path) -> str:
     return result.stdout.strip()
 
 
-def _setup_kuzu_with_repo(tmp_path: Path, git_root: Path, indexed_sha: str) -> KuzuBackend:
-    """Create an in-memory KuzuDB with schema init, a Repo node, and indexed_sha set."""
-    backend = KuzuBackend(":memory:")
+def _setup_kuzu_with_repo(tmp_path: Path, git_root: Path, indexed_sha: str) -> DuckDBBackend:
+    """Create an in-memory DuckDB with schema init, a Repo node, and indexed_sha set."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
     # Insert a Repo node so the freshness query finds a root path
-    backend.run_write(
-        "MERGE (r:Repo {path: $p, name: $n})",
-        {"p": str(git_root), "n": "test_repo"},
-    )
+    backend.upsert_node("Repo", str(git_root), {"path": str(git_root), "name": "test_repo"})
     backend.set_indexed_sha(indexed_sha)
     return backend
 
@@ -166,7 +162,7 @@ class TestDbInfoFreshnessIntegration:
         _commit_all(git_root, "commit A")
 
         # Backend with NO indexed_sha set
-        backend = KuzuBackend(":memory:")
+        backend = DuckDBBackend(":memory:")
         backend.init_schema()
         try:
             with patch("sqlcg.server.tools._get_backend", return_value=backend):
@@ -175,37 +171,4 @@ class TestDbInfoFreshnessIntegration:
             backend.close()
 
         assert result.indexed_sha is None
-        assert result.stale_by_commits is None
-
-
-# ---------------------------------------------------------------------------
-# Scenario F — Neo4j guard: NotImplementedError does not propagate
-# ---------------------------------------------------------------------------
-
-
-class TestDbInfoNeo4jGuard:
-    """Scenario F: backend.get_indexed_sha() raises NotImplementedError → no crash."""
-
-    def test_neo4j_guard_returns_null_sha(self):
-        """db_info returns indexed_sha=None and does not raise for Neo4j backend."""
-        mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "6"
-        mock_backend.get_indexed_sha.side_effect = NotImplementedError("Not implemented for Neo4j")
-
-        def run_read_side_effect(query: str, _params: dict):
-            if "COLUMN_LINEAGE" in query:
-                return [{"count": 0}]
-            if "parsing_mode" in query:
-                return []
-            return [{"count": 0}]
-
-        mock_backend.run_read.side_effect = run_read_side_effect
-
-        with patch("sqlcg.server.tools._get_backend", return_value=mock_backend):
-            result = db_info()  # must not raise
-
-        assert isinstance(result, DbInfoResult)
-        assert result.indexed_sha is None, (
-            "indexed_sha must be None when backend raises NotImplementedError"
-        )
         assert result.stale_by_commits is None

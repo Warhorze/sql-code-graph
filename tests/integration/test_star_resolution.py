@@ -1,7 +1,7 @@
 """Integration tests for star-projection graph resolution.
 
-All tests use a real in-memory KuzuDB and cover the complete data path:
-  parser -> indexer -> graph -> expansion Cypher -> COLUMN_LINEAGE edges.
+All tests use a real in-memory DuckDB and cover the complete data path:
+  parser -> indexer -> graph -> expansion SQL -> COLUMN_LINEAGE edges.
 
 REGRESSION GUARD: test_star_expansion_creates_edges and
 test_no_ddl_means_no_expansion must NEVER be marked skip or xfail once
@@ -10,14 +10,14 @@ they first pass.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
 @pytest.fixture
 def temp_db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    db = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB with schema initialised."""
+    db = DuckDBBackend(":memory:")
     db.init_schema()
     yield db
     db.close()
@@ -45,8 +45,10 @@ def test_ddl_columns_persisted(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
-        "RETURN c.col_name AS n ORDER BY n",
+        'SELECT c.col_name AS n FROM "SqlColumn" c '
+        'JOIN "HAS_COLUMN" hc ON hc.dst_key = c.id '
+        'JOIN "SqlTable" t ON t.qualified = hc.src_key '
+        "WHERE t.qualified = 'ba.src' ORDER BY n",
         {},
     )
     assert rows == [{"n": "col1"}, {"n": "col2"}], (
@@ -60,9 +62,8 @@ def test_ddl_column_node_properties(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (c:SqlColumn {id: 'ba.src.amount'}) "
-        "RETURN c.id AS id, c.col_name AS n, c.table_qualified AS tq",
-        {},
+        'SELECT id, col_name AS n, table_qualified AS tq FROM "SqlColumn" WHERE id = ?',
+        {"id": "ba.src.amount"},
     )
     assert len(rows) == 1
     assert rows[0]["id"] == "ba.src.amount"
@@ -91,9 +92,9 @@ def test_star_source_edge_persisted(temp_db, star_repo):
     Indexer().index_repo(star_repo, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH (q:SqlQuery)-[s:STAR_SOURCE]->(t:SqlTable) "
-        "RETURN t.qualified AS src, s.qualifier AS q, "
-        "s.target_table AS tgt, s.confidence AS conf",
+        "SELECT t.qualified AS src, s.qualifier AS q, s.target_table AS tgt, s.confidence AS conf "
+        'FROM "STAR_SOURCE" s '
+        'JOIN "SqlTable" t ON t.qualified = s.dst_key',
         {},
     )
     assert len(rows) == 1, f"Expected 1 STAR_SOURCE edge, got {len(rows)}: {rows}"
@@ -119,7 +120,7 @@ def test_alias_star_source_edge_has_qualifier(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH ()-[s:STAR_SOURCE]->() RETURN s.qualifier AS q",
+        'SELECT qualifier AS q FROM "STAR_SOURCE"',
         {},
     )
     assert len(rows) == 1
@@ -147,10 +148,9 @@ def test_star_expansion_creates_edges(temp_db, tmp_path):
     )
 
     rows = temp_db.run_read(
-        "MATCH (s:SqlColumn)-[r:COLUMN_LINEAGE]->(d:SqlColumn) "
-        "WHERE r.transform = 'STAR_EXPANSION' "
-        "RETURN s.id AS src, d.id AS dst, r.confidence AS c "
-        "ORDER BY src",
+        "SELECT cl.src_key AS src, cl.dst_key AS dst, cl.confidence AS c "
+        'FROM "COLUMN_LINEAGE" cl '
+        "WHERE cl.transform = 'STAR_EXPANSION' ORDER BY src",
         {},
     )
     assert rows == [
@@ -171,7 +171,7 @@ def test_star_expansion_idempotent(temp_db, tmp_path):
     second_run = indexer._expand_star_sources(temp_db)
 
     rows = temp_db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+        "SELECT count(*) AS n FROM \"COLUMN_LINEAGE\" WHERE transform = 'STAR_EXPANSION'",
         {},
     )
     assert rows[0]["n"] == 1, (
@@ -194,14 +194,14 @@ def test_no_ddl_means_no_expansion(temp_db, tmp_path):
 
     # STAR_SOURCE breadcrumb must still be persisted
     rows = temp_db.run_read(
-        "MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n",
+        'SELECT count(*) AS n FROM "STAR_SOURCE"',
         {},
     )
     assert rows[0]["n"] >= 1, "STAR_SOURCE edge must remain even when expansion produces nothing"
 
     # Zero STAR_EXPANSION edges
     rows2 = temp_db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+        "SELECT count(*) AS n FROM \"COLUMN_LINEAGE\" WHERE transform = 'STAR_EXPANSION'",
         {},
     )
     assert rows2[0]["n"] == 0
@@ -217,14 +217,14 @@ def test_alias_star_expansion(temp_db, tmp_path):
 
     # Qualifier must be stored correctly
     rows = temp_db.run_read(
-        "MATCH ()-[s:STAR_SOURCE]->() RETURN s.qualifier AS q",
+        'SELECT qualifier AS q FROM "STAR_SOURCE"',
         {},
     )
     assert rows[0]["q"] == "base"
 
     # Two expansion edges created
     rows2 = temp_db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+        "SELECT count(*) AS n FROM \"COLUMN_LINEAGE\" WHERE transform = 'STAR_EXPANSION'",
         {},
     )
     assert rows2[0]["n"] == 2
@@ -237,8 +237,8 @@ def test_expansion_edge_transform_and_query_id(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     rows = temp_db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() "
-        "RETURN r.transform AS t, r.confidence AS c, r.query_id AS qid",
+        "SELECT transform AS t, confidence AS c, query_id AS qid "
+        "FROM \"COLUMN_LINEAGE\" WHERE transform = 'STAR_EXPANSION'",
         {},
     )
     assert len(rows) >= 1
@@ -261,14 +261,14 @@ def test_reindex_clears_star_source_when_star_removed(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     # Confirm edge exists
-    rows = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    rows = temp_db.run_read('SELECT count(*) AS n FROM "STAR_SOURCE"', {})
     assert rows[0]["n"] >= 1
 
     # Rewrite ETL without star
     etl.write_text("INSERT INTO BA.tgt SELECT a FROM BA.src;\n")
     Indexer().reindex_file(str(etl), temp_db, dialect=None)
 
-    rows2 = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    rows2 = temp_db.run_read('SELECT count(*) AS n FROM "STAR_SOURCE"', {})
     assert rows2[0]["n"] == 0, "STAR_SOURCE edge must be gone after reindex removes the SELECT *"
 
 
@@ -284,7 +284,7 @@ def test_reindex_re_expands_star_sources(temp_db, tmp_path):
     Indexer().reindex_file(str(etl), temp_db, dialect=None)
 
     rows = temp_db.run_read(
-        "MATCH ()-[r:COLUMN_LINEAGE {transform: 'STAR_EXPANSION'}]->() RETURN count(r) AS n",
+        "SELECT count(*) AS n FROM \"COLUMN_LINEAGE\" WHERE transform = 'STAR_EXPANSION'",
         {},
     )
     assert rows[0]["n"] == 2, "After reindex, star expansion edges must be re-created (not lost)"
@@ -298,12 +298,12 @@ def test_reindex_does_not_multiply_star_source_edges(temp_db, tmp_path):
 
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
-    rows_before = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    rows_before = temp_db.run_read('SELECT count(*) AS n FROM "STAR_SOURCE"', {})
     count_before = rows_before[0]["n"]
 
     Indexer().reindex_file(str(etl), temp_db, dialect=None)
 
-    rows_after = temp_db.run_read("MATCH ()-[s:STAR_SOURCE]->() RETURN count(s) AS n", {})
+    rows_after = temp_db.run_read('SELECT count(*) AS n FROM "STAR_SOURCE"', {})
     count_after = rows_after[0]["n"]
 
     assert count_after == count_before, (
@@ -418,13 +418,17 @@ def test_duplicate_ddl_still_writes_union_columns(temp_db, tmp_path):
     Indexer().index_repo(tmp_path, dialect=None, db=temp_db, use_git=False)
 
     # Exactly one SqlTable node for BA.src
-    tables = temp_db.run_read("MATCH (t:SqlTable {qualified: 'ba.src'}) RETURN count(t) AS n", {})
+    tables = temp_db.run_read(
+        "SELECT count(*) AS n FROM \"SqlTable\" WHERE qualified = 'ba.src'", {}
+    )
     assert tables[0]["n"] == 1, "Duplicate DDL must not create duplicate SqlTable nodes"
 
     # Both columns must be present (union of both DDL files)
     cols = temp_db.run_read(
-        "MATCH (:SqlTable {qualified: 'ba.src'})-[:HAS_COLUMN]->(c:SqlColumn) "
-        "RETURN c.col_name AS n ORDER BY n",
+        'SELECT c.col_name AS n FROM "SqlColumn" c '
+        'JOIN "HAS_COLUMN" hc ON hc.dst_key = c.id '
+        'JOIN "SqlTable" t ON t.qualified = hc.src_key '
+        "WHERE t.qualified = 'ba.src' ORDER BY n",
         {},
     )
     col_names = [r["n"] for r in cols]

@@ -12,9 +12,9 @@ if TYPE_CHECKING:
     import anyio
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.freshness import compute_freshness
 from sqlcg.core.graph_db import GraphBackend
-from sqlcg.core.kuzu_backend import KuzuBackend
 from sqlcg.core.queries import (
     ANALYZE_UNUSED_TABLES_QUERY,
     FIND_DEFINITION_QUERY,
@@ -98,7 +98,7 @@ from sqlcg.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger(__name__)
 
-# Module-level singleton backend (KùzuDB single-writer model)
+# Module-level singleton backend (DuckDB single R/W handle for the process lifetime)
 _backend: GraphBackend | None = None
 
 # Module-level metrics store singleton
@@ -109,15 +109,9 @@ _metrics: MetricsStore | None = None
 # None when no server event-loop is running (unit tests, direct DB access).
 _backend_lock: "anyio.Lock | None" = None
 
-# True when init_backend has opened the backend in RO serving mode.
-# Checked by MCP write tools to decide whether to escalate.
-_serving_ro: bool = False
-
 # The path that init_backend() actually opened.  Captured at init time so
-# MCP write tools (index_repo escalation) use this path, not get_db_path()
-# which returns the default ~/.sqlcg/graph.db regardless of what was passed
-# to init_backend.  Bug B fix: without this, every escalation opened the real
-# live DB instead of the path the server (or test) configured.
+# MCP write tools use this path, not get_db_path() which returns the default
+# ~/.sqlcg/graph.db regardless of what was passed to init_backend.
 _init_db_path: str | None = None
 
 
@@ -147,18 +141,19 @@ def init_backend(db_path: str | None = None) -> None:
     ONLY mode.`` is raised on a non-existent DB opened RO).
 
     Args:
-        db_path: Path to KùzuDB database. If None, uses get_db_path().
+        db_path: Path to DuckDB database. If None, uses get_db_path().
 
     Raises:
         RuntimeError: If backend initialization fails or schema version
             is stale (the caller must not swallow this — server must exit).
     """
-    global _backend, _metrics, _serving_ro, _init_db_path
+    global _backend, _metrics, _init_db_path
     path = db_path or str(get_db_path())
     _init_db_path = path
 
-    # Step 1 — RW open + create schema if absent.
-    rw_backend = KuzuBackend(path, read_only=False)
+    # DuckDB: single R/W handle for the process lifetime — no RO/RW escalation.
+    # init_schema is idempotent; transaction() wraps the DDL in one commit.
+    rw_backend = DuckDBBackend(path)
     try:
         rw_backend.init_schema()
     except Exception as exc:
@@ -168,13 +163,9 @@ def init_backend(db_path: str | None = None) -> None:
     # Step 2 — schema-version gate (Step 1.4).
     _assert_schema_current(rw_backend, path)
 
-    # Step 3 — close RW.
-    rw_backend.close()
-
-    # Step 4 — reopen RO as the serving singleton.
-    _backend = KuzuBackend(path, read_only=True)
-    _serving_ro = True
-    logger.debug(f"Backend initialized (RO serving): {path}")
+    # DuckDB: the same handle is used for reads and writes (MVCC).
+    _backend = rw_backend
+    logger.debug(f"Backend initialized (DuckDB R/W): {path}")
 
     # Initialize metrics store (best-effort, failures are logged as WARNING)
     try:
@@ -191,7 +182,7 @@ def shutdown_backend() -> None:
     Closes the database connection and clears the global reference.
     Safe to call multiple times.
     """
-    global _backend, _metrics, _serving_ro, _init_db_path
+    global _backend, _metrics, _init_db_path
     if _backend is not None:
         _backend.close()
         _backend = None
@@ -199,7 +190,6 @@ def shutdown_backend() -> None:
     if _metrics is not None:
         _metrics.close()
         _metrics = None
-    _serving_ro = False
     _init_db_path = None
 
 
@@ -212,55 +202,6 @@ def _get_backend() -> GraphBackend:
     if _backend is None:
         raise RuntimeError("Backend not initialized. Call init_backend() before using tools.")
     return _backend
-
-
-def _get_or_escalate_rw(db_path_str: str, should_escalate: bool) -> GraphBackend:
-    """Return the current backend for write use.
-
-    When the server has opened the backend RO (should_escalate=True), escalates
-    to RW using escalate_to_rw so the MCP write tool can write.  When the
-    backend is already RW (direct call in tests / non-server context),
-    returns it directly.
-
-    Args:
-        db_path_str: Path string for escalation.
-        should_escalate: True when the server has opened the backend RO.
-    """
-    if not should_escalate:
-        return _get_backend()
-    from sqlcg.server.writer import escalate_to_rw
-
-    return escalate_to_rw(db_path_str, current=_backend)
-
-
-def _de_escalate_to_ro_from_tool(db_path_str: str) -> None:
-    """De-escalate from RW back to RO after a MCP write tool finishes.
-
-    Best-effort: logs on failure but does not raise.
-    """
-    from sqlcg.server.writer import de_escalate_to_ro
-
-    try:
-        de_escalate_to_ro(db_path_str)
-    except Exception as exc:
-        logger.warning(f"de_escalate_to_ro failed in MCP write tool: {exc}")
-
-
-def _escalation_db_path() -> str:
-    """Return the DB path to use for RW escalation in MCP write tools.
-
-    When init_backend() was called with an explicit path, returns that path.
-    Falls back to get_db_path() only when init_backend has not been called
-    (e.g. direct invocation in tests that set up a backend themselves).
-
-    Bug B fix: index_repo previously called str(get_db_path()) directly,
-    which always returns the default ~/.sqlcg/graph.db regardless of the path
-    init_backend() was given.  This caused escalation to open the real live DB
-    even when init_backend was called with a tmp_path in tests.
-    """
-    if _init_db_path is not None:
-        return _init_db_path
-    return str(get_db_path())
 
 
 def _assert_schema_current(backend: GraphBackend, path: str) -> None:
@@ -314,11 +255,11 @@ def _assert_indexed(db: GraphBackend) -> None:
     Raises:
         NotIndexedError: If no repos or files have been indexed
     """
-    rows = db.run_read("MATCH (r:Repo) RETURN count(r) AS n", {})
+    rows = db.run_read('SELECT count(*) AS n FROM "Repo"', {})
     if rows and rows[0]["n"] > 0:
         return
     # Fallback: accept a graph with File nodes but no Repo (test-only or partial state).
-    file_rows = db.run_read("MATCH (f:File) RETURN count(f) AS n", {})
+    file_rows = db.run_read('SELECT count(*) AS n FROM "File"', {})
     if file_rows and file_rows[0]["n"] > 0:
         logger.debug(
             "File nodes present but no Repo node — accepting as test-only/partial graph; "
@@ -345,7 +286,7 @@ def _indexed_root(db: GraphBackend) -> Path | None:
         Absolute Path of the indexed root, or None if unavailable.
     """
     try:
-        rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
         if rows and rows[0].get("path"):
             return Path(rows[0]["path"])
     except Exception:
@@ -495,7 +436,10 @@ def _kahn_topological_sort(affected_tables: list[str], db: GraphBackend) -> tupl
     indegree: dict[str, int] = {t: 0 for t in affected_tables}
 
     for table in affected_tables:
-        rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": table})
+        rows = db.run_read(
+            GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+            {"table_qualified": table, "table_qualified2": table},
+        )
         for row in rows:
             src = row["upstream_table"]
             if src in table_set and src != table and table not in successors[src]:
@@ -599,14 +543,8 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
         if not path.is_dir():
             raise ValueError(f"Repository path is not a directory: {repo_path}")
 
-        # If the backend is in RO serving mode (set by init_backend), escalate
-        # to RW for the duration of this write op, then de-escalate after.
-        # Bug B fix: use _escalation_db_path() instead of str(get_db_path()) so
-        # that escalation targets the DB init_backend() actually opened, not the
-        # default ~/.sqlcg/graph.db.
-        db_path_str = _escalation_db_path()
-        is_ro = _serving_ro
-        rw_db = _get_or_escalate_rw(db_path_str, is_ro)
+        # DuckDB: single R/W handle for the process lifetime — use directly.
+        rw_db = _get_backend()
 
         indexer = Indexer()
         # Ensure the Repo node exists for this repository
@@ -638,9 +576,6 @@ def index_repo(repo_path: str, dialect: str = "ansi") -> dict:
                 RelType.BELONGS_TO,
                 {},
             )
-        if is_ro:
-            _de_escalate_to_ro_from_tool(db_path_str)
-
         logger.info(f"Indexed {result['files_parsed']} files with {result['tables_found']} tables")
 
         # Record metrics
@@ -972,7 +907,10 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
         defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
 
-        up_rows = db.run_read(GET_TABLE_DIRECT_UPSTREAMS_QUERY, {"table_qualified": target})
+        up_rows = db.run_read(
+            GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+            {"table_qualified": target, "table_qualified2": target},
+        )
         upstream_raw = _dedup_preserve_order(
             [r["upstream_table"] for r in up_rows if r["upstream_table"]]
         )
@@ -1605,14 +1543,15 @@ def db_info() -> DbInfoResult:
 
     node_counts: dict[str, int] = {}
     for label in NodeLabel:
-        result = db.run_read(f"MATCH (n:{label}) RETURN COUNT(*) AS count", {})
+        result = db.run_read(f'SELECT count(*) AS count FROM "{label}"', {})
         node_counts[str(label)] = result[0]["count"] if result else 0
 
-    edges_result = db.run_read("MATCH ()-[r:COLUMN_LINEAGE]->() RETURN COUNT(r) AS count", {})
+    edges_result = db.run_read('SELECT count(*) AS count FROM "COLUMN_LINEAGE"', {})
     column_lineage_edges = edges_result[0]["count"] if edges_result else 0
 
     mode_rows = db.run_read(
-        "MATCH (q:SqlQuery) RETURN q.parsing_mode AS mode, COUNT(q) AS cnt ORDER BY cnt DESC",
+        'SELECT parsing_mode AS mode, count(*) AS cnt FROM "SqlQuery" '
+        "GROUP BY parsing_mode ORDER BY cnt DESC",
         {},
     )
     parse_quality: dict[str, int] = {}
@@ -1644,7 +1583,7 @@ def db_info() -> DbInfoResult:
     _freshness_kwargs: dict = {}
     try:
         _indexed_sha = db.get_indexed_sha()
-        _repo_rows = db.run_read("MATCH (r:Repo) RETURN r.path AS path LIMIT 1", {})
+        _repo_rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
         if _repo_rows and _indexed_sha is not None and _repo_rows[0].get("path"):
             _root = Path(_repo_rows[0]["path"])
             _f = compute_freshness(_root, _indexed_sha)
@@ -1674,11 +1613,11 @@ def db_info() -> DbInfoResult:
 
 
 @mcp.tool()
-@_timed_tool("execute_cypher")
-def execute_cypher(query: str) -> list[dict]:
-    """Execute a read-only Cypher query against the graph.
+@_timed_tool("execute_sql")
+def execute_sql(query: str) -> list[dict]:
+    """Execute a read-only SQL query against the graph (DuckDB).
 
-    This tool allows direct Cypher queries for advanced users. It enforces
+    This tool allows direct SQL queries for advanced users. It enforces
     read-only mode by stripping quoted literals and checking for write
     operation keywords. A LIMIT clause is automatically appended if missing.
 
@@ -1689,31 +1628,29 @@ def execute_cypher(query: str) -> list[dict]:
     that contains such keywords.
 
     Args:
-        query: Cypher query string (read-only)
+        query: DuckDB SQL query string (read-only SELECT only)
 
     Returns:
         List of result dictionaries from the query
 
     Raises:
-        ValueError: If the query contains write operations (CREATE, MERGE,
-                   DELETE, SET, REMOVE, DROP, TRUNCATE)
+        ValueError: If the query contains write operations (INSERT, UPDATE,
+                   DELETE, CREATE, DROP, TRUNCATE, MERGE)
     """
     db = _get_backend()
 
     # Strip quoted string literals before blocklist check
-    # This prevents mutation commands hiding inside strings from triggering the blocker
-    # Handle escaped quotes: '' in single quotes, "" in double quotes
     stripped = re.sub(r"'(?:''|[^'])*'", "", query)
     stripped = re.sub(r'"(?:""|[^"])*"', "", stripped)
 
     # Check for write operations (case-insensitive)
     if re.search(
-        r"\b(CREATE|MERGE|DELETE|SET|REMOVE|DROP|TRUNCATE)\b",
+        r"\b(INSERT|UPDATE|DELETE|CREATE|MERGE|DROP|TRUNCATE)\b",
         stripped,
         re.IGNORECASE,
     ):
         raise ValueError(
-            "Write operations are not permitted via execute_cypher. "
+            "Write operations are not permitted via execute_sql. "
             "Use the CLI or dedicated tools instead."
         )
 
@@ -1721,13 +1658,13 @@ def execute_cypher(query: str) -> list[dict]:
     q = query.rstrip()
     if q.endswith(";"):
         q = q[:-1].rstrip()
-    if "limit" not in stripped.lower():  # use stripped, not q.lower()
+    if "limit" not in stripped.lower():
         q = q + " LIMIT 500"
 
     try:
         return db.run_read(q, {})
     except Exception as e:
-        logger.error(f"Cypher execution failed: {e}")
+        logger.error(f"SQL execution failed: {e}")
         raise
 
 
@@ -1818,7 +1755,7 @@ def analyze_unused() -> UnusedTablesResult:
 
         # Single aggregation — no Python per-row graph traversal.
         unused_rows = db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
-        total_rows = db.run_read("MATCH (t:SqlTable) RETURN count(t) AS n", {})
+        total_rows = db.run_read('SELECT count(*) AS n FROM "SqlTable"', {})
         total_tables_scanned = total_rows[0]["n"] if total_rows else 0
 
         prefixes = get_presentation_prefixes(root)

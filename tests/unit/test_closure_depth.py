@@ -8,10 +8,10 @@ The old default max_depth=5 silently truncated these results.
 """
 
 import sqlcg.server.tools as tools
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 
 
-def _build_depth7_chain(backend: KuzuBackend) -> None:
+def _build_depth7_chain(backend: DuckDBBackend) -> None:
     """Build a 7-hop column lineage chain: col_0 -> col_1 -> ... -> col_7."""
     backend.init_schema()
 
@@ -57,7 +57,7 @@ def test_full_closure_reaches_depth_7():
     ba.wtfe_verkoopinfo (128 downstream tables at depth 6-7) was silently cut to
     depth 5, producing an LLM blast-radius answer that missed ~116 tables.
     """
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _build_depth7_chain(backend)
 
     # Import tools and initialize with the in-memory backend
@@ -77,7 +77,7 @@ def test_full_closure_reaches_depth_7():
 
 def test_explicit_max_depth_truncates():
     """Explicit max_depth cap truncates at the limit."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _build_depth7_chain(backend)
 
     tools._backend = backend
@@ -100,7 +100,7 @@ def test_safety_cap_stops_at_50k_nodes():
     threshold (not 50k) by creating a large star graph and verifying the
     safety cap logic triggers correctly.
     """
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
     # Create a Repo node so _assert_indexed() doesn't fail
@@ -165,7 +165,7 @@ def test_safety_cap_stops_at_50k_nodes():
 
 def test_dfs_chain_respects_explicit_max_depth_5():
     """Verify that max_depth=5 explicitly stops at depth 5 (regression baseline)."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _build_depth7_chain(backend)
 
     tools._backend = backend
@@ -181,7 +181,7 @@ def test_dfs_chain_respects_explicit_max_depth_5():
 
 def test_full_closure_upstream():
     """Verify upstream traversal also works with full closure (max_depth=None)."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     _build_depth7_chain(backend)
 
     tools._backend = backend
@@ -197,7 +197,7 @@ def test_full_closure_upstream():
 
 def test_empty_graph_returns_empty_result():
     """Empty graph returns empty result with truncated=False."""
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
 
     # Create a Repo node so _assert_indexed() doesn't fail

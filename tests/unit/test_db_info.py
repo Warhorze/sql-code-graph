@@ -11,32 +11,37 @@ def _make_run_read_routed_side_effect(repo_count=0, query_count=0, col_count=0, 
     """Return a side_effect function for run_read_routed mocks in db info tests."""
 
     def side_effect(query, _params):
-        # Schema version
-        if "SchemaVersion" in query and "indexed_sha" not in query:
+        # Schema version (SELECT version FROM "SchemaVersion" ...)
+        if "SchemaVersion" in query and "version" in query and "count" not in query.lower():
             return [{"version": "6"}]
         # Indexed SHA (freshness)
         if "indexed_sha" in query:
             return [{"sha": None}]
-        # Freshness repo path
-        if "Repo" in query and "path" in query and "name" not in query and "COUNT" not in query:
+        # Freshness repo path (SELECT path FROM "Repo" ...)
+        if (
+            "Repo" in query
+            and "path" in query
+            and "name" not in query
+            and "count" not in query.lower()
+        ):
             return []
-        # STAR_SOURCE / STAR_EXPANSION
+        # STAR_SOURCE / STAR_EXPANSION counts (SELECT count(*) AS n ...)
         if "STAR_SOURCE" in query:
             return [{"n": 0}]
         if "STAR_EXPANSION" in query:
             return [{"n": 0}]
-        # Node counts
-        if "Repo" in query and "COUNT" in query:
+        # Node counts (SELECT count(*) AS count FROM "X")
+        if "Repo" in query and "count" in query.lower():
             return [{"count": repo_count}]
-        if "SqlQuery" in query and "COUNT" in query:
+        if "SqlQuery" in query and "count" in query.lower():
             return [{"count": query_count}]
-        if "SqlColumn" in query and "COUNT" in query:
+        if "SqlColumn" in query and "count" in query.lower():
             return [{"count": col_count}]
-        if "COLUMN_LINEAGE" in query and "COUNT" in query:
+        if "COLUMN_LINEAGE" in query and "count" in query.lower():
             return [{"count": edge_count}]
         if "parsing_mode" in query:
             return []
-        # All other node labels
+        # All other node labels (SchemaVersion count, ExternalConsumer count, etc.)
         return [{"count": 0}]
 
     return side_effect
@@ -110,23 +115,28 @@ class TestDbInfoHealthChecks:
         runner = CliRunner()
 
         def star_side_effect(query, _params):
-            if "SchemaVersion" in query and "indexed_sha" not in query:
+            if "SchemaVersion" in query and "version" in query and "count" not in query.lower():
                 return [{"version": "6"}]
             if "indexed_sha" in query:
                 return [{"sha": None}]
-            if "Repo" in query and "path" in query and "name" not in query and "COUNT" not in query:
+            if (
+                "Repo" in query
+                and "path" in query
+                and "name" not in query
+                and "count" not in query.lower()
+            ):
                 return []
             if "STAR_SOURCE" in query:
                 return [{"n": 5}]
             if "STAR_EXPANSION" in query:
                 return [{"n": 10}]
-            if "Repo" in query and "COUNT" in query:
+            if "Repo" in query and "count" in query.lower():
                 return [{"count": 1}]
-            if "SqlQuery" in query and "COUNT" in query:
+            if "SqlQuery" in query and "count" in query.lower():
                 return [{"count": 10}]
-            if "SqlColumn" in query and "COUNT" in query:
+            if "SqlColumn" in query and "count" in query.lower():
                 return [{"count": 50}]
-            if "COLUMN_LINEAGE" in query and "COUNT" in query:
+            if "COLUMN_LINEAGE" in query and "count" in query.lower():
                 return [{"count": 25}]
             if "parsing_mode" in query:
                 return []

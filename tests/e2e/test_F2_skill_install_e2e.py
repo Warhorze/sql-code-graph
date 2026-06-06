@@ -30,7 +30,7 @@ EXPECTED_TOOLS = [
     "scope_change",
     "analyze_unused",
     "index_repo",
-    "execute_cypher",
+    "execute_sql",
     "submit_feedback",
 ]
 

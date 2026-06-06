@@ -101,8 +101,10 @@ async def _control_socket_task(
       as ``index``.  The handler enqueues only — it never touches the backend
       (B1 invariant: only the drain task resolves a backend, under backend_lock).
     - ``{"op": "query", "cypher": ..., "params": ...}`` → executes a
-      read-only Cypher query on the single backend connection, serialised
-      behind *backend_lock*.  **Length-prefixed framing** (v1.2.0):
+      read-only SQL query on the single backend connection, serialised
+      behind *backend_lock*.  (The ``cypher`` field name is a legacy wire-key
+      retained for protocol compatibility; the value is SQL.)
+      **Length-prefixed framing** (v1.2.0):
       ``<decimal-byte-length>\\n<json-body>`` on both request and response.
 
     Framing protocol:
@@ -121,7 +123,7 @@ async def _control_socket_task(
       — it does NOT rely on EOF as the terminator.
 
     R2 (single connection): all backend operations go through ``backend_lock``
-    so concurrent calls never touch the single Kuzu connection simultaneously.
+    so concurrent calls never touch the single DuckDB connection simultaneously.
 
     R8 teardown ordering: the caller must cancel this task BEFORE calling
     ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
@@ -140,17 +142,17 @@ async def _control_socket_task(
     from sqlcg.core.config import get_db_path as _get_db_path
     from sqlcg.server.writer import WriterRequest
 
-    # Read-only keyword allow-list for the ``query`` op.  Only these leading
-    # keywords are permitted — anything that starts with a write keyword is
-    # rejected before execution.  This is a guard against accidental mutation,
+    # Read-only keyword allow-list for the ``query`` op.  Only SELECT and WITH
+    # (CTE preamble) are permitted — anything that starts with a write keyword
+    # is rejected before execution.  This is a guard against accidental mutation,
     # not a security boundary (the socket is already 0o600 / owner-only).
-    _QUERY_ALLOWED_KEYWORDS = frozenset({"MATCH", "RETURN", "WITH", "CALL", "UNWIND", "OPTIONAL"})
+    _QUERY_ALLOWED_KEYWORDS = frozenset({"SELECT", "WITH", "VALUES", "TABLE"})
 
-    def _is_read_only_cypher(cypher: str) -> bool:
+    def _is_read_only_sql(sql: str) -> bool:
         """Return True iff the leading keyword is in the read-only allow-list."""
         import re
 
-        m = re.match(r"\s*(?:--[^\n]*)?\s*(\w+)", cypher, re.IGNORECASE)
+        m = re.match(r"\s*(?:--[^\n]*)?\s*(\w+)", sql, re.IGNORECASE)
         if not m:
             return False
         return m.group(1).upper() in _QUERY_ALLOWED_KEYWORDS
@@ -205,7 +207,7 @@ async def _control_socket_task(
                         if indexed_sha is not None:
                             try:
                                 rows = db.run_read(
-                                    "MATCH (r:Repo) RETURN r.path AS path LIMIT 1",
+                                    'SELECT path FROM "Repo" LIMIT 1',
                                     {},
                                 )
                                 if rows:
@@ -328,11 +330,12 @@ async def _control_socket_task(
                     return
 
                 elif op == "query":
-                    # Framed op (v1.2.0): read-only Cypher query over the socket.
+                    # Framed op (v1.2.0): read-only SQL query over the socket.
                     # Must only be called with a framed request (sniff above sets framed=True).
-                    cypher = req.get("cypher", "")
+                    # Accept both "cypher" (legacy field name) and "sql" keys.
+                    sql = req.get("sql") or req.get("cypher", "")
                     params = req.get("params") or {}
-                    if not _is_read_only_cypher(cypher):
+                    if not _is_read_only_sql(sql):
                         resp = {"error": "query op is read-only"}
                     else:
                         db = backend_ref()
@@ -341,11 +344,11 @@ async def _control_socket_task(
                         else:
 
                             def _do_query() -> list:
-                                return db.run_read(cypher, params)
+                                return db.run_read(sql, params)
 
                             async with backend_lock:
                                 # R1: run off event-loop thread; R2: lock serialises
-                                # reads and writes on the single Kuzu connection.
+                                # reads and writes on the single DuckDB connection.
                                 rows = await _to_thread.run_sync(_do_query)
                             resp = {"ok": True, "rows": rows}
 
@@ -377,11 +380,11 @@ async def _stop_watcher(
 ) -> None:
     """Wait for stop_event then perform graceful shutdown.
 
-    B2 shutdown ordering:
-      1. Set shutdown_requested so the drain loop exits cleanly and
-         de_escalate_to_ro skips the RO reopen.
-      2. Acquire backend_lock — waits until any active drain has fully
-         de-escalated (so the in-flight RW write is committed, not torn).
+    Shutdown ordering:
+      1. Set shutdown_requested so the drain loop exits cleanly after its
+         current drain completes (no new drains start once this is set).
+      2. Acquire backend_lock — waits until any active drain has finished
+         (committed its transaction).
       3. Call shutdown_backend() under the lock.
       4. Release backend_lock.
       5. Remove control files.
@@ -395,9 +398,9 @@ async def _stop_watcher(
     from sqlcg.server.control import cleanup_control_files
 
     await stop_event.wait()
-    # B2(b): signal de_escalate_to_ro to skip the RO reopen.
+    # Signal drain loop to stop after current drain completes.
     shutdown_requested.set()
-    # B2(a): wait for any active drain to finish (acquires backend_lock).
+    # Wait for any active drain to finish before closing the backend.
     async with backend_lock:
         try:
             _tools.shutdown_backend()
@@ -498,7 +501,7 @@ def main(db_path: str | None = None) -> None:
     """Start the MCP server.
 
     Args:
-        db_path: Path to KùzuDB database. If None, uses SQLCG_DB_PATH env var
+        db_path: Path to DuckDB database. If None, uses SQLCG_DB_PATH env var
                 or ~/.sqlcg/graph.db (via get_db_path in tools module).
     """
     import time

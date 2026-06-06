@@ -1,19 +1,17 @@
-"""Unit tests for WriterQueue coalescing rules and escalation retry.
+"""Unit tests for WriterQueue coalescing rules.
 
 Tests here are fully deterministic — no DB, no sockets, no wall-clock waits.
 Queue tests run under @pytest.mark.anyio because enqueue/pop_next acquire the
 anyio.Lock inside WriterQueue (W4).  coalesce_view() is synchronous and is
 asserted directly.
 
-Escalation tests inject a fake opener to simulate lock errors without needing
-a real DB process holding the lock — the retry budget override is passed via
-the retry_budget_s parameter, never a module-global patch (parallel-test-safe).
+The RO→RW escalation machinery (escalate_to_rw, EscalationLockError,
+de_escalate_to_ro) was deleted in Phase 4 of the DuckDB migration — DuckDB
+holds a single R/W handle for the process lifetime, so no mode-switching is
+needed.  The corresponding tests were removed alongside the deleted code.
 """
 
 from __future__ import annotations
-
-import logging
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -21,10 +19,8 @@ from sqlcg.server.writer import (
     COALESCE_COLLAPSED_INTO_PENDING_REINDEX,
     COALESCE_REINDEX_DROPPED_INDEX_PENDING,
     COALESCE_SUPERSEDED_BY_INDEX,
-    EscalationLockError,
     WriterQueue,
     WriterRequest,
-    escalate_to_rw,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,120 +161,6 @@ async def test_coalesce_view_all_reason_keys_present_when_empty():
 
 
 # ---------------------------------------------------------------------------
-# Escalation retry (unit, deterministic, injectable opener)
-# ---------------------------------------------------------------------------
-
-
-def _lock_error() -> RuntimeError:
-    return RuntimeError("Could not set lock on file: /tmp/test.db")
-
-
-def test_escalate_succeeds_within_budget_after_k_failures():
-    """escalate_to_rw succeeds for K failures within the retry budget."""
-    call_count = [0]
-    mock_backend = MagicMock()
-    mock_backend.read_only = False
-
-    def fake_opener(path, read_only=False):
-        call_count[0] += 1
-        if call_count[0] <= 2:
-            raise _lock_error()
-        return mock_backend
-
-    with patch("sqlcg.server.tools._backend", None):
-        import sqlcg.server.tools as _tools
-
-        _tools._backend = None
-        result = escalate_to_rw(
-            "/tmp/test.db",
-            current=None,
-            opener=fake_opener,
-            retry_budget_s=5.0,
-        )
-
-    assert result is mock_backend
-    assert call_count[0] == 3  # 2 failures then success
-
-
-def test_escalate_raises_escalation_lock_error_when_budget_exhausted():
-    """escalate_to_rw raises EscalationLockError with side-DB workaround text on exhaustion."""
-
-    def always_fail(path, read_only=False):
-        raise _lock_error()
-
-    with patch("sqlcg.server.tools._backend", None), patch(
-        "sqlcg.core.kuzu_backend.find_lock_holder", return_value="PID 9999"
-    ):
-        import sqlcg.server.tools as _tools
-
-        _tools._backend = None
-        with pytest.raises(EscalationLockError) as exc_info:
-            escalate_to_rw(
-                "/tmp/test.db",
-                current=None,
-                opener=always_fail,
-                retry_budget_s=0.05,  # tiny budget so the test finishes fast
-            )
-
-    msg = str(exc_info.value)
-    assert "Could not acquire the write lock" in msg
-    assert "SQLCG_DB_PATH" in msg  # side-DB workaround present
-    assert "9999" in msg or "PID" in msg  # PID hint present
-
-
-def test_escalate_emits_error_log_before_raising(caplog):
-    """escalate_to_rw emits exactly one ERROR log with 'escalation failed:' prefix."""
-
-    def always_fail(path, read_only=False):
-        raise _lock_error()
-
-    with caplog.at_level(logging.ERROR, logger="sqlcg.server.writer"), patch(
-        "sqlcg.server.tools._backend", None
-    ), patch("sqlcg.core.kuzu_backend.find_lock_holder", return_value="PID 1234"):
-        import sqlcg.server.tools as _tools
-
-        _tools._backend = None
-        with pytest.raises(EscalationLockError):
-            escalate_to_rw(
-                "/tmp/test.db",
-                current=None,
-                opener=always_fail,
-                retry_budget_s=0.05,
-            )
-
-    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(error_records) == 1, (
-        f"Expected exactly 1 ERROR log, got {len(error_records)}: "
-        f"{[r.message for r in error_records]}"
-    )
-    assert "escalation failed:" in error_records[0].message
-    assert "1234" in error_records[0].message or "PID" in error_records[0].message
-
-
-def test_escalate_non_lock_error_propagates_immediately():
-    """Non-lock errors from the opener are NOT retried — they propagate immediately."""
-    call_count = [0]
-
-    def one_non_disk_error(path, read_only=False):
-        call_count[0] += 1
-        raise RuntimeError("Disk full — cannot open database at all")
-
-    with patch("sqlcg.server.tools._backend", None):
-        import sqlcg.server.tools as _tools
-
-        _tools._backend = None
-        with pytest.raises(RuntimeError, match="Disk full"):
-            escalate_to_rw(
-                "/tmp/test.db",
-                current=None,
-                opener=one_non_disk_error,
-                retry_budget_s=5.0,
-            )
-
-    assert call_count[0] == 1  # no retries
-
-
-# ---------------------------------------------------------------------------
 # Metrics injection
 # ---------------------------------------------------------------------------
 
@@ -286,6 +168,8 @@ def test_escalate_non_lock_error_propagates_immediately():
 @pytest.mark.anyio
 async def test_queue_records_enqueue_to_metrics():
     """record_queue_event is called with 'enqueued' event after enqueue."""
+    from unittest.mock import MagicMock
+
     mock_metrics = MagicMock()
     q = WriterQueue(metrics=mock_metrics)
 
@@ -299,6 +183,8 @@ async def test_queue_records_enqueue_to_metrics():
 @pytest.mark.anyio
 async def test_queue_records_coalesce_to_metrics():
     """record_queue_event is called with 'coalesced' event and reason on coalesce."""
+    from unittest.mock import MagicMock
+
     mock_metrics = MagicMock()
     q = WriterQueue(metrics=mock_metrics)
 
@@ -306,9 +192,7 @@ async def test_queue_records_coalesce_to_metrics():
     await q.enqueue(_req(op="reindex"))  # triggers collapse
 
     coalesced_calls = [
-        c
-        for c in mock_metrics.record_queue_event.call_args_list
-        if c[0][0] == "coalesced"
+        c for c in mock_metrics.record_queue_event.call_args_list if c[0][0] == "coalesced"
     ]
     assert len(coalesced_calls) == 1
     assert coalesced_calls[0][1].get("reason") == COALESCE_COLLAPSED_INTO_PENDING_REINDEX

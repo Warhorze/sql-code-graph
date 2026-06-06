@@ -3276,3 +3276,145 @@ and not delivered), but the shipped behaviour is exercised indirectly and the su
 so they are **follow-up hardening**, not a ship blocker. They should be filed alongside the
 Deviation-1 fix — the B2/W7/reads-block tests in particular guard the exact concurrency
 contract that Deviation 1 currently bypasses.
+
+---
+
+## Kuzu → DuckDB Migration — Architecture Review (2026-06-05, v1.4.0)
+
+Reviewed `git diff master..HEAD` on `feat/duckdb-migration` (9 commits, 91 files,
+~3885+/2782-). Plan: [`plan/feature_kuzu_to_duckdb_migration.md`](plan/feature_kuzu_to_duckdb_migration.md).
+
+### Conformance verdict: SHIP (1 documentation fix + 1 dead-code cleanup recommended)
+
+Phases 1–5 delivered the specified deliverables. All five Phase-5 exit gates are met:
+the live DWH acceptance gate (index 1,391 files ~2.5 min; reindex ×3 no crash; column
+trace) passed today; perf guards green; parity fixture committed; symbol-deletion clean.
+Two non-blocking gaps (see below).
+
+### Plan conformance — deliverable check
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1 — backend skeleton + schema | **PASS** | [`duckdb_backend.py`](src/sqlcg/core/duckdb_backend.py): 7 node + 12 edge tables, src/dst indexes, idempotent `init_schema` in one txn, real reentrant `transaction()`. |
+| 2 — bulk-upsert sink | **PASS** | `upsert_nodes_bulk`/`upsert_edges_bulk` via `INSERT OR REPLACE … SELECT unnest(?)` — one `execute()` per label/rel per batch. `_flush_row_batch` per-batch shape unchanged ([`indexer.py:90`](src/sqlcg/indexer/indexer.py)). |
+| 3 — query port + parity | **PASS** | Recursive-CTE traversal with depth + cycle guard ([`analyze.py:38`](src/sqlcg/cli/commands/analyze.py)); kind-filter ported as `LEFT JOIN … WHERE kind IS NULL OR IN ('table','external')`; parity fixture + test committed ([`tests/integration/test_duckdb_parity.py`](tests/integration/test_duckdb_parity.py)). `execute_cypher`→`execute_sql` renamed ([`tools.py:1616`](src/sqlcg/server/tools.py)). |
+| 4 — rebuild-in-transaction | **PASS (with deviation, see Concurrency)** | Drain body `with backend.transaction(): clear_all_tables(); index_repo()` ([`writer.py:363`](src/sqlcg/server/writer.py)); escalation machinery deleted; single R/W handle. |
+| 5 — cutover + perf | **PASS** | `kuzu_backend.py`/`neo4j_backend.py` deleted; `KuzuConfig`→`DbConfig` ([`config.py:14`](src/sqlcg/core/config.py)); `buffer_pool` flags removed; `uninstall.py` uses `Path.unlink` + `.wal` ([`uninstall.py:113`](src/sqlcg/cli/commands/uninstall.py)); version 1.4.0; kuzu/neo4j deps dropped. |
+
+**Gaps (non-blocking):**
+1. **Dead Kuzu fallback in the happy path** — [`indexer.py:1393–1423`](src/sqlcg/indexer/indexer.py)
+   `_expand_star_sources` keeps a `# Fallback path for Kuzu legacy backend` branch with inline
+   Cypher `MERGE` strings. Kuzu is deleted, so this branch is unreachable dead code that still
+   references a removed backend's dialect. Plan Tier-1 said cutover removes Kuzu-only code; this
+   is a leftover. Recommend deleting the `else` branch and the `isinstance(db, DuckDBBackend)`
+   guard (the only backend is DuckDB). Not a ship blocker (the live path is the DuckDB branch),
+   but it is exactly the "TODO/stub in the success path" class CLAUDE.md warns against.
+2. **`tests/e2e/test_dwh_e2e.py`** migrated on disk but never committed (correct per MEMORY:
+   feedback_dwh_e2e — gitignored). The double-reindex/perf acceptance was run manually today;
+   there is no committed CI guard for it. Accept (matches existing project policy).
+
+### Performance invariants — pass/fail (CLAUDE.md table)
+
+All guard tests green: `test_perf_scaling_guard`, `test_upsert_batch_invariant`,
+`test_bulk_upsert_invariant`, `test_T09_01_qualify_once` (11 passed).
+
+| Invariant | Verdict | Evidence |
+|---|---|---|
+| `qualify`/`build_scope` module-level import | **PASS** | `base.py` untouched (parser-side, backend-agnostic). |
+| `exp.expand()` file-level sources + `dependency_filter` | **PASS** | parser-side, untouched. |
+| `body_scope` built once per statement | **PASS** | untouched. |
+| Pure-literal skip | **PASS** | untouched. |
+| No `sources=` when scope present / `copy=False`+`trim_selects=False` | **PASS** | untouched. |
+| INSERT body copied once | **PASS** | untouched. |
+| `_upsert_parsed_file` uses bulk (not per-row) | **PASS** | sink re-pointed to `upsert_*_bulk`; no per-row path in flush. |
+| `_flush_row_batch` once-per-batch (not per-file) | **PASS** | [`indexer.py:162–176`](src/sqlcg/indexer/indexer.py): exactly 10 bulk calls per batch; DuckDB `upsert_*_bulk` issues **one** `execute()` per call ([`duckdb_backend.py:412`,`456`](src/sqlcg/core/duckdb_backend.py)). |
+
+**No reintroduced O(N²):** the bulk sink uses array-parameter `unnest`, one round-trip per
+label/rel. Read CTEs carry `WHERE reach.depth < d` + `NOT key = ANY(reach.path)` cycle guard
+([`analyze.py:57–58`](src/sqlcg/cli/commands/analyze.py)). `delete_nodes_for_file` is
+set-based DELETEs, no per-row loop. Edge tables indexed on both `src_key` and `dst_key`.
+One watch item: `array_append`/`= ANY(path)` cycle guard is O(path-length) per row, acceptable
+at depth≤100 but is the only place traversal cost grows with path depth — bounded by the depth cap.
+
+### Concurrency model — assessment
+
+**Reentrant `transaction()` ([`duckdb_backend.py:723`](src/sqlcg/core/duckdb_backend.py)):
+correct.** Depth-counted; only the outermost level emits BEGIN/COMMIT/ROLLBACK; nested calls
+join and re-raise so a failure anywhere rolls back the whole rebuild. This lets the drain wrap
+`clear_all_tables()` + `index_repo()` (which opens its own per-batch transactions) in one atomic
+unit. Verified by `test_mvcc_rebuild.py` (3 passed) and the C6 unit test.
+
+**`clear_all_tables()` preserving `SchemaVersion`: right call.** It truncates all node/edge
+tables but leaves the `SchemaVersion` row so the schema-gate survives a rebuild and
+`indexed_sha` is re-stamped by the indexer inside the same transaction
+([`indexer.py:504`](src/sqlcg/indexer/indexer.py)) — the SHA flips atomically with the graph.
+
+**DEVIATION — "readers never block" is not what shipped (but what shipped is SAFE).**
+The plan/design (§Concurrency, C3) sells DuckDB MVCC: readers on separate cursors see the OLD
+snapshot during a write txn and flip on COMMIT, so reads never block. The implementation does
+**not** use `con.cursor()` per read — `run_read` executes on the **single shared `self._conn`**
+([`duckdb_backend.py:476`](src/sqlcg/core/duckdb_backend.py)), and the server serializes every
+read and the drain through one `anyio` `backend_lock` ([`server.py:347`](src/sqlcg/server/server.py),
+[`writer.py:330`](src/sqlcg/server/writer.py)). Net effect: a `query` arriving mid-rebuild
+**waits** for the rebuild to finish rather than being served the old snapshot. This is *safe*
+(no torn read — the lock prevents a read on a connection with an open uncommitted BEGIN), but
+it forfeits the headline MVCC non-blocking-read benefit. For the full-rebuild path that holds
+the lock for the entire ~2.5 min index, **reads are unavailable for the rebuild duration.**
+Action: fix the plan/docstring claim, OR (better, follow-up) serve reads from `self._conn.cursor()`
+and drop the read side of `backend_lock` to realize the promised non-blocking reads.
+
+**Long-transaction risk in the drain body (lock duration / memory / partial-failure):**
+- *Lock duration:* the full rebuild holds both the OS-level DuckDB file lock and the in-process
+  `backend_lock` for the entire index (~2.5 min on the DWH). Cross-process this is fine (single
+  writer by design); in-process it blocks reads (above). Acceptable for a full rebuild; the real
+  fix is incremental reindex (Option 2, explicitly deferred).
+- *Memory:* one transaction spanning `clear_all_tables()` + all batch inserts means DuckDB holds
+  the rebuild's undo/WAL state until COMMIT. The plan's batch loop still runs, but per-batch
+  transactions are **subsumed** into the outer txn (reentrancy makes them no-ops), so there is
+  **no intermediate commit** — the OOM-prevention intent of `batch_size` is about parse working-set,
+  not write durability, so this is consistent with CLAUDE.md, but worth noting: write-side memory
+  is now one-transaction-wide, not one-batch-wide. The DWH (47k columns, 45k edges) committed in
+  ~2.5 min with no OOM, so empirically fine at current scale; flag for the 1,600-file ceiling.
+- *Partial-failure:* correct — a mid-rebuild raise rolls back to the prior graph (C6, tested).
+  Better than the old swap's corruption window.
+
+### Backend abstraction — assessment (no action requested)
+
+With kuzu/neo4j deleted, `GraphBackend` is a **single-impl ABC** — it now adds indirection
+without polymorphism. It still earns partial keep: (a) tests use an in-memory `:memory:`
+DuckDBBackend through the same interface; (b) the documented v2 roadmap (Snowflake
+ACCESS_HISTORY as a second lineage source) may want a second backend. But several smells:
+- ABC docstrings still say "Cypher for KùzuDB/Neo4j" ([`graph_db.py:121,133`](src/sqlcg/core/graph_db.py))
+  and "skipped by KuzuDB's MERGE semantics" (line 105) — stale, misleading now.
+- `clear_all_tables()` on the ABC with a `NotImplementedError` default ([`graph_db.py:248`](src/sqlcg/core/graph_db.py))
+  is the wrong shape now that only DuckDB implements it: a `NotImplementedError`-default method on
+  an ABC is a code smell (it is neither abstract-required nor universally provided). With one impl,
+  it should either be a plain method on `DuckDBBackend` (not on the ABC) or a proper `@abstractmethod`.
+  Recommend: move it off the ABC, or make it abstract. Low priority — cosmetic, single caller.
+- `transaction()`'s ABC no-op default that "logs a warning" is now dead (only DuckDB, which
+  overrides). Harmless.
+
+**Recommendation (do not act now):** keep the ABC for the v2 second-source path, but schedule a
+docstring de-Cypher pass and relocate `clear_all_tables` off the ABC. If v2 ACCESS_HISTORY is
+shelved, collapse the ABC into `DuckDBBackend` directly.
+
+### Release risk register for 1.4.0 (ranked likelihood × impact)
+
+1. **Reads blocked for the full ~2.5 min rebuild duration (HIGH likelihood × MED impact).**
+   The serialized single-connection model means MCP/CLI reads hang while a full `index`/`reindex`
+   drains. On the DWH that is ~2.5 min of read unavailability per rebuild. Users expecting the
+   plan's "non-blocking reads" will see hangs. Mitigation: cursor-per-read follow-up; for now,
+   document the behavior and rely on rebuild infrequency.
+2. **Dead Kuzu fallback branch ([`indexer.py:1393`](src/sqlcg/indexer/indexer.py)) (MED × LOW).**
+   Unreachable but references a deleted backend; a future reader may mistake it for a live path,
+   and it carries Cypher that no longer has an engine. Delete before/just after release.
+3. **One-transaction-wide write memory at the 1,600-file ceiling (LOW × MED).**
+   Proven fine at DWH scale (1,391 files); the CLAUDE.md target tops out at ~1,600. The whole
+   rebuild is one DuckDB transaction (per-batch commits subsumed), so peak WAL/undo is the full
+   graph. Measure headroom at 1,600 before declaring the perf budget closed.
+4. **No committed CI guard for double-reindex / perf (LOW × MED).**
+   The headline acceptance (double-reindex no-crash + lineage parity) was validated manually via
+   the gitignored e2e test. A regression would not be caught in CI. Accept per project policy, but
+   the committed `test_mvcc_rebuild.py` + parity fixture partially cover the rebuild path.
+5. **Stale "Cypher/Kuzu" references in docstrings/comments across server + indexer (LOW × LOW).**
+   Cosmetic; misleads future maintainers about the engine. Sweep in a docs pass.

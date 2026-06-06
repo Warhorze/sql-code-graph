@@ -80,7 +80,7 @@ def test_F2_install_global_scope_skill_contains_all_16_tools(fake_home: Path) ->
         "scope_change",
         "analyze_unused",
         "index_repo",
-        "execute_cypher",
+        "execute_sql",
         "submit_feedback",
     ]
     assert len(expected_tools) == 16, "Test fixture must list exactly 16 tools"

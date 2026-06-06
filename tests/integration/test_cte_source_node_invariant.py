@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
 @pytest.fixture
 def db():
-    """Fresh in-memory KuzuDB with schema initialised."""
-    backend = KuzuBackend(":memory:")
+    """Fresh in-memory DuckDB backend with schema initialised."""
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     yield backend
     backend.close()
@@ -61,7 +61,7 @@ SELECT val FROM unioned;
 # ---------------------------------------------------------------------------
 
 
-def _check_completeness(db: KuzuBackend) -> list[str]:  # type: ignore[name-defined]
+def _check_completeness(db: DuckDBBackend) -> list[str]:
     """Return list of source table_qualifieds that lack a SqlTable node.
 
     Algorithm:
@@ -76,15 +76,15 @@ def _check_completeness(db: KuzuBackend) -> list[str]:  # type: ignore[name-defi
     """
     # Step 1: distinct table_qualified values from source columns
     src_rows = db.run_read(
-        "MATCH (src:SqlColumn)-[:COLUMN_LINEAGE]->() RETURN DISTINCT src.table_qualified AS tq",
+        'SELECT DISTINCT src.table_qualified AS tq FROM "COLUMN_LINEAGE" cl '
+        'JOIN "SqlColumn" src ON cl.src_key = src.id',
         {},
     )
     src_table_qualifieds = {r["tq"] for r in src_rows if r["tq"]}
 
     # Step 2: known CTE/derived table qualifieds (intentionally virtual)
     cte_rows = db.run_read(
-        "MATCH (t:SqlTable) WHERE t.kind IN ['cte', 'derived'] "
-        "RETURN DISTINCT t.qualified AS qualified",
+        "SELECT DISTINCT qualified FROM \"SqlTable\" WHERE kind IN ('cte', 'derived')",
         {},
     )
     cte_qualifieds = {r["qualified"] for r in cte_rows if r["qualified"]}
@@ -93,7 +93,7 @@ def _check_completeness(db: KuzuBackend) -> list[str]:  # type: ignore[name-defi
     missing = []
     for tq in sorted(src_table_qualifieds - cte_qualifieds):
         node_rows = db.run_read(
-            "MATCH (t:SqlTable {qualified: $tq}) RETURN t.qualified AS qualified LIMIT 1",
+            'SELECT qualified FROM "SqlTable" WHERE qualified = ? LIMIT 1',
             {"tq": tq},
         )
         if not node_rows:
@@ -126,8 +126,8 @@ def test_multi_hop_cte_source_tables_have_nodes(db, tmp_path):
 
     # Also assert the specific node exists with the correct kind
     rows = db.run_read(
-        "MATCH (t:SqlTable {qualified: 'staging.src_a'}) RETURN t.kind AS kind",
-        {},
+        'SELECT kind FROM "SqlTable" WHERE qualified = ?',
+        {"q": "staging.src_a"},
     )
     assert rows, "staging.src_a SqlTable node not found after indexing."
     assert rows[0]["kind"] == "table", (
@@ -152,7 +152,7 @@ def test_union_all_cte_all_source_tables_have_nodes(db, tmp_path):
 
     for tq in ("staging.src_a", "staging.src_b"):
         rows = db.run_read(
-            "MATCH (t:SqlTable {qualified: $tq}) RETURN t.kind AS kind",
+            'SELECT kind FROM "SqlTable" WHERE qualified = ?',
             {"tq": tq},
         )
         assert rows, f"{tq} SqlTable node not found after indexing."

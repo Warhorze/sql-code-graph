@@ -1,13 +1,13 @@
 """Integration tests for v1.2.0: server-routed read proxy (read half of #28).
 
 Proves that a CLI read can return real rows over the control socket while the
-server process holds KuzuDB's process-level write lock — the exact situation
+server process holds DuckDB's process-level write lock — the exact situation
 that makes a direct ``get_backend(read_only=True)`` fail with "Database is
 locked".
 
 Rather than spawn a full ``sqlcg mcp start`` subprocess, these tests drive
 ``_control_socket_task`` directly in an anyio task group with a real
-``KuzuBackend`` that holds the lock (same approach as
+``DuckDBBackend`` that holds the lock (same approach as
 ``test_reindex_op_calls_resync_changed_once``).  This keeps the lock-holding
 process in-test so the "locked" assertion is deterministic.
 
@@ -100,31 +100,32 @@ async def _serve_with_backend(db_path: Path, backend, do_requests):
 def test_scenario_a_query_returns_rows_while_writer_holds_lock(tmp_path: Path) -> None:
     """The #28 proof: real rows come back over the socket while the lock is held,
     and a concurrent direct read-only open of the same DB fails with 'locked'."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
     db_path = tmp_path / "read_a.db"
 
-    backend = KuzuBackend(str(db_path))  # holds the process write lock
+    backend = DuckDBBackend(str(db_path))  # holds the process write lock
     backend.init_schema()
     # Seed a deterministic, JSON-scalar row to assert on.
-    backend.run_write(
-        "CREATE (:SqlTable {qualified: $q, name: $n, kind: 'TABLE'})",
-        {"q": "ba.orders", "n": "orders"},
+    backend.upsert_node(
+        "SqlTable", "ba.orders", {"qualified": "ba.orders", "name": "orders", "kind": "TABLE"}
     )
 
     # Prove the lock is genuinely exclusive ACROSS PROCESSES: a separate
     # process opening the same DB read-only must fail with "locked" while this
     # process holds the write lock.  (A second open within THIS process does
-    # not trip Kuzu's lock — the #28 failure is inherently cross-process, which
+    # not trip DuckDB's lock — the #28 failure is inherently cross-process, which
     # is why the proxy routes through the lock-holder.)
     probe = textwrap.dedent(
         f"""
-        import kuzu
+        import duckdb
         try:
-            kuzu.Database({str(db_path)!r}, read_only=True)
+            duckdb.connect({str(db_path)!r}, read_only=True)
             print("OPENED")
         except Exception as e:
-            print("LOCKED" if "lock" in str(e).lower() else "OTHER:" + str(e))
+            s = str(e).lower()
+            markers = ("lock", "already held", "conflict", "could not")
+            print("LOCKED" if any(m in s for m in markers) else "OTHER:" + str(e))
         """
     )
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=30)
@@ -139,7 +140,7 @@ def test_scenario_a_query_returns_rows_while_writer_holds_lock(tmp_path: Path) -
             sp,
             {
                 "op": "query",
-                "cypher": "MATCH (t:SqlTable) RETURN t.qualified AS qualified, t.kind AS kind",
+                "sql": 'SELECT qualified, kind FROM "SqlTable"',
                 "params": {},
             },
         )
@@ -158,14 +159,13 @@ def test_scenario_a_query_returns_rows_while_writer_holds_lock(tmp_path: Path) -
 
 
 def test_scenario_d_write_statement_rejected_graph_unchanged(tmp_path: Path) -> None:
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
     db_path = tmp_path / "read_d.db"
-    backend = KuzuBackend(str(db_path))
+    backend = DuckDBBackend(str(db_path))
     backend.init_schema()
-    backend.run_write(
-        "CREATE (:SqlTable {qualified: $q, name: $n, kind: 'TABLE'})",
-        {"q": "ba.seed", "n": "seed"},
+    backend.upsert_node(
+        "SqlTable", "ba.seed", {"qualified": "ba.seed", "name": "seed", "kind": "TABLE"}
     )
 
     def _do(sp: Path) -> dict:
@@ -173,7 +173,8 @@ def test_scenario_d_write_statement_rejected_graph_unchanged(tmp_path: Path) -> 
             sp,
             {
                 "op": "query",
-                "cypher": "CREATE (:SqlTable {qualified: 'ba.injected', name: 'x', kind: 'TABLE'})",
+                "sql": 'INSERT INTO "SqlTable" (qualified, name, kind) '
+                "VALUES ('ba.injected', 'x', 'TABLE')",
                 "params": {},
             },
         )
@@ -182,7 +183,7 @@ def test_scenario_d_write_statement_rejected_graph_unchanged(tmp_path: Path) -> 
             sp,
             {
                 "op": "query",
-                "cypher": "MATCH (t:SqlTable) RETURN COUNT(t) AS c",
+                "sql": 'SELECT COUNT(*) AS c FROM "SqlTable"',
                 "params": {},
             },
         )
@@ -205,24 +206,24 @@ def test_scenario_d_write_statement_rejected_graph_unchanged(tmp_path: Path) -> 
 
 def test_scenario_f_large_result_not_truncated(tmp_path: Path) -> None:
     """A result well over a single recv(65536) is returned in full (framing guard)."""
-    from sqlcg.core.kuzu_backend import KuzuBackend
+    from sqlcg.core.duckdb_backend import DuckDBBackend
 
     db_path = tmp_path / "read_f.db"
-    backend = KuzuBackend(str(db_path))
+    backend = DuckDBBackend(str(db_path))
     backend.init_schema()
 
     # ~1000 rows; each path ~200 bytes → response body well over 64 KiB.
     n_rows = 1000
-    for i in range(n_rows):
-        backend.run_write(
-            "CREATE (:SqlTable {qualified: $q, name: $n, kind: 'TABLE'})",
-            {"q": f"schema.table_{i:05d}_" + ("x" * 180), "n": f"t{i}"},
-        )
+    rows_to_insert = [
+        {"qualified": f"schema.table_{i:05d}_" + ("x" * 180), "name": f"t{i}", "kind": "TABLE"}
+        for i in range(n_rows)
+    ]
+    backend.upsert_nodes_bulk("SqlTable", rows_to_insert)
 
     def _do(sp: Path) -> dict:
         return _send_framed(
             sp,
-            {"op": "query", "cypher": "MATCH (t:SqlTable) RETURN t.qualified AS q", "params": {}},
+            {"op": "query", "sql": 'SELECT qualified AS q FROM "SqlTable"', "params": {}},
         )
 
     resp = anyio.run(_serve_with_backend, db_path, backend, _do)

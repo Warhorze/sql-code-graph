@@ -5,7 +5,7 @@ These tests verify schema.py enum values, schema.cypher DDL, and db info output.
 
 import pytest
 
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 
 # ---------------------------------------------------------------------------
 # T-02 — SCHEMA_VERSION bump and RelType.STAR_SOURCE enum
@@ -46,13 +46,16 @@ def test_star_source_rel_table_in_schema_cypher():
 
 def test_star_source_table_created_in_fresh_db():
     """init_schema() on a fresh in-memory DB must create the STAR_SOURCE REL TABLE."""
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     try:
         db.init_schema()
-        rows = db.run_read("CALL show_tables() RETURN *", {})
+        rows = db.run_read(
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'main'",
+            {},
+        )
         table_names = [r["name"] for r in rows]
         assert "STAR_SOURCE" in table_names, (
-            f"STAR_SOURCE not in show_tables() output. Found: {table_names}"
+            f"STAR_SOURCE not in schema tables. Found: {table_names}"
         )
     finally:
         db.close()
@@ -60,7 +63,7 @@ def test_star_source_table_created_in_fresh_db():
 
 def test_star_source_rel_has_correct_properties():
     """The STAR_SOURCE REL TABLE must accept qualifier, target_table, confidence writes."""
-    db = KuzuBackend(":memory:")
+    db = DuckDBBackend(":memory:")
     try:
         db.init_schema()
         # Create source nodes for the edge
@@ -101,8 +104,7 @@ def test_star_source_rel_has_correct_properties():
             {"qualifier": "<unqualified>", "target_table": "BA.tgt", "confidence": 0.8},
         )
         rows = db.run_read(
-            "MATCH ()-[r:STAR_SOURCE]->() "
-            "RETURN r.qualifier AS q, r.target_table AS tgt, r.confidence AS c",
+            'SELECT qualifier AS q, target_table AS tgt, confidence AS c FROM "STAR_SOURCE"',
             {},
         )
         assert len(rows) == 1
@@ -128,27 +130,27 @@ def test_star_metrics_in_info_output():
 
     runner = CliRunner()
 
-    # db info routes every Cypher read through run_read_routed (read_client), so
+    # db info routes every SQL read through run_read_routed (read_client), so
     # the mock must target that function rather than a backend object.
     def run_read_side_effect(query, _params):
-        if "v.version AS version" in query:
+        if "SchemaVersion" in query and "version" in query and "count" not in query.lower():
             return [{"version": "6"}]
-        if "v.indexed_sha" in query:
+        if "indexed_sha" in query:
             return [{"sha": None}]
-        if "r.path AS path" in query:
+        if '"Repo"' in query and "path" in query and "count" not in query.lower():
             # No repo path -> freshness block is skipped.
             return []
         if "STAR_SOURCE" in query and "COLUMN_LINEAGE" not in query:
             return [{"n": 3}]
         if "STAR_EXPANSION" in query:
             return [{"n": 6}]
-        if "Repo" in query:
+        if "Repo" in query and "count" in query.lower():
             return [{"count": 1}]
-        if "SqlQuery" in query:
+        if "SqlQuery" in query and "count" in query.lower():
             return [{"count": 10}]
-        if "SqlColumn" in query:
+        if "SqlColumn" in query and "count" in query.lower():
             return [{"count": 50}]
-        if "COLUMN_LINEAGE" in query:
+        if "COLUMN_LINEAGE" in query and "count" in query.lower():
             return [{"count": 25}]
         return [{"count": 0}]
 

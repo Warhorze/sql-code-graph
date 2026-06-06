@@ -1,4 +1,4 @@
-"""KùzuDB schema definition for sqlcg graph."""
+"""Graph schema definition for sqlcg (DuckDB backend)."""
 
 from enum import StrEnum
 from importlib.resources import files

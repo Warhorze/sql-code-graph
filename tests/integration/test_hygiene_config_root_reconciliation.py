@@ -27,7 +27,7 @@ import inspect
 import pytest
 
 import sqlcg.server.tools as tools
-from sqlcg.core.kuzu_backend import KuzuBackend
+from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
 
@@ -47,7 +47,7 @@ def _index_in_dir_A_then_chdir_B(tmp_path, files: dict[str, str], monkeypatch):
     for name, sql in files.items():
         (dir_a / name).write_text(sql)
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     # Repo PK is the indexed root path — exactly what index_cmd persists.
     backend.upsert_node("Repo", str(dir_a), {"path": str(dir_a), "name": dir_a.name})
@@ -145,7 +145,7 @@ def test_reconciliation_no_repo_node_falls_back_to_cwd(tmp_path, monkeypatch):
     if indexed_root is None:
         pytest.skip("_indexed_root not yet implemented (Phase 4)")
 
-    backend = KuzuBackend(":memory:")
+    backend = DuckDBBackend(":memory:")
     backend.init_schema()
     # NOTE: deliberately NO Repo node upserted.
     (tmp_path / "orphan.sql").write_text("CREATE TABLE ba.real_orphan (id INT);")

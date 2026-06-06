@@ -92,7 +92,6 @@ def _run_index_cmd(tmp_path: Path, *, quiet: bool = False) -> list[str]:
             dialect=None,
             dbt_manifest=None,
             timeout_per_file=5,
-            buffer_pool_size=0,
             batch_size=50,
             no_ddl=False,
             quiet=quiet,

@@ -77,7 +77,7 @@ class GraphBackend(ABC):
 
         Each row dict must contain the primary-key field for `label` (see _pk_field)
         plus any other properties to SET. All rows must share the same property-key
-        set; backends MAY raise if rows are heterogeneous (KuzuBackend does).
+        set; backends MAY raise if rows are heterogeneous (DuckDBBackend does).
 
         Idempotent MERGE semantics, identical to upsert_node per row.
 
@@ -118,7 +118,7 @@ class GraphBackend(ABC):
         """Execute a read-only query and return results.
 
         Args:
-            query: Query string (Cypher for KùzuDB/Neo4j)
+            query: Query string (SQL)
             params: Parameters to bind in the query
 
         Returns:
@@ -130,7 +130,7 @@ class GraphBackend(ABC):
         """Execute a write query (mutation).
 
         Args:
-            query: Query string (Cypher for KùzuDB/Neo4j)
+            query: Query string (SQL)
             params: Parameters to bind in the query
         """
 
@@ -213,7 +213,7 @@ class GraphBackend(ABC):
     def _validate_props(properties: dict[str, Any]) -> None:
         """Validate that all property keys are safe identifiers.
 
-        Guards against Cypher injection via property key interpolation.
+        Guards against SQL injection via property key interpolation.
 
         Args:
             properties: Dictionary of properties to validate
@@ -244,3 +244,19 @@ class GraphBackend(ABC):
             yield self
         except Exception:
             raise
+
+    def clear_all_tables(self) -> None:
+        """Delete all node and edge rows, preserving the schema structure.
+
+        Used by the server drain body for the full-rebuild-in-transaction
+        reindex path. Concrete backends must override this.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support clear_all_tables")
+
+    def expand_star_sources(self) -> int:
+        """Expand SELECT * lineage into per-column STAR_EXPANSION edges.
+
+        Runs once per index after ingestion. Concrete backends must override
+        this; returns the total STAR_EXPANSION edge count.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support expand_star_sources")
