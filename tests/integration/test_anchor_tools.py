@@ -239,10 +239,50 @@ def test_backfill_order_topological(tmp_path, monkeypatch):
 
 
 def test_backfill_order_cycle_degrades(tmp_path, monkeypatch):
-    """Scenario B — a dependency cycle degrades gracefully with a 'cycle' hint."""
-    # b derives its column from a (unambiguous lineage a.id -> b.id), but selects
-    # from both a and c at the table level, while c selects from b — so b and c
-    # form a SELECTS_FROM cycle that the topological sort must handle gracefully.
+    """Scenario B — a dependency cycle degrades gracefully with a 'cycle' hint.
+
+    Issue #38 (Option A): Kahn adjacency is now derived from the COLUMN_LINEAGE
+    closure, not SELECTS_FROM — a table-reference cycle that carries no genuine
+    *column*-level cycle (e.g. b's column derives unambiguously from a while b
+    merely also references c at the table level) is no longer mistaken for a
+    cycle; that was an artifact of the old SELECTS_FROM-based adjacency and is
+    now correctly resolved into a causal a -> b -> c chain (see
+    test_backfill_order_topological_via_column_lineage_chain). To keep the
+    cycle-degradation contract covered, this fixture constructs a genuine
+    *column*-level cycle reachable from the target: b.id derives from a.id
+    (so it is in a's downstream closure) AND from c.id, while c.id derives
+    from b.id — mutual recursion between b and c — which COLUMN_LINEAGE
+    adjacency must still detect and degrade gracefully.
+    """
+    _index_fixture(
+        tmp_path,
+        {
+            "ddl.sql": (
+                "CREATE TABLE ba.a (id INT);CREATE TABLE ba.b (id INT);CREATE TABLE ba.c (id INT);"
+            ),
+            "b1.sql": "INSERT INTO ba.b (id) SELECT a.id AS id FROM ba.a AS a;",
+            "b2.sql": "INSERT INTO ba.b (id) SELECT c.id AS id FROM ba.c AS c;",
+            "c.sql": "INSERT INTO ba.c (id) SELECT b.id AS id FROM ba.b AS b;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.get_backfill_order("ba.a")
+
+    assert len(result.backfill_order) >= 1, "order must be non-empty even with a cycle"
+    assert result.hint is not None and "cycle" in result.hint.lower()
+
+
+def test_backfill_order_topological_via_column_lineage_chain(tmp_path, monkeypatch):
+    """Issue #38 (Option A) — a table-reference cycle with no genuine column-level
+    cycle is resolved into the correct causal chain, not the cycle fallback.
+
+    b's column derives unambiguously from a (a.id -> b.id); b also references c
+    at the table level (a SELECTS_FROM-level "cycle" the old adjacency saw), but
+    there is no column-level cycle: c.id derives from b.id only. COLUMN_LINEAGE
+    adjacency correctly resolves this to the causal chain a -> b -> c — no cycle
+    hint, deterministic producer-before-consumer order.
+    """
     _index_fixture(
         tmp_path,
         {
@@ -258,8 +298,14 @@ def test_backfill_order_cycle_degrades(tmp_path, monkeypatch):
 
     result = tools.get_backfill_order("ba.a")
 
-    assert len(result.backfill_order) >= 1, "order must be non-empty even with a cycle"
-    assert result.hint is not None and "cycle" in result.hint.lower()
+    assert result.hint is None or "cycle" not in result.hint.lower(), (
+        f"no genuine column-level cycle exists; must not degrade: {result.hint}"
+    )
+    assert "ba.b" in result.backfill_order
+    assert "ba.c" in result.backfill_order
+    assert result.backfill_order.index("ba.b") < result.backfill_order.index("ba.c"), (
+        f"b must precede c in rebuild order: {result.backfill_order}"
+    )
 
 
 def test_diff_impact_file_to_blast_radius(tmp_path, monkeypatch):
