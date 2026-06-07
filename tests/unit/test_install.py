@@ -238,6 +238,86 @@ def test_mcp_setup_write_writes_claude_json(
     assert not (tmp_path / ".claude" / "settings.json").exists()
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 — install stops a stale running MCP server (version-parity-and-restart)
+# ---------------------------------------------------------------------------
+
+
+def test_install_stops_server_on_claude_cli_success(fake_home: Path) -> None:
+    """`claude mcp add` success path calls stop_server() exactly once and reports it."""
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stderr = ""
+
+    def which_impl(cmd: str) -> str | None:
+        if cmd in ("sqlcg", "claude"):
+            return f"/usr/local/bin/{cmd}"
+        return None
+
+    with patch("shutil.which", side_effect=which_impl):
+        with patch("subprocess.run", return_value=mock_proc):
+            with patch("sqlcg.cli.commands.install.stop_server", return_value=True) as mock_stop:
+                result = runner.invoke(app, ["install", "--scope", "global"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    mock_stop.assert_called_once()
+    assert "Stopped running MCP server" in result.output
+    assert "respawn it on the new build" in result.output
+    # The message must drop the (vX) suffix — stop_server() returns only a bool.
+    assert "(v" not in result.output
+
+
+def test_install_stops_server_on_already_configured(fake_home: Path) -> None:
+    """The 'Already configured' branch still calls stop_server() exactly once.
+
+    This is the reinstall case: the config did not change but the binary on
+    disk did, so the stale running server still must be stopped.
+    """
+    with patch("shutil.which", side_effect=_which_sqlcg):
+        with patch("sqlcg.cli.commands.install.stop_server", return_value=True) as mock_stop:
+            runner.invoke(app, ["install", "--scope", "global"])
+            mock_stop.reset_mock()
+            result2 = runner.invoke(app, ["install", "--scope", "global"])
+
+    assert "Already configured" in result2.output
+    mock_stop.assert_called_once()
+    assert "Stopped running MCP server" in result2.output
+
+
+def test_install_stops_server_on_fallback_write_path(fake_home: Path) -> None:
+    """The ~/.claude.json fallback-write success path calls stop_server() exactly once."""
+    with patch("shutil.which", side_effect=_which_sqlcg):
+        with patch("sqlcg.cli.commands.install.stop_server", return_value=True) as mock_stop:
+            result = runner.invoke(app, ["install", "--scope", "global"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    mock_stop.assert_called_once()
+    assert "Stopped running MCP server" in result.output
+
+
+def test_install_no_running_server_prints_no_op_message(fake_home: Path) -> None:
+    """When stop_server() finds nothing, install prints the no-op refresh message."""
+    with patch("shutil.which", side_effect=_which_sqlcg):
+        with patch("sqlcg.cli.commands.install.stop_server", return_value=False) as mock_stop:
+            result = runner.invoke(app, ["install", "--scope", "global"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    mock_stop.assert_called_once()
+    assert "No running MCP server to refresh." in result.output
+    assert "Stopped running MCP server" not in result.output
+
+
+def test_install_dry_run_never_stops_server(fake_home: Path) -> None:
+    """--dry-run never calls stop_server() and prints the would-stop preview line."""
+    with patch("shutil.which", side_effect=_which_sqlcg):
+        with patch("sqlcg.cli.commands.install.stop_server") as mock_stop:
+            result = runner.invoke(app, ["install", "--dry-run", "--scope", "global"])
+
+    assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
+    mock_stop.assert_not_called()
+    assert "would stop running MCP server" in result.output
+
+
 def test_mcp_setup_write_merges_into_existing_claude_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
