@@ -1672,13 +1672,22 @@ def db_info() -> DbInfoResult:
       those files. Table-level lineage is still available.
     - `warnings` list — empty means the graph is healthy.
 
+    `sqlcg_version` is the installed *package* build (sqlcg.__version__) — use
+    it to self-check you are talking to the build you expect (the MCP protocol
+    `serverInfo.version` is not reliably visible to the agent persona). This is
+    a different axis from `schema_version`, which tracks the graph schema, not
+    the package: do not conflate the two.
+
     Parse quality legend (parsing_mode per SqlQuery node):
       sqlglot          — standard path; column lineage available if extracted
       scripting_block  — tokenizer fallback; column lineage unavailable
 
     Returns:
-        DbInfoResult with schema version, node counts, parse quality, and warnings
+        DbInfoResult with sqlcg/schema versions, node counts, parse quality,
+        and warnings
     """
+    from sqlcg import __version__
+
     db = _get_backend()
 
     schema_version = db.get_schema_version() or "unknown"
@@ -1745,6 +1754,7 @@ def db_info() -> DbInfoResult:
         pass
 
     return DbInfoResult(
+        sqlcg_version=__version__,
         schema_version=schema_version,
         node_counts=node_counts,
         column_lineage_edges=column_lineage_edges,

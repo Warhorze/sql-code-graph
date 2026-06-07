@@ -190,6 +190,9 @@ class DialectRepoResult(BaseModel):
 class DbInfoResult(BaseModel):
     """Result of db_info tool — graph health and parse quality diagnostics."""
 
+    sqlcg_version: str = Field(
+        ..., description="Installed sqlcg package version (sqlcg.__version__)"
+    )
     schema_version: str = Field(..., description="Graph schema version")
     node_counts: dict[str, int] = Field(
         default_factory=dict,
