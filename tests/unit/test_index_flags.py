@@ -36,6 +36,13 @@ def test_index_quiet_flag_suppresses_summary():
                 patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
                 patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path,
                 patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
+                # Force the direct-write path: a live sqlcg server on the host
+                # machine would otherwise route this through the socket and bypass
+                # every mock below, making the test depend on host runtime state.
+                patch(
+                    "sqlcg.cli.commands.index._try_route_index_via_server",
+                    return_value=False,
+                ),
             ):
                 mock_backend = MagicMock()
                 mock_backend.get_schema_version.return_value = "6"  # Match SCHEMA_VERSION
@@ -95,6 +102,10 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
         patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
         patch("sqlcg.cli.commands.index.get_db_path"),
         patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
+        # Force the direct-write path: a live sqlcg server on the host machine
+        # would otherwise route this through the socket and bypass every mock
+        # below, making the test depend on host runtime state.
+        patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
     ):
         mock_backend = MagicMock()
         mock_backend.get_schema_version.return_value = "6"

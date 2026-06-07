@@ -404,14 +404,19 @@ class AnsiParser(SqlParser):
             create_stmt: CREATE expression (must be a TABLE create)
 
         Returns:
-            List of column names in source order (as they appear in the SQL)
+            List of column names in source order (as they appear in the SQL),
+            normalized to lowercase with surrounding double-quotes stripped —
+            identical to ColumnRef.__post_init__ — so DDL columns share node
+            identity with lowercase ETL lineage columns (issue #38 Phase 5).
         """
         columns: list[str] = []
         # Find all ColumnDef nodes in the CREATE statement
         for col_def in create_stmt.find_all(exp.ColumnDef):
             col_name = col_def.this.name if col_def.this else None
             if col_name:
-                columns.append(col_name)
+                if len(col_name) >= 2 and col_name[0] == '"' and col_name[-1] == '"':
+                    col_name = col_name[1:-1]
+                columns.append(col_name.lower())
         return columns
 
     @staticmethod

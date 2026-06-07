@@ -77,6 +77,10 @@ def _run_index_cmd(tmp_path: Path, *, quiet: bool = False) -> list[str]:
         patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
         patch("sqlcg.cli.commands.index.get_db_path") as mock_db_path,
         patch("sqlcg.cli.commands.index.get_dialect", return_value=None),
+        # Force the direct-write path: a live sqlcg server on the host machine
+        # would otherwise route this through the socket and bypass every mock
+        # below, making the test depend on host runtime state.
+        patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
     ):
         mock_console.print = _capture
         mock_backend = MagicMock()
