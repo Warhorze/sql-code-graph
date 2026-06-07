@@ -77,9 +77,19 @@ def mcp_best_practices() -> None:
 def mcp_status() -> None:
     """Print server status JSON (connects to control socket).
 
-    Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
-    stale_by_commits, connected_clients, uptime, writer_queue when a server
-    is live.
+    Returns JSON with fields: running, version, pid, db_path, indexed_sha,
+    head_sha, stale_by_commits, connected_clients, uptime, writer_queue,
+    stale_by_version when a server is live.
+
+    `version` is the *running* server's reported sqlcg.__version__ (read live
+    over the control socket — the build the editor is currently talking to).
+    `stale_by_version` compares it against the *installed* sqlcg.__version__
+    (the CLI process you just invoked): true when they differ, false when they
+    match, null when the running version cannot be determined (degraded mode).
+    When stale, a warning is printed telling you to restart the MCP server via
+    your editor or run `sqlcg install` (which stops the stale server for you).
+    This is distinct from `stale_by_commits` (graph-vs-repo freshness, not
+    package-vs-binary drift).
 
     The status response is length-prefixed framed (v1.3.0, B3) so large
     writer_queue payloads are received in full — the client uses the
@@ -87,7 +97,8 @@ def mcp_status() -> None:
 
     When no server is found: {"running": false}.
     When the PID file exists with a live process but the socket is unavailable:
-    {"running": true, "degraded": "socket unavailable", ...}.
+    {"running": true, "degraded": "socket unavailable", "stale_by_version": null, ...}
+    (the running version cannot be read without a live socket).
 
     R3 (stale socket): if the socket file exists but the server is not
     responding (ConnectionRefusedError / FileNotFoundError), falls through
@@ -119,8 +130,24 @@ def mcp_status() -> None:
 
         status = json.loads(data.decode())
 
+        # Drift detection: compare the *running* server's reported version (read
+        # over the socket, from the live process) against the *installed*
+        # sqlcg.__version__ (the version of the CLI process you just invoked).
+        from sqlcg import __version__
+
+        running_version = status.get("version")
+        stale = running_version is not None and running_version != __version__
+        status = {**status, "version": running_version, "stale_by_version": stale}
+
         # Pretty-print the base fields.
         console.print_json(json.dumps({k: v for k, v in status.items() if k != "writer_queue"}))
+
+        if stale:
+            console.print(
+                f"[yellow]Warning:[/yellow] running MCP server is v{running_version}, "
+                f"installed sqlcg is v{__version__} — restart the MCP server via your "
+                "editor (or run `sqlcg install`, which stops the stale server for you)."
+            )
 
         # Render the writer_queue block separately for readability.
         wq = status.get("writer_queue")
@@ -178,6 +205,10 @@ def mcp_status() -> None:
                         "degraded": "socket unavailable",
                         "pid": rec["pid"],
                         "db_path": rec["db_path"],
+                        # Cannot read the running version without a live socket —
+                        # omit `version` and report drift as unknown (None → JSON
+                        # null), never guess.
+                        "stale_by_version": None,
                     }
                 )
             )
@@ -185,16 +216,20 @@ def mcp_status() -> None:
             console.print_json(json.dumps({"running": False}))
 
 
-@app.command("stop")
-def mcp_stop() -> None:
-    """Stop the running MCP server gracefully.
+def stop_server() -> bool:
+    """Stop a running MCP server gracefully (best-effort). Returns True if stopped.
 
     Sends a ``stop`` op via the control socket; waits up to 5 s for the
     socket file to disappear (confirming clean exit).  Falls back to SIGTERM
     on the PID-file PID if the socket is unavailable.
 
     R3 (stale socket): ``ConnectionRefusedError`` / ``FileNotFoundError`` are
-    caught — never hangs on a dead socket.
+    caught — never hangs on a dead socket; a socket error here must not abort
+    the caller (``mcp_stop`` and ``install_cmd`` both rely on this).
+
+    Returns:
+        True if a running server was found and stopped (via socket or SIGTERM
+        fallback); False if no running server was found.
     """
     import socket as _socket
     import time
@@ -214,6 +249,7 @@ def mcp_stop() -> None:
                 break
             time.sleep(0.5)
         console.print("[green]Server stopped.[/green]")
+        return True
     except (FileNotFoundError, ConnectionRefusedError, OSError):
         # Socket unavailable — fall back to SIGTERM via PID file
         import signal
@@ -222,8 +258,20 @@ def mcp_stop() -> None:
         if rec and is_pid_alive(rec["pid"]):
             os.kill(rec["pid"], signal.SIGTERM)
             console.print(f"[yellow]Socket unavailable — sent SIGTERM to PID {rec['pid']}[/yellow]")
-        else:
-            console.print("[yellow]No server found to stop.[/yellow]")
+            return True
+        return False
+
+
+@app.command("stop")
+def mcp_stop() -> None:
+    """Stop the running MCP server gracefully.
+
+    Delegates to ``stop_server()`` (shared with ``sqlcg install``) and prints
+    a final message based on whether a server was found.
+    """
+    stopped = stop_server()
+    if not stopped:
+        console.print("[yellow]No server found to stop.[/yellow]")
 
 
 @app.command("restart")
