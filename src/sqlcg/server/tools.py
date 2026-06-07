@@ -21,12 +21,14 @@ from sqlcg.core.queries import (
     FIND_TABLE_USAGES_QUERY,
     GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_PRODUCER_FILES_FOR_TABLE_QUERY,
     GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY,
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_TABLE_KINDS_BATCH_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+    GET_TARGET_TABLES_FOR_FILE_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
@@ -943,7 +945,10 @@ def find_definition(table_qualified: str) -> DefinitionResult:
     with _open_backend() as db:
         _assert_indexed(db)
 
-        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": table_qualified.lower()})
+        target = table_qualified.lower()
+        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": target})
+        producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
+        producer_files = _dedup_preserve_order([r["file_path"] for r in producer_rows])
         noise_filter = NoiseFilter.from_config()
 
         duplicate_ddl = len(rows) > 1
@@ -975,6 +980,7 @@ def find_definition(table_qualified: str) -> DefinitionResult:
             table_qualified=table_qualified,
             definitions=definitions,
             duplicate_ddl=duplicate_ddl,
+            producer_files=producer_files,
             noise_excluded=noise_excluded,
             hint=hint,
         )
@@ -1006,7 +1012,10 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         noise_filter = NoiseFilter.from_config()
 
         def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
-        defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
+        producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
+        defining_files = _dedup_preserve_order(
+            [r["file_path"] for r in def_rows] + [r["file_path"] for r in producer_rows]
+        )
 
         up_rows = db.run_read(
             GET_TABLE_DIRECT_UPSTREAMS_QUERY,
@@ -1161,12 +1170,13 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             fp = Path(file_path)
             if not fp.is_absolute():
                 fp = root / fp
-            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(fp)})
-            for row in rows:
-                tq = row["table_qualified"]
-                if tq not in seen_changed:
-                    seen_changed.add(tq)
-                    changed_tables.append(tq)
+            for query in (GET_TABLES_DEFINED_IN_FILE_QUERY, GET_TARGET_TABLES_FOR_FILE_QUERY):
+                rows = db.run_read(query, {"file_path": str(fp)})
+                for row in rows:
+                    tq = row["table_qualified"]
+                    if tq and tq not in seen_changed:
+                        seen_changed.add(tq)
+                        changed_tables.append(tq)
 
         all_affected_cols: list[str] = []
         affected_seen: set[str] = set()

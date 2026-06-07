@@ -242,6 +242,12 @@ class DefinitionResult(BaseModel):
     duplicate_ddl: bool = Field(
         False, description="True when the same table is defined in more than one file."
     )
+    producer_files: list[str] = Field(
+        default_factory=list,
+        description="Files whose INSERT...SELECT populates this table (via "
+        "QUERY_DEFINED_IN -> SqlQuery.target_table). Often the more useful answer "
+        "to 'where do I change this table's logic?' than the DDL file alone.",
+    )
     noise_excluded: list[str] = Field(
         default_factory=list,
         description="Definition file paths that were flagged as backup/noise.",
