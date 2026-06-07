@@ -325,6 +325,43 @@ def test_diff_impact_file_to_blast_radius(tmp_path, monkeypatch):
     assert "ba.etl_table" in result.affected_tables
 
 
+def test_diff_impact_producer_file_blast_radius(tmp_path, monkeypatch):
+    """ETL producer files (INSERT...SELECT) populate a table without a DEFINED_IN
+    edge — that edge is DDL-only. diff_impact must still resolve the populated
+    table from QUERY_DEFINED_IN -> SqlQuery.target_table, not just DEFINED_IN, or
+    the blast radius is silently empty for the tool's primary CI use case.
+
+    Three SEPARATE files: ddl.sql defines ba.dim (DDL only, DEFINED_IN edge),
+    source.sql defines ba.source (DDL only), producer.sql POPULATES ba.dim via
+    INSERT...SELECT (QUERY_DEFINED_IN + target_table, no DEFINED_IN), and
+    consumer.sql is downstream of ba.dim.
+    """
+    _index_fixture(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE ba.dim (id INT);",
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "producer.sql": "INSERT INTO ba.dim SELECT id FROM ba.source;",
+            "consumer.sql": "CREATE TABLE ba.mart AS SELECT id FROM ba.dim;",
+        },
+        monkeypatch,
+    )
+
+    result = tools.diff_impact([str(tmp_path / "producer.sql")])
+
+    assert "ba.dim" in result.changed_tables, (
+        f"producer file must resolve its populated table via QUERY_DEFINED_IN: "
+        f"{result.changed_tables}"
+    )
+    assert "ba.mart" in result.affected_tables, (
+        f"downstream consumer of the populated table must be in the blast radius: "
+        f"{result.affected_tables}"
+    )
+    assert result.hint is None, (
+        f"a real producer file must not fall through to the 'no tables defined' hint: {result.hint}"
+    )
+
+
 def test_diff_impact_presentation_configured(tmp_path, monkeypatch):
     """Scenario D (configured) — presentation_facing reflects configured prefixes."""
     _index_fixture(

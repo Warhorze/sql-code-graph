@@ -27,6 +27,7 @@ from sqlcg.core.queries import (
     GET_TABLE_KINDS_BATCH_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
+    GET_TARGET_TABLES_FOR_FILE_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
     HUB_RANKING_QUERY,
     INDEX_REPO_FILES_QUERY,
@@ -1161,12 +1162,13 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             fp = Path(file_path)
             if not fp.is_absolute():
                 fp = root / fp
-            rows = db.run_read(GET_TABLES_DEFINED_IN_FILE_QUERY, {"file_path": str(fp)})
-            for row in rows:
-                tq = row["table_qualified"]
-                if tq not in seen_changed:
-                    seen_changed.add(tq)
-                    changed_tables.append(tq)
+            for query in (GET_TABLES_DEFINED_IN_FILE_QUERY, GET_TARGET_TABLES_FOR_FILE_QUERY):
+                rows = db.run_read(query, {"file_path": str(fp)})
+                for row in rows:
+                    tq = row["table_qualified"]
+                    if tq and tq not in seen_changed:
+                        seen_changed.add(tq)
+                        changed_tables.append(tq)
 
         all_affected_cols: list[str] = []
         affected_seen: set[str] = set()

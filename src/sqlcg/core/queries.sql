@@ -198,6 +198,17 @@ FROM "SqlTable" t
 JOIN "DEFINED_IN" di ON di.src_key = t.qualified
 WHERE di.dst_key = ?
 
+-- GET_TARGET_TABLES_FOR_FILE
+-- ETL INSERT...SELECT producers populate a table without a DEFINED_IN edge
+-- (that edge is DDL-only). Resolve query->file QUERY_DEFINED_IN -> SqlQuery.target_table
+-- so diff_impact can also see "populated here" producers, not just "defined here" DDL.
+-- params: [file_path]
+SELECT DISTINCT q.target_table AS table_qualified
+FROM "SqlQuery" q
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+WHERE qdi.dst_key = ?
+  AND q.target_table <> ''
+
 -- GET_TABLE_ADJACENCY_FOR_COLUMNS
 -- Aggregate table-level producer->consumer adjacency derived from COLUMN_LINEAGE,
 -- restricted to a closure's column-id set (Option A — issue #38 backfill fix).

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sql-code-graph"
-version = "1.4.2"
+version = "1.4.3"
 description = "SQL code graph analyzer and lineage tracer"
 readme = "README.md"
 requires-python = ">=3.12"
