@@ -1,3 +1,33 @@
+## Handoff — developer: version-parity-and-restart [2026-06-07]
+
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: version-parity-and-restart (single source of truth for sqlcg.__version__ across CLI/MCP/control-socket/db_info; install stops stale MCP server)
+BRANCH: plan/version-parity-and-restart
+PLAN: plan/version-parity-and-restart.md (approved — plan-reviewer APPROVE WITH CHANGES, all changes applied; no blocking questions; no deviations recorded)
+STATUS: implementation complete, all phases 1-7 done, full gate green — NOT yet PR'd (user runs compliance check first)
+
+IMPLEMENTED (commits on branch, oldest first):
+  0aa8902 feat: eager --version callback + shared _version_string() (Phase 1)
+  5853283 feat: mcp._mcp_server.version = __version__ (Phase 2, private-attr pin)
+  33e2103 feat: control-socket status.version + mcp status stale_by_version drift (Phase 3)
+  6b02cf1 feat: DbInfoResult.sqlcg_version + db_info population (Phase 4)
+  cdb05cc feat: stop_server() extracted to mcp.py; install_cmd stops stale server
+          on all 3 non-dry-run success branches incl. "Already configured" (Phase 5)
+  7f7cd30 test: tests/unit/test_version_parity.py — 5-surface parity assertions (Phase 6)
+  8ecca1d chore: version bump 1.4.3 -> 1.5.0 + uv lock (Phase 7)
+
+GATES: full `uv run pytest` = 1112 passed, 7 skipped, 3 xfailed (488s);
+       `uv run pyright` = 0 errors; `uv run ruff check/format` = clean
+       (2 pre-existing E501s in gitignored tests/e2e/test_dwh_e2e.py, not mine).
+CALL-SITE CONFIRMATION: stop_server grep-confirmed at mcp.py:272 (mcp_stop)
+       and install.py:145 (install_cmd) — exactly the two sites the plan named.
+DEVIATIONS: none — implemented exactly per plan; no ### Deviations section added.
+
+NEXT: architect-planner plan-compliance check, then PR to master (user runs
+      compliance + opens/reviews PR per shepherd policy).
+
+---
+
 ## Current State — developer: diff-impact-producer-file [2026-06-07]
 
 ACTIVE AGENT: developer
@@ -2187,3 +2217,10 @@ VERSION: next patch after #38's 1.4.2 (expected 1.4.3) — re-check at impl time
 No tag, no issue close (user verifies & tags).
 
 NEXT: plan-reviewer gate, then developer.
+
+## Current State — architect-planner: version-parity-and-restart [2026-06-07]
+
+ACTIVE AGENT: architect-planner
+FEATURE: version-parity-and-restart (version parity across pkg/CLI/MCP + auto-restart of stale MCP on reinstall)
+PLAN: plan/version-parity-and-restart.md (being written)
+STATUS: planning
