@@ -198,6 +198,42 @@ FROM "SqlTable" t
 JOIN "DEFINED_IN" di ON di.src_key = t.qualified
 WHERE di.dst_key = ?
 
+-- GET_TABLE_ADJACENCY_FOR_COLUMNS
+-- Aggregate table-level producer->consumer adjacency derived from COLUMN_LINEAGE,
+-- restricted to a closure's column-id set (Option A — issue #38 backfill fix).
+-- Replaces the N x GET_TABLE_DIRECT_UPSTREAMS loop with a single query: CTE-wrapped
+-- INSERT...SELECT statements emit no SELECTS_FROM adjacency at all (the real source
+-- table is nested in the CTE child scope and never surfaces into the statement's
+-- top-level sources). The raw COLUMN_LINEAGE topology bridges producer -> consumer
+-- via a TWO-HOP path through the synthetic cte/derived node (producer -> cte ->
+-- consumer, not a parallel direct edge) — this query returns ALL rolled-up table
+-- pairs (including synthetic endpoints); the caller contracts synthetic-node hops
+-- into direct real-table adjacency in one pass over this small edge set (still
+-- ONCE per closure, never per-table/per-column). Also returns each endpoint's
+-- SqlTable.kind so the caller can identify synthetic nodes without a second query.
+-- params: [col_ids, col_ids]
+SELECT DISTINCT
+  src.table_qualified AS upstream_table,
+  ut.kind AS upstream_kind,
+  dst.table_qualified AS downstream_table,
+  dt.kind AS downstream_kind
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" src ON src.id = cl.src_key
+JOIN "SqlColumn" dst ON dst.id = cl.dst_key
+LEFT JOIN "SqlTable" ut ON ut.qualified = src.table_qualified
+LEFT JOIN "SqlTable" dt ON dt.qualified = dst.table_qualified
+WHERE cl.src_key = ANY(?)
+  AND cl.dst_key = ANY(?)
+  AND src.table_qualified <> dst.table_qualified
+
+-- GET_TABLE_KINDS_BATCH
+-- Batch lookup of SqlTable.kind for a set of qualified names — the authoritative
+-- marker for synthetic cte/derived nodes (issue #38 synthetic-node-leak fix).
+-- params: [table_qualifieds]
+SELECT t.qualified AS table_qualified, t.kind AS kind
+FROM "SqlTable" t
+WHERE t.qualified = ANY(?)
+
 -- ANALYZE_UNUSED_TABLES
 -- params: []
 SELECT t.qualified AS table_qualified

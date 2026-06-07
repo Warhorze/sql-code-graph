@@ -21,8 +21,10 @@ from sqlcg.core.queries import (
     FIND_TABLE_USAGES_QUERY,
     GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY,
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
+    GET_TABLE_KINDS_BATCH_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
     GET_UPSTREAM_DEPENDENCIES_QUERY,
@@ -396,6 +398,51 @@ def _rollup_to_tables(col_ids: list[str]) -> list[str]:
     return tables
 
 
+# Synthetic SqlTable.kind values that must never surface as rebuildable tables —
+# the authoritative marker per indexer.py (kind="cte" / kind="derived"); see
+# _exclude_synthetic_tables. Keying on kind (not the alias string) avoids dropping
+# a real table that happens to share a name with a CTE alias.
+_SYNTHETIC_TABLE_KINDS = frozenset({"cte", "derived"})
+
+
+def _exclude_synthetic_tables(db: GraphBackend, tables: list[str]) -> tuple[list[str], list[str]]:
+    """Split *tables* into (real, synthetic) using the authoritative SqlTable.kind.
+
+    Synthetic CTE/derived nodes (``kind in {"cte", "derived"}``) are emitted into
+    the graph for lineage-tracing purposes but must never surface as rebuildable
+    tables in get_change_scope / get_backfill_order / diff_impact / scope_change
+    (issue #38 synthetic-node leak). Exclusion is keyed on ``kind`` — the
+    authoritative marker set in indexer.py — never on the alias string, so a real
+    table that happens to share a name with a CTE alias is never dropped.
+
+    Args:
+        db: Graph backend.
+        tables: Candidate table_qualified strings (already noise-filtered).
+
+    Returns:
+        (real_tables, synthetic_excluded) — both order-preserving, deduplicated.
+    """
+    if not tables:
+        return [], []
+
+    rows = db.run_read(GET_TABLE_KINDS_BATCH_QUERY, {"table_qualifieds": tables})
+    synthetic_ids = {
+        row["table_qualified"] for row in rows if row["kind"] in _SYNTHETIC_TABLE_KINDS
+    }
+
+    if not synthetic_ids:
+        return tables, []
+
+    real: list[str] = []
+    synthetic: list[str] = []
+    for t in tables:
+        if t in synthetic_ids:
+            synthetic.append(t)
+        else:
+            real.append(t)
+    return real, synthetic
+
+
 def _dedup_preserve_order(items: list[str]) -> list[str]:
     """Deduplicate a list while preserving first-seen order."""
     out: list[str] = []
@@ -421,30 +468,84 @@ def _risk_label(affected_table_count: int) -> str:
     return "high"
 
 
-def _kahn_topological_sort(affected_tables: list[str], db: GraphBackend) -> tuple[list[str], bool]:
+def _kahn_topological_sort(
+    affected_tables: list[str], db: GraphBackend, closure_col_ids: list[str]
+) -> tuple[list[str], bool]:
     """Order affected tables so producers come before consumers (rebuild order).
 
-    Builds an adjacency list from SELECTS_FROM edges *within* the affected set
-    (a table's producing query selecting from another affected table is an edge
-    producer -> consumer) and runs Kahn's algorithm. Returns
-    (ordered_tables, had_cycle). On a cycle the acyclic prefix is emitted in
-    topological order and the remaining cyclic tables are appended in input
-    order — no exception is raised.
+    Builds adjacency from the **COLUMN_LINEAGE closure** (Option A — issue #38),
+    not from ``SELECTS_FROM``: CTE-wrapped ``INSERT ... WITH cte AS (...) SELECT
+    ... FROM cte`` statements emit no ``SELECTS_FROM`` adjacency at all (the real
+    source table is nested in the CTE's child scope and never surfaces into the
+    statement's top-level ``sources``), which previously left every table at
+    indegree 0 and degraded ordering to alphabetical.
+
+    ``COLUMN_LINEAGE`` *does* carry the producer -> consumer connectivity, but —
+    contrary to an earlier (unreproduced) assumption of a parallel direct edge —
+    it bridges producer and consumer via a **two-hop path through the synthetic
+    cte/derived node** (``producer -> cte -> consumer``), not a parallel direct
+    edge bypassing it. Rolling the raw closure up to table level therefore yields
+    edges *to and from* synthetic nodes, not real producer -> consumer adjacency
+    directly. This function **contracts** those synthetic-node hops in one pass
+    over the (small) rolled-up edge set — ``real -> synthetic -> ... -> real``
+    collapses to ``real -> real`` — yielding the true causal adjacency. Still
+    **one** aggregate query + one contraction pass per closure (never
+    per-table/per-column; replaces the old N x GET_TABLE_DIRECT_UPSTREAMS loop).
+
+    Runs Kahn's algorithm over the contracted adjacency. Returns (ordered_tables,
+    had_cycle). On a cycle the acyclic prefix is emitted in topological order
+    and the remaining cyclic tables are appended in input order — no exception
+    is raised.
+
+    Args:
+        affected_tables: Noise-filtered, synthetic-excluded table set to order.
+        db: Graph backend.
+        closure_col_ids: Full column-id set of the closure (start columns plus
+            their transitive downstream columns) — both endpoints of every
+            producer -> consumer hop (including synthetic bridges) must be
+            present here for the adjacency query to find the connecting path.
     """
     table_set = set(affected_tables)
     successors: dict[str, set[str]] = {t: set() for t in affected_tables}
     indegree: dict[str, int] = {t: 0 for t in affected_tables}
 
-    for table in affected_tables:
+    if closure_col_ids:
         rows = db.run_read(
-            GET_TABLE_DIRECT_UPSTREAMS_QUERY,
-            {"table_qualified": table, "table_qualified2": table},
+            GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY,
+            {"col_ids": closure_col_ids, "col_ids2": closure_col_ids},
         )
+        # Raw rolled-up adjacency, including synthetic (cte/derived) endpoints.
+        raw_successors: dict[str, set[str]] = {}
+        synthetic_nodes: set[str] = set()
         for row in rows:
-            src = row["upstream_table"]
-            if src in table_set and src != table and table not in successors[src]:
-                successors[src].add(table)
-                indegree[table] += 1
+            src, dst = row["upstream_table"], row["downstream_table"]
+            if src == dst:
+                continue
+            raw_successors.setdefault(src, set()).add(dst)
+            if row["upstream_kind"] in _SYNTHETIC_TABLE_KINDS:
+                synthetic_nodes.add(src)
+            if row["downstream_kind"] in _SYNTHETIC_TABLE_KINDS:
+                synthetic_nodes.add(dst)
+
+        # Contract synthetic-node hops: from each real producer, BFS through
+        # any chain of synthetic nodes to find the real consumers it reaches —
+        # `real -> synthetic [-> synthetic ...] -> real` collapses to `real -> real`.
+        for src in table_set:
+            seen_chain: set[str] = set()
+            frontier = deque(raw_successors.get(src, ()))
+            while frontier:
+                node = frontier.popleft()
+                if node in seen_chain:
+                    continue
+                seen_chain.add(node)
+                if node in table_set:
+                    if node != src and node not in successors[src]:
+                        successors[src].add(node)
+                        indegree[node] += 1
+                elif node in synthetic_nodes:
+                    frontier.extend(raw_successors.get(node, ()))
+                # Real nodes outside table_set (e.g. noise-filtered) are dead ends —
+                # do not traverse through them; only synthetic bridges are contracted.
 
     # Sort the zero-indegree frontier for deterministic output.
     ready: deque[str] = deque(sorted(t for t in affected_tables if indegree[t] == 0))
@@ -921,7 +1022,13 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
 
         affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
-        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        affected_tables_noise_filtered, noise_excluded = noise_filter.filter_nodes(
+            affected_tables_all
+        )
+        affected_tables, synthetic_excluded = _exclude_synthetic_tables(
+            db, affected_tables_noise_filtered
+        )
+        noise_excluded = [*noise_excluded, *synthetic_excluded]
         kept_tables = set(affected_tables)
         affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
 
@@ -985,11 +1092,21 @@ def get_backfill_order(table_qualified: str) -> BackfillOrderResult:
         affected_cols, _depth, truncated = _affected_columns_closure(db, start_cols, max_depth=None)
 
         affected_tables_all = [t for t in _rollup_to_tables(affected_cols) if t != target]
-        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        affected_tables_noise_filtered, noise_excluded = noise_filter.filter_nodes(
+            affected_tables_all
+        )
+        affected_tables, synthetic_excluded = _exclude_synthetic_tables(
+            db, affected_tables_noise_filtered
+        )
+        noise_excluded = [*noise_excluded, *synthetic_excluded]
         kept_tables = set(affected_tables)
         affected_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_tables]
 
-        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+        # Option A (issue #38): adjacency is derived from the same COLUMN_LINEAGE
+        # closure as membership — pass the full id set (start + affected) so the
+        # direct producer->consumer edge endpoints are both present.
+        closure_col_ids = _dedup_preserve_order([*start_cols, *affected_cols])
+        order, had_cycle = _kahn_topological_sort(affected_tables, db, closure_col_ids)
 
         hint = None
         if had_cycle:
@@ -1053,10 +1170,16 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
 
         all_affected_cols: list[str] = []
         affected_seen: set[str] = set()
+        all_start_cols: list[str] = []
+        start_seen: set[str] = set()
         truncated = False
         for tq in changed_tables:
             col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": tq})
             start_cols = [r["col_id"] for r in col_rows]
+            for col in start_cols:
+                if col not in start_seen:
+                    start_seen.add(col)
+                    all_start_cols.append(col)
             cols, _depth, tr = _affected_columns_closure(db, start_cols, max_depth=None)
             truncated = truncated or tr
             for col in cols:
@@ -1067,9 +1190,18 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
         affected_tables_all = [
             t for t in _rollup_to_tables(all_affected_cols) if t not in seen_changed
         ]
-        affected_tables, noise_excluded = noise_filter.filter_nodes(affected_tables_all)
+        affected_tables_noise_filtered, noise_excluded = noise_filter.filter_nodes(
+            affected_tables_all
+        )
+        affected_tables, synthetic_excluded = _exclude_synthetic_tables(
+            db, affected_tables_noise_filtered
+        )
+        noise_excluded = [*noise_excluded, *synthetic_excluded]
         presentation_facing = [t for t in affected_tables if any(t.startswith(p) for p in prefixes)]
-        order, had_cycle = _kahn_topological_sort(affected_tables, db)
+        # Option A (issue #38): same closure-derived adjacency as get_backfill_order —
+        # union of every changed table's start columns plus the unioned affected set.
+        closure_col_ids = _dedup_preserve_order([*all_start_cols, *all_affected_cols])
+        order, had_cycle = _kahn_topological_sort(affected_tables, db, closure_col_ids)
 
         # Resolve external consumers for the blast radius in a single BATCH query (not per-table).
         external_consumers: list[str] = []
