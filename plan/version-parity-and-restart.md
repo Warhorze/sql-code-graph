@@ -32,8 +32,9 @@ documented backlog items:
   self-check which build it is talking to (the protocol `serverInfo.version` is not
   reliably visible to the agent persona).
 - Make `sqlcg install` stop a running MCP server (best-effort, via the existing control
-  socket) before/after writing config, so the editor respawns a fresh process on the
-  new version.
+  socket) on **every** non-dry-run success path — including "already configured" — so the
+  editor respawns a fresh process on the new version. The stop fires exactly once, at a
+  single shared tail all success branches converge on (see Step 5.1).
 - A test asserting CLI `--version`, MCP `serverInfo.version`, control-socket `status.version`,
   and `db_info.sqlcg_version` all equal `sqlcg.__version__`, and that `__version__`
   equals `importlib.metadata.version("sql-code-graph")`.
@@ -114,12 +115,43 @@ No new runtime dependencies. `importlib.metadata` is stdlib.
 
 **Step 1.2**: Add an eager `--version` callback on the root app.
 - File: [`src/sqlcg/cli/main.py`](src/sqlcg/cli/main.py).
-- Add a `@app.callback()` with a `version: bool = typer.Option(False, "--version", is_eager=True, callback=...)`
-  param; the callback prints `_version_string()` and raises `typer.Exit()`.
-- Must not break existing subcommand dispatch (callback returns when `--version` not passed).
+- This is the **first `@app.callback()` on the root app** — confirmed none exists today
+  (main.py has only `@app.command()` registrations and the `version` subcommand). Use the
+  full eager-option-on-a-root-callback pattern below.
+- The callback **must** use `invoke_without_command=True`. Without it, bare `sqlcg --version`
+  can error "Missing command" before the eager option's callback gets a chance to run —
+  the eager callback fires during parameter processing, but Typer still wants a command
+  unless the root callback opts out of requiring one.
+- Exact pattern (state this verbatim in the implementation):
+  ```python
+  def _version_callback(value: bool) -> None:
+      if value:
+          typer.echo(_version_string())
+          raise typer.Exit()
+
+  @app.callback(invoke_without_command=True)
+  def _root(
+      version: bool = typer.Option(
+          False, "--version", help="Show version and exit.",
+          is_eager=True, callback=_version_callback,
+      ),
+  ) -> None:
+      """SQL code graph analyzer."""
+      # No body needed: the eager --version callback exits before we get here.
+      # When no subcommand is given and --version is absent, Typer shows help
+      # because no_args_is_help is the app default for a group with subcommands.
+  ```
+  Callback function signature is explicit above: `_root(version: bool = typer.Option(...))`
+  returning `None`, and `_version_callback(value: bool) -> None`.
+- Must not break existing subcommand dispatch: the eager callback returns immediately when
+  `--version` is not passed, so `_root` runs as a no-op and Typer dispatches the subcommand.
 - Files affected: `main.py`.
-- Acceptance: `sqlcg --version` prints `sqlcg version 1.5.0` and exits 0; `sqlcg version`
-  still works; `sqlcg index ...` (and all other subcommands) still dispatch normally.
+- Acceptance (each is an observable check):
+  - (a) `sqlcg --version` prints `sqlcg version 1.5.0` and exits 0.
+  - (b) `sqlcg` with no args still shows the help text (not an error).
+  - (c) `sqlcg index --help` (and other subcommands, e.g. `sqlcg mcp status`) still dispatch.
+  - (d) `sqlcg --help` still renders the root help correctly after the callback is added.
+  - (e) `sqlcg version` (the subcommand) still works and echoes `_version_string()`.
 
 ### Phase 2: MCP protocol serverInfo.version
 **Step 2.1**: Set `mcp._mcp_server.version` at module scope.
@@ -146,7 +178,11 @@ No new runtime dependencies. `importlib.metadata` is stdlib.
   - include both in the printed JSON (`version`, `stale_by_version`).
   - if `stale`, print a yellow warning: running vX vs installed vY → restart via editor or run `sqlcg install`.
 - The degraded (PID-only) branch cannot read a version → omit `version`, set
-  `stale_by_version: null` (unknown). Do not guess.
+  `stale_by_version` to Python `None` (unknown). Do not guess.
+- **Typing note**: the `mcp status` output is a plain `dict` serialized by
+  `console.print_json` / `json.dumps`, NOT a Pydantic model. So the degraded branch simply
+  puts Python `None` in the dict, which serializes to JSON `null`. There is no
+  `Optional[bool]` Pydantic field to add and no model change for this — it is a dict value.
 - Acceptance: when running and installed versions differ, `mcp status` JSON shows
   `stale_by_version: true` and the warning text; when equal, `stale_by_version: false`
   and no warning.
@@ -166,23 +202,71 @@ No new runtime dependencies. `importlib.metadata` is stdlib.
   `schema_version` field unchanged.
 
 ### Phase 5: install stops the stale server
-**Step 5.1**: Add a best-effort "stop running server" step to `install_cmd`.
+**Step 5.1**: Make `install_cmd` stop a running MCP server on every non-dry-run success path.
+
+**5.1a — extract `stop_server()` in `mcp.py` (no install-local wrapper).**
+- File: [`src/sqlcg/cli/commands/mcp.py`](src/sqlcg/cli/commands/mcp.py).
+- Extract the socket-stop body of [`mcp_stop`](src/sqlcg/cli/commands/mcp.py) into a
+  reusable module-level function `stop_server() -> bool` in `mcp.py`. It performs the
+  existing connect → send `{"op":"stop"}` → `recv(128)` → wait-for-socket-gone → SIGTERM
+  fallback logic and returns `True` if a server was stopped, `False` if none was found.
+- `mcp_stop` then calls `stop_server()` and prints its existing messages based on the bool.
+- `install_cmd` imports `stop_server` from `mcp.py` and **calls it directly** — there is
+  **no** `_stop_running_server()` install-local wrapper. (The previous draft's
+  `_stop_running_server()` wrapper is dead and is removed from this plan.)
+- Grep-confirmed call sites for the new method: `stop_server` is called from `mcp_stop`
+  **and** from `install_cmd` — two real call sites, satisfying the "every new method has a
+  grep-confirmed call site" rule.
+
+**5.1b — single funnel point in `install_cmd` (`install.py`).**
 - File: [`src/sqlcg/cli/commands/install.py`](src/sqlcg/cli/commands/install.py).
-- Add a private helper `_stop_running_server() -> bool` that reuses the existing socket
-  `stop` protocol (the same connect → send `{"op":"stop"}` → recv(128) pattern in
-  [`mcp_stop`](src/sqlcg/cli/commands/mcp.py)). To avoid duplicating that logic, **extract
-  the socket-stop body of `mcp_stop` into a reusable function** `stop_server() -> bool`
-  in `mcp.py` (returns True if a server was stopped, False if none found) and have both
-  `mcp_stop` and `install`'s helper call it. This satisfies "every new method has a
-  grep-confirmed call site" — `stop_server` is called from `mcp_stop` and `install_cmd`.
-- Call `stop_server()` in `install_cmd` **after** the config write succeeds, on the
-  non-`dry_run` path only, guarded so a missing server is a no-op (not an error). Print
-  one line: "Stopped running MCP server (vX); your editor will respawn it on the new build."
-  or "No running MCP server to refresh." Do not let a stop failure abort install.
-- `dry_run` must NOT stop the server — print "would stop running MCP server" instead.
+- `install_cmd` today has **FOUR** return/exit shapes; three are non-dry-run success paths
+  that must trigger the stop, and dry-run must NOT:
+  1. line 88 — `claude mcp add` succeeds → currently `_provision_skill` + `return`.
+  2. line 115 — "Already configured" (`existing == entry`) → currently `_provision_skill` +
+     `return`. **This is exactly the reinstall case**: the config didn't change but the
+     binary on disk did, so the stale running server still must be stopped. Do NOT skip it.
+  3. line ~137 — the fallback `~/.claude.json` write path → falls through to
+     `_provision_skill` at the function tail.
+  4. dry-run (line 64–74) → `_provision_skill(dry_run=True)` + `return`; must NOT stop,
+     prints "would stop running MCP server" instead.
+- **Restructure so all three non-dry-run branches converge on one tail** rather than
+  returning early. Concretely: replace the early `return`s at lines 88 and 115 so that,
+  after each branch prints its own "Configured" / "Already configured" line, control falls
+  through to a single shared tail that runs **once**:
+  ```python
+  # single non-dry-run tail (reached by all three success branches):
+  stopped = stop_server()
+  if stopped:
+      console.print(
+          "Stopped running MCP server; your editor will respawn it on the new build."
+      )
+  else:
+      console.print("No running MCP server to refresh.")
+  _provision_skill(resolved_scope, repo, dry_run=False)
+  ```
+  Use a structure such as: set the per-branch "Configured" message, then `break`/fall into
+  the shared tail (e.g. wrap the three branches so they assign and then jump past to the
+  tail, or invert the early-returns into `if/elif/else` so the tail is unconditionally
+  reached on the non-dry-run path). The dry-run block keeps its own early `return` and
+  prints "would stop running MCP server" before returning.
+- `stop_server()` is called **exactly once** on the non-dry-run path — do NOT duplicate
+  the call in all three branches, and do NOT miss the "Already configured" branch.
+- The stop is best-effort: `stop_server()` returning `False` (no server) is a no-op with
+  the "No running MCP server to refresh." message; a socket error inside `stop_server()` is
+  already swallowed by its own except clause and must not abort install.
+
+**Message (resolves the `(vX)` inconsistency):** the install stop line **drops the `(vX)`
+version suffix**. `stop_server() -> bool` returns only a bool, not the stopped server's
+version, and querying `status` first just to render `(vX)` would add an extra socket
+round-trip for no real benefit. So the message is exactly:
+"Stopped running MCP server; your editor will respawn it on the new build."
+
 - Acceptance: with a running server, `sqlcg install` (non-dry-run) sends a `stop` op and
-  the server exits; with no server, install completes with the no-op message; `--dry-run`
-  never stops anything.
+  the server exits, for **all three** success branches including "Already configured";
+  `stop_server()` is invoked exactly once per install; with no server, install completes
+  with the no-op message; `--dry-run` never stops anything and prints "would stop running
+  MCP server".
 
 ### Phase 6: Single-source-of-truth test
 **Step 6.1**: Add a parity test.
@@ -196,9 +280,14 @@ No new runtime dependencies. `importlib.metadata` is stdlib.
      OR a focused unit asserting `DbInfoResult` carries the field and the tool passes
      `__version__` (use whichever matches existing `db_info` test infra; prefer the
      integration path if one already exists).
-  5. Control-socket `status` includes `version == sqlcg.__version__` — assert against the
-     `resp` dict construction (unit) or via an existing control-socket integration test
-     harness if present.
+  5. Control-socket `status` includes `version == sqlcg.__version__`. Home this assertion
+     in [`tests/unit/test_mcp_control.py`](tests/unit/test_mcp_control.py) (the existing
+     control-socket test module). The assertion must inspect **observable output**, NOT
+     source-grep the `resp` dict construction. Only these two forms are acceptable:
+     (a) drive the real control socket end-to-end and parse the framed `status` response,
+     asserting the parsed `version` equals `sqlcg.__version__`; or
+     (b) call the `status` handler directly and inspect the returned dict's `version` value.
+     Do not assert by reading the server source for the literal `"version": __version__`.
 - Acceptance: all five assertions pass; the test fails if any surface diverges or
   hardcodes a version.
 
@@ -252,8 +341,10 @@ All three are needed to actually let someone confirm which version is running.
   - CLI `--version` via Typer `CliRunner` — observable stdout asserted (not "no exception").
   - `mcp status` drift: mock the socket `status` payload with a mismatched `version`,
     assert `stale_by_version: true` + warning text in output; matching version → false + no warning.
-  - `install` stop-on-reinstall: mock `stop_server()`, assert it is called on the
-    non-dry-run path and NOT called on `--dry-run`; assert the no-op message when it returns False.
+  - `install` stop-on-reinstall: mock `stop_server()`, assert it is called **exactly once**
+    on the non-dry-run path — including the "Already configured" branch — and NOT called on
+    `--dry-run`; assert the no-op message when it returns False; assert the stop message has
+    no `(vX)` suffix.
   - Private-attr guard: `mcp._mcp_server.version == __version__` (fails loudly if FastMCP
     upstream changes).
 - **Integration** (real backend, in-memory): `db_info().sqlcg_version == __version__`
@@ -263,17 +354,22 @@ All three are needed to actually let someone confirm which version is running.
 - Run full gate before handoff: `uv run pytest`, `uv run pyright`, `uv run ruff check src tests`.
 
 ## Acceptance Criteria
-- [ ] `sqlcg --version` prints `sqlcg version <__version__>` and exits 0; `sqlcg version`
-      still works; all other subcommands dispatch unchanged.
+- [ ] `sqlcg --version` prints `sqlcg version <__version__>` and exits 0; `sqlcg` with no
+      args still shows help; `sqlcg --help` renders correctly after the callback is added;
+      `sqlcg version` still works; all other subcommands (e.g. `sqlcg index --help`,
+      `sqlcg mcp status`) dispatch unchanged.
 - [ ] `mcp._mcp_server.version == sqlcg.__version__` (no longer `None`); the MCP
       `initialize` handshake reports `serverInfo.version`.
 - [ ] Control-socket `status` response includes `version == <running __version__>`.
 - [ ] `sqlcg mcp status` shows `version` and `stale_by_version`, and warns when the running
       server version differs from the installed `__version__`.
 - [ ] `db_info().sqlcg_version == sqlcg.__version__`; `schema_version` unchanged and distinct.
-- [ ] `sqlcg install` (non-dry-run) stops a running MCP server so the editor respawns it;
-      no-op message when none running; `--dry-run` stops nothing.
-- [ ] `stop_server()` has grep-confirmed call sites in both `mcp_stop` and `install_cmd`.
+- [ ] `sqlcg install` (non-dry-run) stops a running MCP server so the editor respawns it,
+      on all three success branches including "Already configured"; `stop_server()` is
+      invoked exactly once per install; no-op message when none running; `--dry-run` stops
+      nothing. Stop message drops the `(vX)` suffix.
+- [ ] `stop_server()` lives in `mcp.py` (no install-local wrapper) and has grep-confirmed
+      call sites in both `mcp_stop` and `install_cmd`.
 - [ ] Parity test asserts all four runtime surfaces equal `__version__` and
       `__version__ == importlib.metadata.version("sql-code-graph")`.
 - [ ] Version bumped to `1.5.0` in `pyproject.toml` + `__init__.py`; `uv lock` run.
