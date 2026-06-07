@@ -21,6 +21,7 @@ from sqlcg.core.queries import (
     FIND_TABLE_USAGES_QUERY,
     GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
+    GET_PRODUCER_FILES_FOR_TABLE_QUERY,
     GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY,
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
@@ -944,7 +945,10 @@ def find_definition(table_qualified: str) -> DefinitionResult:
     with _open_backend() as db:
         _assert_indexed(db)
 
-        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": table_qualified.lower()})
+        target = table_qualified.lower()
+        rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": target})
+        producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
+        producer_files = _dedup_preserve_order([r["file_path"] for r in producer_rows])
         noise_filter = NoiseFilter.from_config()
 
         duplicate_ddl = len(rows) > 1
@@ -976,6 +980,7 @@ def find_definition(table_qualified: str) -> DefinitionResult:
             table_qualified=table_qualified,
             definitions=definitions,
             duplicate_ddl=duplicate_ddl,
+            producer_files=producer_files,
             noise_excluded=noise_excluded,
             hint=hint,
         )
@@ -1007,7 +1012,10 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
         noise_filter = NoiseFilter.from_config()
 
         def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
-        defining_files = _dedup_preserve_order([r["file_path"] for r in def_rows])
+        producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
+        defining_files = _dedup_preserve_order(
+            [r["file_path"] for r in def_rows] + [r["file_path"] for r in producer_rows]
+        )
 
         up_rows = db.run_read(
             GET_TABLE_DIRECT_UPSTREAMS_QUERY,

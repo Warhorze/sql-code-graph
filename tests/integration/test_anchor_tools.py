@@ -362,6 +362,47 @@ def test_diff_impact_producer_file_blast_radius(tmp_path, monkeypatch):
     )
 
 
+def test_get_definition_and_change_scope_surface_producer_files(tmp_path, monkeypatch):
+    """Output-side half of #58 (reverse of the diff_impact producer-file fix above):
+    given a TABLE, get_definition / get_change_scope must surface the ETL producer
+    file (INSERT...SELECT, via QUERY_DEFINED_IN -> SqlQuery.target_table), not just
+    the DDL file (via DEFINED_IN) — the producer file is the more useful answer to
+    "where do I change this table's logic?".
+
+    Separate ddl.sql (DEFINED_IN only) and producer.sql (QUERY_DEFINED_IN +
+    target_table, no DEFINED_IN) — mirrors the input-side fixture pattern.
+    """
+    _index_fixture(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE ba.dim (id INT);",
+            "source.sql": "CREATE TABLE ba.source (id INT);",
+            "producer.sql": "INSERT INTO ba.dim SELECT id FROM ba.source;",
+        },
+        monkeypatch,
+    )
+
+    ddl_path = str(tmp_path / "ddl.sql")
+    producer_path = str(tmp_path / "producer.sql")
+
+    scope = tools.get_change_scope("ba.dim")
+    assert ddl_path in scope.defining_files, (
+        f"DDL file must remain in defining_files: {scope.defining_files}"
+    )
+    assert producer_path in scope.defining_files, (
+        f"ETL producer file must be unioned into defining_files via QUERY_DEFINED_IN: "
+        f"{scope.defining_files}"
+    )
+
+    definition = tools.find_definition("ba.dim")
+    assert producer_path in definition.producer_files, (
+        f"get_definition must surface the producer file: {definition.producer_files}"
+    )
+    assert any(d.file_path == ddl_path for d in definition.definitions), (
+        f"DDL definition must remain present: {definition.definitions}"
+    )
+
+
 def test_diff_impact_presentation_configured(tmp_path, monkeypatch):
     """Scenario D (configured) — presentation_facing reflects configured prefixes."""
     _index_fixture(

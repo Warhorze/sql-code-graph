@@ -172,6 +172,19 @@ JOIN "DEFINED_IN" di ON di.src_key = t.qualified
 JOIN "File" f ON f.path = di.dst_key
 WHERE t.qualified = ?
 
+-- GET_PRODUCER_FILES_FOR_TABLE
+-- ETL INSERT...SELECT producers populate a table without a DEFINED_IN edge
+-- (that edge is DDL-only). Resolve SqlQuery.target_table -> QUERY_DEFINED_IN -> File
+-- so get_definition / get_change_scope can also surface "populated here" producer
+-- files, not just "defined here" DDL files (mirror of GET_TARGET_TABLES_FOR_FILE,
+-- the reverse-direction lookup). table_qualified is stored lowercase.
+-- params: [table_qualified]
+SELECT DISTINCT f.path AS file_path
+FROM "SqlQuery" q
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+JOIN "File" f ON f.path = qdi.dst_key
+WHERE q.target_table = ?
+
 -- GET_TABLE_DIRECT_UPSTREAMS
 -- params: [table_qualified, table_qualified]
 SELECT DISTINCT src.qualified AS upstream_table, f.path AS in_file
