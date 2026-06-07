@@ -232,6 +232,35 @@ None new.
   `COLUMN_LINEAGE` edge exists (so Option A is viable). If either defect does **not** reproduce
   or the DIRECT edge is absent, STOP and re-scope.
 
+### Phase 1 Verdict (developer, synthetic fixture — see Deviation 1 for the topology correction)
+
+Both defects **reproduce**, confirmed on a synthetic 3-table CTE-wrapped INSERT…SELECT
+chain (`s.tablea -> s.zzz_second -> s.aaa_third`, names chosen so alphabetical order
+diverges from causal order):
+
+- **Defect 1 (mis-ordering) reproduces**: `get_backfill_order("s.tablea")` returned
+  `['s.aaa_third', 's.v_consumer', 's.zzz_second']` — the consumer `aaa_third` ordered
+  *before* its producer `zzz_second` (alphabetical, not causal). `SELECTS_FROM` for the
+  CTE-wrapped target queries returned **zero rows**, confirming the missing-adjacency
+  root cause named in the plan.
+- **Defect 2 (synthetic-node leak) reproduces**: the synthetic `cte_b`/`cte_c` nodes
+  (kind=`"cte"`) appeared in `get_change_scope("s.tablea").affected_tables` and
+  `get_backfill_order("s.tablea").backfill_order` before the fix.
+- **Membership equality confirmed**: both tools returned the same table set (modulo
+  ordering), corroborating "no membership drop."
+
+**Topology correction (the plan's central empirical premise does not reproduce — see
+Deviation 1):** the raw `COLUMN_LINEAGE` does **not** contain a DIRECT
+`s.tablea.id -> s.zzz_second.id` edge running parallel to a dead-end `cte` leaf. Every
+reproduction attempt (colliding alias names, distinct per-statement alias names,
+column-list aliasing, bare `SELECT *`) instead produced a clean **two-hop bridge**
+`producer.id -> cte.id -> consumer.id` — the synthetic node is a **transitive relay**,
+not a disconnected dead-end side-branch. `cte`/`derived` nodes DO have outgoing edges
+to the consumer table. Option A's underlying *strategy* (read adjacency from the
+`COLUMN_LINEAGE` closure rather than `SELECTS_FROM`, at the tool layer, no parser
+changes) remains correct and sufficient — only the edge-contraction mechanics differ
+from the plan's literal description (see Deviation 1 for the corrected fix).
+
 **Step 1.2**: If the DWH cannot give a clean, minimal reproduction (noise, scale), build the
 synthetic graph from Step 2.1's fixture instead and pin both defects there. The synthetic
 fixture topology is small enough to assert exact node ids — prefer it for the *pinning* even
@@ -433,3 +462,49 @@ and tags. Keep this branch **separate from open PR #56**.
   shows the **DIRECT `COLUMN_LINEAGE` `s.tablea→s.tableb` edge is also missing** (not just
   `SELECTS_FROM`): then Option A has nothing to read and the fix must move into the parser as a
   separate ticket. Do not edit those files under this plan.
+
+---
+
+### Deviations
+
+#### Deviation 1: Synthetic node is a transitive two-hop bridge, not a dead-end leaf with a parallel direct edge — adjacency fix contracts the bridge instead of reading a direct edge
+- **Reason**: The plan's central empirical "topology fact" (a DIRECT
+  `s.tablea.id -> s.tableb.id` `COLUMN_LINEAGE` edge running parallel to a disconnected
+  dead-end `cte` leaf) **did not reproduce** under any fixture shape tried — colliding
+  CTE alias names across files, distinct per-statement alias names, explicit column-list
+  aliasing, and bare `SELECT *`. In every case the raw topology was a clean **two-hop
+  relay**: `producer.col -> cte.col -> consumer.col`, with the synthetic node carrying
+  *both* an incoming edge from the producer *and* an outgoing edge to the consumer (i.e.
+  it is a transitive bridge, not a dead end). A literal Option-A implementation that rolls
+  up individual `COLUMN_LINEAGE` rows to `(src_table, dst_table)` pairs and looks for
+  `producer -> consumer` therefore finds **nothing** — both tables remain at indegree 0
+  and the alphabetical-fallback bug persists unchanged. This was caught by an
+  intermediate test using non-alphabetically-ordered table names
+  (`s.tablea -> s.zzz_second -> s.aaa_third`) that would pass trivially under the old
+  `sorted()` fallback but fail under true causal ordering.
+- **Change**: Implemented the *strategy* the plan correctly identified (derive Kahn
+  adjacency from the `COLUMN_LINEAGE` closure, at the tool layer, **no parser/indexer
+  changes** — the hard constraint is preserved) but with corrected mechanics: the new
+  [`GET_TABLE_ADJACENCY_FOR_COLUMNS`](../src/sqlcg/core/queries.sql) query returns *all*
+  rolled-up `(upstream_table, upstream_kind, downstream_table, downstream_kind)` pairs
+  over the closure's column-id set — including synthetic endpoints and their
+  `SqlTable.kind` (fetched in the same query via a `LEFT JOIN`, no second round-trip).
+  [`_kahn_topological_sort`](../src/sqlcg/server/tools.py#L424) then **contracts**
+  synthetic-node hops in one BFS pass per real producer over this small rolled-up edge
+  set: `real -> synthetic [-> synthetic ...] -> real` collapses to `real -> real`. This
+  remains a single aggregate query plus one bounded contraction pass — still **once per
+  closure**, never per-table/per-column — and achieves the plan's acceptance criterion
+  (`index(s.tableB) < index(s.tableC)`) that the literal direct-edge reading could not.
+  Per CLAUDE.md's "Option A choice (b)" guidance, this is additive: no contract change
+  to `_affected_columns_closure`'s 3 call sites.
+- **Impact**: No scope change — still entirely at the tool layer
+  ([`tools.py`](../src/sqlcg/server/tools.py) +
+  [`queries.sql`](../src/sqlcg/core/queries.sql)/[`queries.py`](../src/sqlcg/core/queries.py)),
+  no `base.py`/`indexer.py` edits, no API/schema changes. Risk: the contraction adds a
+  bounded BFS over the rolled-up edge set (size bounded by the 50k closure-node cap,
+  same invariant the plan already names) — still well within "once per closure." Tests:
+  `tests/integration/test_backfill_impact_consistency.py` asserts the corrected two-hop
+  topology directly (producer -> cte -> consumer, not a direct bypass edge) so a future
+  parser change that *does* start emitting a direct edge fails loudly here rather than
+  silently relying on a code path that was never exercised.
+- **Date**: 2026-06-07
