@@ -27,6 +27,7 @@ _real_stdout_buffer = os.fdopen(os.dup(1), "wb", buffering=0)
 from dotenv import load_dotenv  # noqa: E402
 from mcp.server import FastMCP  # noqa: E402
 
+from sqlcg import __version__  # noqa: E402
 from sqlcg.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger(__name__)
@@ -34,6 +35,13 @@ logger = getLogger(__name__)
 # Create FastMCP instance at module scope so tools.py can import and register with it.
 # This is safe because _real_stdout_buffer has already captured fd 1 above.
 mcp = FastMCP("SQL Code Graph")
+
+# FastMCP.__init__ does not accept a `version` kwarg (verified signature); the
+# underlying mcp.server.lowlevel.Server.__init__(self, name, version=None, ...)
+# does. Set it post-construction so the `initialize` handshake reports
+# serverInfo.version == sqlcg.__version__ instead of None. Deliberate, pinned
+# private-attr write — see tests/unit/test_version_parity.py.
+mcp._mcp_server.version = __version__
 
 
 def _configure_mcp_logging() -> None:
@@ -219,6 +227,7 @@ async def _control_socket_task(
 
                     resp: dict = {
                         "running": True,
+                        "version": __version__,
                         "pid": os.getpid(),
                         "db_path": str(db_path or _get_db_path()),
                         "indexed_sha": indexed_sha,
