@@ -1,3 +1,31 @@
+## Handoff — developer: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: gain_coverage_metrics
+BRANCH: feat/gain-coverage-metrics
+STATUS: PR OPEN — ready for architect-planner compliance check
+
+COMMITS:
+  2ec1d58  feat(gain_coverage_metrics): implement coverage metrics in db info and gain Section G
+
+FILES CHANGED:
+  - src/sqlcg/cli/coverage.py (NEW): CoverageStats, collect_coverage, colour helpers
+  - src/sqlcg/cli/commands/db.py: Coverage block after parsing-mode output
+  - src/sqlcg/cli/commands/gain.py: Section G + --json coverage object; json_output normalization
+  - tests/integration/test_coverage_metrics_integration.py: fix SqlTable column names
+
+GATES: 24 acceptance tests PASS; 1148 total PASS, 0 failures; pyright 0 errors; ruff clean.
+
+DEVIATIONS:
+  1. gain_cmd json_output normalization: json_output = json_output is True added at top
+     of gain_cmd(). When called directly (not via CLI), typer.Option(...) object is truthy,
+     causing JSON output even without --json. This is a latent bug exposed by the new tests.
+     The fix normalizes to False when the value is not the literal True boolean.
+  2. test_coverage_metrics_integration.py: SqlTable INSERT used wrong column names (id,
+     schema_name not in schema). Fixed to use qualified as PK, removed schema_name.
+
+---
+
 ## Handoff — plan-reviewer: gain_coverage_metrics [2026-06-08]
 
 ACTIVE AGENT: plan-reviewer (complete)

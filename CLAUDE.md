@@ -11,38 +11,46 @@ tracing via MCP tools. Python 3.12, no FastAPI (CLI + MCP server only).
 |-----|---------|
 | `ARCHITECTURE_REVIEW.md` | Living architecture review — findings, decisions, priorities, postmortems |
 | `plan/WORKFLOW.md` | Agent roles, phase sequence, compliance ownership |
-| `plan/sprint_*.md` | Active sprint plans — check latest before implementing anything |
+| `plan/sprints/*.md` | Sprint / feature / fix / release implementation plans — check latest before implementing anything |
+| `plan/research/*.md` | Investigations, experiments, original design docs |
+| `plan/reports/*.md` | Postmortems |
+| `plan/metrics/*.json` | Measurement data |
 
 ## Agents (`.claude/agents/`)
 
 | Agent | Use when |
 |-------|----------|
 | `architect-reviewer` | Update `ARCHITECTURE_REVIEW.md` from findings or user input |
-| `architect-planner` | Plan a single feature → `plan/<feature>.md` |
-| `sprint-planner` | Plan a sprint from multiple findings → `plan/sprint_<name>.md` |
+| `architect-planner` | Plan a single feature → `plan/sprints/<feature>.md` |
+| `sprint-planner` | Plan a sprint from multiple findings → `plan/sprints/sprint_<name>.md` |
 | `plan-reviewer` | Gate before implementation — catch gaps in any plan |
 | `developer` | Implement an approved plan |
 | `code-reviewer` | Review an open PR for code quality |
 | `api-documenter` | Improve OpenAPI output after API changes |
 
-Compliance ownership: `architect-planner` owns `plan/<feature>.md`;
-`sprint-planner` owns `plan/sprint_*.md`. See `plan/WORKFLOW.md` for the full flow.
+Compliance ownership: `architect-planner` owns `plan/sprints/<feature>.md`;
+`sprint-planner` owns `plan/sprints/sprint_*.md`. See `plan/WORKFLOW.md` for the full flow.
 
 ## Source layout
 
 ```
 src/sqlcg/
   cli/commands/     # Typer CLI commands
-  core/             # KuzuBackend, config, graph_db
+  core/             # DuckDBBackend, config, graph_db, schema
   indexer/          # index_repo, reindex_file
   parsers/          # AnsiParser, SnowflakeParser, base.py
   lineage/          # CrossFileAggregator, SchemaResolver
-  server/           # MCP tools, models
+  server/           # MCP server, tools, writer, models
 tests/
   unit/             # No graph backend
-  integration/      # Real KuzuDB in-memory
+  integration/      # Real DuckDB in-memory
   e2e/              # Full CLI runs
-plan/               # Sprint plans, WORKFLOW.md
+plan/
+  WORKFLOW.md       # Agent roles + phase sequence
+  sprints/          # Implementation plans (sprint/feature/fix/release)
+  research/         # Investigations, experiments, original design
+  reports/          # Postmortems
+  metrics/          # Measurement data (JSON)
 .claude/            # Agent configs, progress.txt (gitignored)
 ```
 

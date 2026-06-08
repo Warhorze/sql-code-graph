@@ -2,7 +2,7 @@
 suite, plus a permanent cross-tool consistency invariant for the table-graph
 MCP tools (get_change_scope, get_backfill_order, diff_impact, scope_change).
 
-Confirmed-real defects (see plan/issue-38-backfill-cte-bridge.md, Phase 1
+Confirmed-real defects (see plan/sprints/issue-38-backfill-cte-bridge.md, Phase 1
 Verdict + Deviation 1) for CTE-wrapped ``INSERT ... WITH cte AS (...) SELECT
 ... FROM cte`` chains:
 

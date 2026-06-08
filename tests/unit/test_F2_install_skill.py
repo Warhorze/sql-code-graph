@@ -1,7 +1,7 @@
 """Failing acceptance tests for F2 — install provisions skill (phase 3).
 
 These tests MUST FAIL before the developer extends install.py.
-They encode the acceptance criteria from plan/bundle_claude_skill.md phase 3.
+They encode the acceptance criteria from plan/sprints/bundle_claude_skill.md phase 3.
 """
 
 from pathlib import Path

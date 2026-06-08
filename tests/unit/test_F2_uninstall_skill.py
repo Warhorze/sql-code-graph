@@ -1,7 +1,7 @@
 """Failing acceptance tests for F2 — uninstall removes skill (phase 4).
 
 These tests MUST FAIL before the developer extends uninstall.py.
-They encode the acceptance criteria from plan/bundle_claude_skill.md phase 4.
+They encode the acceptance criteria from plan/sprints/bundle_claude_skill.md phase 4.
 """
 
 from pathlib import Path

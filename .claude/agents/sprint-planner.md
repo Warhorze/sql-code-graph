@@ -168,6 +168,11 @@ critical finding before shipping. Place it in `## Test Strategy` under
 - Include a failure message that names the original regression
   (e.g., `"Column lineage edges must be non-zero — guards against v0.3.0 regression"`)
 
+> Refer to tests by the **behavior** they verify, not by a task/case code (`TC1`,
+> `T-03`, …). The developer names tests `test_<unit>_<scenario>_<expected>` and links
+> the plan in the docstring — see *Test naming* in
+> [`developer.md`](.claude/agents/developer.md). Don't seed codes into "Tests to add".
+
 ## Sprint-Level Acceptance Criteria — Always Required
 
 End every plan with `## Acceptance Criteria (sprint-level)` — a checklist of

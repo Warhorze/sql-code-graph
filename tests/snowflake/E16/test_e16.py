@@ -4,7 +4,7 @@ MERGE statements currently produce zero column lineage because sqlglot's lineage
 API does not handle MERGE branches. The parser records an explicit skip
 (col_lineage_skip:merge_branch:*) so MERGE files are visible in reports.
 
-See plan/sprint_07_open_ecodes.md § T-07-06 for the deferred-decision rationale.
+See plan/sprints/sprint_07_open_ecodes.md § T-07-06 for the deferred-decision rationale.
 """
 
 from pathlib import Path
@@ -17,7 +17,7 @@ def test_e16_merge_match_and_insert(parser):
 
     # DEFERRED: sqlglot lineage API does not visit MERGE branches.
     # When implemented, flip to assert dst_table=="DST" and srcs == {"COL_A", "COL_B"}.
-    # See plan/sprint_07_open_ecodes.md T-07-06.
+    # See plan/sprints/sprint_07_open_ecodes.md T-07-06.
     """
     sql = Path(__file__).with_name("e16_merge.sql").read_text()
     result = parse(parser, sql, "e16_merge.sql")
