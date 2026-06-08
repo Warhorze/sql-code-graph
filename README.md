@@ -1,6 +1,6 @@
 # sql-code-graph
 
-> **Pre-1.0 — expect breaking changes.** APIs, CLI flags, and graph schema may
+> **No backward-compatibility guarantees.** APIs, CLI flags, and graph schema may
 > change between releases without a deprecation period. Pin to an exact version
 > in production. Re-indexing is always the migration path.
 
@@ -57,7 +57,7 @@ for that project.
 # 1. Install
 pip install sql-code-graph
 
-# 2. Register with Claude Code (~/.claude/settings.json)
+# 2. Register with Claude Code (writes ~/.claude.json)
 sqlcg install
 
 # 3. Restart Claude Code
@@ -102,7 +102,7 @@ This project uses sql-code-graph. MCP tools are available:
 - `trace_column_lineage` — trace where a column's value comes from
 - `get_upstream_dependencies` / `get_downstream_dependencies` — dependency chains
 - `search_sql_pattern` — full-text search across all indexed SQL
-- `execute_cypher` — raw graph query for advanced analysis
+- `execute_sql` — raw read-only SQL query for advanced analysis
 ```
 
 The MCP server works without this — Claude can discover the tools on its own —
@@ -178,11 +178,14 @@ After indexing, `sqlcg db info` shows non-zero `STAR_EXPANSION lineage edges`, a
 | `diff_impact(changed_files)` | What a set of changed files affects downstream |
 | `get_backfill_order(table_qualified)` | Topological rebuild/backfill order |
 | `scope_change(target)` | Synthesised change-scope summary for a target |
+| **Analysis** | |
+| `get_hub_ranking(k)` | Top-k tables by downstream dependent count (hub/centrality) |
+| `analyze_unused()` | Tables with no within-corpus consumers (dead-code candidates, heuristic) |
 | **Search & meta** | |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
 | `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
 | `db_info()` | Graph health, node counts, parse quality breakdown, warnings, freshness (indexed SHA vs HEAD) |
-| `execute_cypher(query)` | Raw Cypher query against the graph |
+| `execute_sql(query)` | Raw read-only SQL query against the graph |
 | `submit_feedback(...)` | Report a false positive/negative to improve metrics |
 
 > **Input format**: lineage/dependency tools expect a **schema-qualified** column
@@ -223,16 +226,26 @@ sqlcg gain                             # show usage metrics
 sqlcg report                           # generate FP/error report
 sqlcg mcp best-practices               # print the fact/heuristic boundary for the MCP tools
 sqlcg mcp start                        # start MCP server manually
-sqlcg mcp status                       # server status JSON (via control socket)
+sqlcg mcp status                       # server status JSON — incl. running version + stale_by_version
 sqlcg mcp stop                         # stop the running MCP server gracefully
 sqlcg mcp restart                      # stop the server (client must respawn it)
 sqlcg version                          # show installed version
 ```
 
+### Staying on the latest build (v1.5.0)
+
+The installed package, the CLI, and the running MCP server all report the **same**
+version (`sqlcg.__version__`). After upgrading, an editor may still be talking to an
+old MCP process — `sqlcg mcp status` surfaces this directly: it reports the running
+server's `version` and a `stale_by_version` flag that is `true` when the live server
+differs from the installed build. Re-running `sqlcg install` stops the stale server so
+your editor respawns it on the new build, so you never debug against an outdated server.
+
 ### Reads while the server is running (v1.2.0)
 
-KuzuDB allows a single writer, so while the MCP server is live it holds the
-database lock. CLI **read** commands (`find`, `analyze`, `db info`, `list-repos`,
+DuckDB takes an exclusive lock on the database file, so while the MCP server is
+live it holds that lock (other processes cannot open the file, even read-only).
+CLI **read** commands (`find`, `analyze`, `db info`, `list-repos`,
 `gain`) automatically route their query through the running server over its
 control socket and return rows as usual — no flag, no config. When no server is
 running they open the database directly, exactly as before. If the server is
