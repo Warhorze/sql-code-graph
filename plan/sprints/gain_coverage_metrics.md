@@ -386,3 +386,17 @@ Then patch `run_read_routed` to route to this backend's `run_read` (or run
 - This is the **release-gate dashboard**: track edge health on every `db info`/`gain`
   as the underlying P1/P3/P4 fixes land; the project ships the coverage milestone when
   edge health ≥ 90%.
+
+### Deviations
+
+#### Deviation 1: gain_cmd json_output normalization
+- **Reason**: When `gain_cmd()` is called directly (not via Typer CLI), the `typer.Option(False, "--json", ...)` annotation object is truthy, so `if json_output:` always entered the JSON branch — a latent bug exposed by the new tests that call `gain_cmd()` directly and assert human-readable output.
+- **Change**: Added `json_output = json_output is True` at the top of `gain_cmd()`. This normalizes the value to `False` for any non-`True` value (the correct default). CLI invocation continues to work as before because Typer sets the value to the Python `True` boolean when `--json` is passed.
+- **Impact**: No functional change for CLI users. Fixes silent wrong-branch selection in direct-call tests.
+- **Date**: 2026-06-08
+
+#### Deviation 2: Integration test SqlTable INSERT schema correction
+- **Reason**: `test_coverage_metrics_integration.py` (committed in `81967e5` as a pre-implementation failing test) used `id` and `schema_name` columns in the `SqlTable` INSERT. The actual DuckDB schema has `qualified` as the primary key and no `schema_name` column.
+- **Change**: Fixed the INSERT to use `(qualified, name, catalog, db, kind)` matching the real DDL in [`duckdb_backend.py`](../../src/sqlcg/core/duckdb_backend.py).
+- **Impact**: Test now exercises the real schema correctly. No production code change.
+- **Date**: 2026-06-08
