@@ -9,7 +9,9 @@ Covers:
 
 import json
 import os
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -196,6 +198,134 @@ class TestMcpStatusDegraded:
         assert data["running"] is True
         assert data["degraded"] == "socket unavailable"
         assert data["pid"] == os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# version-parity-and-restart Phase 3 — control-socket `status.version` +
+# `mcp status` drift detection (`stale_by_version`)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatusSocket:
+    """Fake AF_UNIX socket that returns a framed {"op": "status"} response.
+
+    Mirrors the real server's v1.3.0 framing: ``<decimal-byte-length>\\n<json-body>``,
+    read by the client via ``s.makefile("rb")`` + readline + read(n) — exactly the
+    recv-exactly pattern ``mcp_status`` uses.
+    """
+
+    def __init__(self, payload: dict):
+        body = json.dumps(payload).encode()
+        self._frame = f"{len(body)}\n".encode() + body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def settimeout(self, _timeout):
+        pass
+
+    def connect(self, _addr):
+        pass
+
+    def sendall(self, _data):
+        pass
+
+    def makefile(self, _mode):
+        return BytesIO(self._frame)
+
+
+def _run_mcp_status_against_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict
+) -> dict:
+    """Drive mcp_status against a fake live socket returning `payload`.
+
+    Returns the parsed JSON dict mcp_status printed (sans ANSI codes) — i.e.
+    the *observable* status output, not source-grepped construction.
+    """
+    import re
+
+    db = tmp_path / "test.db"
+    monkeypatch.setenv("SQLCG_DB_PATH", str(db))
+
+    from sqlcg.cli.commands.mcp import mcp_status
+
+    with patch("socket.socket", return_value=_FakeStatusSocket(payload)):
+        with patch("sqlcg.cli.commands.mcp.console") as mock_console:
+            mcp_status()
+
+    # console.print_json(json.dumps(...)) is the first call with the base fields.
+    json_calls = list(mock_console.print_json.call_args_list)
+    assert json_calls, (
+        f"console.print_json was never called; print calls: {mock_console.print.call_args_list}"
+    )
+    printed = json.loads(json_calls[0].args[0])
+    clean_printed = {
+        k: re.sub(r"\x1b\[[0-9;]*m", "", v) if isinstance(v, str) else v for k, v in printed.items()
+    }
+    return clean_printed, mock_console
+
+
+class TestMcpStatusVersionDrift:
+    """`mcp status` surfaces the running server's version and drift vs installed."""
+
+    def test_status_matching_version_no_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Running version == installed version → stale_by_version is False, no warning."""
+        from sqlcg import __version__
+
+        payload = {
+            "running": True,
+            "version": __version__,
+            "pid": 12345,
+            "db_path": str(tmp_path / "test.db"),
+            "indexed_sha": None,
+            "head_sha": None,
+            "stale_by_commits": None,
+            "connected_clients": 1,
+            "uptime": 1.0,
+            "writer_queue": {},
+        }
+        data, mock_console = _run_mcp_status_against_payload(tmp_path, monkeypatch, payload)
+
+        assert data["version"] == __version__
+        assert data["stale_by_version"] is False
+
+        warning_calls = [c for c in mock_console.print.call_args_list if "Warning" in str(c)]
+        assert not warning_calls, f"No drift warning expected; got: {warning_calls}"
+
+    def test_status_mismatched_version_reports_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Running version != installed version → stale_by_version is True + warning."""
+        from sqlcg import __version__
+
+        running_version = "0.0.1-stale"
+        payload = {
+            "running": True,
+            "version": running_version,
+            "pid": 12345,
+            "db_path": str(tmp_path / "test.db"),
+            "indexed_sha": None,
+            "head_sha": None,
+            "stale_by_commits": None,
+            "connected_clients": 1,
+            "uptime": 1.0,
+            "writer_queue": {},
+        }
+        data, mock_console = _run_mcp_status_against_payload(tmp_path, monkeypatch, payload)
+
+        assert data["version"] == running_version
+        assert data["stale_by_version"] is True
+        assert running_version != __version__
+
+        warning_text = " ".join(str(c) for c in mock_console.print.call_args_list)
+        assert "Warning" in warning_text
+        assert running_version in warning_text
+        assert __version__ in warning_text
 
 
 # ---------------------------------------------------------------------------
