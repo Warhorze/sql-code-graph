@@ -2224,3 +2224,15 @@ ACTIVE AGENT: architect-planner
 FEATURE: version-parity-and-restart (version parity across pkg/CLI/MCP + auto-restart of stale MCP on reinstall)
 PLAN: plan/version-parity-and-restart.md (being written)
 STATUS: planning
+
+---
+
+## Current State — architect-planner: positional-insert-clone-blindspot [2026-06-08]
+
+ACTIVE AGENT: architect-planner
+FEATURE: positional-insert-clone-blindspot (column-lineage blind spot for CLONE-built
+  facts loaded by positional INSERT...SELECT with no column aliases — phantom source-named
+  nodes, broken upstream/downstream closures)
+SOURCE: plan/reports/dwh_positional_insert_column_blindspot.md
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (drafting)
+STATUS: planning
