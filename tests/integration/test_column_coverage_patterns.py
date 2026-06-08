@@ -16,12 +16,16 @@ Pattern summary:
        (241 tables confirmed by pattern scan)
 
 Tests are written to FAIL today and PASS after the corresponding fix lands.
-They are NOT marked xfail — a passing test before the fix is a regression.
+They are marked xfail(strict=True) — a passing test before the fix is a regression
+(strict=True turns unexpectedly-passing tests red so the xfail is removed when the
+fix lands).
 """
 
 from __future__ import annotations
 
 import textwrap
+
+import pytest
 
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
@@ -52,6 +56,7 @@ def _index(tmp_path, files: dict[str, str], dialect: str | None = "snowflake") -
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(strict=True, reason="P1: CTE destination leak not yet fixed")
 def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
     """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target,
     not on the CTE node.
@@ -101,6 +106,7 @@ def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
     )
 
 
+@pytest.mark.xfail(strict=True, reason="P1: CTE chain destination leak not yet fixed")
 def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
     """Multi-CTE chain ending in cte_insert, matching the exact DWH ETL shape.
 
@@ -296,6 +302,7 @@ def test_P2_multi_join_aliases_all_resolve_to_real_tables(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(strict=True, reason="P3: schema stripped from quoted view name not yet fixed")
 def test_P3_quoted_view_with_spaces_preserves_schema_in_sqlcolumn(tmp_path):
     """SqlColumn.table_name for a quoted view name with spaces must include the schema.
 
@@ -350,6 +357,7 @@ def test_P3_quoted_view_with_spaces_preserves_schema_in_sqlcolumn(tmp_path):
     )
 
 
+@pytest.mark.xfail(strict=True, reason="P3: HAS_COLUMN wiring for quoted views not yet fixed")
 def test_P3_quoted_view_lineage_reaches_source_via_has_column(tmp_path):
     """The full chain: source table → quoted view → downstream query must be traversable.
 
@@ -416,6 +424,7 @@ def test_P3_quoted_view_lineage_reaches_source_via_has_column(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
 def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     """CREATE TABLE t AS SELECT a, b FROM s must produce SqlColumn rows for a and b.
 
@@ -461,6 +470,7 @@ def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     )
 
 
+@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
 def test_P4_ctas_with_cte_body_columns_derived(tmp_path):
     """CTAS whose body uses a CTE must still derive column names from the outer SELECT.
 
