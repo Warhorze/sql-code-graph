@@ -64,15 +64,12 @@ def fixture_backend():
     # Insert SqlTable nodes
     for name in ("orders", "customers", "ghost_a", "ghost_b", "extra"):
         b.run_write(
-            'INSERT INTO "SqlTable" (id, name, qualified, catalog, db, schema_name, kind)'
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            'INSERT INTO "SqlTable" (qualified, name, catalog, db, kind) VALUES (?, ?, ?, ?, ?)',
             {
-                "id": f"mydb.sch.{name}",
-                "name": name,
                 "qualified": f"mydb.sch.{name}",
+                "name": name,
                 "catalog": "mydb",
                 "db": "mydb",
-                "schema_name": "sch",
                 "kind": "table",
             },
         )

@@ -7,6 +7,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from sqlcg.cli.coverage import (
+    blindspot_colour,
+    collect_coverage,
+    edge_health_colour,
+    phantom_colour,
+)
 from sqlcg.metrics import store as metrics_module
 from sqlcg.server.read_client import run_read_routed
 from sqlcg.utils.logging import getLogger
@@ -41,6 +47,8 @@ def gain_cmd(
     All metrics are opt-in via SQLCG_METRICS environment variable.
     If no metrics have been collected, shows a message and exits 0.
     """
+    json_output = json_output is True
+
     if _metrics_path is None:
         metrics_path = Path.home() / ".sqlcg" / "metrics.db"
     else:
@@ -134,6 +142,10 @@ def gain_cmd(
         except Exception:
             pass  # graph not available or server busy — skip quality section
 
+        # Section G: coverage — computed once, used by both json and human branches.
+        # collect_coverage() degrades to None on failure (same contract as Section F).
+        coverage = collect_coverage()
+
         if json_output:
             payload: dict = {
                 "total_calls": total_calls,
@@ -146,6 +158,15 @@ def gain_cmd(
             }
             if parse_quality is not None:
                 payload["parse_quality"] = parse_quality
+            if coverage is not None:
+                payload["coverage"] = {
+                    "catalogued_tables": coverage.catalogued_tables,
+                    "total_tables": coverage.total_tables,
+                    "good_edges": coverage.good_edges,
+                    "total_edges": coverage.total_edges,
+                    "phantom_edges": coverage.phantom_edges,
+                    "blindspot_tables": coverage.blindspot_tables,
+                }
             console.print(json.dumps(payload))
         else:
             # Human-readable output
@@ -217,6 +238,35 @@ def gain_cmd(
                         f"  [yellow]{scripting_pct:.0f}% scripting fallback — "
                         "column lineage limited for those files[/yellow]"
                     )
+                console.print()
+
+            # Section G: coverage — omitted silently when graph unavailable
+            if coverage is not None:
+                console.print("[bold cyan]G. Coverage[/bold cyan]")
+                console.print(
+                    f"  Tables with catalog: {coverage.catalogued_tables} / {coverage.total_tables}"
+                    f" ({coverage.catalog_pct:.0f}%)"
+                )
+                eh_colour = edge_health_colour(coverage.edge_health_pct)
+                console.print(
+                    f"  [{eh_colour}]Edge health: {coverage.good_edges} / {coverage.total_edges}"
+                    f" ({coverage.edge_health_pct:.0f}%)[/{eh_colour}]"
+                )
+                ph_colour = phantom_colour(coverage.phantom_pct)
+                ph_line = (
+                    f"  [{ph_colour}]Phantom edges: {coverage.phantom_edges}"
+                    f" / {coverage.total_edges} ({coverage.phantom_pct:.0f}%)"
+                    f"[/{ph_colour}]"
+                )
+                console.print(ph_line)
+                bs_colour = blindspot_colour(coverage.blindspot_tables)
+                if bs_colour:
+                    console.print(
+                        f"  [{bs_colour}]Blindspot tables:"
+                        f" {coverage.blindspot_tables}[/{bs_colour}]"
+                    )
+                else:
+                    console.print(f"  Blindspot tables: {coverage.blindspot_tables}")
                 console.print()
 
         metrics.close()
