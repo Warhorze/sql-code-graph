@@ -1,3 +1,73 @@
+## Handoff — plan-reviewer: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: gain_coverage_metrics
+PLAN: plan/sprints/gain_coverage_metrics.md (corrected in-place)
+STATUS: READY FOR IMPLEMENTATION
+
+VERDICT: APPROVE-WITH-CORRECTIONS — 1 warning corrected in-plan; no blockers.
+
+CORRECTION MADE (Warning — patch-target ambiguity):
+  W1: The plan said "patch run_read_routed at the seam each module imports it from"
+  without naming the concrete patch target for the db info / gain coverage tests.
+  Since coverage.py is a new module, the developer must patch
+  sqlcg.cli.coverage.run_read_routed (not db.run_read_routed) for coverage-path
+  tests. The simpler approach — patch sqlcg.cli.commands.db.collect_coverage and
+  sqlcg.cli.commands.gain.collect_coverage directly — avoids dispatch complexity.
+  Fixed in-plan: unit test sections for db info and gain now specify the correct
+  patch targets and recommend patching collect_coverage directly.
+
+VERIFICATIONS (all pass):
+  - Key-strip expression: ColumnRef.full_id = table.full_id + "." + name; strip
+    via left(k, len(k)-instr(reverse(k), '.')) yields table.full_id == HAS_COLUMN.src_key.
+    Verified against base.py:122-123 and indexer.py:1150-1151. CORRECT.
+  - Call sites: db_info() in db.py confirmed; gain_cmd() in gain.py confirmed. CORRECT.
+  - typer.Exit MRO: click.exceptions.Exit -> RuntimeError -> Exception. CONFIRMED.
+    except Exception catches it. CORRECT.
+  - HAS_COLUMN.src_key = table full_id (confirmed indexer.py:1151).
+    COLUMN_LINEAGE.dst_key = column full_id = table.full_id + "." + col. CORRECT.
+  - inferred_from_source_name BOOLEAN on COLUMN_LINEAGE (duckdb_backend.py:173). CORRECT.
+  - HAS_COLUMN indexed on src_key (idx_HAS_COLUMN_src, duckdb_backend.py:209). CORRECT.
+  - Version is 1.6.0 in pyproject.toml; bump to 1.6.1 is correct. CONFIRMED.
+  - No perf invariants touched (no base.py / indexer.py changes). CONFIRMED.
+
+BLOCKING QUESTIONS: none (BQ-1 from architect-planner is non-blocking).
+
+FAILING TESTS COMMITTED SEPARATELY:
+  tests/unit/test_coverage_metrics.py        (collect_coverage + colour helpers)
+  tests/unit/test_db_info_coverage.py        (db info Coverage block)
+  tests/unit/test_gain_coverage.py           (gain Section G)
+  tests/integration/test_coverage_metrics_integration.py  (real DuckDB fixture)
+  Run: uv run pytest tests/unit/test_coverage_metrics.py tests/unit/test_db_info_coverage.py tests/unit/test_gain_coverage.py tests/integration/test_coverage_metrics_integration.py --no-header -q
+  Result before implementation: 4 skipped (sqlcg.cli.coverage not yet defined — correct pre-impl state)
+
+NEXT: developer implements plan/sprints/gain_coverage_metrics.md.
+
+---
+
+## Handoff — architect-planner: gain_coverage_metrics [2026-06-08]
+
+PLAN: plan/sprints/gain_coverage_metrics.md (committed)
+SUMMARY: read-only Coverage metrics in `db info` + `gain` Section G via new
+  src/sqlcg/cli/coverage.py (collect_coverage + CoverageStats + colour helpers),
+  reusing run_read_routed. Four verified queries. Version bump 1.6.0 -> 1.6.1 (patch).
+VERIFIED AGAINST SOURCE: HAS_COLUMN.src_key == table.full_id; COLUMN_LINEAGE keys are
+  catalog.db.name.column; inferred_from_source_name BOOLEAN exists; SqlTable node table.
+  Key-strip left(k,len(k)-instr(reverse(k),.)) yields full_id == HAS_COLUMN.src_key.
+BLOCKING Q: BQ-1 (non-blocking) feature not in ARCHITECTURE_REVIEW.md — user/architect-
+  reviewer should add a release-gate line; does NOT block developer.
+NEXT: plan-reviewer gate, then developer.
+
+---
+
+## Current State — architect-planner: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: architect-planner
+FEATURE: gain_coverage_metrics (surface real lineage-coverage metrics in `sqlcg db info` and `sqlcg gain` Section G — read-only, no schema change)
+STATUS: planning — writing plan/sprints/gain_coverage_metrics.md
+
+---
+
 ## Handoff — developer: version-parity-and-restart [2026-06-07]
 
 ACTIVE AGENT: developer (complete — ready for compliance check)

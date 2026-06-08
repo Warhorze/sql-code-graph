@@ -259,11 +259,13 @@ Describe each test by the behaviour it verifies. The developer names tests
 
 ### Unit tests — `tests/unit/test_coverage_metrics.py`
 
-Patch `run_read_routed` (at the seam each module imports it from) with a side-effect that
-returns the four canned result sets keyed on a substring of the query
-(`"SqlTable"` for q1, the `EXISTS`/`good_edges` shape for q2, `"inferred_from_source_name"`
-for q3, the `NOT EXISTS`/`blindspot` shape for q4) — same dispatch style as
-[`test_db_info.py`](../../tests/unit/test_db_info.py).
+Patch `run_read_routed` at **`sqlcg.cli.coverage.run_read_routed`** — the seam where
+`coverage.py` imports it. Do NOT patch `sqlcg.cli.commands.db.run_read_routed` or
+`sqlcg.cli.commands.gain.run_read_routed` for coverage tests: those patch targets only affect
+the non-coverage queries already in those modules, not the four coverage queries routed through
+`coverage.py`. Dispatch the side-effect on a substring of the query string:
+`"SqlTable"` for q1, the `EXISTS`/`good_edges` shape for q2,
+`"inferred_from_source_name"` for q3, the `NOT EXISTS`/`blindspot` shape for q4.
 
 - **collect_coverage returns populated stats** — given the four canned rows, the returned
   `CoverageStats` has the expected six integers and the three percent properties compute
@@ -281,25 +283,37 @@ for q3, the `NOT EXISTS`/`blindspot` shape for q4) — same dispatch style as
 
 In `tests/unit/test_db_info.py` (extend) or a new `test_db_info_coverage.py`:
 
-- **db info prints the Coverage block with live numbers** — with the four queries
-  mocked, the output contains `Coverage:`, `Tables with catalog:`, `Edge health:`,
-  `Phantom edges:`, `Blindspot tables:` and the specific numbers (528, 2944, 14884,
-  51434, 13412, 1681).
-- **db info omits the Coverage block on an empty graph** — when `collect_coverage`
-  returns `None` (mock the four queries to raise or return empty), no `Coverage:` line
-  appears and exit code is 0.
+For the **"prints the Coverage block"** test: patch both `sqlcg.cli.commands.db.run_read_routed`
+(for the existing db-info queries) **and** `sqlcg.cli.coverage.run_read_routed` (for the four
+coverage queries). The simplest approach is to use `unittest.mock.patch` on `sqlcg.cli.commands.db.collect_coverage`
+directly and return a pre-built `CoverageStats` — this keeps the `db info` test independent
+from coverage.py dispatch internals.
+
+- **db info prints the Coverage block with live numbers** — patch `sqlcg.cli.commands.db.collect_coverage`
+  to return a `CoverageStats(528, 2944, 14884, 51434, 13412, 1681)`; assert output contains
+  `Coverage:`, `Tables with catalog:`, `Edge health:`, `Phantom edges:`, `Blindspot tables:`
+  and the specific numbers (528, 2944, 14884, 51434, 13412, 1681).
+- **db info omits the Coverage block on an empty graph** — patch `sqlcg.cli.commands.db.collect_coverage`
+  to return `None`; no `Coverage:` line appears and exit code is 0.
 
 ### Unit tests — `gain` Section G
 
 In `tests/unit/test_gain_coverage.py`:
 
-- **gain prints Section G with the four numbers** — human-readable output contains
+Patch `sqlcg.cli.commands.gain.collect_coverage` directly (returns a `CoverageStats`
+or `None`). Also mock `sqlcg.metrics.store.MetricsStore` and supply a `_metrics_path`
+that exists so gain proceeds past the early-exit guard (same pattern as `test_gain_ratio.py`).
+
+- **gain prints Section G with the four numbers** — patch `collect_coverage` to return
+  `CoverageStats(528, 2944, 14884, 51434, 13412, 1681)`; human-readable output contains
   `G. Coverage` and the four metric labels with numbers.
-- **gain --json includes the coverage object** — JSON payload has a `coverage` key with
-  the six integer fields.
-- **gain omits Section G when the graph is unavailable** — coverage helper returns
-  `None`; no Section G, no crash, existing sections still print (regression guard so
-  Section G failure cannot take down the rest of `gain`, matching Section F semantics).
+- **gain --json includes the coverage object** — same patch; JSON payload has a `coverage`
+  key with the six integer fields `catalogued_tables`, `total_tables`, `good_edges`,
+  `total_edges`, `phantom_edges`, `blindspot_tables`.
+- **gain omits Section G when the graph is unavailable** — patch `collect_coverage` to
+  return `None`; no `Section G` / `G. Coverage` in output, no crash, existing sections
+  still appear (regression guard so Section G failure cannot take down the rest of `gain`,
+  matching Section F semantics).
 
 ### Integration test — `tests/integration/test_coverage_metrics_integration.py`
 
