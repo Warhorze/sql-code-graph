@@ -2337,3 +2337,44 @@ PHASE 0 SEQUENCING DECISIONS (recorded before coding):
 
 NEXT: implement Phases 1-6 per plan; run full pytest + perf invariant guards;
       version bump 1.5.1 -> 1.6.0; open PR to master.
+
+## Implementation complete — positional_insert_clone_blindspot [2026-06-08]
+
+ACTIVE AGENT: shepherd (main session, picked up after developer hit a length
+limit mid-run twice — agent died with "Prompt is too long" both times, but
+each time had already committed/written real progress)
+FEATURE: positional_insert_clone_blindspot — Parts A1/A2/B/C
+BRANCH: feat/positional-insert-clone-blindspot
+COMMITS: 3d0633e (Part A1), 38e177e (Parts A2/B/C + version bump 1.6.0)
+STATUS: DONE — all 7 acceptance tests pass for real, full suite green
+        (1124 passed / 7 skipped / 3 xfailed), perf invariant guards green.
+
+Two integration bugs found and fixed during the post-implementation full-suite
+run (both were in the developer's uncommitted working-tree changes, not in
+3d0633e):
+1. SnowflakeParser.parse_file() didn't accept/forward the new
+   ddl_columns_by_bare kwarg to AnsiParser.parse_file() — pool.py passed it
+   unconditionally, so every snowflake pass-2 task raised
+   "got an unexpected keyword argument 'ddl_columns_by_bare'", silently
+   dropping those files into the 'other' bucket. Cascaded into 18 e2e/
+   integration failures (duckdb_parity, airbnb_e2e, e36_xfile_regression).
+   Fix: added the kwarg to SnowflakeParser.parse_file and forwarded it.
+2. _empty_closure_hint() always re-queried GET_COLUMNS_FOR_TABLE_QUERY, but
+   get_downstream_dependencies() already queries it to pick its own
+   "terminal output" vs "no catalog" message — the redundant second query
+   broke test_tools_hints' mocked side_effect sequence (StopIteration).
+   Fix: _empty_closure_hint now accepts an optional pre-fetched `cols` list.
+
+Housekeeping: removed a stray untracked plan/measurements/ directory
+(byte-identical duplicate of plan/metrics/, recreated by tests/e2e/
+test_dwh_e2e.py's hardcoded old path during a prior full-suite run — that
+test is gitignored per [[feedback_dwh_e2e]] and never committed).
+
+Pre-existing WIP on this branch (carried over from docs/architecture-overhaul's
+dirty working tree at branch-creation time — NOT part of this feature, left
+uncommitted/untouched): ARCHITECTURE_REVIEW.md, CLAUDE.md, .claude/agents/*,
+plan/metrics/sprint_08_*.json, plan/{measurements->metrics} renames context.
+User should handle that separately on docs/architecture-overhaul.
+
+NEXT: user reviews the branch and opens the PR to master when ready (per
+[[feedback_no_close_verify_before_tag]] — agent does not tag/close/merge).
