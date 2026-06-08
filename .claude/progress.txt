@@ -2271,3 +2271,69 @@ KEY DESIGN DECISIONS:
 
 NEXT: plan-reviewer gate, then developer. architect-planner idle for Q&A + compliance check
       on "finished". Phase 0 must resolve B x C sequencing + check for CLONE-of-CTAS shape.
+
+---
+ACTIVE AGENT: plan-reviewer
+FEATURE: positional_insert_clone_blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (reviewing commit 7604de4)
+STATUS: in progress — checklist pass + code verification underway
+
+---
+ACTIVE AGENT: plan-reviewer (handoff complete)
+FEATURE: positional_insert_clone_blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md
+STATUS: READY FOR IMPLEMENTATION
+
+REVIEW VERDICT: plan is sound — core technical claims verified against code
+(exp.Clone/stmt.args["clone"].this confirmed in sqlglot 30.6.0 snowflake dialect;
+register_pass1 iterates defined_tables/defined_columns identically pass1 vs pass2;
+defined_table_registry built post-pass-2 in main process as described). No blocking
+questions remain unresolved (the one open item — B x C sequencing — is correctly
+scoped to Phase 0, not a plan-level blocker).
+
+CORRECTION MADE (commit d891b8d): Step 4.3 / C2-emission originally suggested
+"populate QueryNode.defined_columns in place before _build_file_rows" — this
+CONFLICTS with QueryNode's documented contract ("do not rely on identity after
+pass 2; use dataclasses.replace()"). Also a CLONE create produces NO
+defined_by_query entry (empty defined_columns), so "the matching QueryNode" is
+not unique by full_id once duplicate-DDL registrations are considered. Replaced
+with two contract-respecting strategies: (recommended) emit SqlColumn/HAS_COLUMN
+rows directly from resolve_clone_catalogs()'s resolved index bypassing
+defined_by_query, or (alternative) dataclasses.replace() at the exact
+(file, statement_index) slot. Phase 0 / Step 0.2 now records the chosen
+emission strategy alongside the B x C sequencing decision (one PR note covers
+both). Step 3.3 TC-C guard now explicitly requires asserting source='clone_inherited'
+at the graph-row level (HAS_COLUMN/SqlColumn directly), not via defined_by_query
+presence — since the chosen strategy may bypass that path.
+
+FAILING TESTS (commit cef45c6): tests/unit/test_clone_positional_insert_blindspot.py
+— 7 tests (test_C1_*, test_B_ddl_columns_by_bare_*, test_C2_resolve_clone_catalogs_*,
+test_A2_*, test_A1_*), all skip today on missing symbols (clone_source,
+ddl_columns_by_bare, resolve_clone_catalogs, inferred_from_source_name,
+_empty_closure_hint) via try/except + pytest.skip. Confirmed-skip run logged;
+must flip to passing as each plan part lands — `pytest -k clone_positional` selects
+the suite, ticket-prefix names (test_A1_/A2_/B_/C1_/C2_) make per-part filtering work.
+
+NEXT: developer implements Phase 0 -> 6. Phase 0 is the single highest-attention
+seam — it must record BOTH the B x C sequencing AND the row-emission strategy in
+one PR note (per the correction above) before Phase 4 lands.
+
+## Current State — developer: positional_insert_clone_blindspot [2026-06-08]
+
+ACTIVE AGENT: developer
+FEATURE: positional_insert_clone_blindspot (CLONE + positional-INSERT column-lineage blind spot — Parts A1/A2/B/C)
+BRANCH: feat/positional-insert-clone-blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (plan-reviewer approved at d891b8d, READY FOR IMPLEMENTATION)
+STATUS: implementing
+
+PHASE 0 SEQUENCING DECISIONS (recorded before coding):
+- Part B x Part C ordering: PREFERRED option — resolve_clone_catalogs() runs in the
+  aggregator at the pass1->pass2 boundary (before pass-2 dispatch), extending
+  ddl_columns_by_bare with inherited entries so Part B's parse-time read sees them.
+- C2 row emission strategy: RECOMMENDED option (a) — emit SqlColumn/HAS_COLUMN rows
+  directly from resolve_clone_catalogs()'s resolved index in the main-process upsert
+  seam (FileRowSet/accumulator), bypassing defined_by_query and never mutating
+  QueryNode.defined_columns in place.
+
+NEXT: implement Phases 1-6 per plan; run full pytest + perf invariant guards;
+      version bump 1.5.1 -> 1.6.0; open PR to master.

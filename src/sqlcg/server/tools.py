@@ -728,6 +728,46 @@ def _reason_for(transform: str | None, confidence: float | None) -> str | None:
     return _REASON_MAP.get((transform, rounded)) or f"inferred edge (confidence={confidence:.2f})"
 
 
+def _empty_closure_hint(db: GraphBackend, table_id: str) -> str:
+    """Return the hint string for an empty lineage-closure result.
+
+    Disambiguates two distinct "empty" situations (plan/sprints/positional_insert_clone_blindspot.md
+    Part A1):
+
+    - The table has **zero** catalogued columns (``HAS_COLUMN`` returns no rows). This is
+      the CLONE / no-column-list-positional-INSERT blind spot: sqlcg has no authoritative
+      target column names for this table, so an empty closure here is *unproven*, not a
+      genuine negative — raw ``COLUMN_LINEAGE`` edges may still exist keyed under a
+      source-derived column name.
+    - The table **has** a column catalog and the closure is still empty — the column is
+      genuinely terminal (no further upstream/downstream lineage to report).
+
+    Args:
+        db: GraphBackend to read from.
+        table_id: Qualified table id (schema.table or catalog.schema.table).
+
+    Returns:
+        A diagnostic hint string naming which situation applies.
+    """
+    cols = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": table_id})
+    if not cols:
+        return (
+            f"No column catalog for '{table_id}' (0 catalogued columns). This table was "
+            "likely created via CREATE TABLE ... CLONE and/or loaded by a positional "
+            "INSERT ... SELECT with no column list, so sqlcg has no authoritative target "
+            "column names. Lineage edges may still exist keyed on a SOURCE-derived column "
+            "name — check raw COLUMN_LINEAGE for this table. Empty here is UNPROVEN, not "
+            "negative."
+        )
+    return (
+        "No lineage found. Ensure the column reference includes the schema "
+        "prefix (e.g., ba.table_name.column_name). Check that 'sqlcg db info' "
+        "shows SqlColumn > 0. If SqlColumn is 0, column lineage was not "
+        "extracted — check parse errors. Submit feedback with "
+        "submit_feedback tool if this was a false negative."
+    )
+
+
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
 def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
@@ -865,13 +905,7 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                 "would all match — re-index with an explicit schema for precise results."
             )
         elif not lineage:
-            hint = (
-                "No lineage found. Ensure the column reference includes the schema prefix "
-                "(e.g., ba.table_name.column_name). Check that 'sqlcg db info' shows "
-                "SqlColumn > 0. If SqlColumn is 0, column lineage was not extracted — "
-                "check parse errors. Submit feedback with submit_feedback tool if this "
-                "was a false negative."
-            )
+            hint = _empty_closure_hint(db, table_id)
 
         return LineageResult(column=table_col, lineage=lineage, mermaid=mermaid, hint=hint)
 
@@ -1453,12 +1487,16 @@ def get_downstream_dependencies(table_col: str, max_depth: int | None = None) ->
         column_nodes = [n for n in nodes if n.kind == "column"]
         consumer_nodes = [n for n in nodes if n.kind == "external_consumer"]
         if not column_nodes and not consumer_nodes:
-            hint = (
-                "No downstream consumers found — this column may be a terminal output. "
-                "If you expected consumers, confirm the consuming files were indexed "
-                "and that the column reference includes the schema prefix "
-                "(e.g., ba.table_name.column_name)."
-            )
+            cols = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": table_id})
+            if not cols:
+                hint = _empty_closure_hint(db, table_id)
+            else:
+                hint = (
+                    "No downstream consumers found — this column may be a terminal output. "
+                    "If you expected consumers, confirm the consuming files were indexed "
+                    "and that the column reference includes the schema prefix "
+                    "(e.g., ba.table_name.column_name)."
+                )
 
         if truncated and max_depth is None:
             hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
@@ -1555,16 +1593,10 @@ def get_upstream_dependencies(table_col: str, max_depth: int | None = None) -> D
                 elif node_id not in visited and max_depth is not None and next_depth > max_depth:
                     truncated = True
 
-        # Populate hint if result is empty (Step 4.1)
+        # Populate hint if result is empty (Step 4.1; Part A1 disambiguates no-catalog)
         hint = None
         if not nodes:
-            hint = (
-                "No lineage found. Ensure the column reference includes the schema "
-                "prefix (e.g., ba.table_name.column_name). Check that 'sqlcg db info' "
-                "shows SqlColumn > 0. If SqlColumn is 0, column lineage was not "
-                "extracted — check parse errors. Submit feedback with "
-                "submit_feedback tool if this was a false negative."
-            )
+            hint = _empty_closure_hint(db, table_id)
 
         if truncated and max_depth is None:
             hint = "Traversal stopped at 50,000-node safety cap (exceeded max closure depth)."
