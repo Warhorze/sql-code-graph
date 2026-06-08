@@ -343,12 +343,39 @@ self.ddl_columns_by_bare: dict[str, list[str]] = {}
   lowercased — [ansi_parser.py:419](../src/sqlcg/parsers/ansi_parser.py#L419)). The
   aggregator pulls it from the parsed file's CREATE statements in `register_pass1`, keyed by
   bare name, skipping any bare name already in `_ambiguous_bare`.
-- **Threading into pass 2:** the index is handed to the pass-2 parser the same way schema
-  context is threaded today (via the pass-2 dispatch in `index_repo` → the worker's
-  `parse_file(..., dependency_filter=...)` path / `SchemaResolver`). The developer confirms
-  the exact seam in Phase 0 — **prefer reusing the existing `SchemaResolver` cross-file
-  channel** ([`register_cross_file_sources`](../src/sqlcg/lineage/schema_resolver.py#L90)
-  pattern) over inventing a new parameter, so the catalog rides an already-tested boundary.
+- **Threading into pass 2 — concrete channel (this is more specific than "the same way
+  schema context is threaded" and the developer should not have to reverse-engineer it):**
+  pass-2 parsing runs in **persistent worker subprocesses**
+  ([`pool.py:_run_task`](../src/sqlcg/indexer/pool.py#L98)), dispatched via pickled per-task
+  dicts (`{"type": "parse_pass2", ..., "dependency_filter": ..., "xfile_sql": ...}`,
+  [indexer.py:386–393](../src/sqlcg/indexer/indexer.py#L386)). `_run_task` rebuilds
+  `xfile_sql` into ASTs and calls `parser_p2._schema.register_cross_file_sources(rebuilt)`
+  on the worker's **own** `SchemaResolver` instance (note: `_tables` there is keyed by
+  `(catalog, db, name)` tuples, not bare names — a different shape than
+  `ddl_columns_by_bare`). Concretely, threading `ddl_columns_by_bare` means **one of**:
+  1. **(Recommended) Add a new key to the per-task dict** (e.g. `"ddl_columns_by_bare":
+     {bare: cols, ...}`, filtered to the bare names this file's statements actually
+     reference — mirror the existing `xfile_sql` filter-by-`dep_names` pattern at
+     [indexer.py:374–382](../src/sqlcg/indexer/indexer.py#L374) so payload stays O(N_refs),
+     not O(N_corpus_tables); the existing `dependency_filter` set is already the right
+     filter key). `_run_task` passes it through to `parser_p2.parse_file(..., catalog=...)`
+     (a new optional kwarg) or sets it on `parser_p2` before calling `parse_file` — pick one
+     and grep-confirm the single call site.
+  2. **(Alternative) Fold it into `register_cross_file_sources`'s existing payload** by
+     extending the rebuilt-sources dict shape — riskier, since that channel's contract
+     (`str -> exp.Select`) is exercised by existing tests and would need a shape change.
+  Option 1 is lower blast-radius (additive task-dict key + one new kwarg) and keeps the
+  existing `xfile_sql` contract untouched. **Phase 0 names the chosen channel and the exact
+  call site that reads it inside `_extract_column_lineage` / `parse_file`.**
+- **Per-task payload size — apply the same filter discipline as `xfile_sql`.** Threading the
+  *full* `ddl_columns_by_bare` (potentially thousands of entries on a 1,600-file DWH) into
+  every pass-2 task would re-introduce exactly the O(N_files × N_corpus) cost the
+  `dependency_filter` pattern exists to avoid (see CLAUDE.md performance invariants —
+  "`exp.expand()` called with only file-level sources... `dependency_filter` keeps it
+  O(N_refs)"). The per-task slice **must** be filtered to the bare names the file's INSERT
+  targets reference (the existing `dep_names` set is already computed at
+  [indexer.py:375](../src/sqlcg/indexer/indexer.py#L375) — reuse it, do not build a second
+  filter).
 - **No-op when absent:** single-file / `reindex_file` paths that have no aggregator pass the
   index as `None`; Part B then degrades to the source-named + flagged behaviour. Mirror the
   documented #44 single-file limitation ([v1_2_1_bugfix.md](v1_2_1_bugfix.md) Phase 2 "Known
@@ -401,13 +428,33 @@ and before the upsert batches flush. Part C piggybacks on this single pass:
      nothing.
 4. **Emit inherited catalog rows** onto the CLONE target: for each inherited column at
    ordinal *i*, append a `SqlColumn` row and a `HAS_COLUMN` edge keyed on the CLONE
-   *target*'s `full_id`, tagged `source="clone_inherited"` (distinct from `"ddl"`). The
-   simplest, lowest-blast-radius wiring: **populate the CLONE target `QueryNode`'s
-   `defined_columns` with the inherited list before `_build_file_rows` runs**, so the existing
-   catalog-emission path ([indexer.py:1080–1111](../src/sqlcg/indexer/indexer.py#L1080))
-   produces the rows unchanged — the only delta is the `source` tag, set from a per-table
-   "inherited?" flag. (The developer confirms in Phase 0 whether populating `defined_columns`
-   vs. emitting rows directly is cleaner; both keep the bulk-upsert path intact.)
+   *target*'s `full_id`, tagged `source="clone_inherited"` (distinct from `"ddl"`).
+   **[plan-reviewer 2026-06-08 — corrected]** The originally-suggested "populate
+   `QueryNode.defined_columns` in place before `_build_file_rows`" wiring **conflicts with
+   the documented `QueryNode` mutation contract** ([base.py](../src/sqlcg/parsers/base.py)
+   docstring: *"Do not rely on `QueryNode` identity after pass 2; use `dataclasses.replace()`
+   to create a new instance if mutation semantics are a concern"*). `QueryNode` is a
+   non-frozen `@dataclass`, but that warning exists because in-place post-pass-2 mutation has
+   bitten this codebase before — and a CLONE create produces **no** entry in `defined_by_query`
+   today (its `defined_columns` is empty, and `defined_by_query` filters on non-empty
+   `defined_columns`), so "the matching `QueryNode`" is not even unique-by-`full_id` once
+   duplicate-DDL registrations (`defined_table_registry`) and multi-statement files are
+   considered. **Pick one of these two emission strategies — do not silently mutate:**
+   - **(Recommended) Emit rows directly from `resolve_clone_catalogs()`'s resolved index**,
+     bypassing `defined_by_query` entirely: in the main-process upsert seam, for each CLONE
+     target with a resolved inherited catalog, append `SqlColumn`/`HAS_COLUMN` row dicts
+     straight into the `FileRowSet` (or an equivalent pre-flush accumulator) keyed on the
+     CLONE target's `full_id`, tagged `source="clone_inherited"` per-row — naturally avoiding
+     a side-channel "inherited?" flag and any `QueryNode` touch at all. Lowest blast radius;
+     the existing `defined_by_query` / DDL emission path is untouched.
+   - **(Alternative, if row-level emission proves awkward) `dataclasses.replace()`** to build
+     a *new* `QueryNode` with the inherited `defined_columns` populated, locate its exact
+     (file, statement-index) slot in `pass2_results[i].statements[j]` (by `full_id` **and**
+     statement identity — not `full_id` alone, per the non-uniqueness above), and substitute
+     it before `_build_file_rows` runs. This honors the documented mutation contract but is
+     more invasive; prefer the row-emission path unless it has a concrete blocker.
+   Phase 0 **records which strategy was chosen and why** — this is now part of the Phase-0
+   sequencing note (see Step 0.2), not a developer-discretion footnote.
 5. **Feed Part B.** Because the CLONE target now has a catalog in `ddl_columns_by_bare`
    (extend the index with inherited catalogs once C2 resolves them), Part B's positional
    ordinal mapping finds it and maps the positional INSERT correctly. **Ordering constraint:**
@@ -551,6 +598,15 @@ seam chosen for Part B-catalog threading.
   design): preferred = resolve CLONE catalogs in the aggregator before pass-2 dispatch so the
   inherited catalog is in `ddl_columns_by_bare` when Part B reads it; fallback = re-key in the
   upsert seam. Name the chosen approach in the PR note.
+- **DECIDE AND RECORD the inherited-row emission strategy** (see C2 step 4 — "Emit inherited
+  catalog rows"): either (a) emit `SqlColumn`/`HAS_COLUMN` rows directly from
+  `resolve_clone_catalogs()`'s resolved index, bypassing `defined_by_query` (recommended,
+  lowest blast radius), or (b) `dataclasses.replace()` a new `QueryNode` with populated
+  `defined_columns` and substitute it at its exact `(file, statement_index)` slot before
+  `_build_file_rows` runs. **Do not mutate `QueryNode.defined_columns` in place** — `base.py`'s
+  `QueryNode` docstring explicitly warns against relying on identity after pass 2. Name the
+  chosen strategy in the same PR note as the sequencing decision (one combined record, since
+  both bear on the same main-process seam).
 - Acceptance: a short note in the PR description naming each confirmed seam **and the chosen
   B×C sequencing**; **STOP and raise a blocking question** if (a) the no-column-list INSERT
   does not reach the main column loop as assumed (Part B depends on it), or (b) a CLONE source
@@ -609,8 +665,11 @@ correct interim signal).
 returns `s.src.x`; edges have `inferred_from_source_name=false`.
 **Step 3.3** TC-C (RED until Phase 4):
 - `s.fact_clone` has `SqlColumn` rows `a/b/c` with `HAS_COLUMN` `source="clone_inherited"`
-  (assert the catalog exists and the source tag), and its INSERT dsts are `a/b/c`
-  (`inferred_from_source_name=false`); `get_upstream_dependencies("s.fact_clone.a")` returns `s.t.x`.
+  (assert the catalog exists and the source tag **at the graph-row level** — i.e. query
+  `HAS_COLUMN`/`SqlColumn` directly; do not infer the tag from `defined_by_query` presence,
+  since the chosen emission strategy (Phase 0) may bypass that path entirely), and its INSERT
+  dsts are `a/b/c` (`inferred_from_source_name=false`);
+  `get_upstream_dependencies("s.fact_clone.a")` returns `s.t.x`.
 - `s.fact_clone2` inherits `a/b/c` via the chain (catalog exists).
 - `s.fact_orphan` has **no** catalog; dsts source-named, flagged true; A1 hint fires.
 - The cycle control terminates with no catalog and no exception.
@@ -629,10 +688,11 @@ the pass-1→pass-2 boundary, per the Phase-0 sequencing decision): for each CLO
 empty own `defined_columns`, resolve its source's ordered columns from `ddl_columns_by_bare`,
 following CLONE chains with a visited-set + bounded hop limit; extend `ddl_columns_by_bare`
 with the inherited entry (so Part B sees it). Emit the inherited `SqlColumn`/`HAS_COLUMN` rows
-in the main-process upsert path tagged `source="clone_inherited"` — preferably by populating
-the CLONE target `QueryNode.defined_columns` before `_build_file_rows` so the existing
-emission loop ([indexer.py:1080–1111](../src/sqlcg/indexer/indexer.py#L1080)) produces them,
-with the `source` tag switched via a per-table inherited flag.
+in the main-process upsert path tagged `source="clone_inherited"` using the **Phase-0-recorded
+emission strategy** (recommended: append rows directly from the resolved index into the
+`FileRowSet`/accumulator, bypassing `defined_by_query`; alternative: `dataclasses.replace()` a
+new `QueryNode` at its exact `(file, statement_index)` slot — never mutate
+`QueryNode.defined_columns` in place, see C2 step 4 correction above).
 **Step 4.4 (B — ordinal mapping).** Add the no-column-list positional-INSERT block in
 [`base.py`](../src/sqlcg/parsers/base.py) next to the #25 block, mirroring its body-copy-once
 + per-position guard structure; map projection *i* → `catalog[i]` (catalog now includes
