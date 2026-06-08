@@ -24,11 +24,15 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--db", required=True, help="Path to the indexed sqlcg DuckDB file")
     p.add_argument("--sql", required=True, help="Root of the SQL source repo (for pattern scan)")
     p.add_argument("--out", default=None, help="Optional path to write JSON results")
-    p.add_argument("--min-cols", type=int, default=3, help="Below this, flag as PARTIAL (default 3)")
+    p.add_argument(
+        "--min-cols", type=int, default=3, help="Below this, flag as PARTIAL (default 3)"
+    )
     return p.parse_args()
 
 
@@ -96,7 +100,9 @@ SELECT COUNT(*) AS inferred_edges FROM COLUMN_LINEAGE WHERE inferred_from_source
 _PAT_CLONE       = re.compile(r'\bCREATE\b.*?\bCLONE\b', re.I | re.S)
 _PAT_CTAS        = re.compile(r'\bCREATE\b.*?\bAS\s+SELECT\b', re.I | re.S)
 _PAT_PLAIN_DDL   = re.compile(r'\bCREATE\b[^(]*\(', re.I | re.S)
-_PAT_EXTERNAL    = re.compile(r'\bCREATE\b.*?\b(EXTERNAL|TEMP|TEMPORARY)\b.*?\bTABLE\b', re.I | re.S)
+_PAT_EXTERNAL = re.compile(
+    r'\bCREATE\b.*?\b(EXTERNAL|TEMP|TEMPORARY)\b.*?\bTABLE\b', re.I | re.S
+)
 _PAT_INSERT      = re.compile(r'\bINSERT\s+(?:OVERWRITE\s+)?INTO\b', re.I)
 
 
@@ -157,7 +163,9 @@ def main() -> None:
     try:
         import duckdb
     except ImportError:
-        sys.exit("duckdb not available — run via: uv run python scripts/column_coverage_check.py ...")
+        sys.exit(
+            "duckdb not available — run via: uv run python scripts/column_coverage_check.py ..."
+        )
 
     db_path = Path(args.db).expanduser()
     if not db_path.exists():
@@ -182,7 +190,7 @@ def main() -> None:
 
     table_coverage: dict[str, dict] = {}
     for row in table_rows:
-        r = dict(zip(table_cols, row))
+        r = dict(zip(table_cols, row, strict=False))
         total = r["total_cols"]
         if total == 0:
             flag = "ZERO_COLS"
@@ -199,7 +207,9 @@ def main() -> None:
     print(f"{'table_name':<55} {'ddl':>5} {'clone':>6} {'total':>6}  flag")
     print("-" * 80)
     for t, r in sorted(table_coverage.items(), key=lambda x: (x[1]["flag"], x[0])):
-        print(f"{t:<55} {r['ddl_cols']:>5} {r['inherited_cols']:>6} {r['total_cols']:>6}  {r['flag']}")
+        print(
+            f"{t:<55} {r['ddl_cols']:>5} {r['inherited_cols']:>6} {r['total_cols']:>6}  {r['flag']}"
+        )
 
     # -----------------------------------------------------------------------
     # Section 2 — column lineage coverage
@@ -213,8 +223,9 @@ def main() -> None:
     col_coverage: list[dict] = []
 
     for row in col_rows:
-        r = dict(zip(col_cols, row))
-        r["flag"] = "DEAD_END" if r["upstream_count"] == 0 and r["downstream_count"] == 0 else "OK"
+        r = dict(zip(col_cols, row, strict=False))
+        is_dead = r["upstream_count"] == 0 and r["downstream_count"] == 0
+        r["flag"] = "DEAD_END" if is_dead else "OK"
         if r["flag"] == "DEAD_END":
             dead_end_cols.append(r)
         if r["has_inferred_upstream"]:
@@ -226,7 +237,10 @@ def main() -> None:
     for r in col_coverage:
         key = f"{r['table_name']}.{r['col_name']}"
         inferred_marker = "YES" if r["has_inferred_upstream"] else ""
-        print(f"{key:<65} {r['upstream_count']:>4} {r['downstream_count']:>4}  {inferred_marker:<8}  {r['flag']}")
+        print(
+            f"{key:<65} {r['upstream_count']:>4} {r['downstream_count']:>4}"
+            f"  {inferred_marker:<8}  {r['flag']}"
+        )
 
     # -----------------------------------------------------------------------
     # Section 3 — tables with edges but NO catalog
@@ -237,7 +251,7 @@ def main() -> None:
 
     blindspots: list[dict] = []
     for row in blindspot_rows:
-        r = dict(zip(blindspot_cols, row))
+        r = dict(zip(blindspot_cols, row, strict=False))
         blindspots.append(r)
 
     if not blindspots:
@@ -250,7 +264,9 @@ def main() -> None:
             pat = classify_pattern(r["table_name"], sql_root)
             r["pattern"] = pat
             pattern_counts[pat] += 1
-            print(f"{r['table_name']:<55} {r['edge_count']:>6}  {r['inferred_edge_count']:>8}  {pat}")
+            print(
+                f"{r['table_name']:<55} {r['edge_count']:>6}  {r['inferred_edge_count']:>8}  {pat}"
+            )
 
     # -----------------------------------------------------------------------
     # Section 4 — pattern scan for ZERO_COLS tables (even those with no edges)
@@ -280,8 +296,10 @@ def main() -> None:
 
     print_section("SUMMARY")
     print(f"Tables total:              {total_tables}")
-    print(f"  ZERO_COLS:               {len(zero_cols_tables)}  ({pct(len(zero_cols_tables), total_tables)})")
-    print(f"  PARTIAL (<{args.min_cols} cols):       {len(partial_tables)}  ({pct(len(partial_tables), total_tables)})")
+    zero_pct = pct(len(zero_cols_tables), total_tables)
+    partial_pct = pct(len(partial_tables), total_tables)
+    print(f"  ZERO_COLS:               {len(zero_cols_tables)}  ({zero_pct})")
+    print(f"  PARTIAL (<{args.min_cols} cols):       {len(partial_tables)}  ({partial_pct})")
     print(f"  OK:                      {len(ok_tables)}  ({pct(len(ok_tables), total_tables)})")
     print()
     if zero_cols_tables:
@@ -292,7 +310,8 @@ def main() -> None:
     print(f"Columns total:             {total_cols}")
     print(f"  with upstream lineage:   {cols_with_up}  ({pct(cols_with_up, total_cols)})")
     print(f"  with downstream lineage: {cols_with_dn}  ({pct(cols_with_dn, total_cols)})")
-    print(f"  DEAD_END (both=0):       {len(dead_end_cols)}  ({pct(len(dead_end_cols), total_cols)})")
+    dead_pct = pct(len(dead_end_cols), total_cols)
+    print(f"  DEAD_END (both=0):       {len(dead_end_cols)}  ({dead_pct})")
     print()
     print(f"Blindspot tables (edges, no catalog): {len(blindspots)}")
     if blindspots:
