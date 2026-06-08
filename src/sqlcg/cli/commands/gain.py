@@ -54,22 +54,57 @@ def gain_cmd(
     else:
         metrics_path = _metrics_path
 
+    # Coverage is graph-derived — available even before any metrics are collected.
+    coverage = collect_coverage()
+
     if not metrics_path.exists():
         if json_output:
-            console.print(
-                json.dumps(
-                    {
-                        "total_calls": 0,
-                        "last_7d_calls": 0,
-                        "index_runs": 0,
-                        "feedback_tp": 0,
-                        "feedback_total": 0,
-                        "top_tools": [],
-                    }
-                )
-            )
+            payload: dict = {
+                "total_calls": 0,
+                "last_7d_calls": 0,
+                "index_runs": 0,
+                "feedback_tp": 0,
+                "feedback_total": 0,
+                "top_tools": [],
+            }
+            if coverage is not None:
+                payload["coverage"] = {
+                    "catalogued_tables": coverage.catalogued_tables,
+                    "total_tables": coverage.total_tables,
+                    "good_edges": coverage.good_edges,
+                    "total_edges": coverage.total_edges,
+                    "phantom_edges": coverage.phantom_edges,
+                    "blindspot_tables": coverage.blindspot_tables,
+                }
+            console.print(json.dumps(payload))
         else:
             console.print("No metrics collected yet.")
+            if coverage is not None:
+                console.print()
+                console.print("[bold cyan]G. Coverage[/bold cyan]")
+                console.print(
+                    f"  Tables with catalog: {coverage.catalogued_tables} / {coverage.total_tables}"
+                    f" ({coverage.catalog_pct:.0f}%)"
+                )
+                eh_colour = edge_health_colour(coverage.edge_health_pct)
+                console.print(
+                    f"  [{eh_colour}]Edge health: {coverage.good_edges} / {coverage.total_edges}"
+                    f" ({coverage.edge_health_pct:.0f}%)[/{eh_colour}]"
+                )
+                ph_colour = phantom_colour(coverage.phantom_pct)
+                console.print(
+                    f"  [{ph_colour}]Phantom edges: {coverage.phantom_edges}"
+                    f" / {coverage.total_edges} ({coverage.phantom_pct:.0f}%)"
+                    f"[/{ph_colour}]"
+                )
+                bs_colour = blindspot_colour(coverage.blindspot_tables)
+                if bs_colour:
+                    console.print(
+                        f"  [{bs_colour}]Blindspot tables:"
+                        f" {coverage.blindspot_tables}[/{bs_colour}]"
+                    )
+                else:
+                    console.print(f"  Blindspot tables: {coverage.blindspot_tables}")
         return
 
     try:
@@ -141,10 +176,6 @@ def gain_cmd(
                 parse_quality = {str(r["mode"]): int(r["cnt"]) for r in mode_rows}
         except Exception:
             pass  # graph not available or server busy — skip quality section
-
-        # Section G: coverage — computed once, used by both json and human branches.
-        # collect_coverage() degrades to None on failure (same contract as Section F).
-        coverage = collect_coverage()
 
         if json_output:
             payload: dict = {
