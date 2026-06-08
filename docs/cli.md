@@ -51,6 +51,7 @@ Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
+| --version | BOOLEAN | No | No | False | Show version and exit. |
 | --install-completion | BOOLEAN | No | No |  | Install completion for the current shell. |
 | --show-completion | BOOLEAN | No | No |  | Show completion for the current shell, to copy it or customize the installation. |
 
@@ -547,9 +548,19 @@ sqlcg mcp status [OPTIONS]
 
 Print server status JSON (connects to control socket).
 
-Returns JSON with fields: running, pid, db_path, indexed_sha, head_sha,
-stale_by_commits, connected_clients, uptime, writer_queue when a server
-is live.
+Returns JSON with fields: running, version, pid, db_path, indexed_sha,
+head_sha, stale_by_commits, connected_clients, uptime, writer_queue,
+stale_by_version when a server is live.
+
+`version` is the *running* server's reported sqlcg.__version__ (read live
+over the control socket — the build the editor is currently talking to).
+`stale_by_version` compares it against the *installed* sqlcg.__version__
+(the CLI process you just invoked): true when they differ, false when they
+match, null when the running version cannot be determined (degraded mode).
+When stale, a warning is printed telling you to restart the MCP server via
+your editor or run `sqlcg install` (which stops the stale server for you).
+This is distinct from `stale_by_commits` (graph-vs-repo freshness, not
+package-vs-binary drift).
 
 The status response is length-prefixed framed (v1.3.0, B3) so large
 writer_queue payloads are received in full — the client uses the
@@ -557,7 +568,8 @@ recv-exactly makefile+readline+read(n) pattern, NOT a single recv(4096).
 
 When no server is found: {"running": false}.
 When the PID file exists with a live process but the socket is unavailable:
-{"running": true, "degraded": "socket unavailable", ...}.
+{"running": true, "degraded": "socket unavailable", "stale_by_version": null, ...}
+(the running version cannot be read without a live socket).
 
 R3 (stale socket): if the socket file exists but the server is not
 responding (ConnectionRefusedError / FileNotFoundError), falls through
@@ -577,12 +589,8 @@ sqlcg mcp stop [OPTIONS]
 
 Stop the running MCP server gracefully.
 
-Sends a ``stop`` op via the control socket; waits up to 5 s for the
-socket file to disappear (confirming clean exit).  Falls back to SIGTERM
-on the PID-file PID if the socket is unavailable.
-
-R3 (stale socket): ``ConnectionRefusedError`` / ``FileNotFoundError`` are
-caught — never hangs on a dead socket.
+Delegates to ``stop_server()`` (shared with ``sqlcg install``) and prints
+a final message based on whether a server was found.
 
 ### Options
 
