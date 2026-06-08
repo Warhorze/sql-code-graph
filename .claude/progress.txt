@@ -1,3 +1,11 @@
+## Current State [2026-06-08]
+ACTIVE AGENT: architect-planner
+FEATURE: coverage_p1_p3_p4 (P1 CTE leak, P3 space-name schema strip, P4 CTAS column discovery)
+OUTPUT: plan/sprints/coverage_p1_p3_p4.md
+GOAL: edge health 29% -> >=95% on DWH corpus (1,342 files), minor bump 1.6.1 -> 1.7.0
+
+---
+
 ## Handoff — developer: gain_coverage_metrics [2026-06-08]
 
 ACTIVE AGENT: developer (complete — ready for compliance check)
