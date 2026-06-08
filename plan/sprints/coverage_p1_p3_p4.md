@@ -244,10 +244,14 @@ rows reuse existing shapes.
   `test_P3_quoted_view_lineage_reaches_source_via_has_column` passes — `SqlColumn`,
   `COLUMN_LINEAGE` (dst on the qualified view name), and `HAS_COLUMN` all agree on the
   same qualified key.
-- Verify no other `SqlColumn` emission site (lineage `edge.src`/`edge.dst` at L1203/1231,
-  CLONE at L1376) regresses: their `table_name` stays bare for normal names; apply the same
-  `" " in name` qualify there **only if** an existing test needs it — default is to change
-  the DDL-column loop only (the path the P3 catalog now flows through).
+- Verify no other `SqlColumn` emission site in [`indexer.py`](../../src/sqlcg/indexer/indexer.py)
+  regresses (e.g. the COLUMN_LINEAGE src/dst `table_name` fields set elsewhere in
+  `_build_file_rows`, and the CLONE path). Those fields use `table.name` (bare) and are
+  unrelated to the DDL-column loop being changed here; apply the same `" " in name` qualify
+  there **only if** an existing P3 test fails after Step 2.2 — default is to change the
+  DDL-column loop only (L1147, the path the P3 catalog now flows through).
+  **Note:** earlier draft references to L1203/1231/L1376 referred to `base.py` line numbers,
+  not `indexer.py` — do not search `base.py` for this change.
 
 ### Phase 3: P1 — CTE/derived destination de-leak
 
@@ -256,9 +260,13 @@ rows reuse existing shapes.
   CTE-projection block (L1135–1292).
 - Compute once, before the `for cte in cte_expressions` loop, a boolean
   `_suppress_cte_dsts = isinstance(stmt, exp.Insert) and dst_table is not None and
-  bool(positional_col_names)`. When true, `continue` past the CTE-destination edge
-  emission (skip the whole CTE-projection block for this statement) — the positional
-  block already emitted the authoritative `t.col` edges.
+  bool(positional_col_names)`. When true, guard the **outer** CTE-projection `if`
+  block at L1142 with `if not _suppress_cte_dsts:` so the entire block is skipped for
+  this statement. **Do NOT use `continue` inside the `for cte in cte_expressions` loop**
+  — that would skip one CTE at a time and leave the others emitting. The outer `if` block
+  at L1142 is a separate block from the `combined_sources` CTE registration at L696–707;
+  guarding it skips only the projection-edge emission, not the source registration —
+  the positional block already emitted the authoritative `t.col` edges.
 - This is a single guard read of values already computed earlier in the function; **no new
   qualify / build_scope / sg_lineage / expand**, **once per statement**.
 - Acceptance: `test_P1_cte_destination_does_not_leak_to_cte_node` and

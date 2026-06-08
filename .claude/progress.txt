@@ -1,8 +1,48 @@
 ## Current State [2026-06-08]
-ACTIVE AGENT: architect-planner
+ACTIVE AGENT: plan-reviewer (complete)
 FEATURE: coverage_p1_p3_p4 (P1 CTE leak, P3 space-name schema strip, P4 CTAS column discovery)
-OUTPUT: plan/sprints/coverage_p1_p3_p4.md
-GOAL: edge health 29% -> >=95% on DWH corpus (1,342 files), minor bump 1.6.1 -> 1.7.0
+PLAN: plan/sprints/coverage_p1_p3_p4.md (corrected in-place)
+STATUS: READY FOR IMPLEMENTATION
+
+---
+
+## Handoff — plan-reviewer: coverage_p1_p3_p4 [2026-06-08]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: coverage_p1_p3_p4
+PLAN: plan/sprints/coverage_p1_p3_p4.md (corrected in-place)
+VERDICT: APPROVE-WITH-CORRECTIONS — 2 warnings corrected in-plan; no blockers.
+
+CORRECTIONS MADE:
+  W1 (Step 3.1 — suppression placement): Plan said "continue past the CTE-destination
+  edge emission (skip the whole CTE-projection block)" — ambiguous. Corrected to specify
+  the suppression is a guard `if not _suppress_cte_dsts:` on the OUTER if-block at L1142,
+  NOT a `continue` inside the per-CTE loop. Explicitly documented that the outer block at
+  L1142 is separate from the combined_sources CTE registration at L696-707 — guarding
+  L1142 skips only projection-edge emission, not source registration.
+
+  W2 (Step 2.2 — misleading line references): The step cited "lineage edge.src/edge.dst
+  at L1203/1231, CLONE at L1376" — those are base.py line numbers, NOT indexer.py.
+  Corrected to refer to the indexer.py COLUMN_LINEAGE src/dst table_name fields by
+  description, not line number, and added explicit note: do not search base.py for this
+  indexer.py change.
+
+VERIFICATIONS:
+  - P1 claim CONFIRMED: body = stmt.expression (the SELECT) for INSERT at base.py:681-684;
+    the #25 positional block fires for INSERT-with-explicit-column-list and populates
+    positional_col_names before the CTE-projection block at L1142. Leak is real and the
+    suppression approach is correct.
+  - Indexer seam CONFIRMED: indexer.py L1122-1153 filters on s.defined_columns (L1126),
+    emits SqlColumn rows keyed on table.full_id (L1144), HAS_COLUMN edges (L1150-1152).
+    table_name is bare table.name at L1147 — the P3 fix target is correct.
+  - Perf invariants CLEAN: no new qualify/build_scope/exp.expand/sg_lineage call in any
+    of the three changes. All once-per-statement or once-per-row.
+  - Version bump 1.6.1 -> 1.7.0 present in Scope + Phase 4.
+  - 6 failing acceptance tests exist in tests/integration/test_column_coverage_patterns.py
+    using xfail(strict=True) — correct pre-implementation state.
+
+BLOCKING QUESTIONS: none.
+NEXT: developer implements plan/sprints/coverage_p1_p3_p4.md (order: P4 -> P3 -> P1 -> version bump).
 
 ---
 
