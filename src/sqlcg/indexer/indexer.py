@@ -1144,7 +1144,7 @@ class Indexer:
                         "table_qualified": table.full_id,
                         "catalog": table.catalog or "",
                         "db": table.db or "",
-                        "table_name": table.name,
+                        "table_name": table.full_id if " " in table.name else table.name,
                     }
                 )
                 rows.has_column_edges.append(
@@ -1207,7 +1207,11 @@ class Indexer:
                         "table_qualified": edge.src.table.full_id,
                         "catalog": edge.src.table.catalog or "",
                         "db": edge.src.table.db or "",
-                        "table_name": edge.src.table.name,
+                        "table_name": (
+                            edge.src.table.full_id
+                            if " " in edge.src.table.name
+                            else edge.src.table.name
+                        ),
                     }
                 )
                 # Half A (#39): emit a SqlTable node for the source table.
@@ -1235,7 +1239,11 @@ class Indexer:
                         "table_qualified": edge.dst.table.full_id,
                         "catalog": edge.dst.table.catalog or "",
                         "db": edge.dst.table.db or "",
-                        "table_name": edge.dst.table.name,
+                        "table_name": (
+                            edge.dst.table.full_id
+                            if " " in edge.dst.table.name
+                            else edge.dst.table.name
+                        ),
                     }
                 )
                 # Emit CTE destination table nodes so they appear as SqlTable with kind="cte"

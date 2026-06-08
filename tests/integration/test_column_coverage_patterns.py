@@ -446,7 +446,7 @@ def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     )
     try:
         cols = db.run_read(
-            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.derived_fact'",
+            "SELECT col_name FROM SqlColumn WHERE table_qualified = 'ba.derived_fact'",
             {},
         )
         hc = db.run_read(
@@ -499,7 +499,7 @@ def test_P4_ctas_with_cte_body_columns_derived(tmp_path):
     )
     try:
         cols = db.run_read(
-            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.tmp_base'",
+            "SELECT col_name FROM SqlColumn WHERE table_qualified = 'ba.tmp_base'",
             {},
         )
     finally:
