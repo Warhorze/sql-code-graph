@@ -26,6 +26,7 @@ class TestTraceColumnLineageHint:
             mock_db.run_read.side_effect = [
                 [{"n": 1}],  # _assert_indexed with 'n' key
                 [],  # trace query returns empty
+                [],  # A1 _empty_closure_hint probe (GET_COLUMNS_FOR_TABLE)
             ]
 
             result = trace_column_lineage("orders.amount")
@@ -106,6 +107,7 @@ class TestGetDownstreamDependenciesHint:
                 [{"n": 1}],  # _assert_indexed
                 [],  # downstream BFS query returns empty
                 [],  # batch consumer query — no external consumers
+                [],  # A1 _empty_closure_hint probe (GET_COLUMNS_FOR_TABLE)
             ]
 
             result = get_downstream_dependencies("orders.amount")
@@ -128,6 +130,7 @@ class TestGetUpstreamDependenciesHint:
             mock_db.run_read.side_effect = [
                 [{"n": 1}],  # _assert_indexed
                 [],  # upstream query returns empty
+                [],  # A1 _empty_closure_hint probe (GET_COLUMNS_FOR_TABLE)
             ]
 
             result = get_upstream_dependencies("orders.amount")

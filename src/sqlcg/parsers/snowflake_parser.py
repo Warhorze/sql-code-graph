@@ -61,6 +61,7 @@ class SnowflakeParser(AnsiParser):
         path: Path,
         sql: str,
         dependency_filter: set[str] | None = None,
+        ddl_columns_by_bare: dict[str, list[str]] | None = None,
     ) -> ParsedFile:
         """Parse Snowflake SQL file with scripting block detection.
 
@@ -69,6 +70,8 @@ class SnowflakeParser(AnsiParser):
             sql: SQL text to parse
             dependency_filter: optional set of lowercased table names to filter cross-file sources
                 (passed to AnsiParser.parse_file; see that method for full documentation)
+            ddl_columns_by_bare: optional bare-name → ordered DDL column list, filtered
+                and forwarded to AnsiParser.parse_file (see that method for full documentation)
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -101,6 +104,7 @@ class SnowflakeParser(AnsiParser):
             path,
             sql,
             dependency_filter=dependency_filter,  # type: ignore[call-arg]
+            ddl_columns_by_bare=ddl_columns_by_bare,  # type: ignore[call-arg]
             _precomputed_start_lines=preprocessed_start_lines,  # type: ignore[call-arg]
         )
 

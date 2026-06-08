@@ -45,7 +45,7 @@ def test_index_quiet_flag_suppresses_summary():
                 ),
             ):
                 mock_backend = MagicMock()
-                mock_backend.get_schema_version.return_value = "6"  # Match SCHEMA_VERSION
+                mock_backend.get_schema_version.return_value = "7"  # Match SCHEMA_VERSION
                 mock_get_backend.return_value.__enter__.return_value = mock_backend
 
                 mock_indexer = MagicMock()
@@ -108,7 +108,7 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
         patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
     ):
         mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "6"
+        mock_backend.get_schema_version.return_value = "7"
         mock_get_backend.return_value.__enter__.return_value = mock_backend
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer

@@ -75,6 +75,7 @@ class AnsiParser(SqlParser):
         sql: str,
         dependency_filter: set[str] | None = None,
         _precomputed_start_lines: list[int] | None = None,
+        ddl_columns_by_bare: dict[str, list[str]] | None = None,
     ) -> ParsedFile:
         """Parse SQL file and extract table/column lineage.
 
@@ -94,6 +95,16 @@ class AnsiParser(SqlParser):
                 positions), this list is used directly and ``_compute_start_lines`` is
                 not called on the ``sql`` argument. When ``None``, ``_compute_start_lines
                 (sql)`` is called here.
+            ddl_columns_by_bare: optional bare-name → ordered DDL column list, filtered
+                to the bare names this file's statements reference (mirrors the
+                `dependency_filter`/`xfile_sql` filter discipline — payload stays
+                O(N_refs), never O(N_corpus_tables)). Built by
+                `CrossFileAggregator.register_pass1` (+ `resolve_clone_catalogs` for
+                CLONE-inherited entries) and threaded through the pass-2 task dict.
+                Used by the no-column-list positional-INSERT ordinal mapping (Part B,
+                plan/sprints/positional_insert_clone_blindspot.md). `None` on the
+                single-file / `reindex_file` path — Part B then degrades to the
+                source-named + `inferred_from_source_name=True` fallback.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -179,6 +190,7 @@ class AnsiParser(SqlParser):
                     scope=scope,
                     skip_column_lineage=is_pure_ddl,
                     schema_dict=schema_dict,
+                    ddl_columns_by_bare=ddl_columns_by_bare,
                 )
                 # Assign 1-based start line from the pre-computed map (0 if out of range)
                 query_node.start_line = (
@@ -243,6 +255,7 @@ class AnsiParser(SqlParser):
         scope: Any = None,
         skip_column_lineage: bool = False,
         schema_dict: dict | None = None,
+        ddl_columns_by_bare: dict[str, list[str]] | None = None,
     ) -> QueryNode:
         """Parse a single SQL statement into a QueryNode.
 
@@ -254,6 +267,9 @@ class AnsiParser(SqlParser):
             sources_map: Map of temp table names to SELECT bodies for resolution
             scope: Pre-built sqlglot Scope for the statement (optional optimization)
             skip_column_lineage: When True, skip column lineage extraction (pure-DDL files)
+            ddl_columns_by_bare: optional bare-name → ordered DDL column catalog index,
+                threaded from `parse_file` for the no-column-list positional-INSERT
+                ordinal mapping (Part B). See `parse_file` docstring for provenance.
 
         Returns:
             QueryNode with extracted metadata
@@ -267,6 +283,19 @@ class AnsiParser(SqlParser):
             target = self._apply_table_alias(self._extract_target_table(stmt))
         elif isinstance(stmt, exp.Insert):
             target = self._apply_table_alias(self._extract_insert_target(stmt))
+
+        # C1 — capture the CLONE source TableRef for `CREATE TABLE t CLONE src`.
+        # Metadata-only: one `args.get` per CREATE statement, no body/lineage impact
+        # (a CLONE create has no SELECT body — defined_body stays None, defined_columns
+        # stays empty). Zero per-column hot-path cost
+        # (plan/sprints/positional_insert_clone_blindspot.md Part C1).
+        clone_source: TableRef | None = None
+        if isinstance(stmt, exp.Create) and stmt.kind == "TABLE":
+            clone_arg = stmt.args.get("clone")
+            if isinstance(clone_arg, exp.Clone) and isinstance(clone_arg.this, exp.Table):
+                clone_source = self._apply_table_alias(
+                    self._convert_table_expr_to_ref(clone_arg.this)
+                )
 
         # Extract source tables
         sources = []
@@ -325,6 +354,7 @@ class AnsiParser(SqlParser):
                 dst_table=target,
                 sources=sources_map,
                 query_sources=sources,
+                ddl_columns_by_bare=ddl_columns_by_bare,
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
@@ -361,6 +391,7 @@ class AnsiParser(SqlParser):
             defined_columns=defined_columns,
             star_sources=star_sources,
             defined_body=defined_body,
+            clone_source=clone_source,
         )
 
     @staticmethod

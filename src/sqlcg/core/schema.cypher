@@ -94,7 +94,8 @@ CREATE REL TABLE COLUMN_LINEAGE (
     FROM SqlColumn TO SqlColumn,
     transform STRING,
     confidence FLOAT,
-    query_id STRING
+    query_id STRING,
+    inferred_from_source_name BOOLEAN
 );
 
 -- Query -> Table: query declares/creates this table

@@ -131,13 +131,14 @@ WHERE q.target_table <> ''
 -- EXPAND_STAR_SOURCES_LINEAGE
 -- Insert COLUMN_LINEAGE edges for the star expansion.
 -- params: []
-INSERT OR REPLACE INTO "COLUMN_LINEAGE" (src_key, dst_key, transform, confidence, query_id)
+INSERT OR REPLACE INTO "COLUMN_LINEAGE" (src_key, dst_key, transform, confidence, query_id, inferred_from_source_name)
 SELECT DISTINCT
   c.id AS src_key,
   q.target_table || '.' || c.col_name AS dst_key,
   'STAR_EXPANSION' AS transform,
   0.8 AS confidence,
-  q.id AS query_id
+  q.id AS query_id,
+  FALSE AS inferred_from_source_name
 FROM "STAR_SOURCE" ss
 JOIN "SqlQuery" q ON q.id = ss.src_key
 JOIN "SqlTable" t ON t.qualified = ss.dst_key

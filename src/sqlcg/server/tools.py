@@ -728,7 +728,7 @@ def _reason_for(transform: str | None, confidence: float | None) -> str | None:
     return _REASON_MAP.get((transform, rounded)) or f"inferred edge (confidence={confidence:.2f})"
 
 
-def _empty_closure_hint(db: GraphBackend, table_id: str) -> str:
+def _empty_closure_hint(db: GraphBackend, table_id: str, cols: list[dict] | None = None) -> str:
     """Return the hint string for an empty lineage-closure result.
 
     Disambiguates two distinct "empty" situations (plan/sprints/positional_insert_clone_blindspot.md
@@ -745,11 +745,16 @@ def _empty_closure_hint(db: GraphBackend, table_id: str) -> str:
     Args:
         db: GraphBackend to read from.
         table_id: Qualified table id (schema.table or catalog.schema.table).
+        cols: optional pre-fetched ``GET_COLUMNS_FOR_TABLE_QUERY`` result. Pass this when
+            the caller already queried the catalog (e.g. to branch on it for its own
+            messaging) so this helper does not issue a redundant duplicate query.
+            When ``None``, the helper queries the catalog itself.
 
     Returns:
         A diagnostic hint string naming which situation applies.
     """
-    cols = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": table_id})
+    if cols is None:
+        cols = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": table_id})
     if not cols:
         return (
             f"No column catalog for '{table_id}' (0 catalogued columns). This table was "
@@ -1489,7 +1494,7 @@ def get_downstream_dependencies(table_col: str, max_depth: int | None = None) ->
         if not column_nodes and not consumer_nodes:
             cols = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": table_id})
             if not cols:
-                hint = _empty_closure_hint(db, table_id)
+                hint = _empty_closure_hint(db, table_id, cols=cols)
             else:
                 hint = (
                     "No downstream consumers found — this column may be a terminal output. "

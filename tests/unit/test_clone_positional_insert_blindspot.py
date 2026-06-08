@@ -206,8 +206,8 @@ def test_A2_no_column_list_positional_insert_flags_inferred_edge_in_graph(tmp_pa
         if not rows:
             pytest.skip("no COLUMN_LINEAGE rows produced for fact_nocat/fact_listed fixtures")
 
-        flagged = [r for r in rows if r[1] is True]
-        unflagged = [r for r in rows if r[1] is False]
+        flagged = [r for r in rows if r["inferred_from_source_name"] is True]
+        unflagged = [r for r in rows if r["inferred_from_source_name"] is False]
         assert flagged, (
             "the no-column-list positional INSERT into a catalog-less table must produce "
             "at least one inferred_from_source_name=true edge"
@@ -259,7 +259,7 @@ def test_A1_empty_closure_hint_distinguishes_no_catalog_from_terminal_column(tmp
         if not nocat_rows:
             pytest.skip("fixture produced no COLUMN_LINEAGE edges for fact_nocat — adjust SQL")
 
-        nocat_table_id = nocat_rows[0][0].rsplit(".", 1)[0]
+        nocat_table_id = nocat_rows[0]["dst_key"].rsplit(".", 1)[0]
         no_catalog_hint = tools._empty_closure_hint(db, nocat_table_id)
         hint_lower = no_catalog_hint.lower()
         msg = (
