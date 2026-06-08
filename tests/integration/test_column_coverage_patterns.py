@@ -1,0 +1,540 @@
+"""Integration tests for the four SQL patterns that cause column coverage gaps.
+
+Each test captures one pattern discovered by the systematic diagnostic
+(plan/reports/column_coverage_findings.md) run against the live DWH graph.
+All tests assert observable graph state (COLUMN_LINEAGE rows, HAS_COLUMN rows,
+SqlColumn rows) — never "no exception raised".
+
+Pattern summary:
+  P1 — CTE destination leak (15,102 edges land on CTE/derived nodes, not real tables)
+  P2 — Positional INSERT phantom edges (13,412 inferred_from_source_name=true edges)
+       Covered by existing clone-blindspot tests; the sub-case here is the ALIAS on
+       INSERT target that aliases the table name in scope.
+  P3 — Space-in-name quoted views: schema prefix stripped from SqlColumn.table_name
+       (6,045 edges, 232 tables with full ZERO catalog)
+  P4 — CTAS column discovery: CREATE TABLE t AS SELECT produces no SqlColumn rows
+       (241 tables confirmed by pattern scan)
+
+Tests are written to FAIL today and PASS after the corresponding fix lands.
+They are marked xfail(strict=True) — a passing test before the fix is a regression
+(strict=True turns unexpectedly-passing tests red so the xfail is removed when the
+fix lands).
+"""
+
+from __future__ import annotations
+
+import textwrap
+
+import pytest
+
+from sqlcg.core.duckdb_backend import DuckDBBackend
+from sqlcg.indexer.indexer import Indexer
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _index(tmp_path, files: dict[str, str], dialect: str | None = "snowflake") -> DuckDBBackend:
+    for name, sql in files.items():
+        (tmp_path / name).write_text(textwrap.dedent(sql))
+    db = DuckDBBackend(":memory:")
+    db.init_schema()
+    Indexer().index_repo(tmp_path, dialect=dialect, db=db, use_git=False)
+    return db
+
+
+# ---------------------------------------------------------------------------
+# P1 — CTE destination leak
+#
+# Pattern from DWH: INSERT INTO real_table (col_list)
+#   WITH cte1 AS (...), cte_final AS (...) SELECT ... FROM cte_final
+#
+# Today: lineage destination is `cte_final.col`, not `real_table.col`.
+# Expected: lineage destination is `real_table.col`.
+# Measured impact: 15,102 edges (6,944 on cte-kind + 8,158 on derived-kind).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="P1: CTE destination leak not yet fixed")
+def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
+    """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target,
+    not on the CTE node.
+
+    Reproduces the dominant DWH pattern:
+        INSERT INTO ba.fact (col_a, col_b)
+        WITH base AS (SELECT x AS col_a, y AS col_b FROM ba.src)
+        SELECT col_a, col_b FROM base;
+
+    Expected: COLUMN_LINEAGE dst_key = 'ba.fact.col_a' / 'ba.fact.col_b'
+    Failing today: dst_key = 'base.col_a' / 'base.col_b'
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.src (x INT, y INT);
+            CREATE TABLE ba.fact (col_a INT, col_b INT);
+        """,
+            "etl.sql": """\
+            INSERT INTO ba.fact (col_a, col_b)
+            WITH base AS (
+                SELECT x AS col_a, y AS col_b
+                FROM ba.src
+            )
+            SELECT col_a, col_b
+            FROM base;
+        """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT dst_key FROM COLUMN_LINEAGE "
+            "WHERE dst_key LIKE 'ba.fact.%' OR dst_key LIKE 'base.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    dst_keys = {r["dst_key"] for r in edges}
+    assert any(k.startswith("ba.fact.") for k in dst_keys), (
+        f"Expected lineage edges landing on ba.fact.*, got only: {sorted(dst_keys)}"
+    )
+    assert not any(k.startswith("base.") for k in dst_keys), (
+        f"Edges must NOT land on the CTE node 'base.*', "
+        f"got: {sorted(k for k in dst_keys if k.startswith('base.'))}"
+    )
+
+
+@pytest.mark.xfail(strict=True, reason="P1: CTE chain destination leak not yet fixed")
+def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
+    """Multi-CTE chain ending in cte_insert, matching the exact DWH ETL shape.
+
+    DWH file: etl/sql/fact/wtfe_kpi_gemiddelde_voorraad_artikel_voorraadlocatie.sql
+    (698 edges landed on 'cte_insert' in the live graph)
+
+        INSERT INTO ba.kpi_fact (dn_datum, ma_total)
+        WITH
+            cte_base AS (SELECT dn_datum, ma_total FROM ba.src),
+            cte_insert AS (
+                SELECT dn_datum, ma_total FROM cte_base
+            )
+        SELECT dn_datum, ma_total
+        FROM cte_insert;
+
+    Expected: dst_key = 'ba.kpi_fact.dn_datum' and 'ba.kpi_fact.ma_total'
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.src (dn_datum DATE, ma_total INT);
+            CREATE TABLE ba.kpi_fact (dn_datum DATE, ma_total INT);
+        """,
+            "etl.sql": """\
+            INSERT INTO ba.kpi_fact (dn_datum, ma_total)
+            WITH
+                cte_base AS (SELECT dn_datum, ma_total FROM ba.src),
+                cte_insert AS (SELECT dn_datum, ma_total FROM cte_base)
+            SELECT dn_datum, ma_total
+            FROM cte_insert;
+        """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT dst_key FROM COLUMN_LINEAGE "
+            "WHERE dst_key LIKE 'ba.kpi_fact.%' "
+            "OR dst_key LIKE 'cte_insert.%' OR dst_key LIKE 'cte_base.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    dst_keys = {r["dst_key"] for r in edges}
+    assert any(k.startswith("ba.kpi_fact.") for k in dst_keys), (
+        f"Edges must land on ba.kpi_fact.*, got: {sorted(dst_keys)}"
+    )
+    cte_leaks = {k for k in dst_keys if k.startswith("cte_")}
+    assert not cte_leaks, f"Edges must NOT land on CTE nodes, got: {sorted(cte_leaks)}"
+
+
+def test_P1_derived_subquery_does_not_leak(tmp_path):
+    """Derived subquery (inline FROM (SELECT ...) alias) must not become the dst.
+
+    Covers the 8,158 edges landing on kind='derived' nodes in the live graph.
+
+        INSERT INTO ba.fact (col_a)
+        SELECT sub.col_a
+        FROM (SELECT x AS col_a FROM ba.src) sub;
+
+    Expected: dst = ba.fact.col_a, src = ba.src.x
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.src (x INT);
+            CREATE TABLE ba.fact (col_a INT);
+        """,
+            "etl.sql": """\
+            INSERT INTO ba.fact (col_a)
+            SELECT sub.col_a
+            FROM (SELECT x AS col_a FROM ba.src) sub;
+        """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'ba.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, "Expected at least one edge landing on ba.fact.*"
+    assert all(r["dst_key"].startswith("ba.fact.") for r in edges), (
+        f"All edges must land on ba.fact.*, got: {[r['dst_key'] for r in edges]}"
+    )
+    assert any(r["src_key"].startswith("ba.src.") for r in edges), (
+        f"At least one edge must originate from ba.src.*, got: {[r['src_key'] for r in edges]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P2 — Alias on INSERT target (user-reported concern)
+#
+# Source alias resolution is working (0 unresolved src tables in live graph).
+# Verify the INSERT target with a table alias in the FROM clause does not
+# accidentally become the destination.
+# ---------------------------------------------------------------------------
+
+
+def test_P2_table_alias_in_from_does_not_become_dst(tmp_path):
+    """INSERT whose FROM uses an alias must route edges to the real INSERT target.
+
+    INSERT INTO ba.fact (col_a)
+    SELECT t.x AS col_a FROM ba.src AS t;
+
+    Expected: dst = ba.fact.col_a, src = ba.src.x
+    The alias 't' must NOT appear in any dst_key.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.src (x INT);
+            CREATE TABLE ba.fact (col_a INT);
+        """,
+            "etl.sql": """\
+            INSERT INTO ba.fact (col_a)
+            SELECT t.x AS col_a
+            FROM ba.src AS t;
+        """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE",
+            {},
+        )
+    finally:
+        db.close()
+
+    dst_keys = {r["dst_key"] for r in edges}
+    src_keys = {r["src_key"] for r in edges}
+
+    assert any(k.startswith("ba.fact.") for k in dst_keys), (
+        f"Expected edges landing on ba.fact.*, got: {sorted(dst_keys)}"
+    )
+    assert any(k.startswith("ba.src.") for k in src_keys), (
+        f"Expected edges originating from ba.src.*, got: {sorted(src_keys)}"
+    )
+    # alias 't' as table prefix — check dst_key does not start with 't.' or contain '.t.'
+    alias_leak = {k for k in dst_keys if k.startswith("t.") or ".t." in k}
+    assert not alias_leak, (
+        f"Table alias 't' must not appear as a table qualifier in dst_key, "
+        f"got: {sorted(alias_leak)}"
+    )
+
+
+def test_P2_multi_join_aliases_all_resolve_to_real_tables(tmp_path):
+    """Multi-JOIN with aliases: every src_key must trace to a real catalogued table."""
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.orders (order_id INT, amount INT);
+            CREATE TABLE ba.customers (order_id INT, customer_name VARCHAR);
+            CREATE TABLE ba.fact (order_id INT, amount INT, customer_name VARCHAR);
+        """,
+            "etl.sql": """\
+            INSERT INTO ba.fact (order_id, amount, customer_name)
+            SELECT o.order_id, o.amount, c.customer_name
+            FROM ba.orders o
+            JOIN ba.customers c ON o.order_id = c.order_id;
+        """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'ba.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, "Expected lineage edges into ba.fact"
+    for r in edges:
+        src_table = r["src_key"].rsplit(".", 1)[0]
+        assert src_table in ("ba.orders", "ba.customers"), (
+            f"src_key {r['src_key']!r} does not trace to a known table — alias may be leaking"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P3 — Quoted view names with spaces: schema prefix stripped from SqlColumn
+#
+# 232 tables in the live graph have ZERO HAS_COLUMN entries.
+# SqlTable.qualified = 'ia_semantic.artikel tijdsgebonden'
+# SqlColumn.table_name = 'artikel tijdsgebonden'  (schema stripped)
+# Fix: preserve the full schema-qualified name in SqlColumn.table_name.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="P3: schema stripped from quoted view name not yet fixed")
+def test_P3_quoted_view_with_spaces_preserves_schema_in_sqlcolumn(tmp_path):
+    """SqlColumn.table_name for a quoted view name with spaces must include the schema.
+
+    Today: CREATE OR REPLACE VIEW ia_semantic."ODS Workaround Artikel" AS SELECT ...
+    results in SqlColumn.table_name = 'ods workaround artikel' (schema dropped).
+    Expected: SqlColumn.table_name = 'ia_semantic.ods workaround artikel' (schema preserved).
+    """
+    db = _index(
+        tmp_path,
+        {
+            "src.sql": """\
+            CREATE TABLE da.src_products (code VARCHAR, ean_name VARCHAR, functional_name VARCHAR);
+        """,
+            "view.sql": """\
+            CREATE OR REPLACE VIEW ia_semantic."ODS Workaround Artikel" AS
+            SELECT
+                code            AS "DN_ARTIKEL_NUMMER",
+                ean_name        AS "EAN naam vl",
+                functional_name AS "functionele naam en"
+            FROM da.src_products;
+        """,
+        },
+    )
+    try:
+        cols = db.run_read(
+            "SELECT table_name, col_name FROM SqlColumn "
+            "WHERE table_name LIKE '%workaround%' OR table_name LIKE '%artikel%'",
+            {},
+        )
+        hc = db.run_read(
+            "SELECT src_key, dst_key FROM HAS_COLUMN "
+            "WHERE src_key LIKE '%workaround%' OR src_key LIKE '%artikel%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    table_names = {r["table_name"] for r in cols}
+    assert table_names, "Expected SqlColumn rows for the quoted view"
+
+    # The schema must NOT be stripped — all table_name values must contain 'ia_semantic'
+    bare_names = {t for t in table_names if "ia_semantic" not in t}
+    assert not bare_names, (
+        f"Schema prefix stripped from SqlColumn.table_name: {sorted(bare_names)}. "
+        f"Expected 'ia_semantic.ods workaround artikel', got: {sorted(table_names)}"
+    )
+
+    # HAS_COLUMN must be wired — otherwise the catalog is invisible to lineage traversal
+    assert hc, (
+        f"HAS_COLUMN entries missing for the quoted view. "
+        f"SqlColumn rows exist ({[r['col_name'] for r in cols]}) but HAS_COLUMN is empty."
+    )
+
+
+@pytest.mark.xfail(strict=True, reason="P3: HAS_COLUMN wiring for quoted views not yet fixed")
+def test_P3_quoted_view_lineage_reaches_source_via_has_column(tmp_path):
+    """The full chain: source table → quoted view → downstream query must be traversable.
+
+    When HAS_COLUMN is wired correctly, get_upstream_dependencies on a quoted-view column
+    should return edges from the source. Here we verify the COLUMN_LINEAGE and HAS_COLUMN
+    rows are consistent so a graph traversal would succeed.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "src.sql": """\
+            CREATE TABLE ba.raw_artikel (artikel_nr INT, naam VARCHAR);
+        """,
+            "view.sql": """\
+            CREATE OR REPLACE VIEW ia_semantic."Artikel Tijdsgebonden" AS
+            SELECT artikel_nr AS dn_artikel_nr, naam AS da_naam
+            FROM ba.raw_artikel;
+        """,
+        },
+    )
+    try:
+        # SqlColumn must have schema-qualified table_name
+        cols = db.run_read(
+            "SELECT table_name, col_name FROM SqlColumn "
+            "WHERE LOWER(table_name) LIKE '%artikel tijdsgebonden%'",
+            {},
+        )
+        # COLUMN_LINEAGE must have edges landing on the qualified view name
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE "
+            "WHERE LOWER(dst_key) LIKE '%artikel tijdsgebonden%'",
+            {},
+        )
+        # HAS_COLUMN must connect the view to its columns
+        hc = db.run_read(
+            "SELECT src_key, dst_key FROM HAS_COLUMN "
+            "WHERE LOWER(src_key) LIKE '%artikel tijdsgebonden%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert cols, "Expected SqlColumn rows for 'Artikel Tijdsgebonden' view"
+    assert edges, "Expected COLUMN_LINEAGE edges with dst on 'Artikel Tijdsgebonden'"
+    assert hc, (
+        "Expected HAS_COLUMN entries for 'Artikel Tijdsgebonden'. "
+        "Without these, lineage traversal dead-ends at the view."
+    )
+    # All three must agree on the same qualified key
+    col_tables = {r["table_name"] for r in cols}
+    hc_src_keys = {r["src_key"] for r in hc}
+    assert col_tables == hc_src_keys or col_tables & hc_src_keys, (
+        f"SqlColumn.table_name and HAS_COLUMN.src_key disagree: "
+        f"cols={sorted(col_tables)}, hc={sorted(hc_src_keys)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P4 — CTAS column discovery
+#
+# 241 CTAS tables confirmed in live graph, all with ZERO SqlColumn rows.
+# CREATE TABLE t AS SELECT a, b FROM s — columns come from SELECT projection,
+# not from an explicit (col1, col2) list.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
+def test_P4_ctas_columns_derived_from_select_body(tmp_path):
+    """CREATE TABLE t AS SELECT a, b FROM s must produce SqlColumn rows for a and b.
+
+    Today: SqlColumn has 0 rows for CTAS tables (only explicit column-list DDL harvested).
+    Expected: SqlColumn rows for each aliased projection in the CTAS SELECT body.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.src (x INT, y INT, z INT);
+        """,
+            "ctas.sql": """\
+            CREATE TABLE ba.derived_fact AS
+            SELECT x AS col_a, y AS col_b, z AS col_c
+            FROM ba.src;
+        """,
+        },
+    )
+    try:
+        cols = db.run_read(
+            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.derived_fact'",
+            {},
+        )
+        hc = db.run_read(
+            "SELECT dst_key FROM HAS_COLUMN WHERE src_key = 'ba.derived_fact'",
+            {},
+        )
+    finally:
+        db.close()
+
+    col_names = {r["col_name"] for r in cols}
+    assert col_names, (
+        "Expected SqlColumn rows for CTAS table 'ba.derived_fact'. "
+        "Currently 0 rows — CTAS column discovery is not implemented."
+    )
+    assert col_names == {"col_a", "col_b", "col_c"}, (
+        f"Expected columns {{col_a, col_b, col_c}}, got: {sorted(col_names)}"
+    )
+    assert hc, (
+        f"Expected HAS_COLUMN entries for ba.derived_fact. "
+        f"SqlColumn has {len(cols)} rows but HAS_COLUMN is empty — catalog not wired."
+    )
+
+
+@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
+def test_P4_ctas_with_cte_body_columns_derived(tmp_path):
+    """CTAS whose body uses a CTE must still derive column names from the outer SELECT.
+
+    This matches the real DWH pattern:
+        CREATE OR REPLACE TEMP TABLE ba_tmp.tmp_base AS
+        WITH datum AS (SELECT dn_datum FROM ba.wtda_datum)
+        SELECT d.dn_datum, src.col_x FROM datum d JOIN ba.src src ON ...
+
+    Expected: SqlColumn rows for dn_datum, col_x.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+            CREATE TABLE ba.datum_src (dn_datum DATE);
+            CREATE TABLE ba.src (dn_datum DATE, col_x INT);
+        """,
+            "ctas_cte.sql": """\
+            CREATE TABLE ba.tmp_base AS
+            WITH datum AS (SELECT dn_datum FROM ba.datum_src)
+            SELECT d.dn_datum, s.col_x
+            FROM datum d
+            JOIN ba.src s ON d.dn_datum = s.dn_datum;
+        """,
+        },
+    )
+    try:
+        cols = db.run_read(
+            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.tmp_base'",
+            {},
+        )
+    finally:
+        db.close()
+
+    col_names = {r["col_name"] for r in cols}
+    assert col_names, (
+        "Expected SqlColumn rows for CTAS-with-CTE table 'ba.tmp_base'. "
+        "Currently 0 rows — CTAS column discovery is not implemented."
+    )
+    assert col_names == {"dn_datum", "col_x"}, (
+        f"Expected {{dn_datum, col_x}}, got: {sorted(col_names)}"
+    )
+
+
+def test_P4_ctas_star_select_gracefully_degrades(tmp_path):
+    """CTAS with SELECT * must not crash and should at minimum produce a SqlTable node.
+
+    SELECT * columns cannot be statically resolved without schema expansion.
+    The fix for P4 must degrade gracefully — no SqlColumn rows, no exception.
+    This test ensures the degrade path is safe (not a regression guard for P4).
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE ba.src (x INT, y INT);",
+            "ctas_star.sql": "CREATE TABLE ba.star_fact AS SELECT * FROM ba.src;",
+        },
+    )
+    try:
+        tables = db.run_read(
+            "SELECT qualified FROM SqlTable WHERE qualified = 'ba.star_fact'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"

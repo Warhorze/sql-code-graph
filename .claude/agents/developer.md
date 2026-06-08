@@ -115,6 +115,57 @@ Run through this before marking work done:
    feature produces observable output (e.g., non-empty list, specific field value). Tests
    that only cover exception handling or log messages are insufficient on their own.
 
+## Test naming — describe behavior, link the doc
+
+Tests are read far more often than the plan that spawned them. A name like
+`test_tc2_*` or `test_T35_DOWN_1_*` is meaningless once the sprint closes — the
+reader has to go find the plan to learn what broke. Use a name that stands on its
+own and a docstring that links the governing doc.
+
+**Convention (standard three-part name — nothing to install):**
+
+```
+test_<unit>_<scenario>_<expected>
+```
+
+**Forbidden: opaque plan-internal codes in the test name.** These families are all
+ephemeral identifiers that mean nothing outside their plan — never use them as the
+name:
+
+| Family | Example | Origin |
+|--------|---------|--------|
+| `TC<n>` | `test_tc6b_*` | "test case" numbers in a plan |
+| `T<nn>` task IDs | `test_T01_*`, `test_T09_06_*` | sprint task IDs |
+| `T34`/`T35` (+ `CFG`/`DIFF`/`DOWN`/`IDX` sub-codes) | `test_T35_DOWN_1_*` | feature task IDs |
+| `F<n>` feature IDs | `test_F2_*` | feature IDs |
+| `gap<n>` / `issue<n>` | `test_gap3_*`, `test_issue38_*` | blueprint-gap / issue numbers |
+
+The code goes in the **docstring**, not the name. Link the plan doc (markdown link,
+real path — see the link convention in `ARCHITECTURE_REVIEW.md`) so the reader can
+jump to the rationale:
+
+```python
+def test_filtered_surface_recall_physical_sources(indexed_db):
+    """Physical source tables survive the default analyze filter.
+
+    Guards the #40 user-surface recall plan
+    ([plan doc](plan/sprints/v1_2_1_bugfix.md)).
+    """
+```
+
+**Two exceptions** (these codes are durable, documented vocabulary — keep the code,
+just add the doc-link docstring):
+- The **`E{n}` lineage-failure taxonomy** (`test_e27_*` etc.) — `E{n}` *is* the
+  shared name; renaming it loses meaning. Link the taxonomy doc in the docstring.
+- **CLAUDE.md-pinned regression guards** (`test_T09_01_qualify_once.py`,
+  `*_invariant.py`) are referenced *by filename* in `CLAUDE.md`. Do not rename the
+  file without updating CLAUDE.md in lockstep; prefer leaving the filename and giving
+  the test functions behavioral names + docstrings.
+
+**Rename-on-touch, not big-bang.** Do not open a PR that mass-renames existing tests.
+When you next implement in or edit a test (or its area), bring the tests you touch up
+to this convention as part of that change. New tests follow it from the start.
+
 ## Performance invariants — MUST preserve
 
 `src/sqlcg/parsers/base.py` contains hard-won performance fixes. Before touching this

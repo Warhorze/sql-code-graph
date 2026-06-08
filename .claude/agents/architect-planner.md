@@ -91,6 +91,12 @@ Before starting work, call `list_graph_stats_tool` once.
 - Unit tests: ...
 - Integration tests: ...
 
+> Describe each test by the **behavior** it verifies, never by a task/case code
+> (`TC1`, `T-03`, …). The developer names tests `test_<unit>_<scenario>_<expected>`
+> and links this plan in the docstring — see *Test naming* in
+> [`developer.md`](.claude/agents/developer.md). Do not seed opaque codes the
+> developer will copy into test names.
+
 ## Acceptance Criteria
 - [ ] Criterion 1
 - [ ] Criterion 2

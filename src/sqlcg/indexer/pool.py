@@ -111,6 +111,7 @@ def _run_task(
     # parse_pass2
     dep_filter: set[str] | None = task.get("dependency_filter")
     xfile_sql: dict[str, str] = task.get("xfile_sql") or {}
+    ddl_columns_by_bare: dict[str, list[str]] | None = task.get("ddl_columns_by_bare") or None
 
     if xfile_sql:
         import sqlglot
@@ -126,7 +127,12 @@ def _run_task(
         parser_p2._schema.register_cross_file_sources(rebuilt)
 
     try:
-        return parser_p2.parse_file(path, sql, dependency_filter=dep_filter)
+        return parser_p2.parse_file(
+            path,
+            sql,
+            dependency_filter=dep_filter,
+            ddl_columns_by_bare=ddl_columns_by_bare,
+        )
     finally:
         if xfile_sql:
             # Reset so the next task starts from a clean slate.

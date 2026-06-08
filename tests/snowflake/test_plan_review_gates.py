@@ -1,4 +1,4 @@
-"""Failing acceptance tests for plan/snowflake_en_test_suite.md.
+"""Failing acceptance tests for plan/research/snowflake_en_test_suite.md.
 
 Each test corresponds to a corrected assertion in the reviewed plan.
 Tests must FAIL (or skip) before the developer implements the fixture/test files.
@@ -235,7 +235,7 @@ def test_plan_review_required_test_file_exists(rel_path):
     target = _SUITE_ROOT / rel_path
     assert target.exists(), (
         f"Missing required test file: {target}\n"
-        f"Implement Phase 0/1/2 of plan/snowflake_en_test_suite.md"
+        f"Implement Phase 0/1/2 of plan/research/snowflake_en_test_suite.md"
     )
 
 
@@ -245,5 +245,5 @@ def test_plan_review_required_fixture_file_exists(rel_path):
     target = _SUITE_ROOT / rel_path
     assert target.exists(), (
         f"Missing required SQL fixture: {target}\n"
-        f"Implement Phase 0/1/2 of plan/snowflake_en_test_suite.md"
+        f"Implement Phase 0/1/2 of plan/research/snowflake_en_test_suite.md"
     )

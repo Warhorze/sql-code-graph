@@ -169,6 +169,7 @@ _EDGE_DDLS = [
         transform VARCHAR,
         confidence FLOAT,
         query_id VARCHAR,
+        inferred_from_source_name BOOLEAN,
         PRIMARY KEY (src_key, dst_key)
     )
     """,
@@ -257,7 +258,7 @@ _EDGE_EXTRA_COLUMNS: dict[str, list[str]] = {
     RelType.INSERTS_INTO: [],
     RelType.DELETES_FROM: [],
     RelType.UPDATES: [],
-    RelType.COLUMN_LINEAGE: ["transform", "confidence", "query_id"],
+    RelType.COLUMN_LINEAGE: ["transform", "confidence", "query_id", "inferred_from_source_name"],
     RelType.DECLARES: [],
     RelType.STAR_SOURCE: ["qualifier", "target_table", "confidence"],
     RelType.CONSUMED_BY: [],

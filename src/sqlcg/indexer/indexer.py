@@ -351,6 +351,17 @@ class Indexer:
                     aggregator.register_pass1(parsed)
                     pass1_results.append(parsed)
 
+                # Resolve CLONE-source column catalogs NOW — at the pass-1 -> pass-2
+                # boundary, before pass-2 dispatch (R6 sequencing decision, recorded
+                # in Phase 0 / .claude/progress.txt: the PREFERRED resolution). CLONE
+                # sources are DDL tables registered in pass 1, so their catalogs are
+                # already in `ddl_columns_by_bare`; resolving the CLONE chains here
+                # — and extending that same index with the inherited entries —
+                # means Part B's parse-time (pass-2) catalog read sees them too,
+                # removing the B x C ordering hazard entirely
+                # (plan/sprints/positional_insert_clone_blindspot.md Part C2).
+                aggregator.resolve_clone_catalogs()
+
                 # Optional: load dbt manifest into a transient resolver so that
                 # cross-file sources can reference dbt-managed tables.
                 # Note: dbt schema data is not propagated to pool workers; pass-2
@@ -382,6 +393,26 @@ class Indexer:
                                 logger.warning(
                                     "Failed to serialize cross-file source %s: %s", name, exc
                                 )
+
+                    # Part B-catalog payload: filter ddl_columns_by_bare to the bare
+                    # names this file's statements actually TARGET (no-column-list
+                    # positional INSERT reads its own target's catalog, not a source's
+                    # — `dep_names`/referenced_tables alone would miss it). Mirrors the
+                    # xfile_sql filter-by-dep_names discipline so payload stays
+                    # O(N_refs), never O(N_corpus_tables) (CLAUDE.md perf invariant —
+                    # plan/sprints/positional_insert_clone_blindspot.md Part B-catalog).
+                    target_bare_names = {
+                        (s.target.name or "").lower()
+                        for s in parsed.statements
+                        if s.target and s.target.name
+                    }
+                    catalog_filter = dep_names | target_bare_names
+                    ddl_catalog_slice: dict[str, list[str]] = {
+                        name: cols
+                        for name, cols in aggregator.ddl_columns_by_bare.items()
+                        if name in catalog_filter
+                    }
+
                     pass2_indices.append(i)
                     p2_tasks.append(
                         {
@@ -390,6 +421,7 @@ class Indexer:
                             "sql": file_sqls[i][1],
                             "dependency_filter": dep_names,
                             "xfile_sql": xfile_sql,
+                            "ddl_columns_by_bare": ddl_catalog_slice,
                         }
                     )
 
@@ -473,6 +505,16 @@ class Indexer:
                 _flush_batch(batch)
                 batch = []  # IMPORTANT — free the references so GC can reclaim parsed.statements
         _flush_batch(batch)  # final partial batch
+
+        # C2 — emit CLONE-inherited SqlColumn / HAS_COLUMN rows (Part C2 step 4,
+        # recommended emission strategy: row-level emission directly from
+        # `resolve_clone_catalogs()`'s resolved index, in the main-process upsert
+        # seam, bypassing `defined_by_query` and never mutating `QueryNode` in
+        # place — see plan/sprints/positional_insert_clone_blindspot.md). Runs once,
+        # after the main batch loop, over the (small) set of CLONE targets that
+        # resolved an inherited catalog; rides the existing bulk-upsert path
+        # (idempotent INSERT OR REPLACE — safe as a standalone follow-up flush).
+        self._emit_clone_inherited_rows(aggregator, db, nonlocal_counts)
 
         if profile:
             _t_upsert_end = time.perf_counter()
@@ -588,7 +630,7 @@ class Indexer:
         affected closure (files that SELECT_FROM tables defined in changed/deleted
         files). Avoids a full corpus reindex for small branch deltas.
 
-        Algorithm (see plan/living_codebase_resync.md):
+        Algorithm (see plan/sprints/living_codebase_resync.md):
           1. Compute git delta (added/modified/deleted .sql files).
           2. Capture deleted files' table names BEFORE deletion.
           3. Delete nodes for deleted files.
@@ -1215,6 +1257,7 @@ class Indexer:
                         "transform": edge.transform,
                         "confidence": edge.confidence,
                         "query_id": query_id,
+                        "inferred_from_source_name": edge.inferred_from_source_name,
                     }
                 )
                 rows.counts["edges"] += 1
@@ -1295,6 +1338,73 @@ class Indexer:
                 )
 
         return rows
+
+    def _emit_clone_inherited_rows(
+        self,
+        aggregator: "CrossFileAggregator",
+        db: GraphBackend,
+        nonlocal_counts: dict,
+    ) -> None:
+        """Flush CLONE-inherited SqlColumn / HAS_COLUMN rows (Part C2 step 4).
+
+        Recommended emission strategy (plan/sprints/positional_insert_clone_blindspot.md
+        Part C2, Phase-0 sequencing record): emit rows directly from
+        `aggregator.clone_inherited_catalog_rows()` — the resolved index built by
+        `resolve_clone_catalogs()` — bypassing `defined_by_query` entirely. This
+        avoids any `QueryNode` mutation (the documented "do not rely on identity
+        after pass 2" contract) and keeps the existing DDL emission path untouched.
+
+        Rows ride the existing bulk-upsert path (`upsert_nodes_bulk`/
+        `upsert_edges_bulk`, idempotent `INSERT OR REPLACE`) in a small standalone
+        transaction — safe to run once after the main batch loop, since DuckDB
+        upsert semantics make a follow-up flush of previously-unseen rows
+        equivalent to including them in an earlier batch (CLAUDE.md bulk-upsert
+        invariant; no per-row execute()).
+
+        No-op when no CLONE target resolved an inherited catalog (the common case
+        and the degrade path — A1/A2 label those tables instead).
+        """
+        catalog_rows = aggregator.clone_inherited_catalog_rows()
+        if not catalog_rows:
+            return
+
+        column_rows: list[dict] = []
+        has_column_edges: list[dict] = []
+        for target_ref, inherited_cols in catalog_rows:
+            for col_name in inherited_cols:
+                col_id = f"{target_ref.full_id}.{col_name}"
+                column_rows.append(
+                    {
+                        "id": col_id,
+                        "col_name": col_name,
+                        "table_qualified": target_ref.full_id,
+                        "catalog": target_ref.catalog or "",
+                        "db": target_ref.db or "",
+                        "table_name": target_ref.name,
+                    }
+                )
+                has_column_edges.append(
+                    {
+                        "src_key": target_ref.full_id,
+                        "dst_key": col_id,
+                        "source": "clone_inherited",
+                    }
+                )
+                nonlocal_counts["columns_defined"] += 1
+
+        if not column_rows:
+            return
+
+        logger.info(
+            "CLONE inheritance: %d column(s) inherited across %d CLONE target(s)",
+            len(column_rows),
+            len(catalog_rows),
+        )
+        with db.transaction():
+            db.upsert_nodes_bulk(NodeLabel.COLUMN, column_rows)
+            db.upsert_edges_bulk(
+                NodeLabel.TABLE, NodeLabel.COLUMN, RelType.HAS_COLUMN, has_column_edges
+            )
 
     def _upsert_file_batch(
         self,

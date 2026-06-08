@@ -112,7 +112,7 @@ def _call_index_cmd(
 
     def make_backend(initial_sha: str | None = None) -> MagicMock:
         b = MagicMock()
-        b.get_schema_version.return_value = "6"
+        b.get_schema_version.return_value = "7"
         b.run_read.return_value = []  # no Repo rows, no File rows
         b.__enter__ = MagicMock(return_value=b)
         b.__exit__ = MagicMock(return_value=False)

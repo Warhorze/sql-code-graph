@@ -1,7 +1,7 @@
 """Failing acceptance tests for F2 — skill renderer (phases 1 & 2).
 
 These tests MUST FAIL before the developer implements skill.py.
-They encode the acceptance criteria from plan/bundle_claude_skill.md phases 1 and 2.
+They encode the acceptance criteria from plan/sprints/bundle_claude_skill.md phases 1 and 2.
 """
 
 import pytest

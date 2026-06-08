@@ -3,7 +3,7 @@
 Both patterns previously produced zero edges; sqlglot now traces them correctly.
 These tests assert the expected edges are present.
 
-See plan/sprint_07_open_ecodes.md § T-07-04 for the deferred-decision rationale.
+See plan/sprints/sprint_07_open_ecodes.md § T-07-04 for the deferred-decision rationale.
 """
 
 from pathlib import Path

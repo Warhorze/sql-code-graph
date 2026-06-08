@@ -1,4 +1,4 @@
-"""Failing acceptance tests for plan/fix_firstuser_findings.md.
+"""Failing acceptance tests for plan/sprints/fix_firstuser_findings.md.
 
 Each test is named after the step it exercises and must FAIL (or skip) until the
 developer implements that step. Tests that accidentally pass before implementation
@@ -308,6 +308,11 @@ def test_S4_1_trace_lineage_empty_hint_contains_schema_prefix():
             [{"n": 1}],  # _assert_indexed
             [],  # primary BFS query — no lineage
             [],  # PR-06 bare-name fallback BFS (3-part ref) — also empty
+            # A1 _empty_closure_hint probe (GET_COLUMNS_FOR_TABLE) — table IS
+            # catalogued, so the GENERIC "no lineage found" hint fires (the one
+            # this test pins); the no-catalog hint is covered by the dedicated
+            # A1 acceptance test (test_clone_positional_insert_blindspot.py).
+            [{"col_id": "ba.t.col", "col_name": "col"}],
         ]
         mock_backend_ctx.return_value.__enter__.return_value = mock_db
 
@@ -328,6 +333,9 @@ def test_S4_1_upstream_empty_hint_contains_schema_prefix():
         mock_db.run_read.side_effect = [
             [{"n": 1}],
             [],
+            # A1 probe — table IS catalogued, so the GENERIC hint fires (the one
+            # this test pins); the no-catalog hint has its own dedicated test.
+            [{"col_id": "ba.t.col", "col_name": "col"}],
         ]
         mock_backend_ctx.return_value.__enter__.return_value = mock_db
 
@@ -354,6 +362,7 @@ def test_S4_2_downstream_empty_hint_contains_terminal_output():
             [{"n": 1}],  # _assert_indexed
             [],  # downstream BFS query — no column nodes
             [],  # batch consumer query — no external consumers
+            [{"col_id": "ba.t.col", "col_name": "col"}],  # A1 probe — table IS catalogued
         ]
         mock_backend_ctx.return_value.__enter__.return_value = mock_db
 
@@ -376,15 +385,22 @@ def test_S4_2_downstream_hint_differs_from_upstream_hint():
             mock_backend_ctx.return_value.__enter__.return_value = mock_db
             return mock_backend_ctx
 
+    # Both probes return a non-empty catalog so each tool's GENERIC empty hint
+    # fires (the distinction this test pins is generic-upstream vs
+    # generic-downstream/"terminal output", not catalog-vs-no-catalog — that's
+    # covered separately by the dedicated A1 acceptance test).
+    _catalog_probe = [{"col_id": "ba.t.col", "col_name": "col"}]
+
     with patch("sqlcg.server.tools._open_backend") as m:
         mock_db = MagicMock()
-        mock_db.run_read.side_effect = [[{"n": 1}], []]
+        mock_db.run_read.side_effect = [[{"n": 1}], [], _catalog_probe]
         m.return_value.__enter__.return_value = mock_db
         upstream = get_upstream_dependencies("ba.t.col")
 
     with patch("sqlcg.server.tools._open_backend") as m:
         mock_db = MagicMock()
-        mock_db.run_read.side_effect = [[{"n": 1}], [], []]  # indexed, bfs, batch-consumer
+        # indexed, bfs, batch-consumer, A1 catalog-probe (terminal-output branch)
+        mock_db.run_read.side_effect = [[{"n": 1}], [], [], _catalog_probe]
         m.return_value.__enter__.return_value = mock_db
         downstream = get_downstream_dependencies("ba.t.col")
 

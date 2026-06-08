@@ -1,7 +1,7 @@
 """Failing acceptance tests for v1.1.3 — SELECT * over N-branch UNION ALL of sibling CTEs.
 
 These tests MUST FAIL before the developer implements the fix. They are the definition of
-done for plan/v1_1_3_union_cte_star.md.
+done for plan/sprints/v1_1_3_union_cte_star.md.
 
 Root cause (confirmed empirically 2026-06-01):
   A CTE whose body is a 3-branch UNION ALL (A UNION ALL B UNION ALL C) produces
@@ -150,7 +150,7 @@ def test_union_star_cte_gets_incoming_edges(db, tmp_path):
 
     assert len(incoming_ids) > 0, (
         "cte_union.total_amt has 0 incoming COLUMN_LINEAGE edges — it is an island.\n"
-        "This is the 3-branch UNION ALL star bug (plan/v1_1_3_union_cte_star.md).\n"
+        "This is the 3-branch UNION ALL star bug (plan/sprints/v1_1_3_union_cte_star.md).\n"
         "The fix must walk to the deepest left-branch Select (Step 1.1) and reuse the\n"
         "existing no-`sources=` sg_lineage call so the branch CTE columns are emitted."
     )

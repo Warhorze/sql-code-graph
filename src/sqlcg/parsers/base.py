@@ -133,6 +133,11 @@ class LineageEdge:
         transform: Description of the transformation applied (e.g., "PASS_THROUGH", "AGGREGATION")
         confidence: Confidence score (0.0 to 1.0)
         query_id: Optional identifier of the query that created this edge
+        inferred_from_source_name: True when dst's column name was taken from the
+            SOURCE expression (not an authoritative target catalog) because this is a
+            no-column-list positional INSERT with no resolvable target-column catalog.
+            Default False — only set True on the genuinely source-named degrade path
+            (plan/sprints/positional_insert_clone_blindspot.md Part A2).
     """
 
     src: ColumnRef
@@ -140,10 +145,20 @@ class LineageEdge:
     transform: str = "UNKNOWN"
     confidence: float = 1.0
     query_id: str | None = None
+    inferred_from_source_name: bool = False
 
     def __hash__(self) -> int:
         """Support hashing for use in sets/dicts."""
-        return hash((self.src, self.dst, self.transform, self.confidence, self.query_id))
+        return hash(
+            (
+                self.src,
+                self.dst,
+                self.transform,
+                self.confidence,
+                self.query_id,
+                self.inferred_from_source_name,
+            )
+        )
 
     def __eq__(self, other: object) -> bool:
         """Support equality comparison."""
@@ -155,6 +170,7 @@ class LineageEdge:
             and self.transform == other.transform
             and self.confidence == other.confidence
             and self.query_id == other.query_id
+            and self.inferred_from_source_name == other.inferred_from_source_name
         )
 
 
@@ -209,6 +225,9 @@ class QueryNode:
         parsing_mode: How the query was parsed (e.g., "sqlglot", "fallback", "scripting")
         defined_body: For CTAS statements, the exp.Select or exp.Subquery body being created
         start_line: 1-based start line of statement in file; 0 = unknown (scripting-path sentinel)
+        clone_source: For `CREATE TABLE t CLONE src` statements, the TableRef of the
+            CLONE source `src` (None for non-CLONE creates). Set by C1
+            (plan/sprints/positional_insert_clone_blindspot.md Part C).
     """
 
     file: Path
@@ -226,6 +245,7 @@ class QueryNode:
     defined_columns: list[str] = field(default_factory=list)
     defined_body: Any | None = None
     start_line: int = 0  # 1-based start line of statement in file; 0 = unknown
+    clone_source: TableRef | None = None
 
 
 @dataclass
@@ -450,6 +470,7 @@ class SqlParser(ABC):
         dst_table: "TableRef | None",
         path: Path,
         out: ParsedFile,
+        inferred_from_source_name: bool = False,
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -466,6 +487,11 @@ class SqlParser(ABC):
             dst_col_name: The output column name (destination)
             path: Source file path (for error recording)
             out: ParsedFile for error recording
+            inferred_from_source_name: Propagated onto every emitted LineageEdge.
+                True only for the no-column-list positional-INSERT degrade path where
+                dst_col_name was taken from the SOURCE expression because no
+                authoritative target-column catalog resolved
+                (plan/sprints/positional_insert_clone_blindspot.md Part A2).
 
         Returns:
             List of LineageEdge objects (may be empty if tree is malformed)
@@ -501,6 +527,7 @@ class SqlParser(ABC):
                             dst=ColumnRef(dst_tbl, dst_col_name),
                             transform="SELECT",
                             confidence=1.0,
+                            inferred_from_source_name=inferred_from_source_name,
                         )
                     )
                 except Exception as exc:
@@ -576,6 +603,7 @@ class SqlParser(ABC):
         sources: dict[str, Any] | None = None,
         query_sources: list["TableRef"] | None = None,
         scope: Any | None = None,
+        ddl_columns_by_bare: dict[str, list[str]] | None = None,
     ) -> "LineageExtraction":
         """Extract column-level lineage with structured error recording.
 
@@ -598,6 +626,15 @@ class SqlParser(ABC):
                 If not provided, a scope will be built from the extracted body before each
                 lineage extraction. The scope must be built from the same body as passed to
                 sg_lineage(). Passing an incorrect scope will produce wrong lineage silently.
+            ddl_columns_by_bare: optional bare-name → ordered DDL column catalog index
+                (Part B-catalog; includes CLONE-inherited entries resolved by
+                `CrossFileAggregator.resolve_clone_catalogs` before pass-2 dispatch).
+                Consulted ONCE PER STATEMENT — never per column — for the no-column-list
+                positional-INSERT ordinal mapping
+                (plan/sprints/positional_insert_clone_blindspot.md Part B). `None` when
+                no aggregator is available (single-file / `reindex_file` path); the
+                ordinal mapping then degrades to the source-named +
+                `inferred_from_source_name=True` fallback.
 
         Returns:
             LineageExtraction with edges and star_sources
@@ -610,7 +647,7 @@ class SqlParser(ABC):
 
         # NEW (T-07-06): Record MERGE statements explicitly as deferred.
         # sqlglot's lineage() API does not handle MERGE branches; implementing
-        # multi-branch lineage is deferred (see plan/sprint_07_open_ecodes.md § T-07-06).
+        # multi-branch lineage is deferred (see plan/sprints/sprint_07_open_ecodes.md § T-07-06).
         # TODO: Remove when sqlglot adds MERGE lineage support (T-07-06).
         if isinstance(stmt, exp.Merge):
             dst_name = None
@@ -833,6 +870,116 @@ class SqlParser(ABC):
                     except Exception:
                         pass
 
+            # Part B — no-column-list positional-INSERT ordinal mapping.
+            # Mirrors the #25 block above (body-copy-once, per-position guards) for the
+            # sibling case: `INSERT INTO t SELECT ...` with NO column list
+            # (`stmt.this` is not an `exp.Schema`). The SELECT alias is meaningless to
+            # the INSERT target here too, but unlike #25 there is no explicit column
+            # list to read the authoritative name from — it must come from `t`'s
+            # ordered DDL column catalog (`ddl_columns_by_bare`, including
+            # CLONE-inherited entries resolved before pass-2 dispatch).
+            #
+            # Resolved ONCE per statement (a single dict lookup + map build, identical
+            # cardinality to #25 — no new per-column qualify/scope/expand work; CLAUDE.md
+            # invariants preserved, see plan Performance-invariants table).
+            #
+            # When no catalog resolves for `t`, every dst the main loop emits for this
+            # statement is named from the SOURCE expression — A2 (below, in the main
+            # loop) marks those edges `inferred_from_source_name=True`. When the catalog
+            # DOES resolve, the mapped positions here carry the authoritative target
+            # name and are NOT flagged; only positions beyond the catalog
+            # (length-mismatch overflow) fall through to the main loop and ARE flagged
+            # (R2 degrade — map the overlap, never raise).
+            if (
+                isinstance(stmt, exp.Insert)
+                and not isinstance(stmt.this, exp.Schema)
+                and dst_table is not None
+            ):
+                _ordinal_catalog: list[str] | None = None
+                if ddl_columns_by_bare:
+                    _bare = (dst_table.name or "").lower()
+                    if _bare:
+                        _ordinal_catalog = ddl_columns_by_bare.get(_bare)
+
+                if _ordinal_catalog:
+                    # Build the WITH-stripped body ONCE here (mirrors #25); only the
+                    # single projection is swapped per mapped column below.
+                    _body_no_with_b = body.copy()
+                    _body_no_with_b.set("with_", None)
+                    for _pos_idx, _pcol_expr in enumerate(col_expressions):
+                        if _pos_idx >= len(_ordinal_catalog):
+                            break  # overflow positions fall through to the main loop (R2)
+                        _target_col = _ordinal_catalog[_pos_idx]
+                        if not _target_col:
+                            continue
+                        positional_col_names[_pos_idx] = _target_col
+
+                        # Guard 1: Star projection — mirror the main loop's handling
+                        # EXACTLY, including StarSource registration for graph-backend
+                        # expansion (EXPAND_STAR_SOURCES). Registering this position in
+                        # `positional_col_names` (above) already makes the main loop
+                        # skip it — without this mirror, `INSERT INTO t SELECT * FROM s`
+                        # into a catalogued target would silently drop its STAR_SOURCE
+                        # edge (regression guard: tests/integration/test_star_resolution.py).
+                        _b_inner_guard = (
+                            _pcol_expr.this if isinstance(_pcol_expr, exp.Alias) else _pcol_expr
+                        )
+                        if isinstance(_b_inner_guard, exp.Star) or (
+                            isinstance(_b_inner_guard, exp.Column)
+                            and isinstance(_b_inner_guard.this, exp.Star)
+                        ):
+                            _b_qualifier = (
+                                _b_inner_guard.table
+                                if isinstance(_b_inner_guard, exp.Column)
+                                else None
+                            )
+                            out.errors.append(
+                                f"col_lineage_skip:star:{_b_qualifier or '<unqualified>'}"
+                            )
+                            _b_star_src_table = self._resolve_star_source(
+                                qualifier=_b_qualifier or None,
+                                sources=query_sources or [],
+                            )
+                            if _b_star_src_table is not None:
+                                star_sources.append(
+                                    StarSource(
+                                        source=_b_star_src_table, qualifier=_b_qualifier or None
+                                    )
+                                )
+                            continue
+
+                        # Guard 2: Pure-literal — no Column descendants, nothing to trace.
+                        if not list(_pcol_expr.find_all(exp.Column)):
+                            continue
+
+                        # Wrap as Alias(inner, target_col) — unwrap any existing alias
+                        # first to avoid Alias(Alias(...)) (mirrors #25).
+                        _b_inner = (
+                            _pcol_expr.this if isinstance(_pcol_expr, exp.Alias) else _pcol_expr
+                        )
+                        _b_aliased = exp.Alias(this=_b_inner.copy(), alias=_target_col)
+                        _body_no_with_b.set("expressions", [_b_aliased])
+                        _b_patched_sql = _body_no_with_b.sql(dialect=self.DIALECT)
+                        try:
+                            _b_root = sg_lineage(
+                                _target_col,
+                                _b_patched_sql,
+                                dialect=self.DIALECT,
+                                sources=sources or {},
+                            )
+                            if _b_root:
+                                _b_new_edges = self._lineage_node_to_edges(
+                                    _b_root,
+                                    dst_col_name=_target_col,
+                                    dst_table=dst_table,
+                                    path=path,
+                                    out=out,
+                                    inferred_from_source_name=False,
+                                )
+                                edges.extend(_b_new_edges)
+                        except Exception:
+                            pass
+
             # Extract output columns — skip positions handled by the positional INSERT block
             for loop_idx, col_expr in enumerate(col_expressions):
                 if loop_idx in positional_col_names:
@@ -935,13 +1082,29 @@ class SqlParser(ABC):
                         sg_kwargs["sources"] = sources or {}
                     root = sg_lineage(col_name, body, **sg_kwargs)
                     if root:
-                        # Successfully extracted lineage — walk tree and emit edges
+                        # Successfully extracted lineage — walk tree and emit edges.
+                        #
+                        # A2 provenance: a no-column-list positional INSERT names its
+                        # dst from the SOURCE expression (col_name, derived above from
+                        # col_expr.alias/.name) whenever it reaches this main loop —
+                        # either because no target-column catalog resolved at all, or
+                        # because this position is beyond the catalog's length (R2
+                        # overflow degrade; Part B registered only the in-range
+                        # positions in positional_col_names). Both are genuinely
+                        # source-named — flag them
+                        # (plan/sprints/positional_insert_clone_blindspot.md Part A2).
+                        _is_unmapped_no_list_insert = (
+                            isinstance(stmt, exp.Insert)
+                            and not isinstance(stmt.this, exp.Schema)
+                            and dst_table is not None
+                        )
                         new_edges = self._lineage_node_to_edges(
                             root,
                             dst_col_name=col_name,
                             dst_table=dst_table,
                             path=path,
                             out=out,
+                            inferred_from_source_name=_is_unmapped_no_list_insert,
                         )
                         edges.extend(new_edges)
                         if not new_edges:

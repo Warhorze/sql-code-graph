@@ -227,8 +227,11 @@ def test_scenario_d_schema_version_mismatch_exits(tmp_path):
         stored = db_v4.get_schema_version()
         assert stored == "4"
         assert stored != SCHEMA_VERSION, "SCHEMA_VERSION must differ from '4' after the PR-2 bump"
-        # Confirm the version gate would fire (matches the check in index.py)
-        assert SCHEMA_VERSION == "6", f"Expected SCHEMA_VERSION='6', got {SCHEMA_VERSION!r}"
+        # Confirm the version gate would fire (matches the check in index.py).
+        # SCHEMA_VERSION has since moved to '7' (inferred_from_source_name,
+        # plan/sprints/positional_insert_clone_blindspot.md Part A2) — the gate
+        # logic this test pins (any mismatch triggers re-index) is unaffected.
+        assert SCHEMA_VERSION == "7", f"Expected SCHEMA_VERSION='7', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------

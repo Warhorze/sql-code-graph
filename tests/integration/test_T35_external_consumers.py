@@ -118,12 +118,19 @@ _MANIFEST_TWO_CONSUMERS = (
 # ---------------------------------------------------------------------------
 
 
-def test_T35_schema_version_is_6():
-    """SCHEMA_VERSION must be '6' after PR-1. Fails while still '5'."""
+def test_schema_version_matches_current_migration():
+    """SCHEMA_VERSION gates the re-index migration path (no backward compatibility).
+
+    Originally pinned to '6' for the #35 PR-1 ExternalConsumer DDL; most recently
+    bumped 6 -> 7 for `COLUMN_LINEAGE.inferred_from_source_name`
+    (plan/sprints/positional_insert_clone_blindspot.md Part A2). Update this
+    literal in lockstep whenever schema.py bumps the constant.
+    """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "6", (
-        f"SCHEMA_VERSION must be '6' after #35 PR-1; currently {SCHEMA_VERSION!r}"
+    assert SCHEMA_VERSION == "7", (
+        f"SCHEMA_VERSION must be '7' after the inferred_from_source_name bump; "
+        f"currently {SCHEMA_VERSION!r}"
     )
 
 

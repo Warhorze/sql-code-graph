@@ -1,3 +1,149 @@
+## Current State [2026-06-08]
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: coverage_p1_p3_p4 (P1 CTE leak, P3 space-name schema strip, P4 CTAS column discovery)
+PLAN: plan/sprints/coverage_p1_p3_p4.md (corrected in-place)
+STATUS: READY FOR IMPLEMENTATION
+
+---
+
+## Handoff — plan-reviewer: coverage_p1_p3_p4 [2026-06-08]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: coverage_p1_p3_p4
+PLAN: plan/sprints/coverage_p1_p3_p4.md (corrected in-place)
+VERDICT: APPROVE-WITH-CORRECTIONS — 2 warnings corrected in-plan; no blockers.
+
+CORRECTIONS MADE:
+  W1 (Step 3.1 — suppression placement): Plan said "continue past the CTE-destination
+  edge emission (skip the whole CTE-projection block)" — ambiguous. Corrected to specify
+  the suppression is a guard `if not _suppress_cte_dsts:` on the OUTER if-block at L1142,
+  NOT a `continue` inside the per-CTE loop. Explicitly documented that the outer block at
+  L1142 is separate from the combined_sources CTE registration at L696-707 — guarding
+  L1142 skips only projection-edge emission, not source registration.
+
+  W2 (Step 2.2 — misleading line references): The step cited "lineage edge.src/edge.dst
+  at L1203/1231, CLONE at L1376" — those are base.py line numbers, NOT indexer.py.
+  Corrected to refer to the indexer.py COLUMN_LINEAGE src/dst table_name fields by
+  description, not line number, and added explicit note: do not search base.py for this
+  indexer.py change.
+
+VERIFICATIONS:
+  - P1 claim CONFIRMED: body = stmt.expression (the SELECT) for INSERT at base.py:681-684;
+    the #25 positional block fires for INSERT-with-explicit-column-list and populates
+    positional_col_names before the CTE-projection block at L1142. Leak is real and the
+    suppression approach is correct.
+  - Indexer seam CONFIRMED: indexer.py L1122-1153 filters on s.defined_columns (L1126),
+    emits SqlColumn rows keyed on table.full_id (L1144), HAS_COLUMN edges (L1150-1152).
+    table_name is bare table.name at L1147 — the P3 fix target is correct.
+  - Perf invariants CLEAN: no new qualify/build_scope/exp.expand/sg_lineage call in any
+    of the three changes. All once-per-statement or once-per-row.
+  - Version bump 1.6.1 -> 1.7.0 present in Scope + Phase 4.
+  - 6 failing acceptance tests exist in tests/integration/test_column_coverage_patterns.py
+    using xfail(strict=True) — correct pre-implementation state.
+
+BLOCKING QUESTIONS: none.
+NEXT: developer implements plan/sprints/coverage_p1_p3_p4.md (order: P4 -> P3 -> P1 -> version bump).
+
+---
+
+## Handoff — developer: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: gain_coverage_metrics
+BRANCH: feat/gain-coverage-metrics
+STATUS: PR OPEN — ready for architect-planner compliance check
+
+COMMITS:
+  2ec1d58  feat(gain_coverage_metrics): implement coverage metrics in db info and gain Section G
+
+FILES CHANGED:
+  - src/sqlcg/cli/coverage.py (NEW): CoverageStats, collect_coverage, colour helpers
+  - src/sqlcg/cli/commands/db.py: Coverage block after parsing-mode output
+  - src/sqlcg/cli/commands/gain.py: Section G + --json coverage object; json_output normalization
+  - tests/integration/test_coverage_metrics_integration.py: fix SqlTable column names
+
+GATES: 24 acceptance tests PASS; 1148 total PASS, 0 failures; pyright 0 errors; ruff clean.
+
+DEVIATIONS:
+  1. gain_cmd json_output normalization: json_output = json_output is True added at top
+     of gain_cmd(). When called directly (not via CLI), typer.Option(...) object is truthy,
+     causing JSON output even without --json. This is a latent bug exposed by the new tests.
+     The fix normalizes to False when the value is not the literal True boolean.
+  2. test_coverage_metrics_integration.py: SqlTable INSERT used wrong column names (id,
+     schema_name not in schema). Fixed to use qualified as PK, removed schema_name.
+
+---
+
+## Handoff — plan-reviewer: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: gain_coverage_metrics
+PLAN: plan/sprints/gain_coverage_metrics.md (corrected in-place)
+STATUS: READY FOR IMPLEMENTATION
+
+VERDICT: APPROVE-WITH-CORRECTIONS — 1 warning corrected in-plan; no blockers.
+
+CORRECTION MADE (Warning — patch-target ambiguity):
+  W1: The plan said "patch run_read_routed at the seam each module imports it from"
+  without naming the concrete patch target for the db info / gain coverage tests.
+  Since coverage.py is a new module, the developer must patch
+  sqlcg.cli.coverage.run_read_routed (not db.run_read_routed) for coverage-path
+  tests. The simpler approach — patch sqlcg.cli.commands.db.collect_coverage and
+  sqlcg.cli.commands.gain.collect_coverage directly — avoids dispatch complexity.
+  Fixed in-plan: unit test sections for db info and gain now specify the correct
+  patch targets and recommend patching collect_coverage directly.
+
+VERIFICATIONS (all pass):
+  - Key-strip expression: ColumnRef.full_id = table.full_id + "." + name; strip
+    via left(k, len(k)-instr(reverse(k), '.')) yields table.full_id == HAS_COLUMN.src_key.
+    Verified against base.py:122-123 and indexer.py:1150-1151. CORRECT.
+  - Call sites: db_info() in db.py confirmed; gain_cmd() in gain.py confirmed. CORRECT.
+  - typer.Exit MRO: click.exceptions.Exit -> RuntimeError -> Exception. CONFIRMED.
+    except Exception catches it. CORRECT.
+  - HAS_COLUMN.src_key = table full_id (confirmed indexer.py:1151).
+    COLUMN_LINEAGE.dst_key = column full_id = table.full_id + "." + col. CORRECT.
+  - inferred_from_source_name BOOLEAN on COLUMN_LINEAGE (duckdb_backend.py:173). CORRECT.
+  - HAS_COLUMN indexed on src_key (idx_HAS_COLUMN_src, duckdb_backend.py:209). CORRECT.
+  - Version is 1.6.0 in pyproject.toml; bump to 1.6.1 is correct. CONFIRMED.
+  - No perf invariants touched (no base.py / indexer.py changes). CONFIRMED.
+
+BLOCKING QUESTIONS: none (BQ-1 from architect-planner is non-blocking).
+
+FAILING TESTS COMMITTED SEPARATELY:
+  tests/unit/test_coverage_metrics.py        (collect_coverage + colour helpers)
+  tests/unit/test_db_info_coverage.py        (db info Coverage block)
+  tests/unit/test_gain_coverage.py           (gain Section G)
+  tests/integration/test_coverage_metrics_integration.py  (real DuckDB fixture)
+  Run: uv run pytest tests/unit/test_coverage_metrics.py tests/unit/test_db_info_coverage.py tests/unit/test_gain_coverage.py tests/integration/test_coverage_metrics_integration.py --no-header -q
+  Result before implementation: 4 skipped (sqlcg.cli.coverage not yet defined — correct pre-impl state)
+
+NEXT: developer implements plan/sprints/gain_coverage_metrics.md.
+
+---
+
+## Handoff — architect-planner: gain_coverage_metrics [2026-06-08]
+
+PLAN: plan/sprints/gain_coverage_metrics.md (committed)
+SUMMARY: read-only Coverage metrics in `db info` + `gain` Section G via new
+  src/sqlcg/cli/coverage.py (collect_coverage + CoverageStats + colour helpers),
+  reusing run_read_routed. Four verified queries. Version bump 1.6.0 -> 1.6.1 (patch).
+VERIFIED AGAINST SOURCE: HAS_COLUMN.src_key == table.full_id; COLUMN_LINEAGE keys are
+  catalog.db.name.column; inferred_from_source_name BOOLEAN exists; SqlTable node table.
+  Key-strip left(k,len(k)-instr(reverse(k),.)) yields full_id == HAS_COLUMN.src_key.
+BLOCKING Q: BQ-1 (non-blocking) feature not in ARCHITECTURE_REVIEW.md — user/architect-
+  reviewer should add a release-gate line; does NOT block developer.
+NEXT: plan-reviewer gate, then developer.
+
+---
+
+## Current State — architect-planner: gain_coverage_metrics [2026-06-08]
+
+ACTIVE AGENT: architect-planner
+FEATURE: gain_coverage_metrics (surface real lineage-coverage metrics in `sqlcg db info` and `sqlcg gain` Section G — read-only, no schema change)
+STATUS: planning — writing plan/sprints/gain_coverage_metrics.md
+
+---
+
 ## Handoff — developer: version-parity-and-restart [2026-06-07]
 
 ACTIVE AGENT: developer (complete — ready for compliance check)
@@ -2224,3 +2370,157 @@ ACTIVE AGENT: architect-planner
 FEATURE: version-parity-and-restart (version parity across pkg/CLI/MCP + auto-restart of stale MCP on reinstall)
 PLAN: plan/version-parity-and-restart.md (being written)
 STATUS: planning
+
+---
+
+## Current State — architect-planner: positional-insert-clone-blindspot [2026-06-08]
+
+ACTIVE AGENT: architect-planner
+FEATURE: positional-insert-clone-blindspot (column-lineage blind spot for CLONE-built
+  facts loaded by positional INSERT...SELECT with no column aliases — phantom source-named
+  nodes, broken upstream/downstream closures)
+SOURCE: plan/reports/dwh_positional_insert_column_blindspot.md
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (drafting)
+STATUS: planning
+
+---
+
+## Handoff — architect-planner: positional_insert_clone_blindspot (CLONE folded in) [2026-06-08]
+
+ACTIVE AGENT: architect-planner (plan expansion complete — idle/available for Q&A + compliance)
+FEATURE: positional_insert_clone_blindspot
+BRANCH: docs/architecture-overhaul
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (updated in place; committed)
+
+CHANGE: per user decision (2026-06-08) folded CLONE-source column cataloguing IN-SCOPE as
+new Part C (was previously deferred as a Non-Goal). Part C = C1 parse CREATE TABLE..CLONE
+src (exp.Clone, verified in sqlglot snowflake dialect) onto QueryNode.clone_source; C2
+inherit source's ordered DDL catalog onto CLONE target (SqlColumn/HAS_COLUMN
+source='clone_inherited'), chain-resolved with cycle guard + hop limit, degrade to nothing
+when source un-indexed/cross-DB. Composes with B: C feeds catalog into ddl_columns_by_bare,
+B maps positional INSERT projection i -> inherited target col i. A1/A2 remain the safety net.
+
+KEY DESIGN DECISIONS:
+  - Placement: CLONE inheritance in MAIN-PROCESS seam (indexer.py:430-433 defined_table_registry
+    loop after both passes), NOT pass-2 worker subprocesses (aggregator/cross-file graph live
+    in main process; threading into subprocs = more data movement, no benefit).
+  - Sequencing hazard B x C: B reads catalog at parse time (pass2), C inherits post-pass2.
+    PREFERRED resolution = resolve CLONE catalogs in aggregator (resolve_clone_catalogs())
+    BEFORE pass-2 dispatch so ddl_columns_by_bare has inherited entries when B reads it.
+    Developer picks + records in Phase 0. (R6)
+  - Perf invariants: C1 = one args.get per CREATE (O(N_create)); C2 = once after both passes,
+    O(N_clone_targets x chain_depth) dict lookups + bulk-upsert row appends. NO per-column
+    work, NO qualify/scope/expand/sg_lineage. Inherited rows ride existing bulk upsert.
+    All CLAUDE.md invariants unaffected (row-by-row table in plan).
+  - SemVer: still 1.5.1 -> 1.6.0 minor (CLONE = additive capability).
+  - Only deferred item now: per-column SELECT alias.* star resolution (report follow-up 4).
+
+NEXT: plan-reviewer gate, then developer. architect-planner idle for Q&A + compliance check
+      on "finished". Phase 0 must resolve B x C sequencing + check for CLONE-of-CTAS shape.
+
+---
+ACTIVE AGENT: plan-reviewer
+FEATURE: positional_insert_clone_blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (reviewing commit 7604de4)
+STATUS: in progress — checklist pass + code verification underway
+
+---
+ACTIVE AGENT: plan-reviewer (handoff complete)
+FEATURE: positional_insert_clone_blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md
+STATUS: READY FOR IMPLEMENTATION
+
+REVIEW VERDICT: plan is sound — core technical claims verified against code
+(exp.Clone/stmt.args["clone"].this confirmed in sqlglot 30.6.0 snowflake dialect;
+register_pass1 iterates defined_tables/defined_columns identically pass1 vs pass2;
+defined_table_registry built post-pass-2 in main process as described). No blocking
+questions remain unresolved (the one open item — B x C sequencing — is correctly
+scoped to Phase 0, not a plan-level blocker).
+
+CORRECTION MADE (commit d891b8d): Step 4.3 / C2-emission originally suggested
+"populate QueryNode.defined_columns in place before _build_file_rows" — this
+CONFLICTS with QueryNode's documented contract ("do not rely on identity after
+pass 2; use dataclasses.replace()"). Also a CLONE create produces NO
+defined_by_query entry (empty defined_columns), so "the matching QueryNode" is
+not unique by full_id once duplicate-DDL registrations are considered. Replaced
+with two contract-respecting strategies: (recommended) emit SqlColumn/HAS_COLUMN
+rows directly from resolve_clone_catalogs()'s resolved index bypassing
+defined_by_query, or (alternative) dataclasses.replace() at the exact
+(file, statement_index) slot. Phase 0 / Step 0.2 now records the chosen
+emission strategy alongside the B x C sequencing decision (one PR note covers
+both). Step 3.3 TC-C guard now explicitly requires asserting source='clone_inherited'
+at the graph-row level (HAS_COLUMN/SqlColumn directly), not via defined_by_query
+presence — since the chosen strategy may bypass that path.
+
+FAILING TESTS (commit cef45c6): tests/unit/test_clone_positional_insert_blindspot.py
+— 7 tests (test_C1_*, test_B_ddl_columns_by_bare_*, test_C2_resolve_clone_catalogs_*,
+test_A2_*, test_A1_*), all skip today on missing symbols (clone_source,
+ddl_columns_by_bare, resolve_clone_catalogs, inferred_from_source_name,
+_empty_closure_hint) via try/except + pytest.skip. Confirmed-skip run logged;
+must flip to passing as each plan part lands — `pytest -k clone_positional` selects
+the suite, ticket-prefix names (test_A1_/A2_/B_/C1_/C2_) make per-part filtering work.
+
+NEXT: developer implements Phase 0 -> 6. Phase 0 is the single highest-attention
+seam — it must record BOTH the B x C sequencing AND the row-emission strategy in
+one PR note (per the correction above) before Phase 4 lands.
+
+## Current State — developer: positional_insert_clone_blindspot [2026-06-08]
+
+ACTIVE AGENT: developer
+FEATURE: positional_insert_clone_blindspot (CLONE + positional-INSERT column-lineage blind spot — Parts A1/A2/B/C)
+BRANCH: feat/positional-insert-clone-blindspot
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (plan-reviewer approved at d891b8d, READY FOR IMPLEMENTATION)
+STATUS: implementing
+
+PHASE 0 SEQUENCING DECISIONS (recorded before coding):
+- Part B x Part C ordering: PREFERRED option — resolve_clone_catalogs() runs in the
+  aggregator at the pass1->pass2 boundary (before pass-2 dispatch), extending
+  ddl_columns_by_bare with inherited entries so Part B's parse-time read sees them.
+- C2 row emission strategy: RECOMMENDED option (a) — emit SqlColumn/HAS_COLUMN rows
+  directly from resolve_clone_catalogs()'s resolved index in the main-process upsert
+  seam (FileRowSet/accumulator), bypassing defined_by_query and never mutating
+  QueryNode.defined_columns in place.
+
+NEXT: implement Phases 1-6 per plan; run full pytest + perf invariant guards;
+      version bump 1.5.1 -> 1.6.0; open PR to master.
+
+## Implementation complete — positional_insert_clone_blindspot [2026-06-08]
+
+ACTIVE AGENT: shepherd (main session, picked up after developer hit a length
+limit mid-run twice — agent died with "Prompt is too long" both times, but
+each time had already committed/written real progress)
+FEATURE: positional_insert_clone_blindspot — Parts A1/A2/B/C
+BRANCH: feat/positional-insert-clone-blindspot
+COMMITS: 3d0633e (Part A1), 38e177e (Parts A2/B/C + version bump 1.6.0)
+STATUS: DONE — all 7 acceptance tests pass for real, full suite green
+        (1124 passed / 7 skipped / 3 xfailed), perf invariant guards green.
+
+Two integration bugs found and fixed during the post-implementation full-suite
+run (both were in the developer's uncommitted working-tree changes, not in
+3d0633e):
+1. SnowflakeParser.parse_file() didn't accept/forward the new
+   ddl_columns_by_bare kwarg to AnsiParser.parse_file() — pool.py passed it
+   unconditionally, so every snowflake pass-2 task raised
+   "got an unexpected keyword argument 'ddl_columns_by_bare'", silently
+   dropping those files into the 'other' bucket. Cascaded into 18 e2e/
+   integration failures (duckdb_parity, airbnb_e2e, e36_xfile_regression).
+   Fix: added the kwarg to SnowflakeParser.parse_file and forwarded it.
+2. _empty_closure_hint() always re-queried GET_COLUMNS_FOR_TABLE_QUERY, but
+   get_downstream_dependencies() already queries it to pick its own
+   "terminal output" vs "no catalog" message — the redundant second query
+   broke test_tools_hints' mocked side_effect sequence (StopIteration).
+   Fix: _empty_closure_hint now accepts an optional pre-fetched `cols` list.
+
+Housekeeping: removed a stray untracked plan/measurements/ directory
+(byte-identical duplicate of plan/metrics/, recreated by tests/e2e/
+test_dwh_e2e.py's hardcoded old path during a prior full-suite run — that
+test is gitignored per [[feedback_dwh_e2e]] and never committed).
+
+Pre-existing WIP on this branch (carried over from docs/architecture-overhaul's
+dirty working tree at branch-creation time — NOT part of this feature, left
+uncommitted/untouched): ARCHITECTURE_REVIEW.md, CLAUDE.md, .claude/agents/*,
+plan/metrics/sprint_08_*.json, plan/{measurements->metrics} renames context.
+User should handle that separately on docs/architecture-overhaul.
+
+NEXT: user reviews the branch and opens the PR to master when ready (per
+[[feedback_no_close_verify_before_tag]] — agent does not tag/close/merge).
