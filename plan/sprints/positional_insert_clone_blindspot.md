@@ -12,14 +12,25 @@ though 48+ `COLUMN_LINEAGE` edges exist — keyed under the wrong column name.
 
 Full diagnosis: [`dwh_positional_insert_column_blindspot.md`](../reports/dwh_positional_insert_column_blindspot.md).
 
-This plan ships the two follow-ups that are **tractable and correct without runtime/DB
-metadata** — disambiguating the empty-closure signal (report follow-up 1) and giving
-positional INSERT a target-column catalog whenever one is derivable, flagging the node as
-source-name-inferred when one is not (report follow-ups 2 + 3, scoped honestly). It
-**explicitly defers** the two sub-cases that cannot be solved by static parsing alone
-(CLONE-source column catalog; `SELECT alias.*` per-column star resolution — report
-follow-up 4) with recorded reasoning, so a future ticket can pick them up without
+This plan ships **all of the statically-tractable** report follow-ups: disambiguating the
+empty-closure signal (follow-up 1), giving positional INSERT a target-column catalog
+whenever one is derivable and flagging the node as source-name-inferred when one is not
+(follow-ups 2 + 3, scoped honestly), **and — folded in per user decision 2026-06-08 —
+CLONE-source column cataloguing (follow-up 3, the CLONE half)**: parsing
+`CREATE TABLE … CLONE <source>` and inheriting the source table's `SqlColumn`/`HAS_COLUMN`
+catalog so a CLONE-built fact gets a real target-column catalog. This is the piece that
+actually **corrects** the report's trigger table `ba.wtfs_voorraad_dagstand` (gives the #25
+/ Part-B positional override a real catalog to map against, producing the true `ma_vrije_vrd`
+node) rather than merely labelling the gap. It **explicitly defers** the one sub-case that
+genuinely cannot be solved by static parsing — `SELECT alias.*` per-column star resolution
+(report follow-up 4) — with recorded reasoning, so a future ticket can pick it up without
 re-discovering why.
+
+> **Scope-expansion note (2026-06-08):** an earlier revision of this plan *deferred* CLONE
+> cataloguing as a separate multi-hop schema-inheritance feature. The user decided to fold
+> it into this same plan/PR. The CLONE work below (Part C) is re-derived with its own perf
+> and pipeline-placement analysis; the previously-deferred reasoning is preserved in
+> "Part C — design notes & why the placement is safe" so the trade-offs stay visible.
 
 > Static reads below are pinned to current `master` (v1.5.1). Line numbers are anchors,
 > not exact — the developer re-greps before editing.
@@ -29,36 +40,49 @@ re-discovering why.
 ## Pre-work findings (these reshape the obvious plan — read before scoping)
 
 Verifying the four report follow-ups against current code materially changes what is
-buildable. The headline correction: **report follow-ups 2 and 3, taken literally, do NOT
-fix the report's own example table.**
+buildable, and the **scope expansion to fold in CLONE cataloguing changes the headline
+again**. Two findings drive the design:
 
-1. **The report's exact table has NO derivable target-column catalog from static SQL.**
-   `BA.WTFS_VOORRAAD_DAGSTAND` is born via `CREATE TABLE IF NOT EXISTS … CLONE …` and the
-   `INSERT` is positional **with no column list**. Therefore:
-   - There is no `CREATE TABLE (col …)` DDL → [`_extract_defined_columns`](../src/sqlcg/parsers/ansi_parser.py#L400)
-     never runs for it; `defined_tables`/`HAS_COLUMN`/`SqlColumn` are empty (confirmed by
-     the report's `SELECT COUNT(*) FROM SqlColumn … = 0`).
+1. **The report's exact table has NO target-column catalog *from its own SQL* — but the
+   CLONE source does.** `BA.WTFS_VOORRAAD_DAGSTAND` is born via
+   `CREATE TABLE IF NOT EXISTS … CLONE …` and the `INSERT` is positional **with no column
+   list**. Therefore:
+   - There is no `CREATE TABLE (col …)` DDL on the table itself →
+     [`_extract_defined_columns`](../src/sqlcg/parsers/ansi_parser.py#L400) returns `[]` for
+     it; `defined_columns`/`HAS_COLUMN`/`SqlColumn` are empty (confirmed by the report's
+     `SELECT COUNT(*) FROM SqlColumn … = 0`).
    - There is no `INSERT INTO t (c1, c2)` column list → the #25 positional-override block
      in [`base.py`](../src/sqlcg/parsers/base.py#L738) (`isinstance(stmt.this, exp.Schema)`)
      **does not fire**; the main loop runs and derives the dst name from the source
      expression (`col_expr.name`, [base.py:869](../src/sqlcg/parsers/base.py#L869)) — this
      is exactly where the phantom `mh_vrije_vrd` name comes from.
-   - **`CLONE` is not parsed at all** (grep: zero matches for `clone` in `parsers/`,
-     `lineage/`, `indexer/`). So the only other place a catalog *could* come from — the
-     CLONE source table's columns — is not harvested either.
+   - **`CLONE` is not parsed at all today** (grep: zero matches for `clone` in `parsers/`,
+     `lineage/`, `indexer/` — only unrelated git-clone/shallow-clone strings). So the
+     catalog that *does* exist — the CLONE **source** table's `CREATE TABLE (col …)`
+     columns — is never harvested. **sqlglot already models it**: confirmed
+     `sqlglot.parse_one("CREATE TABLE t CLONE s", dialect="snowflake")` yields
+     `Create(kind=TABLE, this=Table(t), clone=Clone(this=Table(s)))`. The source ref is
+     directly readable from `stmt.args["clone"].this` / `exp.Clone.this`.
 
-   **Consequence:** for a CLONE-built + bare-positional-INSERT table, *no static source of
-   target column names exists in the indexed repo*. Direction-2's "resolve positional
-   INSERT against target DDL" and direction-3's "catalog from `CREATE TABLE`" both have
-   **nothing to read** for this specific table. The honest fix for the report's table is
-   **direction 1 (disambiguate the empty closure) + the `inferred_from_source_name` flag**
-   so a consumer knows the node key is source-derived and unproven — not a phantom
-   correctness claim. Directions 2/3 still pay off for the *broader* class (positional
-   INSERT into a table that DOES have a column-list DDL, or an INSERT with a column list),
-   which the report notes is "the standard fact-table build pattern" — many siblings DO
-   carry DDL even when this one does not. We build the catalog/ordinal machinery so those
-   siblings resolve correctly, and we degrade safely (flag, not phantom) when no catalog
-   exists.
+   **Consequence (revised for the folded-in CLONE work):** a CLONE-built table *can* be
+   given a real catalog by **inheriting the columns of its CLONE source** — provided that
+   source is itself DDL-catalogued (directly, or transitively via another CLONE) **and is
+   indexed in the same repo**. Part C below adds exactly this inheritance. The honest
+   degrade path (direction 1 + the `inferred_from_source_name` flag) is **kept** as the
+   safety net for the residual cases CLONE inheritance cannot reach: a CLONE source that is
+   not in the indexed repo (cross-database CLONE), or a CLONE chain that bottoms out in a
+   table with no DDL columns anywhere. Directions 2/3 (the positional-ordinal mapping, Part
+   B) remain the machinery that *uses* the catalog — Part C feeds the catalog in; Part B
+   maps positional projections onto it.
+
+   **How the three parts compose on the report's table:**
+   `Part C` catalogs `ba.wtfs_voorraad_dagstand` from its CLONE source's DDL → the table now
+   has ordered `SqlColumn`s including `ma_vrije_vrd` at the right ordinal. `Part B` then sees
+   a catalog for the positional `INSERT … SELECT` and maps projection *i* (`vrd.mh_vrije_vrd`)
+   onto target column *i* (`ma_vrije_vrd`) → the real `MH_ → MA_` rename edge is recorded
+   under the **correct** target node. `A1/A2` only fire if Part C found no source catalog
+   (cross-DB / un-indexed source), in which case the table stays labelled-unproven instead
+   of phantom.
 
 2. **#25 already solves positional INSERT *with a column list*.** The block at
    [base.py:738](../src/sqlcg/parsers/base.py#L738) overrides the SELECT alias with the
@@ -87,10 +111,13 @@ fix the report's own example table.**
    block's structure, so the per-column perf invariants are untouched.
 
 Net effect: in-scope work is **(A)** the empty-closure disambiguation +
-`inferred_from_source_name` consumer signal, and **(B)** a no-column-list positional-INSERT
-ordinal mapping against a cross-file DDL column catalog, with a safe `inferred` fallback
-when no catalog exists. CLONE-source cataloguing and per-column star resolution are
-**deferred with reasoning** (see Non-Goals).
+`inferred_from_source_name` consumer signal, **(B)** a no-column-list positional-INSERT
+ordinal mapping against a cross-file DDL column catalog with a safe `inferred` fallback when
+no catalog exists, **and (C — folded in) CLONE-source column cataloguing**: parse
+`CREATE TABLE … CLONE src` and inherit `src`'s DDL column catalog onto the CLONE target so
+that target gets real `SqlColumn`/`HAS_COLUMN` rows and Part B has a catalog to map against.
+Only **per-column `SELECT alias.*` star resolution** (report follow-up 4) is deferred with
+reasoning (see Non-Goals).
 
 ---
 
@@ -120,24 +147,33 @@ when no catalog exists. CLONE-source cataloguing and per-column star resolution 
   behaviour (dst named from source) but set `inferred_from_source_name=true` (A2).
 - **(B-catalog) Cross-file ordered DDL column index** in
   [`CrossFileAggregator`](../src/sqlcg/lineage/aggregator.py): bare-name → ordered DDL
-  column list, built from DDL-defined tables in the existing `register_pass1` loop, threaded
-  into pass-2 parsing the same way schema context already is. Ambiguous bare names (already
-  tracked in `_ambiguous_bare`) are excluded — never guess a catalog across schemas.
-- **Regression guards** (synthetic, committable) for every behaviour above.
-- **Version bump** (patch or minor per SemVer rule — see Phase 6).
+  column list, built from DDL-defined tables in the existing `register_pass1` loop.
+  Ambiguous bare names (already tracked in `_ambiguous_bare`) are excluded — never guess a
+  catalog across schemas. **Threading note:** this index is consumed in the **main-process
+  upsert seam** (`index_repo` lines 416–475), not threaded into pass-2 worker subprocesses —
+  see Part C placement analysis for why this is both correct and cheaper. The same index
+  also feeds Part C's CLONE inheritance.
+- **(C) CLONE-source column cataloguing** (folded in 2026-06-08):
+  - **(C1) Parse `CREATE TABLE … CLONE src`.** Capture the CLONE source `TableRef` on the
+    CLONE target's `QueryNode` (new `clone_source: TableRef | None` field) by reading
+    `stmt.args["clone"].this` (`exp.Clone`) in
+    [`_parse_statement`](../src/sqlcg/parsers/ansi_parser.py#L236). The CLONE target already
+    registers as a `defined_table` with empty `defined_columns` today; C1 only *records the
+    source link*, it does not yet change the catalog.
+  - **(C2) Inherit the source catalog onto the CLONE target** in the main-process seam: for
+    each CLONE target whose own `defined_columns` is empty, resolve the source's ordered DDL
+    columns via the Part-B-catalog index (transitively following CLONE-of-CLONE chains, with
+    a visited-set cycle guard and a bounded hop count), and **populate the CLONE target's
+    catalog rows** (`SqlColumn` + `HAS_COLUMN`) from the inherited columns, tagged
+    `source="clone_inherited"` (vs `"ddl"`). When the source is not in the index (cross-DB
+    CLONE) or the chain bottoms out with no DDL columns, **inherit nothing** — the table
+    stays catalog-less and A1/A2 label it (no fabrication).
+- **Regression guards** (synthetic, committable) for every behaviour above, including a
+  CLONE-of-CLONE chain and an un-indexed-source CLONE (degrade path).
+- **Version bump** (minor per SemVer rule — see Phase 6).
 
 ### Non-Goals (deferred, with reasoning — do not silently drop)
 
-- **CLONE-source column catalogue (report follow-up 3, the CLONE half).** `CREATE TABLE …
-  CLONE src` is not parsed today, and cataloguing `t`'s columns from `src` requires (a)
-  parsing CLONE, (b) resolving `src`'s own catalog — which for the report's chain is itself
-  another CLONE/positional table with no DDL. This is a **multi-hop schema-inheritance
-  feature** with its own blast radius (CLONE parse in every dialect, a new schema-propagation
-  pass, ambiguity when `src` has no catalog either). It does not fit a single safe PR and is
-  **out of scope**; tracked as a follow-up. The report's exact table is covered here only by
-  A1 + A2 (labelled-unproven), which is the correct honest outcome until CLONE cataloguing
-  lands. **This is the central scope decision — see "Scope decision: the report's own table"
-  below.**
 - **Per-column `SELECT alias.*` star resolution (report follow-up 4).** The report flags
   this as a *second, independent gap*: `SELECT vrd.*` in the `*_base`/`*_enriched` temp CTEs
   is materialised as `STAR_SOURCE` rows expanded post-hoc by
@@ -152,37 +188,46 @@ when no catalog exists. CLONE-source cataloguing and per-column star resolution 
   alias map once, mirroring the #25 block which already copies the body once), never per
   column. See "Performance invariants" below for the row-by-row impact statement.
 - **Re-introducing an INFORMATION_SCHEMA / schema-CSV ingestion path** (removed 2026-05 for
-  zero measured edge delta — CLAUDE.md "Schema resolution"). The catalog used here is the
-  **parsed DDL** the indexer already has, not an external schema source.
+  zero measured edge delta — CLAUDE.md "Schema resolution"). The catalog used here — for both
+  Part B and Part C — is the **parsed DDL** the indexer already has, not an external schema
+  source. Part C inherits a CLONE source's *parsed-DDL* columns; it does not read live DB or
+  INFORMATION_SCHEMA metadata.
+- **CLONE inheritance from a source outside the indexed repo** (cross-database CLONE where
+  `src` is never parsed). There is no parsed DDL to inherit, so Part C inherits nothing and
+  A1/A2 label the table unproven. Resolving these would require live-DB metadata (out of
+  scope by the rule above).
 
 ---
 
 ## Scope decision: the report's own table (CLONE + bare positional INSERT)
 
 The trigger table `ba.wtfs_voorraad_dagstand` is the **worst case**: CLONE-built (no DDL
-columns) **and** loaded by a positional INSERT with no column list. For it specifically,
-parts B and B-catalog have **no catalog to read** and therefore change nothing — the dst is
-still named from the source (`mh_vrije_vrd`). What changes for it:
+columns of its own) **and** loaded by a positional INSERT with no column list. With Part C
+folded in, this table is now **corrected, not merely labelled** — *iff its CLONE source is
+indexed*:
 
-- **A1** makes `get_upstream_dependencies("ba.wtfs_voorraad_dagstand.ma_vrije_vrd")` return
-  a hint that says, in effect: *this table has no column catalog (likely CLONE / positional
-  INSERT); lineage may exist under a source-derived column key — empty here is unproven, not
-  negative.* That is the exact disambiguation the report asks for in follow-up 1.
-- **A2** flags the `mh_vrije_vrd` destination edge as `inferred_from_source_name=true`, so a
-  consumer reading the graph (or `trace_column_lineage` landing on it) knows the key is
-  source-derived and may not match the DB column.
+- **Part C** parses the table's `CREATE TABLE … CLONE src`, resolves `src`'s ordered DDL
+  columns (directly or down a CLONE chain), and inherits them onto
+  `ba.wtfs_voorraad_dagstand` as real `SqlColumn`/`HAS_COLUMN` rows
+  (`source="clone_inherited"`), including `ma_vrije_vrd` at its true ordinal.
+- **Part B** then sees a catalog for the positional `INSERT … SELECT`, maps projection *i*
+  (`vrd.mh_vrije_vrd`) → target column *i* (`ma_vrije_vrd`), and records the real
+  `MH_ → MA_` rename edge under the **correct** `ma_vrije_vrd` node. `inferred_from_source_name`
+  is **false** on these edges (catalog-backed).
+- `get_upstream_dependencies("ba.wtfs_voorraad_dagstand.ma_vrije_vrd")` now returns the
+  upstream — the report's exact failing call is **fixed**, not just disambiguated.
 
-This is deliberately **not** a phantom-correctness claim. We do not fabricate an
-`ma_vrije_vrd` node for this table because nothing in the indexed SQL tells us the target
-column is named `ma_vrije_vrd` — only the live DB / a CLONE-source catalog knows that, and
-both are out of scope. Manufacturing the name would be a guess that could be wrong in the
-other direction. **Correct, labelled "unproven" beats confidently wrong.** The full
-correctness fix for this table is the deferred CLONE-source-catalogue follow-up; this plan
-makes the gap *visible and labelled* and fixes the broader catalog-available class.
+**Residual / degrade path (A1 + A2 still earn their keep):** if the CLONE source is *not*
+indexed (cross-database CLONE), or the CLONE chain bottoms out in a table with no DDL columns
+anywhere, Part C inherits nothing and the table stays catalog-less. Then:
 
-> If the reviewer/user wants the CLONE-source catalogue folded in here instead of deferred,
-> that is a scope expansion that needs its own design pass (CLONE parsing + schema
-> inheritance) — flag it as a blocking question rather than stretching this PR.
+- **A1** makes the empty closure return the no-catalog hint (*unproven, not negative*).
+- **A2** flags the source-named dst edge `inferred_from_source_name=true`.
+
+We never fabricate a target name we cannot derive from parsed SQL. **Correct when a source
+catalog exists; correctly-labelled "unproven" when it does not — never confidently wrong.**
+Whether the report's *exact* table resolves end-to-end depends on whether its CLONE source
+is in the indexed DWH; Phase 5 verifies this on the live corpus and records which path fired.
 
 ---
 
@@ -309,6 +354,108 @@ self.ddl_columns_by_bare: dict[str, list[str]] = {}
   documented #44 single-file limitation ([v1_2_1_bugfix.md](v1_2_1_bugfix.md) Phase 2 "Known
   limitation").
 
+### Part C — CLONE-source column cataloguing (parse + main-process inheritance)
+
+#### C1 — parse the CLONE source (parser, once per statement)
+
+In [`_parse_statement`](../src/sqlcg/parsers/ansi_parser.py#L236), when `stmt` is an
+`exp.Create` with `kind=="TABLE"` and `stmt.args.get("clone")` is an `exp.Clone`, extract the
+source `TableRef` from `clone.this` (a `Table`) via the existing
+[`_convert_table_expr_to_ref`](../src/sqlcg/parsers/ansi_parser.py) and store it on the
+`QueryNode` as a new field `clone_source: TableRef | None`.
+
+- **No column lineage / no body change.** CLONE has no SELECT body, so column lineage
+  extraction is skipped exactly as today (a CLONE create already produces empty
+  `defined_columns` and `defined_body=None`). C1 is **metadata only** — one attribute read
+  per CREATE statement, gated on `args.get("clone")` being present. Zero impact on the
+  per-column hot path.
+- **Dialect note.** CLONE is a Snowflake/BigQuery construct; sqlglot parses it under the
+  `snowflake` dialect (verified). ANSI parses without `clone` (the arg is simply absent), so
+  the `args.get("clone")` guard is a no-op for non-CLONE dialects — no parser branching
+  beyond the single `if`.
+
+#### C2 — inherit the source catalog (main-process seam, after both passes)
+
+**Placement: the main-process `index_repo` seam at
+[indexer.py:416–475](../src/sqlcg/indexer/indexer.py#L416), NOT pass-2 worker subprocesses.**
+This is the central architectural decision for the folded-in work — see "why the placement is
+safe" below. The `defined_table_registry` build loop (lines 430–433) already iterates **every
+defined table across every file in the main process**, after pass 1 + pass 2 have completed
+and before the upsert batches flush. Part C piggybacks on this single pass:
+
+1. **Build a bare-name → ordered DDL columns index** (this is exactly the Part-B-catalog
+   `ddl_columns_by_bare`, built in `register_pass1` from `defined_columns`, ambiguous names
+   excluded). Part C reuses it — one index serves both B and C.
+2. **Collect CLONE targets.** During the same `pass2_results` walk, gather
+   `(clone_target_ref, clone_source_ref)` for every `QueryNode` carrying a `clone_source`
+   whose target's own `defined_columns` is empty (a table with its own DDL column list does
+   not inherit — its own catalog wins).
+3. **Resolve each CLONE target's inherited catalog** by following the source link:
+   - Look up the source's ordered DDL columns in `ddl_columns_by_bare` (by bare name,
+     excluding ambiguous).
+   - **CLONE-of-CLONE:** if the source itself is a catalog-less CLONE target, follow *its*
+     `clone_source` link transitively. Use a **visited-set cycle guard** and a **bounded hop
+     limit** (e.g. 16) so a pathological `A CLONE B … CLONE A` cycle or a deep chain
+     terminates deterministically; on cycle/limit/no-DDL-found, inherit nothing.
+   - **Source not indexed** (cross-DB CLONE — bare name absent from the index): inherit
+     nothing.
+4. **Emit inherited catalog rows** onto the CLONE target: for each inherited column at
+   ordinal *i*, append a `SqlColumn` row and a `HAS_COLUMN` edge keyed on the CLONE
+   *target*'s `full_id`, tagged `source="clone_inherited"` (distinct from `"ddl"`). The
+   simplest, lowest-blast-radius wiring: **populate the CLONE target `QueryNode`'s
+   `defined_columns` with the inherited list before `_build_file_rows` runs**, so the existing
+   catalog-emission path ([indexer.py:1080–1111](../src/sqlcg/indexer/indexer.py#L1080))
+   produces the rows unchanged — the only delta is the `source` tag, set from a per-table
+   "inherited?" flag. (The developer confirms in Phase 0 whether populating `defined_columns`
+   vs. emitting rows directly is cleaner; both keep the bulk-upsert path intact.)
+5. **Feed Part B.** Because the CLONE target now has a catalog in `ddl_columns_by_bare`
+   (extend the index with inherited catalogs once C2 resolves them), Part B's positional
+   ordinal mapping finds it and maps the positional INSERT correctly. **Ordering constraint:**
+   C2 inheritance must complete (and extend `ddl_columns_by_bare` with inherited entries)
+   **before** Part B reads the catalog for a CLONE target's INSERT. Since Part B runs at parse
+   time (pass 2) and C2 runs in the main-process upsert seam (after pass 2), there is a
+   sequencing question the developer MUST resolve in Phase 0 — see the **Blocking-Question
+   resolution** below.
+
+#### Part C — design notes & why the placement is safe
+
+- **Why main-process, not pass-2 workers.** Pass-2 parsing runs in worker **subprocesses**
+  ([indexer.py:388 `parse_pass2`](../src/sqlcg/indexer/indexer.py#L388)); the aggregator and
+  the cross-file CLONE graph live in the **main** process. Threading a mutable, globally-
+  resolved CLONE catalog into subprocesses would require serializing the whole cross-file
+  index per task and re-resolving chains per worker — more data movement and duplicated work,
+  with no benefit (catalog emission is a main-process upsert concern anyway). The
+  `defined_table_registry` loop proves the main process already has the full cross-file table
+  set in hand at the right moment. **This keeps CLONE resolution O(N_clone_targets × chain
+  depth) once, in one process — not per-worker, not per-column.**
+- **Why this does not touch any CLAUDE.md per-column / per-statement hot-path invariant.**
+  C1 is one `args.get` per CREATE statement. C2 runs **once, after all parsing**, over the
+  set of CLONE targets — it does no `qualify`, no `build_scope`, no `exp.expand`, no
+  `sg_lineage`, no per-column work at all. It only resolves dict lookups and appends row
+  dicts that ride the **existing bulk/batched upsert** (`source` tag is one extra dict value;
+  no new `execute()`). The invariant table below has a Part-C column.
+- **Sequencing resolution for Part B × Part C (the one real design risk).** Part B reads the
+  catalog at parse time (pass 2), but inherited CLONE catalogs only exist after C2 (post-pass-
+  2). Two acceptable resolutions; **Phase 0 picks one and records it:**
+  - **(Preferred) Resolve CLONE catalogs in the aggregator at the pass-1→pass-2 boundary**,
+    *before* pass-2 dispatch, so `ddl_columns_by_bare` already contains inherited entries when
+    pass-2 Part B reads it. CLONE sources are DDL tables registered in pass 1, so their
+    catalogs are known by the time pass-1 completes; the CLONE chain can be resolved in the
+    aggregator right after the `register_pass1` loop finishes (a `aggregator.resolve_clone_catalogs()`
+    step called once before pass-2 dispatch). Catalog **emission** (the `SqlColumn`/`HAS_COLUMN`
+    rows) still happens in the main-process upsert seam; only the *index* is resolved early so
+    Part B can read it. This keeps everything in the main process and removes the ordering
+    hazard entirely.
+  - **(Fallback) Two-tier catalog in Part B**: Part B reads `ddl_columns_by_bare` for direct
+    DDL catalogs at parse time; for CLONE targets whose catalog only resolves post-pass-2,
+    Part B's mapping is applied in the **same main-process seam** as C2 (re-key the already-
+    parsed positional edges from source-name to target-name using the inherited catalog). This
+    is more code and re-touches edges, so prefer the first resolution.
+  - **STOP / blocking** if neither holds — e.g. a CLONE source is *itself* only resolvable in
+    pass 2 (a CTAS, not a DDL table). CLONE-of-CTAS source cataloguing is **out of scope**
+    (CTAS has a body, not a fixed DDL column list; inheriting from it is the star-resolution
+    problem). Record it as a follow-up; degrade to A1/A2.
+
 ### Data models / API
 
 - `COLUMN_LINEAGE` gains `inferred_from_source_name BOOLEAN` (schema bump,
@@ -317,43 +464,67 @@ self.ddl_columns_by_bare: dict[str, list[str]] = {}
   ([`base.py`](../src/sqlcg/parsers/base.py)).
 - `DependencyNode` / lineage hop model gains optional `inferred_from_source_name`
   ([`models.py`](../src/sqlcg/server/models.py)).
+- `QueryNode` gains `clone_source: TableRef | None = None`
+  ([`base.py`](../src/sqlcg/parsers/base.py)) — set by C1 for CLONE creates.
+- `CrossFileAggregator` gains `ddl_columns_by_bare: dict[str, list[str]]` (shared by B and C)
+  and a `resolve_clone_catalogs()` step that extends that index with inherited CLONE
+  catalogs (chain-resolved, cycle-guarded) before pass-2 dispatch.
+- `HAS_COLUMN` `source` value gains `"clone_inherited"` (alongside `"ddl"`) — a data value,
+  **not** a schema column change. No new graph column for C; only Part A2's
+  `inferred_from_source_name` is a schema bump.
 - No change to tool **signatures**; only richer `hint` + per-node flag.
 
 ### Dependencies
 
-None new.
+None new. (CLONE parsing uses sqlglot's existing `exp.Clone` — no new library.)
 
-### Performance invariants (CLAUDE.md — row-by-row, Part B is the only hot-path touch)
+### Performance invariants (CLAUDE.md — row-by-row; Part B is the only per-column touch, Part C is post-pass main-process only)
 
 | Invariant | Affected? | Why not |
 |-----------|-----------|---------|
 | `qualify`/`build_scope` module-level import | no | no import change |
-| `exp.expand()` with file-level `sources` only | no | Part B reuses the #25 path's `sources=` (not the full corpus); no new expand |
-| `body_scope` built once per statement | no | unchanged; Part B does not rebuild scope per column |
+| `exp.expand()` with file-level `sources` only | no | Part B reuses the #25 path's `sources=` (not the full corpus); no new expand. Part C does no expand at all |
+| `body_scope` built once per statement | no | unchanged; neither B nor C rebuilds scope per column |
 | pure-literal skip | no | Part B applies the **same** guard the #25 block applies |
 | `sources=` not passed when scope present | no | unchanged |
 | `copy=False` + `trim_selects=False` with scope | no | unchanged |
 | `body_scope` built once before column loop | no | unchanged |
-| **INSERT body copied once** | **preserved** | Part B copies `body_no_with` **once** before the per-column loop and swaps only the single projection — identical to the #25 block it mirrors |
-| `_upsert_parsed_file` uses bulk upsert | no | A2 adds one column to the existing bulk row dict; no per-row upsert |
+| **INSERT body copied once** | **preserved** | Part B copies `body_no_with` **once** before the per-column loop and swaps only the single projection — identical to the #25 block it mirrors. Part C touches no INSERT body |
+| `_upsert_parsed_file` uses bulk upsert | no | A2 adds one column to the existing bulk row dict; **Part C's inherited `SqlColumn`/`HAS_COLUMN` rows ride the same bulk upsert** (they are appended to `column_rows`/`has_column_edges` exactly like DDL columns); no per-row upsert |
 | `_flush_row_batch` per-batch flush | no | unchanged cardinality |
 
 - **A1** is read-surface only (one extra `run_read` on the empty path) — outside every
   invariant.
+- **C1** is one `args.get("clone")` per CREATE statement at parse time — O(N_create), not
+  per-column. No qualify/scope/expand/sg_lineage.
+- **C2** runs **once, after both passes**, over the set of CLONE targets in the main process.
+  Cost is O(N_clone_targets × chain_depth) dict lookups + row-dict appends — bounded by the
+  hop limit. It is **not** in any per-column or per-statement parse loop. The catalog-chain
+  resolution (`resolve_clone_catalogs`) is a single main-process pass before pass-2 dispatch
+  (preferred sequencing), or a single pass in the upsert seam (fallback). It cannot regress
+  the scaling guard because it does no parse-time work.
 - **Part B adds a once-per-statement catalog lookup + ordinal map build.** This is the same
   cardinality class as the existing #25 block. The [`test_perf_scaling_guard.py`](../tests/unit/test_perf_scaling_guard.py)
   fixture must stay flat at N and 2N. If Part B introduces a hot-path op that could scale with
   column count, the developer **adds a counter** to the scaling guard (CLAUDE.md rule) — but
   by construction the per-column work is unchanged (same `sg_lineage` call per mapped
   position the #25 block already makes).
+- **Perf budget (CLAUDE.md ~210–256s on the DWH).** Part C adds a single bounded pass over
+  CLONE targets (a small fraction of files); the inherited rows are columns that were
+  *missing* before, so total upsert volume rises by roughly the catalog size of CLONE-built
+  facts — measured in Phase 5. Expected delta is small (column rows are cheap in the bulk
+  path); a regression beyond the 5-minute budget is a STOP condition.
 
 ---
 
 ## Implementation Steps (dependency-ordered)
 
 > Ordering: A1 first (pure read-surface, immediate value, zero schema risk); then the schema
-> bump + A2 carrier; then the catalog + Part B that produces correct names; guards land RED
-> before B and flip green after; release plumbing last.
+> bump + A2 carrier; then the shared catalog index; then **Part C CLONE inheritance** (it
+> *populates* the catalog Part B consumes, so it lands before/with B); then Part B ordinal
+> mapping. Guards for B+C land RED before the implementation and flip green after; release
+> plumbing last. **Part C and Part B share the `ddl_columns_by_bare` index and the catalog
+> chain must be resolved before Part B reads it — see Phase 0 sequencing decision.**
 
 ### Phase 0 — Confirm seams (no code change)
 **Step 0.1** Grep-confirm: the #25 block boundary (`isinstance(stmt.this, exp.Schema)`,
@@ -365,9 +536,26 @@ DDL columns ([indexer.py:1081](../src/sqlcg/indexer/indexer.py#L1081),
 seam (`SchemaResolver.register_cross_file_sources` pattern,
 [schema_resolver.py:90](../src/sqlcg/lineage/schema_resolver.py#L90)). Record the exact
 seam chosen for Part B-catalog threading.
-- Acceptance: a short note in the PR description naming each confirmed seam; **STOP and
-  raise a blocking question** if the no-column-list INSERT does not reach the main column
-  loop as assumed (e.g. it is dropped earlier as table-only) — Part B depends on it.
+**Step 0.2 (CLONE seams + sequencing — folded in).** Confirm:
+- `CREATE TABLE … CLONE src` parses to `exp.Create` with `stmt.args["clone"]` an `exp.Clone`
+  whose `.this` is the source `Table` (verified for the `snowflake` dialect; re-confirm the
+  exact attribute path before C1).
+- The CLONE target currently registers as a `defined_table` with empty `defined_columns`
+  ([ansi_parser.py:204](../src/sqlcg/parsers/ansi_parser.py#L204)) and the catalog-emission
+  loop ([indexer.py:1080–1111](../src/sqlcg/indexer/indexer.py#L1080)) skips it because
+  `defined_by_query` requires non-empty `defined_columns`.
+- The main-process seam that has the full cross-file table set in hand — the
+  `defined_table_registry` build at [indexer.py:430–433](../src/sqlcg/indexer/indexer.py#L430),
+  after both passes, before batch flush.
+- **DECIDE AND RECORD the Part B × Part C sequencing** (see "Sequencing resolution" in Part C
+  design): preferred = resolve CLONE catalogs in the aggregator before pass-2 dispatch so the
+  inherited catalog is in `ddl_columns_by_bare` when Part B reads it; fallback = re-key in the
+  upsert seam. Name the chosen approach in the PR note.
+- Acceptance: a short note in the PR description naming each confirmed seam **and the chosen
+  B×C sequencing**; **STOP and raise a blocking question** if (a) the no-column-list INSERT
+  does not reach the main column loop as assumed (Part B depends on it), or (b) a CLONE source
+  in the corpus is itself a CTAS rather than a DDL table so its catalog is not in
+  `ddl_columns_by_bare` (CLONE-of-CTAS is out of scope — degrade to A1/A2).
 
 ### Phase 1 — A1 empty-closure disambiguation (read surface; highest value/risk)
 **Step 1.1** Add `_empty_closure_hint(db, table_id) -> str` (shared helper) and call it from
@@ -399,54 +587,96 @@ correct interim signal).
 - Invariant guard: bulk/batch upsert + scaling guards green (A2 adds one column to the
   existing bulk row; no per-row upsert).
 
-### Phase 3 — Guards for Part B (land RED)
-**Step 3.1** Synthetic committable fixture: `CREATE TABLE s.fact (a INT, b INT, c INT);`
-plus `INSERT INTO s.fact SELECT src.x, src.y, src.z FROM s.src;` (no column list) where
-`x/y/z` are deliberately **different** names from `a/b/c` (the rename the blind spot hides).
-Add a control: a CLONE-style table with no DDL (just the positional INSERT) to pin the
-no-catalog → flagged path.
-**Step 3.2** TC-B (RED until Phase 4): after indexing, the `COLUMN_LINEAGE` dst nodes for
-`s.fact` are `s.fact.a/b/c` (target names), **not** `s.fact.x/y/z`; `get_upstream_dependencies("s.fact.a")`
-returns `s.src.x`; and these edges have `inferred_from_source_name=false`. For the no-DDL
-control, dsts stay source-named and carry `inferred_from_source_name=true`.
-- Acceptance: TC-B documented-RED before Phase 4, green after (not `xfail`-left).
+### Phase 3 — Guards for Part B + Part C (land RED)
+**Step 3.1** Synthetic committable fixtures:
+- **B fixture (catalog-available positional INSERT):** `CREATE TABLE s.fact (a INT, b INT, c INT);`
+  plus `INSERT INTO s.fact SELECT src.x, src.y, src.z FROM s.src;` (no column list) where
+  `x/y/z` are deliberately **different** names from `a/b/c` (the rename the blind spot hides).
+- **C fixture (the report's actual shape — CLONE + bare positional INSERT):**
+  `CREATE TABLE s.src_ddl (a INT, b INT, c INT);` (the catalog donor),
+  `CREATE TABLE s.fact_clone CLONE s.src_ddl;` (no column list of its own),
+  `INSERT INTO s.fact_clone SELECT t.x, t.y, t.z FROM s.t;` — proves Part C inherits
+  `a/b/c` onto `s.fact_clone` and Part B then maps `x/y/z`→`a/b/c`.
+- **C-chain fixture:** `CREATE TABLE s.fact_clone2 CLONE s.fact_clone;` — proves CLONE-of-CLONE
+  inheritance follows the chain to the DDL donor.
+- **C-degrade control (un-indexed source):** `CREATE TABLE s.fact_orphan CLONE ext.unknown;`
+  plus a positional INSERT — `ext.unknown` is **not** defined in the fixture, so Part C
+  inherits nothing; dsts stay source-named, `inferred_from_source_name=true`, A1 hint fires.
+- **C-cycle control:** two CLONE creates referencing each other — proves the cycle guard
+  terminates and inherits nothing (no hang, no crash).
+**Step 3.2** TC-B (RED until Phase 4): for `s.fact`, `COLUMN_LINEAGE` dst nodes are
+`s.fact.a/b/c` (target names), **not** `s.fact.x/y/z`; `get_upstream_dependencies("s.fact.a")`
+returns `s.src.x`; edges have `inferred_from_source_name=false`.
+**Step 3.3** TC-C (RED until Phase 4):
+- `s.fact_clone` has `SqlColumn` rows `a/b/c` with `HAS_COLUMN` `source="clone_inherited"`
+  (assert the catalog exists and the source tag), and its INSERT dsts are `a/b/c`
+  (`inferred_from_source_name=false`); `get_upstream_dependencies("s.fact_clone.a")` returns `s.t.x`.
+- `s.fact_clone2` inherits `a/b/c` via the chain (catalog exists).
+- `s.fact_orphan` has **no** catalog; dsts source-named, flagged true; A1 hint fires.
+- The cycle control terminates with no catalog and no exception.
+- Acceptance: TC-B and TC-C documented-RED before Phase 4, green after (not `xfail`-left).
 
-### Phase 4 — Part B-catalog + Part B ordinal mapping (flips TC-B green)
-**Step 4.1** Build `ddl_columns_by_bare` in
+### Phase 4 — Part B-catalog + Part C CLONE inheritance + Part B ordinal mapping (flips TC-B/TC-C green)
+**Step 4.1 (shared catalog index).** Build `ddl_columns_by_bare` in
 [`CrossFileAggregator.register_pass1`](../src/sqlcg/lineage/aggregator.py#L33) from ordered
-`defined_columns`, excluding `_ambiguous_bare`. Thread it into pass-2 parsing via the seam
-confirmed in Phase 0.
-**Step 4.2** Add the no-column-list positional-INSERT block in
+`defined_columns`, excluding `_ambiguous_bare`.
+**Step 4.2 (C1 — parse CLONE source).** In
+[`_parse_statement`](../src/sqlcg/parsers/ansi_parser.py#L236), set `QueryNode.clone_source`
+from `stmt.args["clone"].this` when an `exp.Clone` is present. Add the `clone_source` field to
+`QueryNode` ([`base.py`](../src/sqlcg/parsers/base.py)).
+**Step 4.3 (C2 — inherit catalog).** Add `aggregator.resolve_clone_catalogs()` (called once at
+the pass-1→pass-2 boundary, per the Phase-0 sequencing decision): for each CLONE target with
+empty own `defined_columns`, resolve its source's ordered columns from `ddl_columns_by_bare`,
+following CLONE chains with a visited-set + bounded hop limit; extend `ddl_columns_by_bare`
+with the inherited entry (so Part B sees it). Emit the inherited `SqlColumn`/`HAS_COLUMN` rows
+in the main-process upsert path tagged `source="clone_inherited"` — preferably by populating
+the CLONE target `QueryNode.defined_columns` before `_build_file_rows` so the existing
+emission loop ([indexer.py:1080–1111](../src/sqlcg/indexer/indexer.py#L1080)) produces them,
+with the `source` tag switched via a per-table inherited flag.
+**Step 4.4 (B — ordinal mapping).** Add the no-column-list positional-INSERT block in
 [`base.py`](../src/sqlcg/parsers/base.py) next to the #25 block, mirroring its body-copy-once
-+ per-position guard structure; map projection *i* → `catalog[i]`; handle length mismatch by
-mapping the overlap only. When mapped, dst is the target name and `inferred_from_source_name`
-is **not** set; unmapped/no-catalog positions retain the Phase 2 flag.
-- Files: [`aggregator.py`](../src/sqlcg/lineage/aggregator.py), [`base.py`](../src/sqlcg/parsers/base.py),
-  and the threading seam (`SchemaResolver` or the pass-2 dispatch).
-- Call site: the new aggregator index has a grep-confirmed reader (the parser/pass-2 seam).
-- Acceptance: TC-B green; **single-file no-op** — when no aggregator index is threaded, the
-  block degrades to source-named + flagged (TC-B control still green).
++ per-position guard structure; map projection *i* → `catalog[i]` (catalog now includes
+CLONE-inherited entries); handle length mismatch by mapping the overlap only. When mapped, dst
+is the target name and `inferred_from_source_name` is **not** set; unmapped/no-catalog
+positions retain the Phase 2 flag.
+- Files: [`aggregator.py`](../src/sqlcg/lineage/aggregator.py),
+  [`ansi_parser.py`](../src/sqlcg/parsers/ansi_parser.py),
+  [`base.py`](../src/sqlcg/parsers/base.py),
+  [`indexer.py`](../src/sqlcg/indexer/indexer.py), and the threading seam.
+- Call site: the new aggregator index + `resolve_clone_catalogs` have grep-confirmed readers
+  (the parser/pass-2 seam and the upsert seam respectively) — CLAUDE.md call-site rule.
+- Acceptance: TC-B and TC-C green; **single-file no-op** — when no aggregator is present
+  (`reindex_file`), Part B and Part C both degrade to source-named + flagged (controls green).
 - Invariant guard: [`test_perf_scaling_guard.py`](../tests/unit/test_perf_scaling_guard.py),
   [`test_T09_01_qualify_once.py`](../tests/unit/test_T09_01_qualify_once.py),
   [`test_bulk_upsert_invariant.py`](../tests/unit/test_bulk_upsert_invariant.py),
-  [`test_upsert_batch_invariant.py`](../tests/unit/test_upsert_batch_invariant.py) all green.
+  [`test_upsert_batch_invariant.py`](../tests/unit/test_upsert_batch_invariant.py) all green —
+  Part C adds no per-column op and rides the bulk upsert, so they cannot regress.
 
 ### Phase 5 — Live-DWH re-verification (read-only; never commit to the DWH)
 **Step 5.1** Index the real DWH (`/home/ignwrad/Projects/dwh`) into a throwaway DB
 (read-only on the repo; `tests/e2e/test_dwh_e2e.py` is gitignored — never commit it).
-- Confirm A1: `get_upstream_dependencies("ba.wtfs_voorraad_dagstand.ma_vrije_vrd")` now
-  returns the **no-catalog** hint (the report's exact failing call) instead of bare empty.
-- Confirm A2: the `mh_vrije_vrd` dst edge carries `inferred_from_source_name=true`.
-- Confirm Part B on a **catalog-available** sibling fact (a fact that DOES have column-list
-  DDL but a positional INSERT): its dsts now carry target names.
-- Confirm perf budget unchanged (~210–256s baseline, CLAUDE.md indexer perf note).
+- **Confirm Part C on the report's exact table.** Check whether `ba.wtfs_voorraad_dagstand`'s
+  CLONE source is indexed. If yes: `SELECT COUNT(*) FROM SqlColumn WHERE table_name =
+  'ba.wtfs_voorraad_dagstand'` is now **> 0** (was 0), a `ma_vrije_vrd` node exists with
+  `HAS_COLUMN source='clone_inherited'`, and
+  `get_upstream_dependencies("ba.wtfs_voorraad_dagstand.ma_vrije_vrd")` returns the upstream
+  (the report's exact failing call is **fixed**). Record the CLONE source's identity.
+- **If the CLONE source is NOT indexed** (cross-DB): confirm the degrade path — A1 returns the
+  no-catalog hint and A2 flags the `mh_vrije_vrd` edge `inferred_from_source_name=true`. Record
+  which path fired; this is an acceptable outcome, not a failure.
+- Confirm Part B on a **catalog-available** sibling fact (DDL column-list + positional INSERT):
+  its dsts now carry target names.
+- Confirm perf budget unchanged (~210–256s baseline, CLAUDE.md indexer perf note); record the
+  inherited-catalog row-count delta. A regression beyond the 5-minute budget is a STOP.
 - Record the verdict in the PR description (not committed to the DWH repo).
 
 ### Phase 6 — Release plumbing
-**Step 6.1** Version bump. **SemVer:** A2 adds a new graph field + tool-surface signal and
-Part B is a new resolution capability ⇒ **minor** (`1.5.1` → `1.6.0`) per CLAUDE.md
-(additive capability is minor; the schema bump forces a re-index, which is the documented
-migration path, and is not a breaking API change). Update
+**Step 6.1** Version bump. **SemVer:** A2 adds a new graph field + tool-surface signal, Part B
+is a new positional-resolution capability, and **Part C is a new CLONE-cataloguing
+capability** ⇒ **minor** (`1.5.1` → `1.6.0`) per CLAUDE.md (additive capability is minor; the
+schema bump forces a re-index, which is the documented migration path, and is not a breaking
+API change). Update
 [`pyproject.toml`](../pyproject.toml), [`src/sqlcg/__init__.py`](../src/sqlcg/__init__.py),
 `uv lock`.
 **Step 6.2** Full gate: `uv run pytest`; `uv run pyright`; `uv run ruff check src tests`.
@@ -458,25 +688,37 @@ migration path, and is not a breaking API change). Update
 ## Test Strategy
 
 - **Unit** (no graph): aggregator builds `ddl_columns_by_bare` in order, excludes ambiguous
-  bare names; the parser's ordinal block maps positions correctly and handles length
-  mismatch without raising; `inferred_from_source_name` defaults `False` and is set only on
-  the no-catalog no-column-list dst.
+  bare names; `resolve_clone_catalogs` inherits a source catalog onto a CLONE target, follows
+  a CLONE-of-CLONE chain, terminates on a cycle (visited-set guard) and on the hop limit,
+  and inherits nothing for an un-indexed source; C1 sets `QueryNode.clone_source` from
+  `exp.Clone` and leaves it `None` for non-CLONE creates; the parser's ordinal block maps
+  positions correctly and handles length mismatch without raising; `inferred_from_source_name`
+  defaults `False` and is set only on the no-catalog no-column-list dst.
 - **Integration** (real in-memory DuckDB via `Indexer().index_repo`):
   - *Empty-closure disambiguation* — table with edges but no `HAS_COLUMN` yields the
     no-catalog hint; normally-catalogued terminal column yields the generic hint.
   - *Ordinal correctness* — positional INSERT (no column list) into a DDL-catalogued table
     produces target-named dsts and a working `get_upstream_dependencies`; the source-rename
     fixture proves the dst is the **target** name, not the source name.
-  - *No-catalog fallback* — CLONE-style table (no DDL) keeps source-named dsts flagged
-    `inferred_from_source_name=true`, and the empty-closure hint fires.
+  - *CLONE inheritance end-to-end* — `CREATE TABLE fact CLONE src_ddl` + positional INSERT
+    yields `SqlColumn` rows on `fact` (`HAS_COLUMN source='clone_inherited'`), and the INSERT
+    dsts carry the **inherited target** names (not source names) with
+    `inferred_from_source_name=false`; `get_upstream_dependencies` on an inherited column
+    returns the source — the report's table shape, corrected.
+  - *CLONE chain* — `fact2 CLONE fact1 CLONE src_ddl` inherits `src_ddl`'s catalog onto `fact2`.
+  - *CLONE degrade (un-indexed source)* — `fact_orphan CLONE ext.unknown` (source absent) keeps
+    source-named dsts flagged `inferred_from_source_name=true`, and the empty-closure hint
+    fires — no fabricated catalog.
+  - *CLONE cycle* — mutually-referencing CLONEs terminate with no catalog and no exception.
   - *Single-file no-op* — `reindex_file` of the same file with no aggregator does not crash
-    and degrades to the flagged fallback.
+    and degrades to the flagged fallback (no CLONE inheritance, no positional mapping).
 - **Perf invariants** — the four guard tests stay green; if Part B adds any per-column op,
   a scaling-guard counter is added (it should not, by construction).
 - **Observable-output rule** — every test asserts on returned node sets / hint substrings /
   edge flags, never "no exception raised" (CLAUDE.md).
-- **Live-DWH** (read-only, gitignored harness) — the report's exact failing call returns the
-  labelled hint; a catalog-available sibling resolves target names.
+- **Live-DWH** (read-only, gitignored harness) — the report's exact failing call is **fixed**
+  (returns upstream) if the CLONE source is indexed, else returns the labelled hint; a
+  catalog-available sibling resolves target names; the inherited-catalog row delta is recorded.
 
 ## Acceptance Criteria
 
@@ -497,15 +739,29 @@ migration path, and is not a breaking API change). Update
 - [ ] When **no** catalog is available, dsts keep source-derived names **and** carry
       `inferred_from_source_name=true` (no fabricated target name).
 - [ ] `CrossFileAggregator.ddl_columns_by_bare` is built from ordered DDL columns, excludes
-      ambiguous bare names, and is threaded into pass 2 via the confirmed existing seam; the
+      ambiguous bare names, and is shared by Part B and Part C; the
       block degrades to a no-op (flagged fallback) on the single-file path.
+- [ ] **(Part C) `CREATE TABLE … CLONE src` is parsed** — `QueryNode.clone_source` is set
+      from `exp.Clone` for CLONE creates and `None` otherwise.
+- [ ] **(Part C) A CLONE-built table with no own column-list DDL inherits its CLONE source's
+      ordered DDL catalog** as `SqlColumn`/`HAS_COLUMN` rows tagged `source='clone_inherited'`;
+      CLONE-of-CLONE chains resolve to the DDL donor; cycles and the hop limit terminate
+      cleanly inheriting nothing; an un-indexed source inherits nothing (degrades to A1/A2).
+- [ ] **(Part C × B) After inheritance, a positional INSERT into a CLONE-built table maps
+      projection *i* → inherited target column *i*** — dsts carry the real target names with
+      `inferred_from_source_name=false`; `get_upstream_dependencies` on an inherited column
+      returns the source (the report's table shape, corrected, when the source is indexed).
 - [ ] No new per-row `upsert_node`/`upsert_edge`; Part B's added work is once-per-statement
-      (mirrors the #25 block); the four perf-invariant guard tests stay green.
-- [ ] No `# TODO` in the happy path; every new helper has a grep-confirmed call site.
-- [ ] CLONE-source cataloguing and per-column star resolution are recorded as **deferred
-      follow-ups** (this plan's Non-Goals), not silently dropped.
-- [ ] Live-DWH re-verification recorded in the PR (read-only; report's exact call now
-      labelled; catalog-available sibling resolves; perf within budget).
+      (mirrors the #25 block); Part C's inherited rows ride the bulk upsert and Part C does no
+      per-column work; the four perf-invariant guard tests stay green.
+- [ ] No `# TODO` in the happy path; every new helper (`_empty_closure_hint`,
+      `resolve_clone_catalogs`) has a grep-confirmed call site.
+- [ ] Per-column `SELECT alias.*` star resolution is recorded as the **only** deferred
+      follow-up (this plan's Non-Goals), not silently dropped; CLONE cataloguing is now
+      in-scope and delivered.
+- [ ] Live-DWH re-verification recorded in the PR (read-only; report's exact call fixed if the
+      CLONE source is indexed, else labelled; catalog-available sibling resolves; CLONE source
+      identity + inherited row delta recorded; perf within budget).
 - [ ] Version bumped to **1.6.0** in `pyproject.toml` + `__init__.py` + `uv lock`; not
       tagged; no issue closed.
 
@@ -531,16 +787,39 @@ migration path, and is not a breaking API change). Update
 - **R5 — A1 hint mislabels a genuinely-terminal column on a CLONE table** (correctly has no
   upstream AND no catalog). *Mitigation:* the hint is explicitly framed as "unproven, not
   negative" — it does not claim lineage exists, only that absence is not authoritative for
-  no-catalog tables. This is the honest signal the report asked for.
+  no-catalog tables. This is the honest signal the report asked for. With Part C, this only
+  applies to CLONE tables whose source is un-indexed (cross-DB) — a smaller residual set.
+- **R6 (Part C) — Part B reads the catalog before Part C has inherited it** (sequencing
+  hazard: Part B at parse time / pass 2, Part C in the main process). *Mitigation:* the
+  preferred sequencing (Phase 0) resolves CLONE catalogs in the aggregator **before** pass-2
+  dispatch, so `ddl_columns_by_bare` already contains inherited entries when Part B reads it;
+  the fallback re-keys in the upsert seam. Phase 0 picks and records one; this is the single
+  highest-attention integration point.
+- **R7 (Part C) — CLONE cycle / unbounded chain hangs the indexer.** *Mitigation:* visited-set
+  cycle guard + bounded hop limit in `resolve_clone_catalogs`; on cycle/limit, inherit nothing.
+  A cycle-control fixture pins termination.
+- **R8 (Part C) — wrong-schema CLONE inheritance** (the CLONE source's bare name is ambiguous
+  across schemas). *Mitigation:* the source lookup uses `ddl_columns_by_bare`, which already
+  excludes `_ambiguous_bare` — an ambiguous source inherits nothing rather than a guessed
+  catalog (degrade to A1/A2), same discipline as Part B (R1).
+- **R9 (Part C) — CLONE-of-CTAS source.** A CLONE whose source is a CTAS (body, not fixed DDL
+  columns) has no entry in `ddl_columns_by_bare`. *Mitigation:* out of scope (it is the
+  star/body-resolution problem); Part C inherits nothing and degrades to A1/A2. Phase 0 STOPs
+  and records if this shape dominates the corpus.
+- **R10 (Part C) — perf budget regression** from the extra inherited catalog rows.
+  *Mitigation:* the rows ride the existing bulk/batched upsert and are bounded by CLONE-fact
+  catalog size; Phase 5 measures the delta against the ~210–256s baseline; >5 min is a STOP.
 
 ### Blocking Questions
 
-- **Should the CLONE-source column catalogue be folded into this PR rather than deferred?**
-  The report's own trigger table is only *labelled* (not *corrected*) by this plan, because
-  correcting it requires parsing `CREATE TABLE … CLONE` and inheriting the source table's
-  columns — a multi-hop schema feature with its own blast radius (CLONE parsing per dialect,
-  a schema-inheritance pass, source-of-source ambiguity). This plan **defers** it with
-  reasoning (see "Scope decision: the report's own table"). If the user wants it in-scope,
-  that is a separate design pass — flag before implementing, do not stretch this PR.
+- **(Resolved 2026-06-08 by user) Fold CLONE-source cataloguing into this PR.** The user
+  decided to fold it in rather than defer. It is now Part C above (in-scope, designed,
+  sequenced, with its own perf and pipeline-placement analysis). The previously-deferred
+  reasoning is preserved in "Part C — design notes & why the placement is safe."
+- **(Open for Phase 0, not blocking the plan) Part B × Part C sequencing.** The developer
+  resolves the parse-time-vs-main-process ordering in Phase 0 (preferred: resolve CLONE
+  catalogs in the aggregator before pass-2 dispatch). STOP only if a CLONE source is itself a
+  CTAS (CLONE-of-CTAS is out of scope) and that shape is common in the corpus.
 - **(Resolved, recorded) Per-column `SELECT alias.*` star resolution** (report follow-up 4)
-  is a distinct effort the report itself says can be scoped out; deferred as a Non-Goal.
+  is the only remaining deferred item — a distinct effort the report itself says can be scoped
+  out; deferred as a Non-Goal.

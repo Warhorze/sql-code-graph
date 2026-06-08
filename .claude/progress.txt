@@ -2236,3 +2236,38 @@ FEATURE: positional-insert-clone-blindspot (column-lineage blind spot for CLONE-
 SOURCE: plan/reports/dwh_positional_insert_column_blindspot.md
 PLAN: plan/sprints/positional_insert_clone_blindspot.md (drafting)
 STATUS: planning
+
+---
+
+## Handoff — architect-planner: positional_insert_clone_blindspot (CLONE folded in) [2026-06-08]
+
+ACTIVE AGENT: architect-planner (plan expansion complete — idle/available for Q&A + compliance)
+FEATURE: positional_insert_clone_blindspot
+BRANCH: docs/architecture-overhaul
+PLAN: plan/sprints/positional_insert_clone_blindspot.md (updated in place; committed)
+
+CHANGE: per user decision (2026-06-08) folded CLONE-source column cataloguing IN-SCOPE as
+new Part C (was previously deferred as a Non-Goal). Part C = C1 parse CREATE TABLE..CLONE
+src (exp.Clone, verified in sqlglot snowflake dialect) onto QueryNode.clone_source; C2
+inherit source's ordered DDL catalog onto CLONE target (SqlColumn/HAS_COLUMN
+source='clone_inherited'), chain-resolved with cycle guard + hop limit, degrade to nothing
+when source un-indexed/cross-DB. Composes with B: C feeds catalog into ddl_columns_by_bare,
+B maps positional INSERT projection i -> inherited target col i. A1/A2 remain the safety net.
+
+KEY DESIGN DECISIONS:
+  - Placement: CLONE inheritance in MAIN-PROCESS seam (indexer.py:430-433 defined_table_registry
+    loop after both passes), NOT pass-2 worker subprocesses (aggregator/cross-file graph live
+    in main process; threading into subprocs = more data movement, no benefit).
+  - Sequencing hazard B x C: B reads catalog at parse time (pass2), C inherits post-pass2.
+    PREFERRED resolution = resolve CLONE catalogs in aggregator (resolve_clone_catalogs())
+    BEFORE pass-2 dispatch so ddl_columns_by_bare has inherited entries when B reads it.
+    Developer picks + records in Phase 0. (R6)
+  - Perf invariants: C1 = one args.get per CREATE (O(N_create)); C2 = once after both passes,
+    O(N_clone_targets x chain_depth) dict lookups + bulk-upsert row appends. NO per-column
+    work, NO qualify/scope/expand/sg_lineage. Inherited rows ride existing bulk upsert.
+    All CLAUDE.md invariants unaffected (row-by-row table in plan).
+  - SemVer: still 1.5.1 -> 1.6.0 minor (CLONE = additive capability).
+  - Only deferred item now: per-column SELECT alias.* star resolution (report follow-up 4).
+
+NEXT: plan-reviewer gate, then developer. architect-planner idle for Q&A + compliance check
+      on "finished". Phase 0 must resolve B x C sequencing + check for CLONE-of-CTAS shape.
