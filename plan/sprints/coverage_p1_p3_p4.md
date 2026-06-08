@@ -402,6 +402,78 @@ projection). Record the before/after numbers in the postmortem.
 | Perf regression from a hot-path scaling flip | No new per-column op; all changes once-per-statement or once-per-row. Four perf-guard files run after each phase; whole-corpus timing ≤180s checked post-merge. |
 | Edge health misses ≥95% because residual P2 phantom edges remain | Findings project P2 residual collapses once P3/P4 supply catalogs; if measured health lands below 95%, that is a **stop condition** — re-run the diagnostic (`scripts/column_coverage_check.py`) to identify the residual pattern before claiming the milestone, do not relax the gate. |
 
+## Escalation — P1 conflicts with multi-hop upstream traversal
+
+**Date**: 2026-06-08  
+**Status**: Escalated to planner — P1 implementation stopped pending redesign.
+
+### What was tried
+
+Implemented P1 suppression: computed `_suppress_cte_dsts = isinstance(stmt, exp.Insert) and
+dst_table is not None and bool(positional_col_names)` once before the CTE-projection loop
+and guarded the outer `if isinstance(body, exp.Select) and body.args.get("with_"):` block
+with `if not _suppress_cte_dsts:`.
+
+P1 acceptance tests passed (XPASS → need xfail removal). But `test_analyze_case_fold.py::
+test_uppercase_upstream_anchor_returns_same_ids_as_lowercase` broke.
+
+### Why the plan's approach breaks existing functionality
+
+The CTE-projection block emits TWO kinds of edges for INSERT-with-CTE:
+
+1. **CTE chain edges** (needed): `staging.src_raw.val → raw.m` — where the CTE node is
+   the `dst`. These are required for multi-hop upstream traversal:
+   `mart.fact_enriched.m ← raw.m ← staging.src_raw.val`.
+
+2. **Leak edges** (the P1 problem): same edges viewed differently — the "leak" IS the chain
+   edge. The P1 test asserts `raw.*` / `base.*` does NOT appear as a dst_key. But upstream
+   traversal REQUIRES this edge to exist (following dst→src).
+
+The plan's claim that "the authoritative `t.col` edges already carry the full
+source→target lineage" is only correct for DIRECT (1-hop) lineage. The positional block
+emits `raw.m → mart.fact_enriched.m`, but the upstream tool needs to continue from `raw.m`
+back to `staging.src_raw.val`. That second hop requires the suppressed edge.
+
+### Affected test
+
+`tests/integration/test_analyze_case_fold.py::test_uppercase_upstream_anchor_returns_same_ids_as_lowercase`
+
+SQL fixture:
+```sql
+INSERT INTO mart.fact_enriched (m, k)
+WITH raw AS (SELECT val AS m, key AS k FROM staging.src_raw)
+SELECT m, k FROM raw;
+```
+Expected upstream from `mart.fact_enriched.m`: `['staging.src_raw.val']`  
+Actual with P1 fix: `['raw.m']` (chain broken, can only reach CTE node, not original source)
+
+### Constraint
+
+Cannot suppress all CTE-projection edges for INSERT-with-emitted-target because:
+- The positional block emits edges where the CTE IS the src (e.g. `raw.m → mart.fact_enriched.m`)
+- The CTE-projection block emits edges where the CTE IS the dst (e.g. `staging.src_raw.val → raw.m`)
+- Upstream traversal requires BOTH to chain the full path
+
+### Planner action needed
+
+Redesign P1 so that:
+- CTE chain edges (`src_table.col → cte_name.col`) are preserved (needed for traversal)
+- EITHER the P1 acceptance tests are relaxed (the "leak" is an acceptable graph shape for
+  INSERT-with-CTE since traversal needs these edges), OR
+- A different fix is found (e.g. the P1 "leak" is measured differently, or the upstream
+  traversal is redesigned to follow a different path)
+
+Alternative approaches to explore:
+1. **Accept dual-destination graph shape**: Keep CTE chain edges. The "leak" in the DWH
+   was that 15,102 edges landed ONLY on CTE nodes (with no path forward). If both the real
+   target AND the CTE chain are present, traversal works. The P1 test assertion `not any
+   cte_* in dst_keys` may be too strict.
+2. **Rewrite P1 test to allow CTE chain but require real target**: Change the test to assert
+   `ba.fact.*` exists in dst_keys, without asserting `base.*` must NOT be in dst_keys.
+3. **Emit direct source edges in the positional block**: Instead of relying on CTE-chain
+   edges, have the positional block resolve the full transitive source. This is a deeper
+   change to the `#25` block.
+
 ## Rollout / Rollback
 
 - **Rollout:** ships in `1.7.0`. Re-index is the migration path (no backward-compat shims,
