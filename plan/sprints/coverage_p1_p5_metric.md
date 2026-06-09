@@ -339,28 +339,33 @@ kinds cannot downgrade a real table.
 ### P1b — positional block UNION handling
 
 The `#25` positional block in [`base.py`](../../src/sqlcg/parsers/base.py) (~L776–871)
-extracts column names from the final SELECT body to match INSERT column positions. When the
-terminal CTE body is `exp.Union`, the block needs to walk left to the deepest `exp.Select`
-to extract columns:
+emits column lineage from INSERT+CTE patterns. When the terminal CTE body is an `exp.Union`,
+something in the block silently fails to emit INSERT-target edges.
 
-```python
-body = cte_body
-while isinstance(body, exp.Union):
-    body = body.this  # left branch of UNION
-# now body is a Select — extract projections
-```
+> **BLOCKER NOTE (plan-reviewer):** The `#25` block at L776–871 operates on
+> `col_expressions` drawn from the outer SELECT body (e.g. `SELECT c1, c2 FROM cte_final`)
+> — not from the CTE body itself. The `body` variable at L780 is the outer INSERT's SELECT,
+> which is a plain `exp.Select`, not a Union. The Union lives inside the CTE definition
+> (`cte_final AS (SELECT … UNION SELECT …)`). The fix direction — a Union walk — is correct
+> in principle, but the **target variable** must be identified during diagnosis (Step 2.1),
+> not assumed from the Design section. The pseudo-code below is intentionally omitted to
+> avoid misdirecting the developer. Step 2.1 must pinpoint the exact line and variable
+> before any code is written.
 
-This is safe because:
-- Column names in a UNION must be consistent across branches (SQL semantics); the left
-  branch column names are authoritative.
+Directional guidance (to be verified in Step 2.1):
+- The UNION structure is inside the CTE body, not the outer INSERT SELECT.
+- The fix likely involves resolving the CTE body to its left-most `exp.Select` when the
+  block looks up the terminal CTE's column names or projection count:
+  `while isinstance(cte_body, exp.Union): cte_body = cte_body.this`
+- Column names in a UNION are consistent across branches (SQL semantics); the left branch
+  is authoritative for name extraction.
 - No new `qualify`/`build_scope`/`exp.expand`/`sg_lineage` calls — purely an AST walk on
   the already-parsed CTE body.
 - O(UNION depth) — constant for any realistic CTE.
 
-**Perf invariant check:** the UNION walk is a pure Python AST traversal (no sqlglot
-operations beyond attribute access). It does not re-enter the hot path. The perf scaling
-guard will not flag it. However, add a behavioural assertion in the unit test: the UNION
-walk must happen **once before** the column-assignment loop, not inside it.
+**Perf invariant check:** The walk is pure Python AST traversal. It must run once per
+INSERT-with-CTE statement, not once per column. Add a behavioural assertion in the unit
+test confirming this.
 
 ---
 
@@ -392,6 +397,11 @@ walk must happen **once before** the column-assignment loop, not inside it.
   (from P4 catalog). Assert the COLUMN_LINEAGE edge to `da.htdyn_vendvendor.x` is counted
   in `good_edges` by the coverage metric.
 - Re-index DWH. Verify Sub-problem A table count drops from 55 toward 0.
+- **Remove `xfail` markers** from `test_P1_cte_destination_does_not_leak_to_cte_node` and
+  `test_P1_cte_chain_final_cte_does_not_leak` in
+  [`tests/integration/test_column_coverage_patterns.py`](../../tests/integration/test_column_coverage_patterns.py)
+  for any pattern that P1a now fixes. If P1b is required to fix those tests, defer xfail
+  removal to Step 2.2. Leaving `strict=True` xfail on a now-passing test causes CI failure.
 
 ### Phase 2: P1b — Diagnose and fix positional block UNION terminal
 
