@@ -460,8 +460,8 @@ guard files must pass after each phase.
 
 | Test | Location | Pins |
 |------|----------|------|
-| `test_P1a_ctas_target_kind_is_table_not_derived` | `tests/integration/test_column_coverage_patterns.py` | After indexing CTAS-then-INSERT, `SqlTable.kind='table'`, `HAS_COLUMN` wired, edge counted good |
-| `test_P1a_kind_guard_prevents_derived_overwrite` | `tests/integration/test_column_coverage_patterns.py` | Two-file scenario: CTAS file parsed first, INSERT file second; kind stays `'table'` |
+| `test_P1a_ctas_target_kind_is_table_not_derived` | `tests/integration/test_column_coverage_patterns.py` | After indexing CTAS-then-INSERT, `SqlTable.kind='table'`. **Passes today** — regression guard (Candidate 1 ruled out; real DWH failure is cross-batch, not reproducible in minimal fixture). |
+| `test_P1a_kind_guard_prevents_derived_overwrite` | `tests/integration/test_column_coverage_patterns.py` | CTAS+INSERT same run: kind='table' and HAS_COLUMN wired. **Passes today** — regression guard for Candidate 2 in-batch case. |
 | `test_P1b_insert_cte_with_union_terminal_reaches_real_target` | `tests/integration/test_column_coverage_patterns.py` | INSERT+CTE+UNION terminal emits real-target edges, not CTE-only |
 | `test_P1b_union_walk_happens_once_per_statement` | `tests/unit/test_perf_scaling_guard.py` (or new `test_T_p1b_union_walk.py`) | UNION walk is per-statement, not per-column |
 

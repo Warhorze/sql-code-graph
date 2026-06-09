@@ -534,3 +534,170 @@ def test_P4_ctas_star_select_gracefully_degrades(tmp_path):
         db.close()
 
     assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"
+
+
+# ---------------------------------------------------------------------------
+# P1a — CTAS kind misclassification
+#
+# Pattern from DWH: 55 schema-qualified CTAS target tables stored as
+# kind='derived' instead of kind='table'.
+#
+# Root cause analysis (plan-reviewer, 2026-06-09):
+#   - Candidate 1 (parser): sqlglot normalises TRANSIENT/TEMPORARY TABLE to
+#     exp.Create(kind='TABLE'), so _parse_statement already matches all CTAS
+#     variants. Candidate 1 is NOT the root cause.
+#   - Candidate 2 (indexer): at L1335 of indexer.py, when canonical_by_bare
+#     lookup fails (e.g. bare name is ambiguous or the CTAS was not registered
+#     in defined_table_ids for that batch), target_kind defaults to 'derived'.
+#     This is the real root cause for the DWH tables.
+#
+# The simple 2-3 file fixture already passes today (CTAS and INSERT are in the
+# same index run so defined_table_ids includes the CTAS). These tests are
+# written WITHOUT xfail as passing regression guards: they confirm the correct
+# behaviour that must not regress. The DWH-specific cross-batch failure must
+# be diagnosed against the live DWH corpus — it is not reproducible in a
+# minimal in-memory fixture without controlling batch boundaries.
+# ---------------------------------------------------------------------------
+
+
+def test_P1a_ctas_target_kind_is_table_not_derived(tmp_path):
+    """CTAS target followed by INSERT from another file must have kind='table', not 'derived'.
+
+    Regression guard for P1a: any change to the CTAS recognition or kind-merge guard
+    must not break the baseline case where CTAS and INSERT are indexed together.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.other (x INT);",
+            "ctas.sql": "CREATE TABLE da.htdyn_fact AS SELECT x FROM da.src;",
+            "insert.sql": "INSERT INTO da.htdyn_fact SELECT x FROM da.other;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'da.htdyn_fact'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "da.htdyn_fact must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for CTAS target da.htdyn_fact, got kind='{rows[0]['kind']}'"
+    )
+
+
+def test_P1a_kind_guard_prevents_derived_overwrite(tmp_path):
+    """CTAS-then-INSERT: kind='table' must survive after the INSERT file is processed.
+
+    Regression guard for Candidate 2 (plan): the indexer kind-merge guard must not
+    allow a kind='derived' row from the INSERT-target path to overwrite an existing
+    kind='table' row in the same index run.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "src.sql": "CREATE TABLE ba.src (a INT, b INT);",
+            "ctas.sql": "CREATE TABLE ba.target AS SELECT a, b FROM ba.src;",
+            "insert.sql": "INSERT INTO ba.target SELECT a, b FROM ba.src;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'ba.target'",
+            {},
+        )
+        has_col = db.run_read(
+            "SELECT COUNT(*) AS n FROM HAS_COLUMN hc "
+            "JOIN SqlTable t ON hc.src_key = t.qualified "
+            "WHERE t.qualified = 'ba.target'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "ba.target must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for ba.target after INSERT file processed, "
+        f"got kind='{rows[0]['kind']}'"
+    )
+    assert has_col[0]["n"] > 0, (
+        "ba.target must have HAS_COLUMN rows (P4 catalog); "
+        "they only wire if kind='table' is preserved"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1b — INSERT + CTE with UNION terminal
+#
+# Pattern from DWH: terminal CTE body is a UNION; positional block emits
+# CTE-destination edges only, not real INSERT-target edges.
+# This test must FAIL before the P1b fix lands.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="P1b: positional block UNION terminal not yet fixed",
+)
+def test_P1b_insert_cte_with_union_terminal_reaches_real_target(tmp_path):
+    """INSERT+CTE where the terminal CTE body is a UNION must produce edges landing
+    on the real INSERT target, not only on the terminal CTE node.
+
+    Reproduces Sub-problem B from the DWH (4,561 orphaned edges on CTE nodes such as
+    cte_insert, final, base, totaal that are UNION bodies):
+
+        INSERT INTO ba.fact (col_a, col_b)
+        WITH
+            cte_data AS (SELECT col_a, col_b FROM ba.src),
+            cte_final AS (
+                SELECT col_a, col_b FROM cte_data
+                UNION
+                SELECT col_a, col_b FROM cte_data
+            )
+        SELECT col_a, col_b FROM cte_final;
+
+    Expected: COLUMN_LINEAGE dst_key contains 'ba.fact.col_a' and 'ba.fact.col_b'
+    Failing today: dst_key is 'cte_final.col_a' / 'cte_final.col_b' (or absent)
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": """\
+                CREATE TABLE ba.src (col_a INT, col_b INT);
+                CREATE TABLE ba.fact (col_a INT, col_b INT);
+            """,
+            "etl.sql": """\
+                INSERT INTO ba.fact (col_a, col_b)
+                WITH
+                    cte_data AS (SELECT col_a, col_b FROM ba.src),
+                    cte_final AS (
+                        SELECT col_a, col_b FROM cte_data
+                        UNION
+                        SELECT col_a, col_b FROM cte_data
+                    )
+                SELECT col_a, col_b FROM cte_final;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT dst_key FROM COLUMN_LINEAGE "
+            "WHERE dst_key LIKE 'ba.fact.%' OR dst_key LIKE 'cte_final.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    dst_keys = {r["dst_key"] for r in edges}
+    assert "ba.fact.col_a" in dst_keys, (
+        f"Expected lineage edge to ba.fact.col_a; got destinations: {sorted(dst_keys)}"
+    )
+    assert "ba.fact.col_b" in dst_keys, (
+        f"Expected lineage edge to ba.fact.col_b; got destinations: {sorted(dst_keys)}"
+    )
+    assert not any(k.startswith("cte_final.") for k in dst_keys), (
+        f"Edges must NOT land on the CTE node 'cte_final.*'; "
+        f"got: {sorted(k for k in dst_keys if k.startswith('cte_final.'))}"
+    )
