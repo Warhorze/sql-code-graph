@@ -247,6 +247,97 @@ class SnowflakeParser(AnsiParser):
         """
         return self._parse_with_recovery(sql, self.DIALECT)
 
+    def _transform_statements(self, statements: list[Any]) -> list[Any]:
+        """Snowflake P5: track USE SCHEMA context and qualify bare table references.
+
+        Walks the statement list once (O(N_statements)).  When a ``USE SCHEMA <s>``
+        statement is encountered it becomes the active schema context for all
+        subsequent statements in the file.  For each subsequent statement, bare
+        table references (no db/catalog prefix) are qualified to ``<schema>.<name>``
+        via an in-place AST mutation — ``exp.Table.db`` is set to the schema identifier.
+
+        CTE alias names defined within each statement are excluded from qualification
+        so that CTE-internal references stay unqualified and sqlglot can resolve them
+        normally.
+
+        Perf invariant: pure AST walk — no qualify/build_scope/exp.expand/sg_lineage
+        calls.  The walk is O(N_tables_per_stmt) per statement, executed once per
+        statement in the file-level loop.
+
+        Args:
+            statements: List of parsed sqlglot AST nodes from ``_do_parse``.
+
+        Returns:
+            The same list with ``USE SCHEMA`` nodes replaced by ``None`` (to skip them
+            in the statement loop) and bare table refs in subsequent nodes qualified.
+        """
+        current_schema: str | None = None
+        result: list[Any] = []
+
+        for stmt in statements:
+            if stmt is None:
+                result.append(None)
+                continue
+
+            # Detect USE SCHEMA / USE DATABASE statements (Snowflake context setters).
+            # sqlglot parses these as exp.Use with args['kind'] = Var('SCHEMA') or
+            # Var('DATABASE').  We track SCHEMA context; DATABASE context is ignored
+            # (the full db.schema qualifier in the db field would require more state).
+            if isinstance(stmt, exp.Use):
+                kind_var = stmt.args.get("kind")
+                kind_str = (kind_var.name if kind_var else "").upper()
+                if kind_str == "SCHEMA" and stmt.this is not None:
+                    schema_table = stmt.this
+                    current_schema = schema_table.name.lower() if schema_table.name else None
+                # Suppress the USE statement — it is not a real query node.
+                result.append(None)
+                continue
+
+            # Qualify bare table references in this statement if we have a schema context.
+            if current_schema:
+                self._qualify_bare_tables(stmt, current_schema)
+
+            result.append(stmt)
+
+        return result
+
+    @staticmethod
+    def _qualify_bare_tables(stmt: Any, schema: str) -> None:
+        """In-place: prefix all bare (no db/catalog) exp.Table refs with ``schema``.
+
+        Excludes CTE alias names defined within ``stmt`` so that intra-statement CTE
+        references remain unqualified and sqlglot can resolve them normally.
+
+        Args:
+            stmt: sqlglot AST node to mutate in place.
+            schema: Lowercase schema name to prepend (e.g. ``'da'``).
+        """
+        # Collect CTE names defined in this statement so we can skip them.
+        cte_names: set[str] = set()
+        # CTEs may appear on the stmt itself (exp.Select with WITH) or on the
+        # expression body (exp.Insert whose SELECT body carries WITH).
+        for candidate in (stmt, getattr(stmt, "expression", None)):
+            if candidate is None:
+                continue
+            with_clause = candidate.args.get("with_") or candidate.args.get("with")
+            if with_clause is not None:
+                for cte in getattr(with_clause, "expressions", []):
+                    if cte.alias:
+                        cte_names.add(cte.alias.lower())
+
+        for table in stmt.find_all(exp.Table):
+            # Skip if already qualified (has a db or catalog component).
+            if table.args.get("db") or table.args.get("catalog"):
+                continue
+            # Skip CTE alias names — they are resolved within the statement scope.
+            if table.name and table.name.lower() in cte_names:
+                continue
+            # Skip empty or synthetic names.
+            if not table.name:
+                continue
+            # Apply the schema prefix in place.
+            table.set("db", exp.Identifier(this=schema, quoted=False))
+
     def _has_scripting_block(self, sql: str) -> bool:
         """Token-aware BEGIN detection — avoids false-positives on string literals and comments.
 
