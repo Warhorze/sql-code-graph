@@ -416,10 +416,49 @@ class DuckDBBackend(GraphBackend):
         arrays = [[row.get(c) for row in rows] for c in cols]
         col_list = ", ".join(f'"{c}"' for c in cols)
         unnest_cols = ", ".join(f'unnest(?::VARCHAR[]) AS "{c}"' for c in cols)
-        self._conn.execute(
-            f'INSERT OR REPLACE INTO "{label}" ({col_list}) SELECT {unnest_cols}',
-            arrays,
-        )
+
+        if label == NodeLabel.TABLE:
+            # P1a (DWH 2026-06-09): guard against cross-batch kind downgrade.
+            # A CTAS target written as kind='table' in one batch must not be overwritten
+            # with kind='derived' when a later batch processes an INSERT into that table
+            # and canonical_by_bare cannot resolve it.  The in-batch dedup in
+            # _flush_row_batch already excludes 'derived' from upgrading 'table' within
+            # a batch; this ON CONFLICT guard extends that rule across batch boundaries
+            # for rows already committed to the database.
+            # defined_in_file is similarly preserved: a row with DDL provenance keeps
+            # its defined_in_file even when a later reference row arrives with ''.
+            non_pk_cols = [c for c in cols if c != "qualified"]
+            # Build per-column SET clauses; kind and defined_in_file get special guards.
+            set_parts: list[str] = []
+            for c in non_pk_cols:
+                if c == "kind":
+                    set_parts.append(
+                        '"kind" = CASE '
+                        "WHEN \"SqlTable\".\"kind\" IN ('table', 'view') "
+                        "AND EXCLUDED.\"kind\" = 'derived' "
+                        'THEN "SqlTable"."kind" '
+                        'ELSE EXCLUDED."kind" END'
+                    )
+                elif c == "defined_in_file":
+                    set_parts.append(
+                        '"defined_in_file" = CASE '
+                        "WHEN EXCLUDED.\"defined_in_file\" = '' "
+                        'THEN "SqlTable"."defined_in_file" '
+                        'ELSE EXCLUDED."defined_in_file" END'
+                    )
+                else:
+                    set_parts.append(f'"{c}" = EXCLUDED."{c}"')
+            set_clause = ", ".join(set_parts)
+            self._conn.execute(
+                f'INSERT INTO "{label}" ({col_list}) SELECT {unnest_cols} '
+                f'ON CONFLICT ("qualified") DO UPDATE SET {set_clause}',
+                arrays,
+            )
+        else:
+            self._conn.execute(
+                f'INSERT OR REPLACE INTO "{label}" ({col_list}) SELECT {unnest_cols}',
+                arrays,
+            )
 
     def upsert_edges_bulk(
         self,

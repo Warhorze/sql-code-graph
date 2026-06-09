@@ -1,17 +1,17 @@
 {
   "label": "full corpus (ddl + etl)",
-  "run_date": "2026-06-08T22:23:50",
+  "run_date": "2026-06-09T08:00:12",
   "corpus_dir": "/home/ignwrad/Projects/dwh",
   "dialect": "snowflake",
   "total_files": 1378,
-  "runtime_seconds_total": 106.7,
-  "rss_delta_kb": 291728,
-  "pass2_skipped": 881,
-  "parse_errors": 3326,
-  "lineage_edges_created": 48537,
-  "tables_found": 2071,
-  "columns_defined": 20952,
-  "star_edges_expanded": 11208,
+  "runtime_seconds_total": 129.98,
+  "rss_delta_kb": 317356,
+  "pass2_skipped": 883,
+  "parse_errors": 3312,
+  "lineage_edges_created": 46413,
+  "tables_found": 2026,
+  "columns_defined": 35393,
+  "star_edges_expanded": 12798,
   "batch_size": 50,
   "anchor_omloopsnelheid": {
     "lineage_edge_count": 0,
@@ -21,16 +21,16 @@
     "lineage_edge_count_total": 0,
     "sample_edges": []
   },
-  "parse_failed_queries": 3575,
-  "parse_errors_total": 3326,
+  "parse_failed_queries": 3569,
+  "parse_errors_total": 3312,
   "comparison_with_sprint_07": {
     "parse_only_baseline_seconds": 119.6,
     "e1_count_baseline": 1148,
-    "parse_errors_now": 3326,
-    "parse_errors_delta": 2178
+    "parse_errors_now": 3312,
+    "parse_errors_delta": 2164
   },
   "budget_check_1600_files": {
-    "extrapolated_seconds": 123.89,
+    "extrapolated_seconds": 150.91,
     "budget_seconds": 300,
     "passes_budget": true
   }
