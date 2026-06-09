@@ -302,7 +302,6 @@ def test_P2_multi_join_aliases_all_resolve_to_real_tables(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="P3: schema stripped from quoted view name not yet fixed")
 def test_P3_quoted_view_with_spaces_preserves_schema_in_sqlcolumn(tmp_path):
     """SqlColumn.table_name for a quoted view name with spaces must include the schema.
 
@@ -357,7 +356,6 @@ def test_P3_quoted_view_with_spaces_preserves_schema_in_sqlcolumn(tmp_path):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="P3: HAS_COLUMN wiring for quoted views not yet fixed")
 def test_P3_quoted_view_lineage_reaches_source_via_has_column(tmp_path):
     """The full chain: source table → quoted view → downstream query must be traversable.
 
@@ -424,7 +422,6 @@ def test_P3_quoted_view_lineage_reaches_source_via_has_column(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
 def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     """CREATE TABLE t AS SELECT a, b FROM s must produce SqlColumn rows for a and b.
 
@@ -446,7 +443,7 @@ def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     )
     try:
         cols = db.run_read(
-            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.derived_fact'",
+            "SELECT col_name FROM SqlColumn WHERE table_qualified = 'ba.derived_fact'",
             {},
         )
         hc = db.run_read(
@@ -470,7 +467,6 @@ def test_P4_ctas_columns_derived_from_select_body(tmp_path):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="P4: CTAS column discovery not yet implemented")
 def test_P4_ctas_with_cte_body_columns_derived(tmp_path):
     """CTAS whose body uses a CTE must still derive column names from the outer SELECT.
 
@@ -499,7 +495,7 @@ def test_P4_ctas_with_cte_body_columns_derived(tmp_path):
     )
     try:
         cols = db.run_read(
-            "SELECT col_name FROM SqlColumn WHERE table_name = 'ba.tmp_base'",
+            "SELECT col_name FROM SqlColumn WHERE table_qualified = 'ba.tmp_base'",
             {},
         )
     finally:

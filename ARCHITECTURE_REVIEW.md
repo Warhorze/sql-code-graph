@@ -133,6 +133,30 @@ A kind-filter (`WHERE kind IS NULL OR kind IN ('table','external')`) keeps CTE/d
 scratch nodes out of user-facing surfaces. Up/down direction differ only in which
 `COLUMN_LINEAGE` edge endpoint binds the result's `file:line`.
 
+> **Mental model — CTE/derived edges are structural, not coverage gaps.** For
+> `INSERT INTO t (cols) WITH cte … SELECT … FROM cte`, the parser emits two *different,
+> both-correct* edge families: (1) **CTE chain edges** where the CTE node is the `dst`
+> (`src.x → cte.col`, from the CTE-projection block) and (2) **positional edges** where the
+> CTE is the `src` and the real target is the `dst` (`cte.col → t.col`, from the `#25`
+> block). Multi-hop **upstream** traversal walks *both* to chain `t.col ← cte.col ← src.x`.
+> A `kind='cte'`/`kind='derived'` node is a scratch intermediate, never persistent schema,
+> so it can **never** carry a `HAS_COLUMN` row — but it is *required* in the edge set for
+> traversal. Suppressing family (1) (an earlier "P1 de-leak" attempt) dead-ends upstream
+> traversal at the CTE node and was reverted; the canary is
+> [`test_analyze_case_fold`](tests/integration/test_analyze_case_fold.py)
+> (`test_uppercase_upstream_anchor_returns_same_ids_as_lowercase`).
+
+> **Coverage-metric formula — edge health is scoped to real-table destinations.** The
+> `edge_health` and `blindspot` metrics in [`coverage.py`](src/sqlcg/cli/coverage.py)
+> count a `COLUMN_LINEAGE` edge as "good" only when its stripped dst table has a
+> `HAS_COLUMN` entry. Because CTE/derived dst edges can never be catalogued (above), they
+> are **excluded from both numerator and denominator** via
+> `WHERE EXISTS (SELECT 1 FROM "SqlTable" t WHERE t.qualified = <dst_table strip> AND
+> t.kind NOT IN ('cte','derived'))`. This mirrors the analyze-surface kind-filter: scratch
+> nodes are scored out of coverage exactly as they are filtered out of user surfaces.
+> Counting them (the pre-2026-06 formula) made ≥95 % edge health mathematically impossible
+> — ~29 % of all edges legitimately point at CTE/derived intermediates.
+
 ### 3.3 MCP server + single-writer model
 [`server.py`](src/sqlcg/server/server.py) runs FastMCP over stdio. Writes (`index`,
 `reindex`) are enqueued and drained by [`writer.py`](src/sqlcg/server/writer.py) under
@@ -175,6 +199,7 @@ Only genuinely-open items live here. Resolved findings and their reasoning are i
 | F4 | LOW | **Single-impl ABC + stale Cypher/Kuzu docstrings.** `GraphBackend` adds indirection without polymorphism now; `clear_all_tables` is a `NotImplementedError`-default on the ABC; a docstring still says "skipped by KuzuDB's MERGE semantics". De-Cypher the docstrings and relocate `clear_all_tables` off the ABC, or collapse the ABC if v2 ACCESS_HISTORY is shelved. | [`graph_db.py`](src/sqlcg/core/graph_db.py) | none yet |
 | F5 | LOW | **TC6b guard reconstructs the query.** The terminal-sink test rebuilds the downstream Cypher/SQL string instead of running `analyze downstream` end-to-end, so it can drift from the shipped query. Replace with a `CliRunner`-based guard. | [`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py) | none yet |
 | F6 | LOW | **Dead `_set_backend_lock` stub.** Defined but never called (the escalation plumbing it belonged to was deleted in the DuckDB migration). Violates the CLAUDE.md "every new method has a grep-confirmed call site" rule — remove it. | [`tools.py`](src/sqlcg/server/tools.py) | none yet |
+| F7 | MED | **95 % edge-health milestone is ~30 points short after P1/P3/P4.** With the scoped metric (CTE/derived excluded) the DWH baseline is ≈41 %; P3 (+6,045 edges) + P4 lift it to ≈55–65 %. Reaching ≥95 % needs catalogs for ~566 residual **real-table** blindspots — the P2 cohort (temp / cross-file / unseen-DDL tables) and the deferred P5 `USE SCHEMA` bare-name group (956 tables). The 95 % milestone must be re-baselined or scoped to a follow-up sprint (BQ-2). | [`coverage.py`](src/sqlcg/cli/coverage.py), [`base.py`](src/sqlcg/parsers/base.py) | [coverage_p1_p3_p4](plan/sprints/coverage_p1_p3_p4.md) §95 % Feasibility Analysis |
 
 ---
 

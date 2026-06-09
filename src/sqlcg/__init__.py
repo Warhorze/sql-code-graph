@@ -1,5 +1,5 @@
 """SQL Code Graph - SQL lineage and dependency analysis tool."""
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 __all__ = ["__version__"]

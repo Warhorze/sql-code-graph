@@ -13,7 +13,7 @@
     "BELONGS_TO": 0,
     "DEFINED_IN": 13,
     "QUERY_DEFINED_IN": 14,
-    "HAS_COLUMN": 28,
+    "HAS_COLUMN": 76,
     "SELECTS_FROM": 11,
     "COLUMN_LINEAGE": 54,
     "STAR_SOURCE": 2

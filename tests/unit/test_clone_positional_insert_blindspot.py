@@ -238,9 +238,12 @@ def test_A1_empty_closure_hint_distinguishes_no_catalog_from_terminal_column(tmp
 
     sql_path = tmp_path / "etl.sql"
     sql_path.write_text(
-        # fact_nocat: no DDL columns, loaded by no-column-list positional INSERT
-        # -> COLUMN_LINEAGE edges exist, HAS_COLUMN is empty.
-        "CREATE TABLE s.fact_nocat AS SELECT 1 AS placeholder WHERE FALSE;\n"
+        # fact_nocat: bare CREATE with no column list and no CTAS body, so P4 cannot
+        # derive any columns. Loaded by a no-column-list positional INSERT.
+        # -> COLUMN_LINEAGE edges exist, HAS_COLUMN is empty (truly catalog-less).
+        # Previously used `CREATE TABLE ... AS SELECT 1 AS placeholder WHERE FALSE`,
+        # but P4 derives 'placeholder' from that CTAS projection, giving it a catalog.
+        "CREATE TABLE s.fact_nocat;\n"
         "INSERT INTO s.fact_nocat SELECT t.x AS renamed_x FROM s.src t;\n"
         # fact_terminal: has a real DDL catalog and a column with no upstream lineage
         # (a literal-only projection) -> genuinely terminal.

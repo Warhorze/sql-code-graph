@@ -373,6 +373,16 @@ class AnsiParser(SqlParser):
             if isinstance(_expr, exp.Select):
                 defined_body = _expr
 
+        # P3/P4: derive output columns from the SELECT projection for CREATE TABLE/VIEW AS SELECT.
+        # Only when defined_columns is still empty (explicit column-list DDL already populated it).
+        # Both TABLE and VIEW AS SELECT gain a catalog; CLONE/CREATE without SELECT body unchanged.
+        if isinstance(stmt, exp.Create) and stmt.kind in ("TABLE", "VIEW") and not defined_columns:
+            _body = stmt.expression
+            if isinstance(_body, exp.Subquery):
+                _body = _body.this
+            if isinstance(_body, exp.Select):
+                defined_columns = self._extract_select_output_columns(_body)
+
         # Remove duplicates while preserving order
         sources = self._deduplicate_table_refs(sources)
 
@@ -448,6 +458,49 @@ class AnsiParser(SqlParser):
                 if len(col_name) >= 2 and col_name[0] == '"' and col_name[-1] == '"':
                     col_name = col_name[1:-1]
                 columns.append(col_name.lower())
+        return columns
+
+    @staticmethod
+    def _extract_select_output_columns(select_body: exp.Select) -> list[str]:
+        """Derive output column names from a SELECT projection list.
+
+        For each projection: alias if present, else the bare column name. Star
+        projections and unnamed/literal expressions yield nothing (graceful degrade).
+        Names are lowercased + quote-stripped, identical to _extract_defined_columns /
+        ColumnRef.__post_init__, so the catalog shares node identity with lineage cols.
+
+        Used by P3 (CREATE VIEW AS SELECT) and P4 (CREATE TABLE AS SELECT) to populate
+        defined_columns when no explicit column list is present.
+
+        Args:
+            select_body: A sqlglot exp.Select node (the outer SELECT of a CTAS or view)
+
+        Returns:
+            List of column names derived from the projection, in source order.
+            Empty list if all projections are stars or unresolvable literals.
+        """
+        columns: list[str] = []
+        for expr in select_body.expressions:
+            # Alias wins: SELECT x AS col_a → col_a
+            if expr.alias:
+                col_name: str = expr.alias
+            elif isinstance(expr, exp.Column):
+                # Plain column ref: SELECT d.dn_datum → dn_datum; SELECT col → col
+                col_name = expr.name
+            elif isinstance(expr, (exp.Star,)):
+                # SELECT * or SELECT t.* — cannot statically resolve; skip
+                continue
+            else:
+                # Unnamed literal, function without alias, etc. — skip
+                continue
+
+            if not col_name or col_name == "*":
+                continue
+
+            # Normalize: lowercase + strip surrounding double-quotes
+            if len(col_name) >= 2 and col_name[0] == '"' and col_name[-1] == '"':
+                col_name = col_name[1:-1]
+            columns.append(col_name.lower())
         return columns
 
     @staticmethod
