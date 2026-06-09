@@ -534,3 +534,160 @@ def test_P4_ctas_star_select_gracefully_degrades(tmp_path):
         db.close()
 
     assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"
+
+    # ---------------------------------------------------------------------------
+    assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"
+
+
+# ---------------------------------------------------------------------------
+# P1a — CTAS kind misclassification
+#
+# Pattern from DWH: 55 schema-qualified CTAS target tables stored as
+# kind='derived' instead of kind='table'.
+#
+# Root cause analysis (plan-reviewer, 2026-06-09):
+#   - Candidate 1 (parser): sqlglot normalises TRANSIENT/TEMPORARY TABLE to
+#     exp.Create(kind='TABLE'), so _parse_statement already matches all CTAS
+#     variants. Candidate 1 is NOT the root cause.
+#   - Candidate 2 (indexer): at L1335 of indexer.py, when canonical_by_bare
+#     lookup fails (e.g. bare name is ambiguous or the CTAS was not registered
+#     in defined_table_ids for that batch), target_kind defaults to 'derived'.
+#     This is the real root cause for the DWH tables.
+#
+# The simple 2-3 file fixture already passes today (CTAS and INSERT are in the
+# same index run so defined_table_ids includes the CTAS). These tests are
+# written WITHOUT xfail as passing regression guards: they confirm the correct
+# behaviour that must not regress. The DWH-specific cross-batch failure must
+# be diagnosed against the live DWH corpus — it is not reproducible in a
+# minimal in-memory fixture without controlling batch boundaries.
+# ---------------------------------------------------------------------------
+
+
+def test_P1a_ctas_target_kind_is_table_not_derived(tmp_path):
+    """CTAS target followed by INSERT from another file must have kind='table', not 'derived'.
+
+    Regression guard for P1a: any change to the CTAS recognition or kind-merge guard
+    must not break the baseline case where CTAS and INSERT are indexed together.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.other (x INT);",
+            "ctas.sql": "CREATE TABLE da.htdyn_fact AS SELECT x FROM da.src;",
+            "insert.sql": "INSERT INTO da.htdyn_fact SELECT x FROM da.other;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'da.htdyn_fact'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "da.htdyn_fact must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for CTAS target da.htdyn_fact, got kind='{rows[0]['kind']}'"
+    )
+
+
+def test_P1a_kind_guard_prevents_derived_overwrite(tmp_path):
+    """CTAS-then-INSERT: kind='table' must survive after the INSERT file is processed.
+
+    Regression guard for Candidate 2 (plan): the indexer kind-merge guard must not
+    allow a kind='derived' row from the INSERT-target path to overwrite an existing
+    kind='table' row in the same index run.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "src.sql": "CREATE TABLE ba.src (a INT, b INT);",
+            "ctas.sql": "CREATE TABLE ba.target AS SELECT a, b FROM ba.src;",
+            "insert.sql": "INSERT INTO ba.target SELECT a, b FROM ba.src;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'ba.target'",
+            {},
+        )
+        has_col = db.run_read(
+            "SELECT COUNT(*) AS n FROM HAS_COLUMN hc "
+            "JOIN SqlTable t ON hc.src_key = t.qualified "
+            "WHERE t.qualified = 'ba.target'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "ba.target must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for ba.target after INSERT file processed, "
+        f"got kind='{rows[0]['kind']}'"
+    )
+    assert has_col[0]["n"] > 0, (
+        "ba.target must have HAS_COLUMN rows (P4 catalog); "
+        "they only wire if kind='table' is preserved"
+    )
+
+
+def test_P1a_cross_batch_kind_guard_prevents_derived_overwrite(tmp_path):
+    """kind='table' written in one upsert batch must not be overwritten by kind='derived'
+    from a second independent upsert batch.
+
+    Simulates the DWH cross-batch scenario: File A (batch 1) defines the CTAS target as
+    kind='table'; File B (batch 2) references it as an INSERT target that cannot be
+    resolved via canonical_by_bare, so the INSERT-target path emits kind='derived'.
+    The DB-level ON CONFLICT guard in upsert_nodes_bulk must prevent the downgrade.
+
+    Guards the P1a fix in duckdb_backend.py and plan/sprints/coverage_p1_p5_metric.md.
+    """
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+    from sqlcg.core.schema import NodeLabel
+
+    db = DuckDBBackend(":memory:")
+    db.init_schema()
+
+    # Batch 1: CTAS defines the table as kind='table' with DDL provenance.
+    db.upsert_nodes_bulk(
+        NodeLabel.TABLE,
+        [
+            {
+                "qualified": "da.ctas_target",
+                "catalog": "",
+                "db": "da",
+                "name": "ctas_target",
+                "kind": "table",
+                "defined_in_file": "ctas.sql",
+            }
+        ],
+    )
+
+    # Batch 2: INSERT-target path emits kind='derived' (canonical_by_bare miss).
+    db.upsert_nodes_bulk(
+        NodeLabel.TABLE,
+        [
+            {
+                "qualified": "da.ctas_target",
+                "catalog": "",
+                "db": "da",
+                "name": "ctas_target",
+                "kind": "derived",
+                "defined_in_file": "",
+            }
+        ],
+    )
+
+    rows = db.run_read(
+        "SELECT kind, defined_in_file FROM SqlTable WHERE qualified = 'da.ctas_target'", {}
+    )
+    db.close()
+
+    assert rows, "da.ctas_target must exist"
+    assert rows[0]["kind"] == "table", (
+        f"Cross-batch kind downgrade: expected kind='table', got kind='{rows[0]['kind']}'. "
+        "upsert_nodes_bulk must not overwrite 'table' with 'derived'."
+    )
+    assert rows[0]["defined_in_file"] == "ctas.sql", (
+        "defined_in_file must be preserved from the first (DDL) batch, not overwritten by ''."
+    )

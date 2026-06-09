@@ -182,11 +182,19 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     # --- Phase B: batch-scoped dedup ---
     # For table_rows, prefer defined rows (non-empty defined_in_file) so provenance
     # is not lost when a shared table is referenced by multiple files.
-    # Also prefer structurally-assigned kinds ('cte', 'derived', 'external') over the
-    # default 'table' kind: a CTE alias emitted first as a source reference (kind='table'
-    # default) and later confirmed as a CTE destination (kind='cte') must keep 'cte' so
-    # the kind filter correctly excludes it from default filtered output.
-    _structural_kinds = {"cte", "derived", "external"}
+    # Kind upgrade rules (applied after Rule 1):
+    #   - 'cte' and 'external' upgrade a source-reference row (kind='table') when the
+    #     same qualified name is later confirmed as a CTE/external destination.  This
+    #     ensures CTE aliases keep kind='cte' even when first seen as a source reference
+    #     with the default kind='table'.
+    #   - 'derived' does NOT upgrade 'table' or 'view': a CTAS target may be seen first
+    #     as kind='table' (from defined_tables) and later as kind='derived' (from the
+    #     INSERT-target path's canonical_by_bare miss).  Allowing 'derived' to win would
+    #     misclassify real ETL target tables (P1a, DWH 2026-06-09).  The cross-batch
+    #     case is guarded at the DB level in upsert_nodes_bulk.
+    _upgrade_wins_over = {"table"}  # incoming 'cte'/'external' upgrades existing 'table'
+    _upgrade_kinds = {"cte", "external"}  # kinds that are allowed to upgrade 'table'
+    # 'derived' is intentionally absent from _upgrade_kinds
     table_dedup: dict[str, dict] = {}
     for r in buf.table_rows:
         key = r["qualified"]
@@ -197,10 +205,11 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
             # Rule 1: prefer rows with defined_in_file (DDL provenance)
             if not existing.get("defined_in_file") and r.get("defined_in_file"):
                 table_dedup[key] = r
-            # Rule 2: prefer structural kind over default 'table'
+            # Rule 2: 'cte' or 'external' upgrades an existing 'table' row.
+            # 'derived' does NOT upgrade 'table' — see comment above.
             elif (
-                existing.get("kind", "table") not in _structural_kinds
-                and r.get("kind", "table") in _structural_kinds
+                existing.get("kind", "table") in _upgrade_wins_over
+                and r.get("kind", "table") in _upgrade_kinds
             ):
                 table_dedup[key] = r
     table_rows = list(table_dedup.values())
