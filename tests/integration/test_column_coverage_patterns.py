@@ -691,3 +691,146 @@ def test_P1a_cross_batch_kind_guard_prevents_derived_overwrite(tmp_path):
     assert rows[0]["defined_in_file"] == "ctas.sql", (
         "defined_in_file must be preserved from the first (DDL) batch, not overwritten by ''."
     )
+
+
+# ---------------------------------------------------------------------------
+# P5 — USE SCHEMA bare name resolution
+#
+# 3,016 edges / 149 tables. Bare table names after a USE SCHEMA statement
+# must be qualified with the active schema so they resolve to the correct
+# SqlTable node in the graph.
+# ---------------------------------------------------------------------------
+
+
+def test_P5_use_schema_qualifies_bare_source_table(tmp_path):
+    """USE SCHEMA sets the active schema; bare table refs in subsequent statements
+    must resolve to schema-qualified names.
+
+    Reproduces Sub-problem C from the DWH: a file starts with
+        USE SCHEMA da;
+    and later statements reference tables without the 'da.' prefix.
+    Without P5 the edges land on bare 'src_table' not 'da.src_table'.
+
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src_table (x INT, y INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO real_target (col_a, col_b)
+                SELECT x AS col_a, y AS col_b
+                FROM src_table;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read("SELECT src_key, dst_key FROM COLUMN_LINEAGE", {})
+        bare_table = db.run_read("SELECT qualified FROM SqlTable WHERE qualified = 'src_table'", {})
+    finally:
+        db.close()
+
+    src_keys = {r["src_key"] for r in edges}
+    assert any(k.startswith("da.src_table.") for k in src_keys), (
+        f"Expected edges from da.src_table.*, got: {sorted(src_keys)}. "
+        "Bare 'src_table' must be qualified to 'da.src_table' via USE SCHEMA."
+    )
+    assert not bare_table, (
+        "Bare 'src_table' node must NOT exist — it must be qualified to 'da.src_table'."
+    )
+
+
+def test_P5_use_schema_qualifies_insert_target(tmp_path):
+    """USE SCHEMA also qualifies bare INSERT targets.
+
+    After USE SCHEMA da, an INSERT INTO fact should land on da.fact, not bare 'fact'.
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a)
+                SELECT x AS col_a FROM src;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, (
+        "Expected COLUMN_LINEAGE edges to da.fact.col_a after USE SCHEMA da qualifies bare 'fact'."
+    )
+
+
+def test_P5_use_schema_does_not_qualify_cte_names(tmp_path):
+    """CTE names defined within a statement must NOT be schema-qualified.
+
+    USE SCHEMA da must qualify external table refs but leave CTE aliases intact
+    so sqlglot can resolve CTE-internal column references correctly.
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a)
+                WITH cte1 AS (SELECT x AS col_a FROM src)
+                SELECT col_a FROM cte1;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+        bad_cte = db.run_read("SELECT qualified FROM SqlTable WHERE qualified = 'da.cte1'", {})
+    finally:
+        db.close()
+
+    assert edges, "Expected COLUMN_LINEAGE edges landing on da.fact.* via USE SCHEMA"
+    assert not bad_cte, (
+        "CTE 'cte1' must NOT be qualified to 'da.cte1' — CTE names are statement-local."
+    )
+
+
+def test_P5_use_schema_scope_is_per_file(tmp_path):
+    """USE SCHEMA context is file-scoped: a file without USE SCHEMA must not be affected.
+
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "with_use.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a) SELECT x AS col_a FROM src;
+            """,
+            "without_use.sql": """\
+                INSERT INTO da.fact (col_a) SELECT x AS col_a FROM da.src;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, "Expected COLUMN_LINEAGE edges to da.fact after both files are indexed"
+    dst_keys = {r["dst_key"] for r in edges}
+    assert "da.fact.col_a" in dst_keys, f"Expected da.fact.col_a in edges, got: {sorted(dst_keys)}"
