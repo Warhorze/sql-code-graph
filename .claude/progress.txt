@@ -1,8 +1,10 @@
 ## Current State [2026-06-09]
-ACTIVE AGENT: plan-reviewer (complete)
+ACTIVE AGENT: developer (complete)
 FEATURE: coverage_p1_p5_metric
 PLAN: plan/sprints/coverage_p1_p5_metric.md
-STATUS: READY FOR IMPLEMENTATION (blocker corrected in-plan)
+STATUS: PR #66 OPEN — ready for review
+BRANCH: feat/coverage-p1-metric-and-p2p5
+PR: https://github.com/Warhorze/sql-code-graph/pull/66
 
 ---
 
