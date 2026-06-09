@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import textwrap
 
-import pytest
-
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
@@ -56,18 +54,24 @@ def _index(tmp_path, files: dict[str, str], dialect: str | None = "snowflake") -
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="P1: CTE destination leak not yet fixed")
-def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
-    """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target,
-    not on the CTE node.
+def test_P1_cte_destination_resolves_to_real_target_with_chain(tmp_path):
+    """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target.
+    The CTE chain intermediate edges (base.col_a, base.col_b) must also exist — they are
+    required for upstream traversal (ARCHITECTURE_REVIEW §3.2).
 
     Reproduces the dominant DWH pattern:
         INSERT INTO ba.fact (col_a, col_b)
         WITH base AS (SELECT x AS col_a, y AS col_b FROM ba.src)
         SELECT col_a, col_b FROM base;
 
-    Expected: COLUMN_LINEAGE dst_key = 'ba.fact.col_a' / 'ba.fact.col_b'
-    Failing today: dst_key = 'base.col_a' / 'base.col_b'
+    Expected:
+      - Real-target edges: dst_key = 'ba.fact.col_a' / 'ba.fact.col_b' (INSERT target reached)
+      - Chain edges: dst_key = 'base.col_a' / 'base.col_b' ALSO EXIST (chain preserved)
+
+    Previously xfail because the first assertion failed (real target had no edges).
+    The prior sprint (coverage_p1_p5_metric.md) fixed the positional block — both edges
+    now exist. The second assertion is updated from "no CTE dst" to "CTE chain MUST EXIST"
+    per ARCHITECTURE_REVIEW §3.2 and plan/sprints/coverage_phantom_tables.md §W2.
     """
     db = _index(
         tmp_path,
@@ -97,21 +101,23 @@ def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
         db.close()
 
     dst_keys = {r["dst_key"] for r in edges}
+    # Real INSERT target must receive edges (the core P1 fix)
     assert any(k.startswith("ba.fact.") for k in dst_keys), (
         f"Expected lineage edges landing on ba.fact.*, got only: {sorted(dst_keys)}"
     )
-    assert not any(k.startswith("base.") for k in dst_keys), (
-        f"Edges must NOT land on the CTE node 'base.*', "
-        f"got: {sorted(k for k in dst_keys if k.startswith('base.'))}"
+    # CTE chain edges must also exist (ARCHITECTURE_REVIEW §3.2 — required for upstream traversal)
+    assert any(k.startswith("base.") for k in dst_keys), (
+        f"CTE chain edges (base.*) must EXIST for upstream traversal — "
+        f"got dst_keys: {sorted(dst_keys)}"
     )
 
 
-@pytest.mark.xfail(strict=True, reason="P1: CTE chain destination leak not yet fixed")
-def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
-    """Multi-CTE chain ending in cte_insert, matching the exact DWH ETL shape.
+def test_P1_cte_chain_reaches_real_target_and_preserves_chain(tmp_path):
+    """Multi-CTE chain ending in cte_insert must reach the real INSERT target.
+    CTE chain intermediate edges must also be present (ARCHITECTURE_REVIEW §3.2).
 
     DWH file: etl/sql/fact/wtfe_kpi_gemiddelde_voorraad_artikel_voorraadlocatie.sql
-    (698 edges landed on 'cte_insert' in the live graph)
+    (698 edges landed on 'cte_insert' in the live graph — these are correct chain edges)
 
         INSERT INTO ba.kpi_fact (dn_datum, ma_total)
         WITH
@@ -122,7 +128,14 @@ def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
         SELECT dn_datum, ma_total
         FROM cte_insert;
 
-    Expected: dst_key = 'ba.kpi_fact.dn_datum' and 'ba.kpi_fact.ma_total'
+    Expected:
+      - Real INSERT target: dst_key = 'ba.kpi_fact.dn_datum' and 'ba.kpi_fact.ma_total'
+      - CTE chain intermediates: 'cte_insert.*' and 'cte_base.*' ALSO EXIST
+
+    Previously xfail because real-target edges were absent. Fixed by the positional
+    block (coverage_p1_p5_metric.md). Second assertion updated from "no CTE dst" to
+    "chain must EXIST" per ARCHITECTURE_REVIEW §3.2 and
+    plan/sprints/coverage_phantom_tables.md §W2.
     """
     db = _index(
         tmp_path,
@@ -152,11 +165,16 @@ def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
         db.close()
 
     dst_keys = {r["dst_key"] for r in edges}
+    # Real INSERT target must receive edges
     assert any(k.startswith("ba.kpi_fact.") for k in dst_keys), (
         f"Edges must land on ba.kpi_fact.*, got: {sorted(dst_keys)}"
     )
-    cte_leaks = {k for k in dst_keys if k.startswith("cte_")}
-    assert not cte_leaks, f"Edges must NOT land on CTE nodes, got: {sorted(cte_leaks)}"
+    # CTE chain intermediate edges must ALSO exist (required for upstream traversal)
+    cte_chain_edges = {k for k in dst_keys if k.startswith("cte_")}
+    assert cte_chain_edges, (
+        f"CTE chain edges (cte_insert.*, cte_base.*) must EXIST for upstream traversal — "
+        f"ARCHITECTURE_REVIEW §3.2. Got dst_keys: {sorted(dst_keys)}"
+    )
 
 
 def test_P1_derived_subquery_does_not_leak(tmp_path):

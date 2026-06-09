@@ -31,8 +31,30 @@ class TestStructurallyLineageFreeStatementsNotMarkedFailed:
         assert stmt.kind == "OTHER"
         assert stmt.parse_failed is False
 
-    def test_use_schema_not_parse_failed(self):
+    def test_use_schema_consumed_as_context_not_parse_failed(self):
+        # P5 (USE SCHEMA bare-name resolution): SnowflakeParser._transform_statements
+        # consumes USE SCHEMA as qualification context — it is not emitted as a
+        # statement at all, so it can never be marked parse_failed.
         result = _parse("USE SCHEMA ba_tmp;", dialect="snowflake")
+        assert result.statements == []
+        assert result.errors == []
+
+    def test_use_schema_context_qualifies_following_bare_ref(self):
+        # The consumed USE SCHEMA must actually act as context for what follows.
+        result = _parse(
+            "USE SCHEMA ba_tmp;\nINSERT INTO target_t SELECT a FROM src_t;",
+            dialect="snowflake",
+        )
+        assert len(result.statements) == 1
+        stmt = result.statements[0]
+        assert stmt.parse_failed is False
+        referenced = {t.full_id for t in result.referenced_tables}
+        assert "ba_tmp.src_t" in referenced, f"expected qualified src, got {referenced}"
+
+    def test_use_statement_ansi_not_parse_failed(self):
+        # Non-Snowflake dialects have no _transform_statements override: USE remains
+        # an emitted OTHER-kind statement and must not be flagged parse_failed.
+        result = _parse("USE my_db;")
         assert len(result.statements) == 1
         stmt = result.statements[0]
         assert stmt.kind == "OTHER"
