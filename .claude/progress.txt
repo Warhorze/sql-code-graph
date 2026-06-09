@@ -1,8 +1,64 @@
-## Current State [2026-06-08]
+## Current State [2026-06-09]
 ACTIVE AGENT: plan-reviewer (complete)
-FEATURE: coverage_p1_p3_p4 (P1 CTE leak, P3 space-name schema strip, P4 CTAS column discovery)
-PLAN: plan/sprints/coverage_p1_p3_p4.md (corrected in-place)
-STATUS: READY FOR IMPLEMENTATION
+FEATURE: coverage_p1_p5_metric
+PLAN: plan/sprints/coverage_p1_p5_metric.md
+STATUS: READY FOR IMPLEMENTATION (blocker corrected in-plan)
+
+---
+
+## Handoff — plan-reviewer: coverage_p1_p5_metric [2026-06-09]
+
+ACTIVE AGENT: plan-reviewer (complete)
+FEATURE: coverage_p1_p5_metric (P1a CTAS kind misclassification, P1b INSERT+CTE UNION terminal)
+PLAN: plan/sprints/coverage_p1_p5_metric.md (corrected in-place)
+STATUS: NEEDS CHANGES (applied) — 1 blocker corrected, 1 warning corrected
+
+BLOCKER FIXED (B1 — P1b Design pseudo-code targets wrong variable):
+  The Design section's UNION walk pseudo-code (`body = cte_body; while isinstance(body,
+  exp.Union): body = body.this`) was attached to the wrong variable. Reading base.py
+  L776-881 confirms: the #25 positional block's `body` variable at L780 is the outer
+  INSERT's SELECT expression (always exp.Select, never exp.Union). The UNION lives inside
+  the CTE definition, not the outer INSERT SELECT. The walk direction is correct but the
+  target variable must be confirmed during Step 2.1 diagnosis. Replaced the pseudo-code
+  with a BLOCKER NOTE and directional guidance deferring the variable to diagnosis.
+  Also confirmed: exp.Union.this gives the left-branch Select (not the right branch).
+
+WARNING FIXED (W1 — xfail markers not addressed):
+  Two existing tests (test_P1_cte_destination_does_not_leak_to_cte_node,
+  test_P1_cte_chain_final_cte_does_not_leak) are marked xfail(strict=True). If P1a/P1b
+  fix those patterns they become XPASS(strict) = CI failure. Added Step 1.3 requirement
+  to remove xfail markers once the corresponding fix lands.
+
+NOTE (P1a — kind guard logic direction):
+  The existing _structural_kinds merge guard (indexer.py L130-134) PREFERS structural
+  kinds over 'table' — this is correct for CTE-alias upgrade but BACKWARDS for P1a.
+  The Candidate 2 fix cannot flip the existing guard (would break CTE upgrade). It must
+  add a DATABASE-LEVEL condition (INSERT OR UPDATE WHERE existing.kind NOT IN
+  ('table','view')). Plan already states this correctly in the Design section.
+
+P1a TEST ANALYSIS (plan-reviewer, 2026-06-09):
+  - Candidate 1 (parser): sqlglot normalises TRANSIENT/TEMPORARY TABLE to
+    exp.Create(kind='TABLE'). Verified with: sqlglot.parse_one('CREATE OR REPLACE
+    TRANSIENT TABLE t AS SELECT 1', dialect='snowflake').find(exp.Create).kind == 'TABLE'.
+    Candidate 1 is NOT the root cause. Developer should confirm this in Step 1.1 but
+    can skip the parser fix unless diagnosis reveals otherwise.
+  - Candidate 2 (indexer cross-batch miss): real DWH failure is when CTAS is not in
+    defined_table_ids for the INSERT file's batch + canonical_by_bare bare lookup fails
+    → falls through to target_kind='derived' at indexer.py:1335.
+
+ACCEPTANCE TESTS COMMITTED (separate commit):
+  - test_P1a_ctas_target_kind_is_table_not_derived: PASSING today (regression guard)
+  - test_P1a_kind_guard_prevents_derived_overwrite: PASSING today (regression guard)
+    Note: simple 2-3 file fixtures pass because CTAS+INSERT are in the same index run
+    so defined_table_ids includes the CTAS. DWH-specific cross-batch failure is not
+    reproducible without controlling batch boundaries. Tests guard against regressions.
+  - test_P1b_insert_cte_with_union_terminal_reaches_real_target: XFAILS correctly
+    (INSERT+CTE+UNION fixture emits only CTE-destination edges, not real-target edges)
+
+Test run: 2 passed, 1 xfailed — confirmed before commit.
+
+BLOCKING QUESTIONS: none (blocker corrected in-plan).
+NEXT: developer implements plan/sprints/coverage_p1_p5_metric.md (P1a diagnosis → fix → P1b diagnosis → fix).
 
 ---
 
