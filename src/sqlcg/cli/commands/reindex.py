@@ -34,7 +34,7 @@ def reindex_cmd(  # noqa: B008
         None, "--to", help="Target git SHA (defaults to HEAD when --from is given)"
     ),
     dialect: str | None = typer.Option(  # noqa: B008
-        None, "--dialect", "-d", help="SQL dialect (or 'auto' to read from .sqlcg.toml)"
+        "auto", "--dialect", "-d", help="SQL dialect ('auto' reads from .sqlcg.toml, default)"
     ),
     quiet: bool = typer.Option(  # noqa: B008
         False, "--quiet", "-q", help="Suppress summary output"
