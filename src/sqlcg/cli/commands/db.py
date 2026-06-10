@@ -8,10 +8,8 @@ from rich.console import Console
 
 from sqlcg.cli.coverage import (
     CoverageStats,  # noqa: F401 — re-exported for patch targets in tests
-    blindspot_colour,
     collect_coverage,
-    edge_health_colour,
-    phantom_colour,
+    render_coverage_lines,
 )
 from sqlcg.core.config import get_backend, get_db_path
 from sqlcg.core.freshness import compute_freshness, render_freshness_line
@@ -179,27 +177,8 @@ def db_info() -> None:
     coverage = collect_coverage()
     if coverage is not None:
         console.print("\n  Coverage:")
-        console.print(
-            f"    Tables with catalog: {coverage.catalogued_tables:>6} / {coverage.total_tables}"
-            f"  ({coverage.catalog_pct:.0f}%)"
-        )
-        eh_colour = edge_health_colour(coverage.edge_health_pct)
-        console.print(
-            f"    [{eh_colour}]Edge health: {coverage.good_edges:>10} / {coverage.total_edges}"
-            f"  ({coverage.edge_health_pct:.0f}%)[/{eh_colour}]"
-        )
-        ph_colour = phantom_colour(coverage.phantom_pct)
-        console.print(
-            f"    [{ph_colour}]Phantom edges: {coverage.phantom_edges:>8} / {coverage.total_edges}"
-            f"  ({coverage.phantom_pct:.0f}%)[/{ph_colour}]"
-        )
-        bs_colour = blindspot_colour(coverage.blindspot_tables)
-        if bs_colour:
-            console.print(
-                f"    [{bs_colour}]Blindspot tables: {coverage.blindspot_tables:>5}[/{bs_colour}]"
-            )
-        else:
-            console.print(f"    Blindspot tables: {coverage.blindspot_tables:>5}")
+        for line in render_coverage_lines(coverage, indent="    "):
+            console.print(line)
 
 
 @app.command("list-repos")
