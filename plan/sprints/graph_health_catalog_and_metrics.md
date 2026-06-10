@@ -548,6 +548,36 @@ disambiguate `schema.table.col.with.dots` from `schema.table.col`; a correct fix
 needs a `HAS_COLUMN`-keyed longest-prefix lookup or a stored `table_id` column.
 Filed as a future `coverage.py` follow-up, not fixed in PR5.
 
+### Phase B/C result (2026-06-10)
+
+**Phase B (one shape shipped):** `SqlParser._can_have_column_lineage(stmt)`
+(base.py) + gating in `ansi_parser.py` `_parse_statement`, both
+`parse_failed=True` branches. Repro tests:
+[`test_parse_failed_classification.py`](../../tests/unit/test_parse_failed_classification.py)
+(15 tests, all pass) — assert `parse_failed is False` for TRUNCATE/USE/SET/
+COMMENT/ALTER/DROP/CREATE-without-AS-SELECT/INSERT-VALUES/UPDATE/DELETE/MERGE
+and `parse_failed` unchanged (`True` on degraded scope-build) for
+SELECT/INSERT-SELECT/CTAS. Mandatory regression-guard block (perf scaling,
+qualify-once, bulk-upsert, batch-upsert, case-fold) — 17/17 pass.
+
+**Phase C (DWH measurement, before = master @ `34d0af8`, after = this branch
+@ `41b3f37`):**
+
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| `sqlcg index --profile` total | 73.89s | 71.53s | -3.2% (flat, within budget) |
+| `SqlQuery.parse_failed` (overall) | 4,727 / 6,857 (68.9%) | 0 / 6,857 (0.0%) | -68.9 pts |
+| etl/ `parse_failed` | 1,768 / 3,091 (57.2%) | 0 / 3,091 (0.0%) | -57.2 pts |
+| ddl/ `parse_failed` | 2,959 / 3,766 (78.6%) | 0 / 3,766 (0.0%) | -78.6 pts |
+| `COLUMN_LINEAGE` edges | 46,873 | 46,873 | 0 (pure reclassification, as designed) |
+
+Full numbers: [`pr5_extraction_recall_taxonomy.json`](../measurements/pr5_extraction_recall_taxonomy.json)
+`phase_c_measurement`. Edge count is byte-identical — confirms zero new/lost
+lineage extraction. The 349 UPDATE/DELETE/MERGE/CREATE_PROC statements remain
+at 0 column-lineage edges by design (structural, T-07-XX, out of scope) but no
+longer count toward `parse_failed`, since they were never going to produce
+lineage in the first place.
+
 ---
 
 ## 8. Cross-cutting

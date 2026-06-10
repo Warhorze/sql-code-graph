@@ -68,5 +68,51 @@
     "query": "SELECT count(*) FROM COLUMN_LINEAGE cl WHERE EXISTS (SELECT 1 FROM HAS_COLUMN hc WHERE hc.dst_key = cl.dst_key) AND NOT EXISTS (SELECT 1 FROM HAS_COLUMN hc WHERE hc.src_key = <left(cl.dst_key, len-instr(reverse(cl.dst_key),'.'))>)",
     "root_cause": "coverage.py's _DST_TABLE macro derives a column-lineage edge's destination TABLE id by stripping everything after the LAST '.' in dst_key. This breaks when the COLUMN NAME ITSELF contains a literal '.' (e.g. Dutch BI column names like 'Omzet excl.', 'Gegeven korting incl.', 'Korting excl.') -- stripping after the last '.' removes only the trailing empty segment, yielding 'schema.table.omzet excl' instead of 'schema.table'. All 5 sampled rows are this exact shape (ia_tableau.kassatransactie/korting columns ending in '.').",
     "verdict": "structural, NOT a one-line fix -- a purely syntactic 'strip after last dot' cannot disambiguate 'schema.table.col.with.dots' from 'schema.table.col' without a table-id lookup. A correct fix requires either (a) a HAS_COLUMN-keyed lookup that finds the longest src_key prefix of dst_key, or (b) storing table_id alongside dst_key in COLUMN_LINEAGE/HAS_COLUMN to avoid string-splitting entirely. Filed as a future PR1/coverage.py follow-up, not fixed in PR5 (out of scope per 'fix only if one-line')."
+  },
+  "phase_c_measurement": {
+    "run_date": "2026-06-10",
+    "corpus_dir": "/home/ignwrad/Projects/dwh",
+    "method": "uv run sqlcg index /home/ignwrad/Projects/dwh --profile, throwaway DBs via SQLCG_DB_PATH; before = master @ 34d0af8 (PR #67 merge, pre-fix), after = feat/etl-extraction-recall @ 41b3f37 (post-fix). Measured via sqlcg.server.read_client.run_read_routed against each throwaway DuckDB.",
+    "before": {
+      "db_path": "/tmp/pr5_before/graph.db",
+      "wall_time_s": {"pass1_parse": 12.33, "pass2_resolve": 13.53, "upsert": 47.83, "star_expand": 0.19, "total": 73.89},
+      "files_indexed": 1379,
+      "ms_per_file": 53.6,
+      "sql_query_total": 6857,
+      "sql_query_parse_failed": 4727,
+      "parse_failed_pct": 68.9,
+      "etl_parse_failed": 1768,
+      "etl_total": 3091,
+      "etl_parse_failed_pct": 57.2,
+      "ddl_parse_failed": 2959,
+      "ddl_total": 3766,
+      "ddl_parse_failed_pct": 78.6,
+      "column_lineage_edges": 46873
+    },
+    "after": {
+      "db_path": "/tmp/pr5_after/graph.db",
+      "wall_time_s": {"pass1_parse": 12.39, "pass2_resolve": 12.77, "upsert": 46.17, "star_expand": 0.19, "total": 71.53},
+      "files_indexed": 1379,
+      "ms_per_file": 51.9,
+      "sql_query_total": 6857,
+      "sql_query_parse_failed": 0,
+      "parse_failed_pct": 0.0,
+      "etl_parse_failed": 0,
+      "etl_total": 3091,
+      "etl_parse_failed_pct": 0.0,
+      "ddl_parse_failed": 0,
+      "ddl_total": 3766,
+      "ddl_parse_failed_pct": 0.0,
+      "column_lineage_edges": 46873
+    },
+    "delta": {
+      "wall_time_s": -2.36,
+      "wall_time_pct": -3.2,
+      "column_lineage_edges": 0,
+      "parse_failed_pct_points": -68.9,
+      "etl_parse_failed_pct_points": -57.2,
+      "ddl_parse_failed_pct_points": -78.6
+    },
+    "interpretation": "Edge count is byte-identical before/after (46,873 == 46,873) -- confirms the fix is a pure measurement reclassification with zero new/lost lineage extraction, as designed (no new qualify/build_scope/exp.expand/sg_lineage calls). Wall time is flat (within run-to-run noise, -3.2%, well under the +/-15% flag threshold and the 180s budget). parse_failed drops to 0% across the board: every statement kind that _can_have_column_lineage()==True already had parse_failed=False pre-fix on this corpus (no genuinely-degraded Select/Insert-Select/CTAS statements exist in the DWH today); the remaining 349 UPDATE/DELETE/MERGE/CREATE_PROC statements (165+159+20+5 by kind) are structurally lineage-free and correctly read parse_failed=False post-fix even though they still emit 0 column-lineage edges by design (T-07-XX, out of scope). The honest recall line (PR1, gain Section G/F) will now report 0% etl/ddl parse-failure on this corpus instead of the previously-inflated 57.2%/78.6%."
   }
 }
