@@ -125,3 +125,63 @@ def test_v1_1_1_F1_flush_row_batch_method_exists():
     if not _FLUSH_ROW_BATCH_EXISTS:
         pytest.skip("_flush_row_batch not yet implemented (T-F1 not landed)")
     assert callable(_flush_row_batch), "_flush_row_batch must be callable"
+
+
+def test_usage_rows_ride_existing_bulk_calls_no_extra_execute():
+    """Usage-derived catalog rows ride the existing HAS_COLUMN bulk call.
+
+    PR 3 (usage-derived catalog): when _flush_row_batch produces usage HAS_COLUMN
+    rows, they must be appended to the existing has_column_edges list before the
+    single upsert_edges_bulk(HAS_COLUMN) call — not trigger an extra execute().
+    Total bulk call count must remain flat (= 10) regardless of whether usage rows
+    are present.
+
+    Guards the batch-invariant: bulk entry points called once per batch.
+    Plan doc: plan/sprints/graph_health_catalog_and_metrics.md §5
+    """
+    # An ETL file with a schema-qualified source table generates usage rows.
+    # A DDL-only file does not. Both must produce the same bulk-call count.
+    N = 4
+
+    # Files with schema-qualified sources produce usage HAS_COLUMN rows
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(N):
+            (Path(tmpdir) / f"t{i}.sql").write_text(
+                f"INSERT INTO mydb.sch.dst_{i} SELECT col_a, col_b FROM mydb.sch.src_{i}"
+            )
+        mock_db = _make_mock_db()
+        indexer = Indexer()
+        indexer.index_repo(
+            Path(tmpdir),
+            dialect=None,
+            db=mock_db,
+            batch_size=N * 2,
+            use_git=False,
+        )
+    count_with_usage = _count_bulk_calls(mock_db)
+
+    # Files with no sources (SELECT constant only) produce no usage rows
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(N):
+            (Path(tmpdir) / f"t{i}.sql").write_text(f"SELECT {i} AS val")
+        mock_db_no_usage = _make_mock_db()
+        indexer2 = Indexer()
+        indexer2.index_repo(
+            Path(tmpdir),
+            dialect=None,
+            db=mock_db_no_usage,
+            batch_size=N * 2,
+            use_git=False,
+        )
+    count_no_usage = _count_bulk_calls(mock_db_no_usage)
+
+    # Both must produce the same call count — usage rows ride along, never add calls
+    assert count_with_usage == count_no_usage, (
+        f"Usage rows must not add extra bulk calls: "
+        f"with_usage={count_with_usage}, no_usage={count_no_usage}. "
+        "If count_with_usage > count_no_usage, usage harvest added extra execute() calls."
+    )
+    assert count_with_usage <= 12, (
+        f"Bulk call count with usage rows is {count_with_usage} — expected <= 12 "
+        "(4 upsert_nodes_bulk + 6 upsert_edges_bulk = 10; slack 2 for empty groups)"
+    )

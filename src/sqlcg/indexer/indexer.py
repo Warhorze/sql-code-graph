@@ -87,6 +87,77 @@ class BatchRowBuffer:
         return buf
 
 
+_USAGE_ELIGIBLE_KINDS = frozenset({"table", "view"})
+
+
+def _harvest_usage_catalog(
+    column_lineage_edges: list[dict],
+    table_kind_map: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """Derive SqlColumn + HAS_COLUMN(source='usage') rows from src endpoints.
+
+    For each COLUMN_LINEAGE src endpoint (sqlglot-resolved real reads), if the
+    src table resolves to kind 'table' or 'view' AND is schema-qualified (contains
+    at least one dot), emit a SqlColumn node and a HAS_COLUMN edge with
+    source='usage'.
+
+    Honesty guard: only src endpoints (sqlglot-resolved real reads), never dst
+    endpoints (positional guesses). A read is proof the column exists.
+
+    Schema-qualification guard: bare names (no dots) such as CTE aliases are
+    excluded even when their batch kind is 'table' — the parser emits CTE aliases
+    with role='table' when they appear as FROM-references in the outer SELECT, so
+    kind alone is insufficient to distinguish physical tables from CTEs.
+
+    Zero new execute() calls — rows ride the existing bulk upserts.
+    Zero parse-time work — pure Python set-dedup over already-in-memory rows.
+    """
+    seen_col_ids: set[str] = set()
+    usage_column_rows: list[dict] = []
+    usage_has_column_edges: list[dict] = []
+
+    for edge in column_lineage_edges:
+        src_key = edge["src_key"]
+        # src_key = "{table_qualified}.{col_name}" — strip last segment
+        dot_pos = src_key.rfind(".")
+        if dot_pos < 0:
+            continue
+        table_qualified = src_key[:dot_pos]
+        col_name = src_key[dot_pos + 1 :]
+
+        # Only harvest for physical tables/views, never cte/derived.
+        # Schema-qualification guard: bare names (no dots) are CTE aliases —
+        # the parser emits CTE aliases with role='table' when used as FROM sources,
+        # so we cannot rely on kind alone.
+        kind = table_kind_map.get(table_qualified)
+        if kind not in _USAGE_ELIGIBLE_KINDS:
+            continue
+        if "." not in table_qualified:
+            # Bare name — treat as CTE alias, skip
+            continue
+
+        col_id = src_key  # src_key IS the column id
+        if col_id in seen_col_ids:
+            continue
+        seen_col_ids.add(col_id)
+
+        usage_column_rows.append(
+            {
+                "id": col_id,
+                "col_name": col_name,
+                "table_qualified": table_qualified,
+                "catalog": "",
+                "db": "",
+                "table_name": table_qualified.rsplit(".", 1)[-1],
+            }
+        )
+        usage_has_column_edges.append(
+            {"src_key": table_qualified, "dst_key": col_id, "source": "usage"}
+        )
+
+    return usage_column_rows, usage_has_column_edges
+
+
 def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     """Dedup accumulated rows across the batch, then issue the 10 bulk calls ONCE.
 
@@ -157,6 +228,33 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     star_source_edges = list(
         {(r["src_key"], r["dst_key"]): r for r in buf.star_source_edges}.values()
     )
+
+    # --- Phase B2: usage-derived catalog harvest ---
+    # Post-dedup: for each COLUMN_LINEAGE src endpoint whose table is a physical
+    # table/view (never cte/derived), emit SqlColumn + HAS_COLUMN(source='usage').
+    # Zero new execute() calls — rows ride the existing bulk upserts below.
+    table_kind_map = {r["qualified"]: r.get("kind", "table") for r in table_rows}
+    usage_column_rows, usage_has_column_edges = _harvest_usage_catalog(
+        column_lineage_edges, table_kind_map
+    )
+
+    # Merge usage rows into the batch-level sets (existing DDL rows win via precedence
+    # upsert in upsert_edges_bulk; new column rows are deduplicated by primary key).
+    if usage_column_rows:
+        # Merge into existing column_rows dedup (existing DDL-sourced rows win by id).
+        existing_col_ids = {r["id"] for r in column_rows}
+        new_col_rows = [r for r in usage_column_rows if r["id"] not in existing_col_ids]
+        column_rows = column_rows + new_col_rows
+
+    if usage_has_column_edges:
+        # Merge into existing has_column_edges.  The backend precedence upsert will
+        # ensure DDL rows (source='ddl') are never overwritten by usage rows.
+        existing_hc_keys = {(r["src_key"], r["dst_key"]) for r in has_column_edges}
+        has_column_edges = has_column_edges + [
+            r
+            for r in usage_has_column_edges
+            if (r["src_key"], r["dst_key"]) not in existing_hc_keys
+        ]
 
     # --- Phase C: flush in dependency order (nodes before their edges) ---
     db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)

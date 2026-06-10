@@ -248,6 +248,33 @@ _NODE_COLUMNS: dict[str, list[str]] = {
     NodeLabel.EXTERNAL_CONSUMER: ["name", "consumer_type"],
 }
 
+# ---------------------------------------------------------------------------
+# HAS_COLUMN source precedence — ddl > information_schema > usage
+# ---------------------------------------------------------------------------
+
+# Precedence ranks (higher = wins on conflict).
+_HAS_COLUMN_SOURCE_RANK: dict[str, int] = {
+    "ddl": 3,
+    "information_schema": 2,
+    "usage": 1,
+}
+
+
+def _has_column_precedence(sql_expr: str) -> str:
+    """Return a SQL CASE expression that maps a source VARCHAR to its precedence rank.
+
+    Used inside the HAS_COLUMN conflict-resolution clause in upsert_edges_bulk.
+    Rank: ddl=3 > information_schema=2 > usage=1 > unknown=0.
+    """
+    return (
+        "CASE "
+        f"WHEN {sql_expr} = 'ddl' THEN 3 "
+        f"WHEN {sql_expr} = 'information_schema' THEN 2 "
+        f"WHEN {sql_expr} = 'usage' THEN 1 "
+        "ELSE 0 END"
+    )
+
+
 # Edge rel type → extra property columns beyond (src_key, dst_key)
 _EDGE_EXTRA_COLUMNS: dict[str, list[str]] = {
     RelType.BELONGS_TO: [],
@@ -431,6 +458,11 @@ class DuckDBBackend(GraphBackend):
         """Bulk-upsert edges of one (src_label, rel_type, dst_label) triple.
 
         One execute() per rel_type per batch — bulk-upsert invariant from CLAUDE.md.
+
+        For HAS_COLUMN edges a precedence-aware conflict policy is applied:
+        ``ddl > information_schema > usage``.  An incoming row with a lower-precedence
+        ``source`` value never overwrites an existing row with a higher-precedence one.
+        All other edge types use plain INSERT OR REPLACE (last-writer-wins).
         """
         if not rows:
             return
@@ -460,10 +492,28 @@ class DuckDBBackend(GraphBackend):
         arrays = [[row.get(c) for row in rows] for c in all_cols]
         col_list = ", ".join(f'"{c}"' for c in all_cols)
         unnest_cols = ", ".join(f'unnest(?::VARCHAR[]) AS "{c}"' for c in all_cols)
-        self._conn.execute(
-            f'INSERT OR REPLACE INTO "{rel_type}" ({col_list}) SELECT {unnest_cols}',
-            arrays,
-        )
+
+        if rel_type == RelType.HAS_COLUMN:
+            # Precedence-aware upsert: ddl > information_schema > usage.
+            # On conflict (same src_key, dst_key), update source only when the
+            # incoming source has strictly higher precedence than the existing one.
+            # One execute() call — bulk-upsert invariant preserved.
+            self._conn.execute(
+                f'INSERT INTO "{rel_type}" ({col_list}) SELECT {unnest_cols} '
+                "ON CONFLICT (src_key, dst_key) DO UPDATE SET "
+                "source = CASE "
+                "  WHEN " + _has_column_precedence("EXCLUDED.source") + " > "
+                "       " + _has_column_precedence(f'"{rel_type}".source') + " "
+                "  THEN EXCLUDED.source "
+                f'  ELSE "{rel_type}".source '
+                "END",
+                arrays,
+            )
+        else:
+            self._conn.execute(
+                f'INSERT OR REPLACE INTO "{rel_type}" ({col_list}) SELECT {unnest_cols}',
+                arrays,
+            )
 
     # ------------------------------------------------------------------
     # Read / write
