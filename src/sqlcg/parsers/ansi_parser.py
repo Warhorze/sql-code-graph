@@ -114,6 +114,15 @@ class AnsiParser(SqlParser):
         # Parse all statements in the file using the hook (allows subclass overrides)
         statements, parse_errors = self._do_parse(sql)
         out.errors.extend(parse_errors)
+
+        # Apply dialect-specific statement-level transforms (e.g. USE SCHEMA qualification
+        # in SnowflakeParser).  The base implementation is a no-op; subclasses override to
+        # inject per-file context (e.g. current_schema tracking).  Must run BEFORE the
+        # statement loop so that source/target table refs in subsequent statements are
+        # already qualified when _parse_statement extracts them.
+        # Perf invariant: no qualify/build_scope/expand/sg_lineage calls allowed here.
+        statements = self._transform_statements(statements)
+
         if not statements:
             logger.debug("Failed to parse file %s", path)
             out.parse_quality = ParseQuality.FAILED
@@ -244,6 +253,26 @@ class AnsiParser(SqlParser):
             return sqlglot.parse(sql, dialect=self.DIALECT), []
         except Exception as exc:
             return [], [f"parse_error:{exc}"]
+
+    def _transform_statements(self, statements: list[Any]) -> list[Any]:
+        """Hook for dialect-specific per-file statement transforms.
+
+        Called once per file after ``_do_parse`` and before the statement loop in
+        ``parse_file``.  The base implementation is a no-op that returns statements
+        unchanged.  Subclasses override to inject per-file context such as USE SCHEMA
+        qualification (SnowflakeParser).
+
+        Perf invariant: implementations MUST NOT call qualify, build_scope, exp.expand,
+        or sg_lineage — those are per-statement hot paths.  Only pure AST walks and
+        mutations are permitted (O(N_statements × N_tables_per_stmt)).
+
+        Args:
+            statements: List of parsed sqlglot AST nodes (may include None entries).
+
+        Returns:
+            Transformed statements list (may be a new list or the same list mutated).
+        """
+        return statements
 
     def _parse_statement(
         self,

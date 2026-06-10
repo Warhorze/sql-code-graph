@@ -52,6 +52,79 @@ NEXT: architect-planner plan-compliance check, then user reviews PR.
 
 ---
 
+## Current State [2026-06-09]
+ACTIVE AGENT: developer
+FEATURE: coverage_phantom_tables (reduce 974 blindspot tables / 17,760 phantom edges on DWH)
+PLAN: plan/sprints/coverage_phantom_tables.md
+BRANCH: feat/coverage-p1-metric-and-p2p5
+STATUS: IN PROGRESS — Phase 0 diagnosis complete; P1a xfail fix; P1b canonical_by_bare in progress
+
+DIAGNOSIS RESULTS (Step 0-4):
+  P1 cohort (615 bare-name tables / 12,353 edges):
+    - kind=cte/derived (CTE chain intermediates, correct, no HAS_COLUMN by design): 401 tables, 6,604 edges
+      NOTE: P1a is already implemented from prior sprint. The positional block emits edges
+            to both the real INSERT target AND the CTE chain intermediate. 100% of queries
+            producing cte_insert as dst ALSO have real-target edges. No code fix needed.
+            The xfail tests need updating to match ARCHITECTURE_REVIEW §3.2 (chain edges
+            must EXIST, not be absent).
+    - kind=table/view bare-name (P5 miss, unresolved schema): 208 tables, 6,332 edges
+      FIX: P1b - canonical_by_bare source-ref resolution in indexer.py
+    - Not in SqlTable (7 orphan bare names): 7 tables, 181 edges
+      ACTION: investigate, likely structural
+  P2 cohort (358 qualified tables / 6,497 edges):
+    ALL Bucket B - DDL lives in Liquibase XML format, no SQL DDL files for indexing
+    EXCEPTION: 1 Bucket C (da.rthyb_promotion_prognosis, CREATE TABLE...LIKE syntax)
+    ACTION: Document as structural gap. No code fix possible for XML DDL.
+  P3 (<unknown>, 764 edges):
+    NOT a false-positive scripting detection in semtex_views.sql.
+    semtex_views.sql is parsed correctly via normal path (0 BEGIN tokens).
+    <unknown> edges spread across 76 files (complex joins, unresolvable columns, 1 stored proc)
+    ACTION: Document as structural gap.
+
+IMPLEMENTATION ORDER:
+  1. Fix xfail tests (W2 from plan-reviewer) - update assertions to require chain edges EXIST
+  2. P1b: canonical_by_bare source-ref resolution for bare physical table refs
+  3. Document P2 Bucket B structural gap, P3 structural gap
+  4. Version bump, postmortem
+
+---
+
+## Handoff — plan-reviewer: coverage_phantom_tables [2026-06-09] (superseded)
+ACTIVE AGENT: plan-reviewer
+FEATURE: coverage_phantom_tables (reduce 974 blindspot tables / 17,760 phantom edges on DWH)
+PLAN: plan/sprints/coverage_phantom_tables.md
+STATUS: APPROVED WITH CORRECTIONS (2 warnings fixed in-plan)
+  WARNING FIXED (W1 — regression-guard command missing CTE-chain canary):
+    The Performance section's "Regression-guard files" command block omitted
+    test_analyze_case_fold.py. P1a modifies base.py and the test is the documented
+    canary for CTE-chain suppression (ARCHITECTURE_REVIEW §3.2). Added to the command
+    block with an explanatory note so the developer runs it after every P1a change,
+    not only in the full anti-regression sweep.
+  WARNING FIXED (W2 — pre-existing xfail tests have incorrect assertions):
+    test_P1_cte_destination_does_not_leak_to_cte_node (line 59) and
+    test_P1_cte_chain_final_cte_does_not_leak (line 109) assert that CTE dst edges
+    do NOT exist. This contradicts ARCHITECTURE_REVIEW §3.2 — CTE chain edges
+    (e.g. ba.src.x → base.col_a) are required for upstream traversal. Verified:
+    current branch code already emits both real-target edges AND chain edges for
+    simple fixtures; those tests fail because they assert "no CTE dst." Developer
+    must update the second assertion in those tests (require chain edges EXIST)
+    when the fix lands; not just remove the xfail markers. Added to Step 1.3.
+  NOTE (line drift — non-blocking):
+    Plan references _qualify_bare_tables CTE-skip as "L332-334"; actual location in
+    current code is ~L333. Line drift only — logic description is accurate.
+  NOTE (no new acceptance tests written):
+    The plan is diagnosis-first; concrete failing shapes cannot be pinned without
+    the DWH corpus (Step 0). Simple in-memory fixtures for P1a (explicit-col-list,
+    SELECT *, no-col-list, multi-CTE-chain) all already produce correct edges on the
+    current branch. The two pre-existing xfail tests remain as pre-implementation
+    guards once their assertions are corrected.
+  BQ-1 (metric-scope contradiction) carries forward as an open architect-reviewer
+    action item. Does NOT block the developer; plan proceeds against shipped
+    unscoped metric as documented.
+NEXT: developer implements plan/sprints/coverage_phantom_tables.md (branch off
+  master after PR #66 merges; Phase 0 baseline first).
+---
+
 ## Handoff — developer: usage-derived-catalog (PR 3) [2026-06-10]
 
 ACTIVE AGENT: developer (complete — ready for compliance check)

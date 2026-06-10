@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import textwrap
 
-import pytest
-
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
 
@@ -56,18 +54,24 @@ def _index(tmp_path, files: dict[str, str], dialect: str | None = "snowflake") -
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="P1: CTE destination leak not yet fixed")
-def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
-    """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target,
-    not on the CTE node.
+def test_P1_cte_destination_resolves_to_real_target_with_chain(tmp_path):
+    """Edges from INSERT ... WITH cte SELECT FROM cte must land on the real INSERT target.
+    The CTE chain intermediate edges (base.col_a, base.col_b) must also exist — they are
+    required for upstream traversal (ARCHITECTURE_REVIEW §3.2).
 
     Reproduces the dominant DWH pattern:
         INSERT INTO ba.fact (col_a, col_b)
         WITH base AS (SELECT x AS col_a, y AS col_b FROM ba.src)
         SELECT col_a, col_b FROM base;
 
-    Expected: COLUMN_LINEAGE dst_key = 'ba.fact.col_a' / 'ba.fact.col_b'
-    Failing today: dst_key = 'base.col_a' / 'base.col_b'
+    Expected:
+      - Real-target edges: dst_key = 'ba.fact.col_a' / 'ba.fact.col_b' (INSERT target reached)
+      - Chain edges: dst_key = 'base.col_a' / 'base.col_b' ALSO EXIST (chain preserved)
+
+    Previously xfail because the first assertion failed (real target had no edges).
+    The prior sprint (coverage_p1_p5_metric.md) fixed the positional block — both edges
+    now exist. The second assertion is updated from "no CTE dst" to "CTE chain MUST EXIST"
+    per ARCHITECTURE_REVIEW §3.2 and plan/sprints/coverage_phantom_tables.md §W2.
     """
     db = _index(
         tmp_path,
@@ -97,21 +101,23 @@ def test_P1_cte_destination_does_not_leak_to_cte_node(tmp_path):
         db.close()
 
     dst_keys = {r["dst_key"] for r in edges}
+    # Real INSERT target must receive edges (the core P1 fix)
     assert any(k.startswith("ba.fact.") for k in dst_keys), (
         f"Expected lineage edges landing on ba.fact.*, got only: {sorted(dst_keys)}"
     )
-    assert not any(k.startswith("base.") for k in dst_keys), (
-        f"Edges must NOT land on the CTE node 'base.*', "
-        f"got: {sorted(k for k in dst_keys if k.startswith('base.'))}"
+    # CTE chain edges must also exist (ARCHITECTURE_REVIEW §3.2 — required for upstream traversal)
+    assert any(k.startswith("base.") for k in dst_keys), (
+        f"CTE chain edges (base.*) must EXIST for upstream traversal — "
+        f"got dst_keys: {sorted(dst_keys)}"
     )
 
 
-@pytest.mark.xfail(strict=True, reason="P1: CTE chain destination leak not yet fixed")
-def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
-    """Multi-CTE chain ending in cte_insert, matching the exact DWH ETL shape.
+def test_P1_cte_chain_reaches_real_target_and_preserves_chain(tmp_path):
+    """Multi-CTE chain ending in cte_insert must reach the real INSERT target.
+    CTE chain intermediate edges must also be present (ARCHITECTURE_REVIEW §3.2).
 
     DWH file: etl/sql/fact/wtfe_kpi_gemiddelde_voorraad_artikel_voorraadlocatie.sql
-    (698 edges landed on 'cte_insert' in the live graph)
+    (698 edges landed on 'cte_insert' in the live graph — these are correct chain edges)
 
         INSERT INTO ba.kpi_fact (dn_datum, ma_total)
         WITH
@@ -122,7 +128,14 @@ def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
         SELECT dn_datum, ma_total
         FROM cte_insert;
 
-    Expected: dst_key = 'ba.kpi_fact.dn_datum' and 'ba.kpi_fact.ma_total'
+    Expected:
+      - Real INSERT target: dst_key = 'ba.kpi_fact.dn_datum' and 'ba.kpi_fact.ma_total'
+      - CTE chain intermediates: 'cte_insert.*' and 'cte_base.*' ALSO EXIST
+
+    Previously xfail because real-target edges were absent. Fixed by the positional
+    block (coverage_p1_p5_metric.md). Second assertion updated from "no CTE dst" to
+    "chain must EXIST" per ARCHITECTURE_REVIEW §3.2 and
+    plan/sprints/coverage_phantom_tables.md §W2.
     """
     db = _index(
         tmp_path,
@@ -152,11 +165,16 @@ def test_P1_cte_chain_final_cte_does_not_leak(tmp_path):
         db.close()
 
     dst_keys = {r["dst_key"] for r in edges}
+    # Real INSERT target must receive edges
     assert any(k.startswith("ba.kpi_fact.") for k in dst_keys), (
         f"Edges must land on ba.kpi_fact.*, got: {sorted(dst_keys)}"
     )
-    cte_leaks = {k for k in dst_keys if k.startswith("cte_")}
-    assert not cte_leaks, f"Edges must NOT land on CTE nodes, got: {sorted(cte_leaks)}"
+    # CTE chain intermediate edges must ALSO exist (required for upstream traversal)
+    cte_chain_edges = {k for k in dst_keys if k.startswith("cte_")}
+    assert cte_chain_edges, (
+        f"CTE chain edges (cte_insert.*, cte_base.*) must EXIST for upstream traversal — "
+        f"ARCHITECTURE_REVIEW §3.2. Got dst_keys: {sorted(dst_keys)}"
+    )
 
 
 def test_P1_derived_subquery_does_not_leak(tmp_path):
@@ -534,3 +552,303 @@ def test_P4_ctas_star_select_gracefully_degrades(tmp_path):
         db.close()
 
     assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"
+
+    # ---------------------------------------------------------------------------
+    assert tables, "CTAS with SELECT * must still produce a SqlTable node (no crash)"
+
+
+# ---------------------------------------------------------------------------
+# P1a — CTAS kind misclassification
+#
+# Pattern from DWH: 55 schema-qualified CTAS target tables stored as
+# kind='derived' instead of kind='table'.
+#
+# Root cause analysis (plan-reviewer, 2026-06-09):
+#   - Candidate 1 (parser): sqlglot normalises TRANSIENT/TEMPORARY TABLE to
+#     exp.Create(kind='TABLE'), so _parse_statement already matches all CTAS
+#     variants. Candidate 1 is NOT the root cause.
+#   - Candidate 2 (indexer): at L1335 of indexer.py, when canonical_by_bare
+#     lookup fails (e.g. bare name is ambiguous or the CTAS was not registered
+#     in defined_table_ids for that batch), target_kind defaults to 'derived'.
+#     This is the real root cause for the DWH tables.
+#
+# The simple 2-3 file fixture already passes today (CTAS and INSERT are in the
+# same index run so defined_table_ids includes the CTAS). These tests are
+# written WITHOUT xfail as passing regression guards: they confirm the correct
+# behaviour that must not regress. The DWH-specific cross-batch failure must
+# be diagnosed against the live DWH corpus — it is not reproducible in a
+# minimal in-memory fixture without controlling batch boundaries.
+# ---------------------------------------------------------------------------
+
+
+def test_P1a_ctas_target_kind_is_table_not_derived(tmp_path):
+    """CTAS target followed by INSERT from another file must have kind='table', not 'derived'.
+
+    Regression guard for P1a: any change to the CTAS recognition or kind-merge guard
+    must not break the baseline case where CTAS and INSERT are indexed together.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.other (x INT);",
+            "ctas.sql": "CREATE TABLE da.htdyn_fact AS SELECT x FROM da.src;",
+            "insert.sql": "INSERT INTO da.htdyn_fact SELECT x FROM da.other;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'da.htdyn_fact'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "da.htdyn_fact must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for CTAS target da.htdyn_fact, got kind='{rows[0]['kind']}'"
+    )
+
+
+def test_P1a_kind_guard_prevents_derived_overwrite(tmp_path):
+    """CTAS-then-INSERT: kind='table' must survive after the INSERT file is processed.
+
+    Regression guard for Candidate 2 (plan): the indexer kind-merge guard must not
+    allow a kind='derived' row from the INSERT-target path to overwrite an existing
+    kind='table' row in the same index run.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "src.sql": "CREATE TABLE ba.src (a INT, b INT);",
+            "ctas.sql": "CREATE TABLE ba.target AS SELECT a, b FROM ba.src;",
+            "insert.sql": "INSERT INTO ba.target SELECT a, b FROM ba.src;",
+        },
+    )
+    try:
+        rows = db.run_read(
+            "SELECT kind FROM SqlTable WHERE qualified = 'ba.target'",
+            {},
+        )
+        has_col = db.run_read(
+            "SELECT COUNT(*) AS n FROM HAS_COLUMN hc "
+            "JOIN SqlTable t ON hc.src_key = t.qualified "
+            "WHERE t.qualified = 'ba.target'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert rows, "ba.target must exist as a SqlTable node"
+    assert rows[0]["kind"] == "table", (
+        f"Expected kind='table' for ba.target after INSERT file processed, "
+        f"got kind='{rows[0]['kind']}'"
+    )
+    assert has_col[0]["n"] > 0, (
+        "ba.target must have HAS_COLUMN rows (P4 catalog); "
+        "they only wire if kind='table' is preserved"
+    )
+
+
+def test_P1a_cross_batch_kind_guard_prevents_derived_overwrite(tmp_path):
+    """kind='table' written in one upsert batch must not be overwritten by kind='derived'
+    from a second independent upsert batch.
+
+    Simulates the DWH cross-batch scenario: File A (batch 1) defines the CTAS target as
+    kind='table'; File B (batch 2) references it as an INSERT target that cannot be
+    resolved via canonical_by_bare, so the INSERT-target path emits kind='derived'.
+    The DB-level ON CONFLICT guard in upsert_nodes_bulk must prevent the downgrade.
+
+    Guards the P1a fix in duckdb_backend.py and plan/sprints/coverage_p1_p5_metric.md.
+    """
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+    from sqlcg.core.schema import NodeLabel
+
+    db = DuckDBBackend(":memory:")
+    db.init_schema()
+
+    # Batch 1: CTAS defines the table as kind='table' with DDL provenance.
+    db.upsert_nodes_bulk(
+        NodeLabel.TABLE,
+        [
+            {
+                "qualified": "da.ctas_target",
+                "catalog": "",
+                "db": "da",
+                "name": "ctas_target",
+                "kind": "table",
+                "defined_in_file": "ctas.sql",
+            }
+        ],
+    )
+
+    # Batch 2: INSERT-target path emits kind='derived' (canonical_by_bare miss).
+    db.upsert_nodes_bulk(
+        NodeLabel.TABLE,
+        [
+            {
+                "qualified": "da.ctas_target",
+                "catalog": "",
+                "db": "da",
+                "name": "ctas_target",
+                "kind": "derived",
+                "defined_in_file": "",
+            }
+        ],
+    )
+
+    rows = db.run_read(
+        "SELECT kind, defined_in_file FROM SqlTable WHERE qualified = 'da.ctas_target'", {}
+    )
+    db.close()
+
+    assert rows, "da.ctas_target must exist"
+    assert rows[0]["kind"] == "table", (
+        f"Cross-batch kind downgrade: expected kind='table', got kind='{rows[0]['kind']}'. "
+        "upsert_nodes_bulk must not overwrite 'table' with 'derived'."
+    )
+    assert rows[0]["defined_in_file"] == "ctas.sql", (
+        "defined_in_file must be preserved from the first (DDL) batch, not overwritten by ''."
+    )
+
+
+# ---------------------------------------------------------------------------
+# P5 — USE SCHEMA bare name resolution
+#
+# 3,016 edges / 149 tables. Bare table names after a USE SCHEMA statement
+# must be qualified with the active schema so they resolve to the correct
+# SqlTable node in the graph.
+# ---------------------------------------------------------------------------
+
+
+def test_P5_use_schema_qualifies_bare_source_table(tmp_path):
+    """USE SCHEMA sets the active schema; bare table refs in subsequent statements
+    must resolve to schema-qualified names.
+
+    Reproduces Sub-problem C from the DWH: a file starts with
+        USE SCHEMA da;
+    and later statements reference tables without the 'da.' prefix.
+    Without P5 the edges land on bare 'src_table' not 'da.src_table'.
+
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src_table (x INT, y INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO real_target (col_a, col_b)
+                SELECT x AS col_a, y AS col_b
+                FROM src_table;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read("SELECT src_key, dst_key FROM COLUMN_LINEAGE", {})
+        bare_table = db.run_read("SELECT qualified FROM SqlTable WHERE qualified = 'src_table'", {})
+    finally:
+        db.close()
+
+    src_keys = {r["src_key"] for r in edges}
+    assert any(k.startswith("da.src_table.") for k in src_keys), (
+        f"Expected edges from da.src_table.*, got: {sorted(src_keys)}. "
+        "Bare 'src_table' must be qualified to 'da.src_table' via USE SCHEMA."
+    )
+    assert not bare_table, (
+        "Bare 'src_table' node must NOT exist — it must be qualified to 'da.src_table'."
+    )
+
+
+def test_P5_use_schema_qualifies_insert_target(tmp_path):
+    """USE SCHEMA also qualifies bare INSERT targets.
+
+    After USE SCHEMA da, an INSERT INTO fact should land on da.fact, not bare 'fact'.
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a)
+                SELECT x AS col_a FROM src;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, (
+        "Expected COLUMN_LINEAGE edges to da.fact.col_a after USE SCHEMA da qualifies bare 'fact'."
+    )
+
+
+def test_P5_use_schema_does_not_qualify_cte_names(tmp_path):
+    """CTE names defined within a statement must NOT be schema-qualified.
+
+    USE SCHEMA da must qualify external table refs but leave CTE aliases intact
+    so sqlglot can resolve CTE-internal column references correctly.
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "etl.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a)
+                WITH cte1 AS (SELECT x AS col_a FROM src)
+                SELECT col_a FROM cte1;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+        bad_cte = db.run_read("SELECT qualified FROM SqlTable WHERE qualified = 'da.cte1'", {})
+    finally:
+        db.close()
+
+    assert edges, "Expected COLUMN_LINEAGE edges landing on da.fact.* via USE SCHEMA"
+    assert not bad_cte, (
+        "CTE 'cte1' must NOT be qualified to 'da.cte1' — CTE names are statement-local."
+    )
+
+
+def test_P5_use_schema_scope_is_per_file(tmp_path):
+    """USE SCHEMA context is file-scoped: a file without USE SCHEMA must not be affected.
+
+    Guards plan/sprints/coverage_p1_p5_metric.md § Sub-problem C.
+    """
+    db = _index(
+        tmp_path,
+        {
+            "ddl.sql": "CREATE TABLE da.src (x INT); CREATE TABLE da.fact (col_a INT);",
+            "with_use.sql": """\
+                USE SCHEMA da;
+                INSERT INTO fact (col_a) SELECT x AS col_a FROM src;
+            """,
+            "without_use.sql": """\
+                INSERT INTO da.fact (col_a) SELECT x AS col_a FROM da.src;
+            """,
+        },
+    )
+    try:
+        edges = db.run_read(
+            "SELECT src_key, dst_key FROM COLUMN_LINEAGE WHERE dst_key LIKE 'da.fact.%'",
+            {},
+        )
+    finally:
+        db.close()
+
+    assert edges, "Expected COLUMN_LINEAGE edges to da.fact after both files are indexed"
+    dst_keys = {r["dst_key"] for r in edges}
+    assert "da.fact.col_a" in dst_keys, f"Expected da.fact.col_a in edges, got: {sorted(dst_keys)}"
