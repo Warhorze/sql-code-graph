@@ -448,6 +448,32 @@ class DuckDBBackend(GraphBackend):
             arrays,
         )
 
+    def insert_table_nodes_if_absent(self, rows: list[dict[str, Any]]) -> None:
+        """Insert bare SqlTable rows only for tables not already in the graph.
+
+        Uses ``INSERT OR IGNORE`` (``ON CONFLICT DO NOTHING``) so existing rows
+        with a real ``kind`` or ``defined_in_file`` are never overwritten.  Called
+        by ``catalog load`` to register catalog-only tables without downgrading
+        parser-discovered tables.  One ``execute()`` call — bulk-upsert invariant
+        preserved.
+
+        Args:
+            rows: SqlTable dicts with keys: qualified, catalog, db, name, kind,
+                  defined_in_file.
+        """
+        if not rows:
+            return
+        cols = _NODE_COLUMNS.get(NodeLabel.TABLE)
+        if cols is None:  # pragma: no cover
+            raise ValueError("Unknown node label: SqlTable")
+        arrays = [[row.get(c) for row in rows] for c in cols]
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        unnest_cols = ", ".join(f'unnest(?::VARCHAR[]) AS "{c}"' for c in cols)
+        self._conn.execute(
+            f'INSERT OR IGNORE INTO "{NodeLabel.TABLE}" ({col_list}) SELECT {unnest_cols}',
+            arrays,
+        )
+
     def upsert_edges_bulk(
         self,
         src_label: str,
@@ -571,20 +597,28 @@ class DuckDBBackend(GraphBackend):
         DuckDB has no DETACH DELETE — we delete edge rows first, then node rows.
         """
         try:
-            # A: columns for tables defined in this file
+            # A: columns for tables defined in this file.
+            # Source-aware: preserve 'information_schema' and 'usage' rows across a
+            # per-file reindex (Decision B3 — plan §4 §3).  Only 'ddl' (and NULL/other)
+            # rows are deleted.  NULL source rows are treated like 'ddl' — they come
+            # from upsert_edge() calls in tests/legacy code, not from catalog load.
             self._conn.execute(
                 'DELETE FROM "SqlColumn" WHERE id IN ('
-                '  SELECT dst_key FROM "HAS_COLUMN" WHERE src_key IN ('
+                '  SELECT dst_key FROM "HAS_COLUMN"'
+                "  WHERE src_key IN ("
                 '    SELECT src_key FROM "DEFINED_IN" WHERE dst_key = ?'
                 "  )"
+                "  AND (source IS NULL OR source NOT IN ('information_schema', 'usage'))"
                 ")",
                 [file_path],
             )
-            # Remove HAS_COLUMN edges for those tables
+            # Remove HAS_COLUMN edges for those tables — source-aware (same guard).
             self._conn.execute(
-                'DELETE FROM "HAS_COLUMN" WHERE src_key IN ('
-                '  SELECT src_key FROM "DEFINED_IN" WHERE dst_key = ?'
-                ")",
+                'DELETE FROM "HAS_COLUMN"'
+                " WHERE src_key IN ("
+                '   SELECT src_key FROM "DEFINED_IN" WHERE dst_key = ?'
+                " )"
+                " AND (source IS NULL OR source NOT IN ('information_schema', 'usage'))",
                 [file_path],
             )
 

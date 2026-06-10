@@ -1,0 +1,81 @@
+{
+  "description": "PR 2 (INFORMATION_SCHEMA catalog enrichment) — measured 2026-06-10",
+  "branch": "feat/catalog-load-information-schema",
+  "version": "1.11.0",
+  "commit": "be3419a",
+  "catalog_file": "/home/ignwrad/Projects/sql-code-graph/columns.csv",
+  "catalog_stats": {
+    "rows_read": 144311,
+    "malformed_skipped": 0,
+    "tables_loaded": 5673,
+    "columns_loaded": 144311,
+    "load_wall_seconds": 77.68
+  },
+  "baseline_plateau": {
+    "note": "PR 3 (v1.10.0) repo-native plateau — same corpus, with usage harvest",
+    "ref": "plan/measurements/pr3_repo_native_plateau.json",
+    "edge_health_strict_column_pct": 69,
+    "edge_health_scoped_pct": 91,
+    "blindspot_tables": 632,
+    "phantom": {
+      "confirmed": 6149,
+      "contradicted": 2439,
+      "contradicted_pct_all": 5.0,
+      "unverified": 4735
+    }
+  },
+  "after_catalog_load": {
+    "note": "v1.11.0 — after sqlcg catalog load columns.csv (144,311 cols / 5,673 tables)",
+    "corpus": {
+      "files_indexed": 1379,
+      "indexed_sha": "d015f8c08f62de33b51df347f56622ef5d20d50b",
+      "index_wall_seconds": 69.51
+    },
+    "tables_with_catalog": {"n": 6378, "total": 7217, "pct": 88},
+    "edge_health_strict_column": {"n": 36250, "total": 48783, "pct": 74},
+    "edge_health_table_level_legacy": {"n": 37419, "total": 48783, "pct": 77},
+    "edge_health_scoped": {"n": 32191, "total": 34685, "pct": 93},
+    "phantom_edges": {
+      "total": 13323,
+      "all_edges": 48783,
+      "pct": 27,
+      "confirmed": 8284,
+      "contradicted": 690,
+      "contradicted_pct_all": 1.4,
+      "unverified": 4349
+    },
+    "blindspot_tables": 602
+  },
+  "delta_vs_plateau": {
+    "edge_health_strict_column_pts": "+5",
+    "edge_health_scoped_pts": "+2",
+    "blindspot_tables_delta": "-30",
+    "confirmed_delta": "+2135",
+    "contradicted_delta": "-1749",
+    "unverified_delta": "-386"
+  },
+  "contradicted_by_source_split": {
+    "note": "Contradicted edges split by catalog source of the dst table",
+    "ddl_sourced_tables": {
+      "n": 787,
+      "interpretation": "Parser positional guesses where dst column name is wrong. These are the real parser bugs (parser emits a wrong column name for the dst)."
+    },
+    "information_schema_sourced_tables": {
+      "n": 12,
+      "interpretation": "Export drift — the INFORMATION_SCHEMA CSV is stale vs. the graph. Refresh the CSV to reduce. Low count as expected."
+    },
+    "usage_sourced_tables": {
+      "n": 15,
+      "interpretation": "Usage-derived catalog has different column names than the graph edges. Likely a combination of column renames or different src/dst column mappings."
+    },
+    "other": {
+      "n": 151,
+      "interpretation": "Edges where dst table is in SqlTable but category resolution gave 'other'. Orphan or NULL-source tables."
+    },
+    "rubric": "contradicted on ddl-sourced tables = parser guess-bugs. contradicted on information_schema-sourced tables = export drift (refresh CSV). The XML-DDL cohort (da.*/ba.* old tables) shows only 12 contradicted — matches expectation that old tables don't change (recent changes would be in .sql changelogs)."
+  },
+  "index_profile_delta": {
+    "baseline_index_seconds": 69.51,
+    "note": "Index wall time with catalog re-apply NOT configured (two-step workflow). Index path is untouched — no parse-time work added."
+  }
+}
