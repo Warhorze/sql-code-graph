@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 
 from sqlcg.cli.commands import (
     analyze,
+    catalog,
     db,
     find,
     gain,
@@ -73,6 +74,7 @@ def _root(
 app.add_typer(db.app, name="db")
 app.add_typer(find.app, name="find")
 app.add_typer(analyze.app, name="analyze")
+app.add_typer(catalog.app, name="catalog")
 app.add_typer(mcp.app, name="mcp")
 app.add_typer(git.app, name="git")
 

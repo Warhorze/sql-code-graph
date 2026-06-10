@@ -319,6 +319,35 @@ def get_external_consumers(path: Path) -> list[ExternalConsumerSpec]:
     return []
 
 
+def get_catalog_path(path: Path) -> Path | None:
+    """Get the INFORMATION_SCHEMA catalog CSV path from .sqlcg.toml.
+
+    Reads ``[sqlcg.catalog] path = "..."`` from .sqlcg.toml.  When configured,
+    ``index_repo`` re-applies the catalog at the end of a full index so that the
+    catalog survives a full rebuild without a manual ``sqlcg catalog load``::
+
+        [sqlcg.catalog]
+        path = "/path/to/columns.csv"
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        Path to the catalog CSV if configured, None otherwise.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("catalog", {}).get("path")
+            if raw and isinstance(raw, str):
+                return Path(raw)
+        except Exception:
+            pass
+    return None
+
+
 def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a DuckDBBackend instance.
 

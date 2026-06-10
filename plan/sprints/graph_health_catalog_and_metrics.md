@@ -344,6 +344,20 @@ User exports `INFORMATION_SCHEMA.COLUMNS` from Snowflake (one query, any warehou
       recorded).
 - [ ] Version bump **minor**; full gate green.
 
+### Deviations
+
+#### Deviation 1: insert_table_nodes_if_absent
+- **Reason**: Plan said "check the existing TABLE-node conflict guard in upsert_nodes_bulk" — that guard does not exist. `upsert_nodes_bulk` uses plain `INSERT OR REPLACE` for all node labels. Using it for SqlTable rows in catalog load would overwrite existing `kind`/`defined_in_file` values.
+- **Change**: Added `insert_table_nodes_if_absent()` method to `DuckDBBackend` using `INSERT OR IGNORE` (same as `ON CONFLICT DO NOTHING`). Catalog tables are registered only when not already in the graph.
+- **Impact**: Correct behavior — existing tables with real DDL provenance are never downgraded by catalog load. No scope change.
+- **Date**: 2026-06-10
+
+#### Deviation 2: Source-aware delete NULL handling
+- **Reason**: SQL `NULL NOT IN ('information_schema', 'usage')` evaluates to UNKNOWN, not TRUE. `delete_nodes_for_file` with plain `NOT IN` would silently skip deletion for rows with `source IS NULL` (created by legacy `upsert_edge()` calls in tests and historical code).
+- **Change**: Changed the guard to `(source IS NULL OR source NOT IN ('information_schema', 'usage'))` so NULL-source rows are treated like ddl-source rows and deleted on per-file reindex.
+- **Impact**: Existing test `test_delete_nodes_for_file` was failing before this fix — confirmed the guard was necessary. No semantic change for information_schema/usage rows.
+- **Date**: 2026-06-10
+
 ---
 
 ## 5. PR 3 — usage-derived catalog (runs **before** PR 2 in the decided order)

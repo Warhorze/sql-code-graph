@@ -157,10 +157,51 @@ sqlcg index . --dialect snowflake   # index DDL + ETLs together
 After indexing, `sqlcg db info` shows non-zero `STAR_EXPANSION lineage edges`, and
 `trace_column_lineage` returns results for queries that previously returned empty.
 
-> **Note:** earlier versions accepted an exported `INFORMATION_SCHEMA` CSV (`sqlcg
-> load-schema`). That path was **removed** — profiling showed it added zero lineage
-> edges over DDL + cross-file CTAS resolution on a real warehouse. DDL is now the
-> single source of column truth; no CSV is needed or accepted.
+> **Note:** an earlier `sqlcg load-schema` command was removed in 2026-05 — it fed
+> column names into the parse/qualify loop (hot path) and measured zero edge delta on
+> a real warehouse.  The new `sqlcg catalog load` (see below) is different: it writes
+> `HAS_COLUMN` rows **after** indexing and never touches the parser.
+
+## INFORMATION_SCHEMA catalog enrichment
+
+If your warehouse DDL lives in XML changelogs (Liquibase, Flyway) or other non-SQL
+formats that sqlcg cannot parse, you can supply an `INFORMATION_SCHEMA.COLUMNS` export
+to enrich edge health without re-parsing anything.
+
+```bash
+# Export from Snowflake (or any SQL client):
+# SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, data_type
+# FROM information_schema.columns
+# WHERE table_schema NOT IN ('INFORMATION_SCHEMA')
+# ORDER BY table_schema, table_name, ordinal_position;
+# → save as columns.csv
+
+sqlcg catalog load columns.csv
+sqlcg gain          # check the delta
+```
+
+**What it does:**
+- Reads `table_catalog` (optional), `table_schema`, `table_name`, `column_name` columns.
+- Delimiter sniffed (`,` or `;`); extra columns ignored; names case-folded to lowercase.
+- Creates `SqlColumn` nodes and `HAS_COLUMN(source='information_schema')` edges.
+- DDL-sourced rows are never overwritten (`ddl > information_schema > usage` precedence).
+- Idempotent — running it twice produces no row growth.
+- Catalog-sourced rows survive per-file reindex (`sqlcg reindex`).
+
+**Persisting across full rebuilds:** add to `.sqlcg.toml`:
+
+```toml
+[sqlcg.catalog]
+path = "/path/to/columns.csv"
+```
+
+With this set, `sqlcg index` automatically re-applies the catalog at the end of each
+full rebuild. If the file is missing, indexing succeeds with a warning.
+
+**What it does not do:**
+- It does not feed column names into the parse/qualify hot path — `SELECT *` expansion
+  uses only DDL files and cross-file CTAS bodies (unchanged).
+- It does not create new lineage edges — it only validates / invalidates existing ones.
 
 ## MCP tools reference
 
