@@ -1,3 +1,62 @@
+## Current State [2026-06-10]
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: usage-derived-catalog (PR 3 of graph_health_catalog_and_metrics sprint)
+PLAN: plan/sprints/graph_health_catalog_and_metrics.md §5
+BRANCH: feat/usage-derived-catalog
+STATUS: PR OPEN — https://github.com/Warhorze/sql-code-graph/pull/69
+
+---
+
+## Handoff — developer: usage-derived-catalog (PR 3) [2026-06-10]
+
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: PR 3 of graph_health_catalog_and_metrics sprint
+BRANCH: feat/usage-derived-catalog
+PR: https://github.com/Warhorze/sql-code-graph/pull/69
+VERSION: 1.9.0 → 1.10.0
+
+COMMITS:
+  d032240  feat(PR3): usage-derived HAS_COLUMN catalog + source-precedence upsert (v1.10.0)
+  62ebcb0  docs(PR3): record repo-native plateau measurements (2026-06-10)
+
+FILES CHANGED:
+  src/sqlcg/core/duckdb_backend.py:
+    - Added _HAS_COLUMN_SOURCE_RANK dict and _has_column_precedence() helper
+    - upsert_edges_bulk: HAS_COLUMN now uses ON CONFLICT precedence upsert
+      (ddl > information_schema > usage); all other types unchanged
+  src/sqlcg/indexer/indexer.py:
+    - Added _USAGE_ELIGIBLE_KINDS frozenset
+    - Added _harvest_usage_catalog() function
+    - _flush_row_batch: Phase B2 post-dedup usage catalog harvest
+  pyproject.toml, src/sqlcg/__init__.py: version 1.9.0 → 1.10.0
+  uv.lock: updated
+  tests/unit/test_has_column_precedence_upsert.py: NEW (7 tests)
+  tests/unit/test_upsert_batch_invariant.py: +1 test (usage rides bulk calls)
+  tests/integration/test_usage_derived_catalog.py: NEW (6 tests)
+  plan/measurements/pr3_repo_native_plateau.json: NEW
+
+GATES:
+  - Full suite: 1097 passed, 4 skipped, 3 xfailed, 0 failures
+  - Mandatory guards: 18/18 passed (perf_scaling, qualify_once, bulk_upsert, batch_upsert, analyze_case_fold)
+  - pyright: 0 errors
+  - ruff: all checks passed
+
+MEASUREMENTS (DWH, 1379 files):
+  Before (v1.9.0): 46,813 edges, 66% strict, 89% scoped, 702 blindspots
+  After  (v1.10.0): 48,783 edges, 69% strict, 91% scoped, 632 blindspots
+  Delta: +1970 edges, +3046 strict-good, +609 catalogued tables, -70 blindspots
+  Index wall time: ~85s (budget: 180s)
+  Plateau saved: plan/measurements/pr3_repo_native_plateau.json
+
+DEVIATIONS:
+  1. Schema-qualification guard in _harvest_usage_catalog: added "." dot check
+     because CTE aliases have role='table' in parser output when used as FROM sources.
+     Kind alone is unreliable. Bare names (no dots) excluded from usage harvest.
+
+NEXT: architect-planner plan-compliance check, then user reviews PR #69.
+
+---
+
 ## Current State [2026-06-08]
 ACTIVE AGENT: plan-reviewer (complete)
 FEATURE: coverage_p1_p3_p4 (P1 CTE leak, P3 space-name schema strip, P4 CTAS column discovery)
