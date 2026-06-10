@@ -303,6 +303,18 @@ class AnsiParser(SqlParser):
         confidence = 1.0
         parse_failed = False
 
+        # PR5 (graph_health_catalog_and_metrics §7): a falsy/raising build_scope()
+        # is only a *degraded extraction* for statement kinds that
+        # _extract_column_lineage would otherwise have attempted (Select, INSERT
+        # ... SELECT, CREATE ... AS SELECT). For everything else (Use, Set,
+        # Comment, TruncateTable, Drop, Alter, Command, CREATE ... LIKE/CLONE/
+        # column-defs, INSERT ... VALUES, Update, Delete, Merge), build_scope()
+        # returning None is expected sqlglot behaviour for non-Select-rooted
+        # statements and does NOT indicate lost lineage. Gating parse_failed on
+        # this avoids 96% of the corpus's parse_failed=true rows being a pure
+        # measurement artifact (96.1%/4,544 of 4,727 on the DWH corpus).
+        can_have_lineage = self._can_have_column_lineage(stmt)
+
         # Try to extract table references using scope analysis
         try:
             # Use pre-built scope if provided, otherwise build it here (fallback)
@@ -321,7 +333,7 @@ class AnsiParser(SqlParser):
                     for s in self._fallback_table_scan(stmt)
                     if (r := self._apply_table_alias(s)) is not None
                 ]
-                parse_failed = True
+                parse_failed = can_have_lineage
         except Exception as exc:
             logger.debug("Failed to build scope for statement %d in %s: %s", stmt_index, path, exc)
             sources = [
@@ -329,7 +341,7 @@ class AnsiParser(SqlParser):
                 for s in self._fallback_table_scan(stmt)
                 if (r := self._apply_table_alias(s)) is not None
             ]
-            parse_failed = True
+            parse_failed = can_have_lineage
 
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
         if target:

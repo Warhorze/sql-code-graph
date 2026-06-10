@@ -388,6 +388,34 @@ class SqlParser(ABC):
             return False
         return has_any_stmt  # must have at least one statement
 
+    @staticmethod
+    def _can_have_column_lineage(stmt: Any) -> bool:
+        """Return True if `_extract_column_lineage` would attempt extraction for `stmt`.
+
+        Mirrors the type/body checks `_extract_column_lineage` (below, this class)
+        already performs: only `exp.Select`, `exp.Insert` with a `SELECT` body, and
+        `exp.Create` with a `Select`/`Subquery` body (CTAS / CREATE VIEW AS SELECT)
+        can ever produce column-lineage edges. `exp.Merge` is explicitly skipped there
+        (T-07-06, deferred). Everything else (Update, Delete, Use, Set, Comment, Drop,
+        Alter, Command, TruncateTable, CREATE ... LIKE/CLONE/column-defs, INSERT ...
+        VALUES) is structurally lineage-free regardless of `build_scope`'s outcome.
+
+        Used by `AnsiParser._parse_statement` to avoid marking `parse_failed=True`
+        for statement kinds that were never going to produce column lineage in the
+        first place — `build_scope()` returns `None` for nearly all non-`exp.Select`-
+        rooted statements by sqlglot design, which is not a degraded extraction for
+        these kinds.
+        """
+        import sqlglot.expressions as exp
+
+        if isinstance(stmt, exp.Select):
+            return True
+        if isinstance(stmt, exp.Insert):
+            return isinstance(stmt.expression, exp.Select)
+        if isinstance(stmt, exp.Create):
+            return isinstance(stmt.expression, (exp.Select, exp.Subquery))
+        return False
+
     def _real_tables(self, scope: Any) -> list[TableRef]:
         """Return real (non-CTE) tables referenced in a scope.
 
