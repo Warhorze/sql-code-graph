@@ -65,6 +65,53 @@ STATUS: READY FOR IMPLEMENTATION
 
 ---
 
+## Handoff (merged to master) [2026-06-10]
+ACTIVE AGENT: developer (complete — ready for architect-planner compliance check)
+FEATURE: etl_extraction_recall (PR 5 of plan/sprints/graph_health_catalog_and_metrics.md §7)
+BRANCH: feat/etl-extraction-recall
+PLAN: plan/sprints/graph_health_catalog_and_metrics.md §7
+STATUS: PR ready to open — diagnosis + fix + measurements complete, full gate green
+
+SUMMARY:
+- Phase A diagnosis (commit 63d2fed, prior session): top shape covers 96.1%
+  (4,544/4,727) of parse_failed=true SqlQuery rows on the DWH corpus — a pure
+  measurement artifact (build_scope() returns None for non-Select-rooted
+  statements that _extract_column_lineage never attempts). 96.1% >> 20% gate
+  passes with ONE shape; remaining 3.9% (UPDATE/DELETE/MERGE/CREATE_PROC) is
+  structural, filed as future T-07-XX. 122-row HAS_COLUMN prefix-inconsistency
+  open item: structural (coverage.py _DST_TABLE "strip after last dot" breaks
+  on Dutch BI column names containing literal '.'), filed as coverage.py
+  follow-up, not fixed here.
+- Phase B fix (commit 41b3f37, prior session): SqlParser._can_have_column_lineage()
+  (base.py) gates both parse_failed=True branches in ansi_parser.py
+  _parse_statement. Dialect-agnostic, zero new hot-loop ops, pure
+  reclassification. 15 new tests in test_parse_failed_classification.py, all
+  green. Mandatory regression-guard block (perf scaling, qualify-once,
+  bulk-upsert, batch-upsert, case-fold) — 17/17 pass.
+- Phase C measurement (this session, commit 086f6bc): indexed DWH into
+  throwaway DBs (/tmp/pr5_before from master @ 34d0af8, /tmp/pr5_after from
+  this branch @ 41b3f37) via SQLCG_DB_PATH + --profile, queried via
+  run_read_routed. Edge count byte-identical (46,873 == 46,873) — zero
+  new/lost lineage. Wall time flat (73.89s -> 71.53s, -3.2%, within 180s
+  budget). parse_failed: 68.9% -> 0.0% overall (etl 57.2% -> 0%, ddl 78.6% ->
+  0%). Full numbers in plan/measurements/pr5_extraction_recall_taxonomy.json
+  phase_c_measurement; markdown summary appended to plan §7.
+- Version bump 1.9.0 -> 1.9.1 (patch — pure measurement/classification fix).
+- Full gate: uv run pytest -> 1184 passed, 7 skipped, 3 xfailed (pre-existing
+  baseline); pyright 0 errors; ruff clean.
+
+NOTE: this worktree was inherited mid-checkout from feat/coverage-p1-metric-
+and-p2p5 with unresolved merge conflicts in .claude/progress.txt,
+plan/measurements/sprint_08_*.json, and plan/sprints/coverage_blindspot_high_
+impact.md (leftover uncommitted work from a different feature branch). These
+were resolved by checking out HEAD's versions / removing the file (none of
+that content belongs to PR5) — see commit history on feat/etl-extraction-
+recall for the clean state.
+
+NEXT: open PR feat/etl-extraction-recall -> master; architect-planner
+performs plan-compliance check (per CLAUDE.md/WORKFLOW.md) before code review.
+---
+
 ## Handoff — plan-reviewer: coverage_p1_p3_p4 [2026-06-08]
 
 ACTIVE AGENT: plan-reviewer (complete)
