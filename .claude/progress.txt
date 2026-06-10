@@ -2788,3 +2788,64 @@ NEXT: user reviews the branch and opens the PR to master when ready (per
 Current State: agent=plan-reviewer, plan=v1.14.0_dialect_and_query_config_fixes
 Reviewing 4-PR batch (Fix1 dialect default, Fix2 catalog alias fold, Fix3
 repo-anchored config, Fix4 metrics/UX polish) before developer starts.
+
+---
+HANDOFF: plan-reviewer -> developer
+Plan: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md
+Status: READY FOR IMPLEMENTATION (no blocking questions)
+
+Verdict: APPROVE-WITH-CORRECTIONS. Corrections committed in 7fd750c (plan) and
+0d604eb (failing tests).
+
+Key corrections made:
+- Fix 3's gain.py/coverage.py audit step (Step 3.4 + acceptance criterion)
+  removed — grep-verified those modules have zero NoiseFilter/alias/prefix
+  config reads (raw SQL via run_read_routed only). Do not chase this.
+- Fix 2 D2.1 self-contradiction resolved: PR 2 implements a standalone
+  _resolve_repo_root(backend) in catalog.py (reads Repo.path via its own
+  backend handle, cwd fallback — does NOT reintroduce the cwd disease).
+  Fix 3 gets a new Step 3.4: de-duplicate _resolve_repo_root against
+  _indexed_root once PR 3 lands (grep-confirm _resolve_repo_root is gone).
+- D3.4 added: multi-repo / un-indexed scratch dir semantics documented
+  (LIMIT 1 pre-existing, unchanged; un-indexed -> cwd fallback unchanged).
+- Fix 1 Test Strategy: added a watch_cmd-specific unit test requirement
+  (watch.py has ZERO "auto" resolution today, unlike index/reindex).
+- PR-split section: added explicit per-PR version-bump steps (pyproject.toml,
+  __init__.py, uv lock) per CLAUDE.md; clarified PR N+1 branches once PR N's
+  merge lands on master, independent of when the user tags it.
+
+Failing tests: tests/integration/test_v1_14_0_dialect_and_query_config_fixes.py
+(6 fail red, 5 skip on missing symbols, 2 pass as documented unchanged-behaviour
+guards). Run `pytest -k Fix1` / `Fix2` / `Fix3` / `Fix4a` / `Fix4b` per ticket.
+
+NEXT: developer implements PR 1 (Fix 1, v1.13.1) first — it is the headline bug
+and has no dependencies on the other three.
+
+---
+HANDOFF: developer -> architect-planner (compliance check) -> code-reviewer
+PR 1 (Fix 1, v1.13.1) — dialect default "auto"
+Branch: fix/dialect-auto-default
+Status: IMPLEMENTED, ready for compliance check / PR review
+
+Changes:
+- index.py / reindex.py: --dialect default None -> "auto" (existing
+  resolution before server-route already correct, untouched).
+- watch.py: added "auto" -> get_dialect(path) resolution (path resolved
+  to absolute first); resolved dialect now reaches index_repo,
+  WatchJobManager, and SqlFileEventHandler. Help text updated to match
+  index/reindex.
+- Version bumped 1.13.0 -> 1.13.1 (pyproject.toml, __init__.py, uv.lock).
+
+Test results:
+- tests/integration/test_v1_14_0_dialect_and_query_config_fixes.py -k Fix1:
+  4/4 now pass (was 4 fail). Full file: 6 passed, 2 failed (Fix4a/4b,
+  unchanged — belong to PR 4), 5 skipped (Fix2/Fix3, unchanged — belong to
+  PR 2/3).
+- Full suite: 1273 passed, 2 failed (same Fix4a/4b), 12 skipped, 3 xfailed —
+  no new failures vs master baseline.
+- ruff + pyright clean on touched files.
+
+PR: opened against master (see gh pr list / PR description for link).
+Do NOT merge or tag — user verifies and tags per house rules.
+
+ARCHITECT-PLANNER: ready for plan-compliance check ("finished" signal sent).
