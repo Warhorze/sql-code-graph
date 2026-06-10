@@ -8,10 +8,9 @@ import typer
 from rich.console import Console
 
 from sqlcg.cli.coverage import (
-    blindspot_colour,
     collect_coverage,
-    edge_health_colour,
-    phantom_colour,
+    coverage_to_json,
+    render_coverage_lines,
 )
 from sqlcg.metrics import store as metrics_module
 from sqlcg.server.read_client import run_read_routed
@@ -68,43 +67,15 @@ def gain_cmd(
                 "top_tools": [],
             }
             if coverage is not None:
-                payload["coverage"] = {
-                    "catalogued_tables": coverage.catalogued_tables,
-                    "total_tables": coverage.total_tables,
-                    "good_edges": coverage.good_edges,
-                    "total_edges": coverage.total_edges,
-                    "phantom_edges": coverage.phantom_edges,
-                    "blindspot_tables": coverage.blindspot_tables,
-                }
+                payload["coverage"] = coverage_to_json(coverage)
             console.print(json.dumps(payload))
         else:
             console.print("No metrics collected yet.")
             if coverage is not None:
                 console.print()
                 console.print("[bold cyan]G. Coverage[/bold cyan]")
-                console.print(
-                    f"  Tables with catalog: {coverage.catalogued_tables} / {coverage.total_tables}"
-                    f" ({coverage.catalog_pct:.0f}%)"
-                )
-                eh_colour = edge_health_colour(coverage.edge_health_pct)
-                console.print(
-                    f"  [{eh_colour}]Edge health: {coverage.good_edges} / {coverage.total_edges}"
-                    f" ({coverage.edge_health_pct:.0f}%)[/{eh_colour}]"
-                )
-                ph_colour = phantom_colour(coverage.phantom_pct)
-                console.print(
-                    f"  [{ph_colour}]Phantom edges: {coverage.phantom_edges}"
-                    f" / {coverage.total_edges} ({coverage.phantom_pct:.0f}%)"
-                    f"[/{ph_colour}]"
-                )
-                bs_colour = blindspot_colour(coverage.blindspot_tables)
-                if bs_colour:
-                    console.print(
-                        f"  [{bs_colour}]Blindspot tables:"
-                        f" {coverage.blindspot_tables}[/{bs_colour}]"
-                    )
-                else:
-                    console.print(f"  Blindspot tables: {coverage.blindspot_tables}")
+                for line in render_coverage_lines(coverage, indent="  "):
+                    console.print(line)
         return
 
     try:
@@ -190,14 +161,7 @@ def gain_cmd(
             if parse_quality is not None:
                 payload["parse_quality"] = parse_quality
             if coverage is not None:
-                payload["coverage"] = {
-                    "catalogued_tables": coverage.catalogued_tables,
-                    "total_tables": coverage.total_tables,
-                    "good_edges": coverage.good_edges,
-                    "total_edges": coverage.total_edges,
-                    "phantom_edges": coverage.phantom_edges,
-                    "blindspot_tables": coverage.blindspot_tables,
-                }
+                payload["coverage"] = coverage_to_json(coverage)
             console.print(json.dumps(payload))
         else:
             # Human-readable output
@@ -274,30 +238,8 @@ def gain_cmd(
             # Section G: coverage — omitted silently when graph unavailable
             if coverage is not None:
                 console.print("[bold cyan]G. Coverage[/bold cyan]")
-                console.print(
-                    f"  Tables with catalog: {coverage.catalogued_tables} / {coverage.total_tables}"
-                    f" ({coverage.catalog_pct:.0f}%)"
-                )
-                eh_colour = edge_health_colour(coverage.edge_health_pct)
-                console.print(
-                    f"  [{eh_colour}]Edge health: {coverage.good_edges} / {coverage.total_edges}"
-                    f" ({coverage.edge_health_pct:.0f}%)[/{eh_colour}]"
-                )
-                ph_colour = phantom_colour(coverage.phantom_pct)
-                ph_line = (
-                    f"  [{ph_colour}]Phantom edges: {coverage.phantom_edges}"
-                    f" / {coverage.total_edges} ({coverage.phantom_pct:.0f}%)"
-                    f"[/{ph_colour}]"
-                )
-                console.print(ph_line)
-                bs_colour = blindspot_colour(coverage.blindspot_tables)
-                if bs_colour:
-                    console.print(
-                        f"  [{bs_colour}]Blindspot tables:"
-                        f" {coverage.blindspot_tables}[/{bs_colour}]"
-                    )
-                else:
-                    console.print(f"  Blindspot tables: {coverage.blindspot_tables}")
+                for line in render_coverage_lines(coverage, indent="  "):
+                    console.print(line)
                 console.print()
 
         metrics.close()
