@@ -50,6 +50,13 @@ class HotOpCounters:
         self.scope_lineage_calls = 0  # sg_lineage calls that pass a pre-built scope
         self.scope_without_copy_false = 0  # ...of those, how many omit copy=False
         self.multi_proj_body_copy = 0  # .copy() of a multi-projection SELECT body
+        # PR 4 (transform-kind classification) behavioural guard:
+        # _classify_transform must call .sql() ZERO times — it is AST-only
+        # (no serialization). Tracking .sql() calls here pins this invariant.
+        # Note: we only count calls whose receiver is NOT a patched body_no_with
+        # SELECT — the INSERT positional block has a legitimate _patched_sql
+        # serialisation for sg_lineage, which is separate from classification.
+        self.sql_calls_on_classify_path = 0  # .sql() inside _classify_transform
 
 
 @contextmanager
@@ -79,6 +86,7 @@ def count_hot_ops():
         "base_bs": base_mod.build_scope,
         "base_q": base_mod.qualify,
         "exp_copy": sqlglot_exp.Expression.copy,
+        "exp_sql": sqlglot_exp.Expression.sql,
     }
 
     def lineage_wrap(*a, **k):
@@ -115,10 +123,32 @@ def count_hot_ops():
             c.multi_proj_body_copy += 1
         return orig["exp_copy"](self, *a, **k)
 
+    # PR 4 invariant: wrap _classify_transform to count .sql() calls made
+    # inside it. We do this by patching Expression.sql only while _classify_transform
+    # is executing, using a flag.
+    _in_classify = False
+
+    orig_classify = base_mod.SqlParser._classify_transform
+
+    def classify_wrap(col_expr):
+        nonlocal _in_classify
+        _in_classify = True
+        try:
+            return orig_classify(col_expr)
+        finally:
+            _in_classify = False
+
+    def sql_wrap(self, *a, **k):
+        if _in_classify:
+            c.sql_calls_on_classify_path += 1
+        return orig["exp_sql"](self, *a, **k)
+
     sqlglot_lin.lineage = lineage_wrap
     base_mod.build_scope = build_scope_wrap_factory("base_bs")
     base_mod.qualify = qualify_wrap_factory("base_q")
     sqlglot_exp.Expression.copy = copy_wrap
+    sqlglot_exp.Expression.sql = sql_wrap
+    base_mod.SqlParser._classify_transform = staticmethod(classify_wrap)
     try:
         yield c
     finally:
@@ -126,6 +156,8 @@ def count_hot_ops():
         base_mod.build_scope = orig["base_bs"]
         base_mod.qualify = orig["base_q"]
         sqlglot_exp.Expression.copy = orig["exp_copy"]
+        sqlglot_exp.Expression.sql = orig["exp_sql"]
+        base_mod.SqlParser._classify_transform = staticmethod(orig_classify)
 
 
 def assert_flat(base: int, doubled: int, label: str, slack: int = 2) -> None:
@@ -284,3 +316,38 @@ def test_qualify_not_retried_per_column_when_it_fails():
 
     assert base_calls >= 1, "fixture did not reach the qualify path"
     assert_flat(base_calls, doubled_calls, "qualify (on the failure path)")
+
+
+# ---------------------------------------------------------------------------
+# Axis 3 (PR 4) — _classify_transform must call .sql() ZERO times.
+# The transform classification is AST-only; any serialization here is the
+# same per-call-cost class that regressed in 4234e5d.
+# Uses _wide_select (plain SELECT, no INSERT positional block, no CTE) so
+# every .sql() count observed is attributable to classification, not to the
+# legitimate INSERT body serialisation.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_transform_calls_sql_zero_times():
+    """_classify_transform is AST-only: .sql() must be called 0 times on SELECT path.
+
+    On a wide SELECT (no INSERT column-list block, no CTE body serialisation),
+    the only path that could call .sql() is _classify_transform — and it must not.
+    Serialization inside the classification path is the per-call-cost regression
+    class from commit 4234e5d (see CLAUDE.md 'Performance invariants').
+
+    Guards PR 4 (plan/sprints/graph_health_catalog_and_metrics.md §6).
+    """
+    parser = AnsiParser(SchemaResolver(dialect=None))
+    with count_hot_ops() as c:
+        parser.parse_file(Path("classify.sql"), _wide_select(COLS_BASE))
+
+    assert c.sg_lineage > 0, (
+        "fixture did not exercise the lineage path; guard would be vacuously green"
+    )
+    assert c.sql_calls_on_classify_path == 0, (
+        f"_classify_transform called .sql() {c.sql_calls_on_classify_path} time(s) "
+        "on a pure SELECT fixture — classification must be AST-only (no serialization). "
+        "Serialization inside the classification path is the per-call-cost regression "
+        "class from commit 4234e5d. Restore AST-only classification."
+    )
