@@ -11,7 +11,7 @@ from typing import Any
 import typer
 from rich.console import Console
 
-from sqlcg.core.config import get_backend
+from sqlcg.core.config import get_backend, get_schema_aliases
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.utils.logging import getLogger
 
@@ -38,7 +38,8 @@ def _sniff_delimiter(header_line: str) -> str:
 
 def load_catalog_csv(
     csv_path: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int, int]:
+    schema_aliases: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
     """Parse a INFORMATION_SCHEMA.COLUMNS CSV export into bulk-upsert row lists.
 
     Design (plan §4 §1):
@@ -50,15 +51,24 @@ def load_catalog_csv(
     - Single catalog component (``table_catalog``) dropped from graph keys —
       graph keys are ``schema.table`` (two-part, lower-cased).
 
+    ``schema_aliases`` (e.g. ``{"ba_tmp": "ba"}``, from
+    ``[sqlcg.schema_aliases]`` in ``.sqlcg.toml``) folds staging-schema rows
+    onto their canonical schema **before** dedup/qualified-name construction,
+    so ``ba_tmp.foo`` rows upsert as ``ba.foo`` — the same identity the
+    lineage edges already use. Defaults to an empty dict (no folding, today's
+    verbatim behaviour).
+
     Returns:
-        (table_rows, column_rows, has_column_edges, rows_read, malformed_skipped)
-        where:
+        (table_rows, column_rows, has_column_edges, rows_read, malformed_skipped,
+        folded_rows) where:
           - table_rows: SqlTable upsert dicts (bare, ``kind='table'``, ``defined_in_file=''``)
           - column_rows: SqlColumn upsert dicts
           - has_column_edges: HAS_COLUMN edge dicts with ``source='information_schema'``
           - rows_read: total data rows read (excl. header)
           - malformed_skipped: rows skipped for missing required fields
+          - folded_rows: rows whose schema was rewritten via ``schema_aliases``
     """
+    schema_aliases = schema_aliases or {}
     raw = csv_path.read_text(encoding="utf-8", errors="replace")
     lines = raw.splitlines()
     if not lines:
@@ -84,6 +94,7 @@ def load_catalog_csv(
     has_column_edges: list[dict[str, Any]] = []
     rows_read = 0
     malformed_skipped = 0
+    folded_rows = 0
 
     # Dedup tables — emit one SqlTable row per qualified table.
     seen_tables: set[str] = set()
@@ -107,6 +118,13 @@ def load_catalog_csv(
         schema = schema_raw.strip().lower()
         table = table_raw.strip().lower()
         col = col_raw.strip().lower()
+
+        # Fold staging schema onto its canonical schema (e.g. ba_tmp -> ba) before
+        # building the qualified name, so folded rows share dedup/precedence with
+        # their canonical counterparts (D2.2/D2.3).
+        if schema in schema_aliases:
+            schema = schema_aliases[schema]
+            folded_rows += 1
 
         if not schema or not table or not col:
             malformed_skipped += 1
@@ -161,12 +179,37 @@ def load_catalog_csv(
                 }
             )
 
-    return table_rows, column_rows, has_column_edges, rows_read, malformed_skipped
+    return table_rows, column_rows, has_column_edges, rows_read, malformed_skipped, folded_rows
+
+
+def _resolve_repo_root(backend: Any) -> Path:
+    """Return the indexed repo root, or ``Path.cwd()`` if no Repo row exists.
+
+    Reads the persisted ``Repo.path`` primary key via the already-open backend
+    handle (D2.1) — same query/fallback pattern as ``_indexed_root(db)`` in
+    [`tools.py`](../../server/tools.py), kept as a local copy here since
+    ``tools.py`` is server-side and ``catalog.py`` is CLI-side. PR 3 (Fix 3
+    Step 3.4) is expected to de-duplicate this against the shared helper.
+
+    Args:
+        backend: An open GraphBackend instance (DuckDBBackend).
+
+    Returns:
+        Absolute Path of the indexed root, or ``Path.cwd()``.
+    """
+    try:
+        rows = backend.run_read('SELECT path FROM "Repo" LIMIT 1', {})
+        if rows and rows[0].get("path"):
+            return Path(rows[0]["path"])
+    except Exception:
+        pass
+    return Path.cwd()
 
 
 def apply_catalog_to_backend(
     csv_path: Path,
     backend: Any,
+    schema_aliases: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Load catalog CSV rows into the graph backend.
 
@@ -178,12 +221,16 @@ def apply_catalog_to_backend(
     Args:
         csv_path: Path to the INFORMATION_SCHEMA.COLUMNS CSV file.
         backend:  An open GraphBackend instance (DuckDBBackend).
+        schema_aliases: Optional staging-schema -> canonical-schema map (from
+            ``[sqlcg.schema_aliases]``); folds rows like ``ba_tmp.*`` onto
+            ``ba.*`` before upsert. Defaults to no folding.
 
     Returns:
-        Dict with keys: rows_read, malformed_skipped, tables_loaded, columns_loaded.
+        Dict with keys: rows_read, malformed_skipped, tables_loaded, columns_loaded,
+        folded_rows.
     """
-    table_rows, column_rows, has_column_edges, rows_read, malformed_skipped = load_catalog_csv(
-        csv_path
+    table_rows, column_rows, has_column_edges, rows_read, malformed_skipped, folded_rows = (
+        load_catalog_csv(csv_path, schema_aliases=schema_aliases)
     )
 
     # SqlTable: INSERT OR IGNORE — never overwrite existing rows with real kind/
@@ -204,6 +251,7 @@ def apply_catalog_to_backend(
         "malformed_skipped": malformed_skipped,
         "tables_loaded": len(table_rows),
         "columns_loaded": len(column_rows),
+        "folded_rows": folded_rows,
     }
 
 
@@ -231,7 +279,9 @@ def catalog_load(
 
     try:
         with get_backend() as backend:
-            result = apply_catalog_to_backend(file, backend)
+            repo_root = _resolve_repo_root(backend)
+            schema_aliases = get_schema_aliases(repo_root)
+            result = apply_catalog_to_backend(file, backend, schema_aliases=schema_aliases)
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
@@ -245,6 +295,11 @@ def catalog_load(
         f"{result['tables_loaded']} tables, "
         f"{result['columns_loaded']} columns."
     )
+    if result["folded_rows"] > 0:
+        console.print(
+            f"{result['folded_rows']} rows folded via schema alias "
+            f"({', '.join(f'{src} -> {dst}' for src, dst in schema_aliases.items())})."
+        )
     if result["malformed_skipped"] > 0:
         console.print(
             f"[yellow]Warning:[/yellow] {result['malformed_skipped']} rows were skipped "

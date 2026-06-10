@@ -1716,8 +1716,10 @@ class Indexer:
             return empty
         try:
             from sqlcg.cli.commands.catalog import apply_catalog_to_backend
+            from sqlcg.core.config import get_schema_aliases
 
-            result = apply_catalog_to_backend(catalog_csv, db)
+            schema_aliases = get_schema_aliases(path)
+            result = apply_catalog_to_backend(catalog_csv, db, schema_aliases=schema_aliases)
             logger.info(
                 "catalog re-applied: %d columns from %s",
                 result["columns_loaded"],

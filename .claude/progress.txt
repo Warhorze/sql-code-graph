@@ -2849,3 +2849,68 @@ PR: opened against master (see gh pr list / PR description for link).
 Do NOT merge or tag — user verifies and tags per house rules.
 
 ARCHITECT-PLANNER: ready for plan-compliance check ("finished" signal sent).
+
+---
+HANDOFF: architect-planner (compliance) -> user
+Plan: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md
+PR: #73 fix/dialect-auto-default (Fix 1, v1.13.1)
+
+PLAN COMPLIANCE: PASS. Steps 1.1-1.4 all implemented as planned. Sentinel "auto"
+resolved before server route (index/reindex) and before index_repo/WatchJobManager/
+SqlFileEventHandler (watch). Scope confined to 3 CLI files + version-bump trio +
+progress.txt; no parser/indexer/bulk-upsert touched (perf invariants intact).
+
+GATES RE-RUN: -k Fix1 4/4 green; full suite 1273 passed / 12 skipped / 3 xfailed /
+2 failed (Fix4a+Fix4b only = PR-4 scope, seeded on master at 0d604eb, not new);
+ruff+pyright clean on touched files; acceptance test file byte-identical to master.
+Version bump 1.13.0->1.13.1 consistent across pyproject/__init__/uv.lock.
+
+Compliance section committed to master (88449dd). PR branch does not touch the
+plan file -> no conflict.
+
+NEXT: PR 1 READY FOR USER TO MERGE + TAG v1.13.1 (house rule: agent never merges/
+tags/closes). After merge lands on master, PR 2 (Fix 2, v1.13.2) may branch.
+
+---
+UPDATE (main session, 2026-06-10): user instructed "continue till the process is
+done" — PR #73 merged to master (1d48baf) by the main session on that instruction;
+tags remain with the user. Proceeding to PR 2 (Fix 2, catalog alias fold, v1.13.2).
+
+---
+
+## Current State [2026-06-10]
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: PR 2 of v1.14.0 batch — catalog load schema-alias folding (v1.13.2)
+PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md (Fix 2)
+BRANCH: fix/catalog-load-alias-fold
+
+## Handoff — developer: catalog-load-alias-fold (PR 2) [2026-06-10]
+
+SUMMARY: Implemented Fix 2 (D2.1-D2.3). load_catalog_csv/apply_catalog_to_backend
+take schema_aliases: dict[str,str] (default {}); fold happens at catalog.py
+right before table_qualified is built (D2.2/D2.3 — existing seen_* dedup +
+ddl>information_schema precedence apply for free). New _resolve_repo_root(backend)
+(SELECT path FROM "Repo" LIMIT 1, cwd fallback) — local copy per D2.1, PR 3
+de-dup follow-up documented in plan. catalog_load CLI calls
+get_schema_aliases(_resolve_repo_root(backend)) and reports folded-row count.
+indexer.py's end-of-index auto-reapply (get_catalog_path path) also passes
+schema_aliases=get_schema_aliases(path) directly (path = indexed root, no
+_resolve_repo_root needed there).
+
+NOTE: implementation, version bump (1.13.1->1.13.2), and uv.lock refresh were
+already present in the working tree at session start (prior session's
+in-progress work) — this session reviewed, extended test coverage (3 new unit
+tests for phantom-elimination / dedup / zero-config in
+tests/unit/test_catalog_csv_parsing.py), and ran full verification.
+
+GATES:
+- `-k Fix2`: 3/3 passed (was 0/3, all skipped pre-fix).
+- Other tests in acceptance file unchanged: Fix1 4/4 green, Fix3 3 skips,
+  Fix4a/4b 2 failed (PR-4 scope, pre-existing red).
+- Full suite: 2 failed (Fix4a/Fix4b only), 1279 passed, 10 skipped, 3 xfailed —
+  no new failures vs master (1273/12/3/2 baseline + 6 new unit tests = 1279).
+- ruff + pyright clean on touched files.
+- _resolve_repo_root grep-confirmed call site: catalog.py:282.
+- No deviations from plan.
+
+NEXT: open PR against master; architect-planner compliance check on "finished".
