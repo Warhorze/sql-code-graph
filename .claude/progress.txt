@@ -1,9 +1,54 @@
 ## Current State [2026-06-10]
 ACTIVE AGENT: developer (complete — ready for compliance check)
-FEATURE: usage-derived-catalog (PR 3 of graph_health_catalog_and_metrics sprint)
-PLAN: plan/sprints/graph_health_catalog_and_metrics.md §5
-BRANCH: feat/usage-derived-catalog
-STATUS: PR OPEN — https://github.com/Warhorze/sql-code-graph/pull/69
+FEATURE: catalog-load-information-schema (PR 2 of graph_health_catalog_and_metrics sprint)
+PLAN: plan/sprints/graph_health_catalog_and_metrics.md §4
+BRANCH: feat/catalog-load-information-schema
+STATUS: PR OPEN — pending PR URL (push + open in progress)
+
+---
+
+## Handoff — developer: catalog-load-information-schema (PR 2) [2026-06-10]
+
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: PR 2 of graph_health_catalog_and_metrics sprint — INFORMATION_SCHEMA catalog enrichment
+BRANCH: feat/catalog-load-information-schema
+VERSION: 1.10.0 → 1.11.0
+
+COMMITS:
+  be3419a  feat(catalog): sqlcg catalog load — INFORMATION_SCHEMA enrichment (PR 2, v1.11.0)
+  d1dcffd  docs(PR2): record catalog load eval measurements (2026-06-10)
+
+FILES CHANGED:
+  src/sqlcg/cli/commands/catalog.py: NEW — sqlcg catalog load <file> command
+  src/sqlcg/cli/main.py: registered catalog.app as catalog subcommand
+  src/sqlcg/core/config.py: added get_catalog_path() helper
+  src/sqlcg/core/duckdb_backend.py: insert_table_nodes_if_absent(), source-aware delete
+  src/sqlcg/indexer/indexer.py: _reapply_catalog_if_configured(), catalog_result in result
+  CLAUDE.md: Schema resolution paragraph updated
+  ARCHITECTURE_REVIEW.md: §3.2b added
+  README.md: catalog load section added
+  pyproject.toml, src/sqlcg/__init__.py: 1.10.0 → 1.11.0
+  tests/unit/test_catalog_csv_parsing.py: NEW (16 tests)
+  tests/integration/test_catalog_load_integration.py: NEW (12 tests)
+  plan/measurements/pr2_catalog_load_eval.json: NEW
+
+GATES:
+  1140 passed, 4 skipped, 3 xfailed; pyright 0 errors; ruff clean
+
+MEASUREMENTS:
+  Index: 69.51s; Catalog load: 77.68s (144,311 rows, 5,673 tables)
+  strict: 69%→74%, scoped: 91%→93%, blindspots: 632→602
+  contradicted: 2,439→690 (−72%)
+  Contradicted by source: ddl=787, info_schema=12, usage=15, other=151
+
+DEVIATIONS:
+  1. insert_table_nodes_if_absent: new backend method (INSERT OR IGNORE) — plan said
+     "check existing TABLE-node conflict guard in upsert_nodes_bulk" but that guard
+     doesn't exist. New method correctly preserves existing kind/defined_in_file.
+  2. Source-aware delete NULL handling: `source IS NULL OR` added to NOT IN clause
+     because SQL NULL NOT IN (...) = UNKNOWN. Legacy upsert_edge() creates NULL-source rows.
+
+NEXT: architect-planner plan-compliance check, then user reviews PR.
 
 ---
 
