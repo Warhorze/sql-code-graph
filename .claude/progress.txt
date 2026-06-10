@@ -1,9 +1,9 @@
 ## Current State [2026-06-10]
-ACTIVE AGENT: developer (complete — ready for compliance check)
-FEATURE: catalog-load-information-schema (PR 2 of graph_health_catalog_and_metrics sprint)
-PLAN: plan/sprints/graph_health_catalog_and_metrics.md §4
-BRANCH: feat/catalog-load-information-schema
-STATUS: PR OPEN — pending PR URL (push + open in progress)
+ACTIVE AGENT: architect-planner (planning — idle after commit)
+FEATURE: dialect-and-query-config fix batch (post-graph-health DWH verification)
+PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md
+BRANCH: master (plan only; per-fix branches to follow)
+STATUS: PLAN WRITTEN — awaiting plan-reviewer gate
 
 ---
 
