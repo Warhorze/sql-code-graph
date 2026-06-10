@@ -7,6 +7,41 @@ STATUS: PLAN WRITTEN — awaiting plan-reviewer gate
 
 ---
 
+## Handoff — architect-planner: dialect-and-query-config fix batch [2026-06-10]
+
+PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md (committed)
+
+SUMMARY: 4-fix batch from the live DWH verification. Recommended PR split:
+  PR1 Fix1 dialect default -> "auto" (index/reindex/watch)   patch  v1.13.1
+  PR2 Fix2 catalog load applies schema aliases               patch  v1.13.2
+  PR3 Fix3 repo-anchored query config (NoiseFilter+gain)     MINOR  v1.14.0
+  PR4 Fix4 blindspot cte-exclude + post-filter-empty hint    patch  v1.14.1
+  + final re-measure (doc commit, not a PR; user tags).
+
+KEY FINDINGS FOR THE DEVELOPER:
+  - Fix1: index.py:109 / reindex.py:84 already resolve "auto" BEFORE the
+    server-route call (Bug A). Only the option DEFAULTS change (None->"auto").
+    watch.py has NO resolution at all — add it before index_repo AND before
+    WatchJobManager/SqlFileEventHandler receive dialect.
+  - Fix2: fold schema at catalog.py:107 before table_qualified is built;
+    existing seen_tables/seen_col_ids dedup + ddl>information_schema upsert
+    precedence both stay correct as long as folding precedes the upsert.
+  - Fix3: Repo.path already persisted (index.py:352) and read by
+    _indexed_root(db) (tools.py:276). tools.py:1201/1943 already do it right;
+    991/1051/1136/2040 + all 6 CLI sites (analyze x4, find x2) do not.
+  - Fix4a: mirror _Q_EDGE_HEALTH_SCOPED's kind guard into _Q_BLINDSPOT_WEIGHTED
+    bad_edges CTE (coverage.py:138); use ('cte','derived') for KPI parity.
+
+NEXT STEP: plan-reviewer gate, then developer implements PR1 first.
+
+NOTE: MCP code-review-graph server was NOT available this session — explored
+via Read/Grep. Re-run list_graph_stats_tool when picking this up.
+
+ARCHITECT-PLANNER IS NOW IDLE — available for developer Q&A and the
+plan-compliance check when the developer says "finished".
+
+---
+
 ## Handoff — developer: catalog-load-information-schema (PR 2) [2026-06-10]
 
 ACTIVE AGENT: developer (complete — ready for compliance check)
@@ -2748,3 +2783,8 @@ User should handle that separately on docs/architecture-overhaul.
 
 NEXT: user reviews the branch and opens the PR to master when ready (per
 [[feedback_no_close_verify_before_tag]] — agent does not tag/close/merge).
+
+---
+Current State: agent=plan-reviewer, plan=v1.14.0_dialect_and_query_config_fixes
+Reviewing 4-PR batch (Fix1 dialect default, Fix2 catalog alias fold, Fix3
+repo-anchored config, Fix4 metrics/UX polish) before developer starts.
