@@ -28,7 +28,7 @@ _INDEX_SOCKET_TIMEOUT_S = 600
 def index_cmd(  # noqa: B008
     path: Path = typer.Argument(..., help="Directory to index"),  # noqa: B008
     dialect: str | None = typer.Option(  # noqa: B008
-        None, "--dialect", "-d", help="SQL dialect (or 'auto' to read from .sqlcg.toml)"
+        "auto", "--dialect", "-d", help="SQL dialect ('auto' reads from .sqlcg.toml, default)"
     ),
     dbt_manifest: Path | None = typer.Option(  # noqa: B008
         None, "--dbt-manifest", help="Path to dbt manifest"

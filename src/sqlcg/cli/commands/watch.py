@@ -7,7 +7,7 @@ import typer
 from rich.console import Console
 from watchdog.observers import Observer
 
-from sqlcg.core.config import get_backend, get_db_path
+from sqlcg.core.config import get_backend, get_db_path, get_dialect
 from sqlcg.core.jobs import WatchJobManager
 from sqlcg.indexer.indexer import Indexer
 from sqlcg.indexer.watcher import SqlFileEventHandler
@@ -19,10 +19,18 @@ console = Console()
 def watch_cmd(  # noqa: B008
     path: Path = typer.Argument(..., help="Directory to watch"),  # noqa: B008
     dialect: str | None = typer.Option(  # noqa: B008
-        None, "--dialect", "-d", help="SQL dialect"
+        "auto", "--dialect", "-d", help="SQL dialect ('auto' reads from .sqlcg.toml, default)"
     ),
 ) -> None:
     """Watch a directory and re-index on SQL file changes."""
+    # Resolve path early and resolve "auto" -> .sqlcg.toml dialect before the
+    # initial index and before WatchJobManager / SqlFileEventHandler are
+    # constructed (mirrors the index/reindex Bug A fix — the sentinel "auto"
+    # must never reach the indexer or the watch helpers).
+    path = path.resolve()
+    if dialect == "auto":
+        dialect = get_dialect(path)
+
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
