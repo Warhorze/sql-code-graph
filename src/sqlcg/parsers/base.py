@@ -491,6 +491,47 @@ class SqlParser(ABC):
 
         return dataclasses.replace(ref, db=aliased)
 
+    @staticmethod
+    def _classify_transform(col_expr: Any) -> str:
+        """Classify the transform kind for a SELECT-list projection expression.
+
+        AST-only — no serialization, no qualify/build_scope/exp.expand calls.
+        One bounded ``find`` on the *single projection expression* (not the body).
+        Called once per column in the main loop, before sg_lineage.
+
+        Classification rules (evaluated in order):
+        - ``PASS_THROUGH`` — bare ``exp.Column`` with no alias, or alias equal to
+          the column name (case-insensitive). The value flows unchanged.
+        - ``RENAME`` — bare ``exp.Column`` with an alias that differs from the
+          column name. No transformation, just a rename.
+        - ``AGGREGATION`` — projection contains at least one ``exp.AggFunc``
+          descendant (e.g. SUM, COUNT, MAX). Uses a bounded ``find`` on the single
+          projection node — never traverses the whole body.
+        - ``EXPRESSION`` — everything else (arithmetic, CAST, CASE WHEN, function
+          calls without AggFunc, etc.).
+
+        ``CTE_PROJECTION``/``CTE_PROJECTION_AMBIGUOUS``/``UNKNOWN`` edges are
+        produced outside this method and are never passed through it.
+        """
+        import sqlglot.expressions as exp
+
+        # Unwrap alias to inspect the inner expression.
+        inner = col_expr.this if isinstance(col_expr, exp.Alias) else col_expr
+        alias: str | None = col_expr.alias if isinstance(col_expr, exp.Alias) else None
+
+        if isinstance(inner, exp.Column):
+            col_name = inner.name or ""
+            if alias is None or alias.lower() == col_name.lower():
+                return "PASS_THROUGH"
+            return "RENAME"
+
+        # Bounded find on the single projection — never on the body.
+        # exp.Expression.find() returns the matching node directly (or None).
+        if col_expr.find(exp.AggFunc) is not None:
+            return "AGGREGATION"
+
+        return "EXPRESSION"
+
     def _lineage_node_to_edges(
         self,
         root: Any,
@@ -499,6 +540,7 @@ class SqlParser(ABC):
         path: Path,
         out: ParsedFile,
         inferred_from_source_name: bool = False,
+        transform: str = "SELECT",
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -553,7 +595,7 @@ class SqlParser(ABC):
                         LineageEdge(
                             src=ColumnRef(src_table_ref, src_col_name),
                             dst=ColumnRef(dst_tbl, dst_col_name),
-                            transform="SELECT",
+                            transform=transform,
                             confidence=1.0,
                             inferred_from_source_name=inferred_from_source_name,
                         )
@@ -879,6 +921,7 @@ class SqlParser(ABC):
                     # (regressed by eb19f29; broke the MA_AANTAL_OP_ORDER anchor link 5).
                     # Cross-statement temps (e.g. CREATE TEMP TABLE t) live in `sources`
                     # and SHOULD still expand (E36 multi-temp: t → src).
+                    _ins_transform = self._classify_transform(_col_expr)
                     try:
                         _root = sg_lineage(
                             _insert_col,
@@ -893,6 +936,7 @@ class SqlParser(ABC):
                                 dst_table=dst_table,
                                 path=path,
                                 out=out,
+                                transform=_ins_transform,
                             )
                             edges.extend(_new_edges)
                     except Exception:
@@ -988,6 +1032,7 @@ class SqlParser(ABC):
                         _b_aliased = exp.Alias(this=_b_inner.copy(), alias=_target_col)
                         _body_no_with_b.set("expressions", [_b_aliased])
                         _b_patched_sql = _body_no_with_b.sql(dialect=self.DIALECT)
+                        _b_transform = self._classify_transform(_pcol_expr)
                         try:
                             _b_root = sg_lineage(
                                 _target_col,
@@ -1003,6 +1048,7 @@ class SqlParser(ABC):
                                     path=path,
                                     out=out,
                                     inferred_from_source_name=False,
+                                    transform=_b_transform,
                                 )
                                 edges.extend(_b_new_edges)
                         except Exception:
@@ -1088,6 +1134,11 @@ class SqlParser(ABC):
                         )
                         continue
 
+                # Classify the transform kind once per column — AST-only, no serialization,
+                # no qualify/build_scope/exp.expand/sg_lineage calls (CLAUDE.md invariants).
+                # Result is passed through to _lineage_node_to_edges for every emitted edge.
+                col_transform = self._classify_transform(col_expr)
+
                 try:
                     # When a scope is available it embeds full column→table resolution.
                     # On the qualify-failed fallback path (no scope), pass only the small
@@ -1133,6 +1184,7 @@ class SqlParser(ABC):
                             path=path,
                             out=out,
                             inferred_from_source_name=_is_unmapped_no_list_insert,
+                            transform=col_transform,
                         )
                         edges.extend(new_edges)
                         if not new_edges:
