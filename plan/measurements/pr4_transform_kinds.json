@@ -1,0 +1,55 @@
+{
+  "description": "PR 4 — transform-kind classification on lineage edges",
+  "date": "2026-06-10",
+  "corpus": "DWH (1,379 files)",
+  "branch": "feat/transform-kind-classification",
+
+  "profile": {
+    "master_baseline_session": {
+      "total_s": 74.67,
+      "ms_per_file": 54.1,
+      "files": 1379,
+      "note": "Recorded at start of this session on master (v1.12.0)"
+    },
+    "pr4_after": {
+      "total_s": 69.53,
+      "ms_per_file": 50.8,
+      "files": 1379,
+      "note": "v1.13.0 on feat/transform-kind-classification; third run on the same DB (no cold-start cache benefit)"
+    },
+    "delta_s": -5.14,
+    "budget_s": 5.0,
+    "verdict": "PASS — delta is negative (improvement, within noise); well under the 5s cap"
+  },
+
+  "transform_distribution": {
+    "db_path": "/tmp/pr4_eval/graph.db",
+    "query": "SELECT transform, COUNT(*) AS cnt FROM \"COLUMN_LINEAGE\" GROUP BY transform ORDER BY cnt DESC",
+    "results": [
+      {"transform": "PASS_THROUGH",              "cnt": 14045},
+      {"transform": "STAR_EXPANSION",             "cnt": 13461},
+      {"transform": "RENAME",                     "cnt": 7089},
+      {"transform": "EXPRESSION",                 "cnt": 5718},
+      {"transform": "CTE_PROJECTION",             "cnt": 4343},
+      {"transform": "AGGREGATION",                "cnt": 2112},
+      {"transform": "CTE_PROJECTION_AMBIGUOUS",   "cnt": 1641},
+      {"transform": "UNKNOWN",                    "cnt": 470}
+    ],
+    "total_edges": 48879,
+    "note": "No 'SELECT' rows — every edge has been classified. STAR_EXPANSION edges are emitted by graph-backend star-expansion, not by _extract_column_lineage; they retain their existing value."
+  },
+
+  "consumer_audit": {
+    "tools.py_L839_L880": "row.get('transform') or 'SELECT' — truthy new values pass through as Mermaid labels; 'SELECT' fallback only fires when transform is None/empty. Intended more-informative labels.",
+    "_REASON_MAP_L707": "Keys on STAR_EXPANSION/UNKNOWN/None — never on 'SELECT'. Unaffected by new values.",
+    "models.py_L78": "Doc-string only (field-description examples). No logic change.",
+    "no_consumer_filters_on_SELECT": true
+  },
+
+  "test_gates": {
+    "new_tests": 21,
+    "new_tests_breakdown": "20 in test_transform_kind_classification.py + 1 in test_perf_scaling_guard.py",
+    "full_suite": "1258 passed, 7 skipped, 1 xfailed (master baseline 1237 + 21 new = 1258)",
+    "mandatory_guards": "19/19 passed (perf_scaling_guard, qualify_once, bulk_upsert, batch_upsert, analyze_case_fold)"
+  }
+}
