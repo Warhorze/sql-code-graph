@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlcg.core.config import get_external_consumers, get_presentation_prefixes
+from sqlcg.core.config import get_catalog_path, get_external_consumers, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.error_classify import _classify_error, dominant_cause
@@ -645,6 +645,11 @@ class Indexer:
         except Exception as _sha_exc:
             logger.debug("Could not write indexed_sha: %s", _sha_exc)
 
+        # Post-ingestion: re-apply INFORMATION_SCHEMA catalog if configured in .sqlcg.toml
+        # (Decision B2 — plan §4 §2). Runs once after the last batch flush, outside all
+        # hot loops. One-shot bulk path: zero parse-time work, constant execute() count.
+        catalog_result = self._reapply_catalog_if_configured(db, path)
+
         # Classify all errors into buckets for measurement and reporting
         error_summary: dict[str, int] = {
             "E1": 0,
@@ -687,6 +692,8 @@ class Indexer:
             "external_consumers": ingest_result["consumers"],
             "external_consumer_edges": ingest_result["edges"],
             "external_consumer_warnings": ingest_result["warnings"],
+            "catalog_reapplied": catalog_result.get("columns_loaded", 0) > 0,
+            "catalog_result": catalog_result,
         }
 
         if profile:
@@ -1673,3 +1680,41 @@ class Indexer:
             "edges": len(edge_rows),
             "warnings": warnings,
         }
+
+    def _reapply_catalog_if_configured(self, db: GraphBackend, path: Path) -> dict:
+        """Re-apply the INFORMATION_SCHEMA catalog if configured in .sqlcg.toml.
+
+        Decision B2 (plan §4 §2): reads ``[sqlcg.catalog] path`` from .sqlcg.toml
+        via ``get_catalog_path()``.  When set and readable, re-applies the catalog
+        via one-shot bulk upserts after the last batch flush.  If the file is
+        missing or unreadable: one warning line, index result unaffected.
+
+        Returns:
+            Dict with keys: rows_read, malformed_skipped, tables_loaded,
+            columns_loaded (all zero when no catalog is configured or file missing).
+        """
+        empty: dict = {
+            "rows_read": 0,
+            "malformed_skipped": 0,
+            "tables_loaded": 0,
+            "columns_loaded": 0,
+        }
+        catalog_csv = get_catalog_path(path)
+        if catalog_csv is None:
+            return empty
+        if not catalog_csv.exists():
+            logger.warning("catalog re-apply skipped: configured path not found: %s", catalog_csv)
+            return empty
+        try:
+            from sqlcg.cli.commands.catalog import apply_catalog_to_backend
+
+            result = apply_catalog_to_backend(catalog_csv, db)
+            logger.info(
+                "catalog re-applied: %d columns from %s",
+                result["columns_loaded"],
+                catalog_csv,
+            )
+            return result
+        except Exception as exc:
+            logger.warning("catalog re-apply failed: %s", exc)
+            return empty

@@ -108,8 +108,24 @@ graph internals to get useful lineage.
 and cross-file CTAS bodies harvested in pass 1. An earlier INFORMATION_SCHEMA-CSV
 feature (in-memory `schema_sources` + a graph-level `load-schema` gold-table path) was
 removed in 2026-05 after profiling measured **zero edge delta** vs. no-schema on the
-DWH corpus — cross-file pass-2 resolution already dominated. Do not reintroduce a
-schema-CSV ingestion path without a measured lineage-coverage win to justify it.
+DWH corpus — cross-file pass-2 resolution already dominated.
+
+**Updated rule (2026-06-10, PR 2 graph-health sprint):** the 2026-05 prohibition was
+conditional on "no measured lineage-coverage win". That condition is now disproven by
+direct measurement (see [`plan/sprints/graph_health_catalog_and_metrics.md`](plan/sprints/graph_health_catalog_and_metrics.md) §1):
+≤12,914 reachable bad edges traced to tables whose DDL lives in Liquibase XML (not
+indexed); an INFORMATION_SCHEMA export covers those tables *plus* falsifies wrong
+positional guesses (contradicted). The new rule:
+
+- **Catalog-level enrichment is allowed**: `sqlcg catalog load <csv>` loads
+  `INFORMATION_SCHEMA.COLUMNS` into the graph as `HAS_COLUMN(source='information_schema')`
+  rows **after** indexing. DDL wins over information_schema wins over usage (precedence
+  in the backend). This path never touches the parser or qualify loop.
+- **Parse-time schema feeding remains forbidden**: passing `schema_sources` into
+  `exp.expand()` or `qualify()` is still prohibited (the hot-loop cost class that
+  measured zero and regressed performance in the 2026-05 experiment).
+- Do not reintroduce a parse-time schema-CSV path without a new measured win over the
+  post-PR2 baseline.
 
 **OOM history**: a prior approach loaded all parsed files into memory before writing to
 KuzuDB, causing OOM on large repos. The fix (write one file at a time + commit) is

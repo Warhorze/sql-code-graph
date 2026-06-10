@@ -157,6 +157,32 @@ scratch nodes out of user-facing surfaces. Up/down direction differ only in whic
 > Counting them (the pre-2026-06 formula) made ≥95 % edge health mathematically impossible
 > — ~29 % of all edges legitimately point at CTE/derived intermediates.
 
+### 3.2b INFORMATION_SCHEMA catalog enrichment (PR 2, 2026-06-10)
+
+**Why the 2026-05 prohibition is lifted.** The 2026-05 removal of INFORMATION_SCHEMA
+CSV ingestion was based on a "zero edge delta" measurement — true but wrong-axis: schema
+never creates edges, it makes edge *targets resolvable* (`HAS_COLUMN`). The strict
+column-level health metric that shows the win didn't exist until v1.6.1 (PR 1).
+
+Measured root cause (2026-06-10, DWH, ~69k edges): 94 % of all bad edges (18,244/19,438)
+come from ETL files writing to tables whose DDL lives in Liquibase **XML** changelogs
+(not indexed). An INFORMATION_SCHEMA export covers those tables directly, falsifying
+wrong positional guesses (contradicted bucket) rather than hiding them.
+
+**Design rule (replaces the old prohibition):**
+- `sqlcg catalog load <csv>` loads `INFORMATION_SCHEMA.COLUMNS` into the graph as
+  `HAS_COLUMN(source='information_schema')` rows **post-index** (never at parse time).
+- Precedence: `ddl > information_schema > usage` — enforced in `upsert_edges_bulk`
+  via `ON CONFLICT (src_key, dst_key) DO UPDATE SET source = CASE … END`.
+- **Parse-time schema feeding remains forbidden.** Passing `schema_sources` into
+  `exp.expand()` or `qualify()` is still prohibited (the hot-loop path that measured
+  zero and regressed performance in 2026-05).
+- Per-file reindex (`delete_nodes_for_file`) is **source-aware**: only `ddl`/NULL rows
+  are deleted; `information_schema` and `usage` rows survive incremental reindex.
+- Config persistence: `[sqlcg.catalog] path = "..."` in `.sqlcg.toml` causes
+  `index_repo` to re-apply the catalog at the end of every full rebuild (zero parse-time
+  cost, one-shot bulk upsert outside all hot loops).
+
 ### 3.3 MCP server + single-writer model
 [`server.py`](src/sqlcg/server/server.py) runs FastMCP over stdio. Writes (`index`,
 `reindex`) are enqueued and drained by [`writer.py`](src/sqlcg/server/writer.py) under
