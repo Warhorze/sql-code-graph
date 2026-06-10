@@ -499,6 +499,55 @@ recall is worth the seconds (that trade-off is explicitly a user call, per the s
       after diagnosis — escalate if the top 3 shapes cover < 20% of failures).
 - [ ] Version bump **patch or minor** per shipped surface; full gate green.
 
+### Phase A diagnosis result (2026-06-10)
+
+Full taxonomy: [`pr5_extraction_recall_taxonomy.json`](../measurements/pr5_extraction_recall_taxonomy.json).
+Re-indexed `/home/ignwrad/Projects/dwh` into a throwaway DB
+(`/tmp/pr5_diag/graph.db`, 6,857 `SqlQuery` rows, 4,727 `parse_failed=true` —
+68.9%, close to the 4,770/7,008 baseline; corpus drift accounts for the small
+delta). Bucketed all `parse_failed=true` rows by `kind` and sampled SQL text:
+
+| Shape | Count | % of failures | Distinct write targets | Verdict |
+|---|---|---|---|---|
+| `kind=OTHER` (TRUNCATE, USE, COMMENT, SET *var*, ALTER VIEW/TABLE incl. SET TAG w/o trailing `;`, ALTER EXTERNAL, DROP, CALL) | 3,957 | 83.7% | 1 | **fixed** (measurement) |
+| `kind=CREATE_TABLE` w/o `AS SELECT` (LIKE, CLONE, column-defs, SEQUENCE) | 524 | 11.1% | 296 | **fixed** (measurement) |
+| `kind=INSERT ... VALUES` (no SELECT) | 63 | 1.3% | 4 | **fixed** (measurement) |
+| `kind=UPDATE/DELETE/MERGE/CREATE_PROC` | 183 | 3.9% | 1 | structural (no UPDATE/DELETE lineage path; MERGE = T-07-06) |
+
+**Root cause (single, dialect-agnostic):** `build_scope(stmt)` returns `None`
+for almost every non-`exp.Select`-rooted statement by sqlglot design — including
+statement types that `_extract_column_lineage` (base.py L663/672-674/681) was
+never going to attempt extraction for in the first place (Use, Set, Comment,
+TruncateTable, Drop, Alter, Command, CREATE without AS-SELECT, INSERT without
+SELECT, Update, Delete, Merge). `ansi_parser.py` `_parse_statement` (L307-332)
+unconditionally set `parse_failed=True` whenever `build_scope` was falsy/raised,
+conflating "structurally lineage-free statement" with "degraded extraction of a
+statement that should have produced lineage". This is the W4-flagged "sanity-check
+the counter itself" case — **96.1% of `parse_failed=true` rows (4,544/4,727) were a
+measurement artifact, not a recall opportunity**.
+
+**Fix (PR5, ships as Phase B "shape 1"):** add `SqlParser._can_have_column_lineage(stmt)`
+(base.py, mirrors `_extract_column_lineage`'s own type/body checks exactly) and gate
+both `parse_failed=True` branches in `ansi_parser.py` `_parse_statement` on it.
+Dialect-agnostic, zero new hot-loop ops, no per-column work — pure reclassification
+of an existing boolean. This is the only shape shipped; the remaining 183 (3.9%)
+UPDATE/DELETE/MERGE/CREATE_PROC rows are a structural gap (new column-lineage
+extraction path needed for UPDATE/DELETE; MERGE is the existing T-07-06 deferral) and
+are explicitly out of scope per the "no per-column work" stop condition.
+
+**Top-3-shapes-cover-≥20%-gate:** 96.1% ≫ 20% — proceed to Phase B.
+
+**122-row `HAS_COLUMN` prefix-inconsistency (carried-over open item):** measured 61
+in this snapshot (plan baseline 122; same root cause, corpus drift). Root cause:
+`coverage.py`'s `_DST_TABLE` macro strips everything after the **last** `.` in
+`dst_key` to derive the destination table id — this breaks for column names that
+themselves contain a literal `.` (Dutch BI names like `"Omzet excl."`,
+`"Gegeven korting incl."`). All 5 sampled rows are this exact shape. **Verdict:
+structural, not a one-line fix** — a purely syntactic "strip after last dot" cannot
+disambiguate `schema.table.col.with.dots` from `schema.table.col`; a correct fix
+needs a `HAS_COLUMN`-keyed longest-prefix lookup or a stored `table_id` column.
+Filed as a future `coverage.py` follow-up, not fixed in PR5.
+
 ---
 
 ## 8. Cross-cutting

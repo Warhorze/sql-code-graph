@@ -1,0 +1,72 @@
+{
+  "label": "PR 5 — ETL extraction recall, Phase A diagnosis",
+  "run_date": "2026-06-10",
+  "corpus_dir": "/home/ignwrad/Projects/dwh",
+  "db_path": "/tmp/pr5_diag/graph.db (throwaway, indexed from feat/etl-extraction-recall pre-fix master code)",
+  "totals": {
+    "sql_query_total": 6857,
+    "sql_query_parse_failed": 4727,
+    "parse_failed_pct": 68.9,
+    "etl_total": 3091,
+    "etl_parse_failed": 1768,
+    "etl_parse_failed_pct": 57.2,
+    "ddl_total": 3766,
+    "ddl_parse_failed": 2959,
+    "ddl_parse_failed_pct": 78.6
+  },
+  "root_cause": {
+    "summary": "build_scope(stmt) returns None (or raises) for nearly all non-exp.Select-rooted statements (Use, Set, Comment, TruncateTable, Drop, Alter, Command, CREATE ... LIKE/CLONE/column-defs, INSERT ... VALUES, UPDATE, DELETE, MERGE) by sqlglot design -- this is NOT a degraded extraction for these kinds because _extract_column_lineage (base.py L663) only ever attempts extraction for exp.Select, exp.Insert-with-SELECT-body, and exp.Create-with-Select/Subquery-body (CTAS). ansi_parser.py _parse_statement (L307-332) unconditionally sets parse_failed=True whenever build_scope is falsy/raises, regardless of whether the statement type could ever produce column lineage. Result: parse_failed is massively over-counted -- it conflates 'this statement structurally has no column lineage by SQL semantics' with 'scope-build degraded for a statement that should have produced lineage'.",
+    "verified_by": "repro via uv run python: build_scope() returns None for TruncateTable, Use, Drop, Set, Comment, Command (ALTER EXTERNAL/CALL), Alter (ALTER VIEW/TABLE), Update, Delete, and Create-CLONE -- all parse successfully into correct sqlglot expression types, none raise during sqlglot.parse, all just have no scope because they are not query-shaped.",
+    "verdict": "fixable -- one-line, dialect-agnostic, once-per-statement classification fix in ansi_parser.py (the W4-cited L307-332 region). PR1 (already merged) owns the parse_failed/recall measurement; this PR fixes it as part of the diagnosis-mandated sanity check ('if the metric is inflated... fix the measurement first')."
+  },
+  "shapes": [
+    {
+      "shape": "kind=OTHER (TRUNCATE TABLE, USE SCHEMA/WAREHOUSE, COMMENT, SET <var>, ALTER VIEW/TABLE incl. SET TAG without trailing ';', ALTER EXTERNAL, DROP TABLE/VIEW, CALL ...)",
+      "query_count": 3957,
+      "pct_of_total_failed": 83.7,
+      "distinct_write_targets": 1,
+      "bucket": "fully_unparsed_by_metric_but_structurally_lineage_free",
+      "verdict": "fixed (measurement bug)",
+      "notes": "Sample breakdown (etl/, n=1715): TRUNCATE TABLE 556, USE SCHEMA 535, COMMENT 168, SET <var> ~210 (FULL_TABLENAME/VAR_DELTA*/WAREHOUSENAME/etc), USE WAREHOUSE 20, ALTER EXTERNAL 20, DROP TABLE 5, CALL 7. Sample breakdown (ddl/, n=2242): ALTER VIEW 1242 (mostly MODIFY COLUMN ... SET TAG without trailing ';' -- the existing Gap 4b strip in snowflake_parser.py requires a trailing ';' and misses the last statement in a file), COMMENT 454, ALTER TABLE 159, DROP TABLE 134, DROP VIEW 89, SET WAREHOUSENAME 47, ALTER WAREHOUSE 31, CREATE OR (REPLACE FUNCTION etc) 23, TRUNCATE TABLE 17, USE SCHEMA 11. None of these statement types can ever carry SELECT-derived column lineage; _can_have_column_lineage() returns False for all of them, so parse_failed should be False."
+    },
+    {
+      "shape": "kind=CREATE_TABLE without AS SELECT (CREATE TABLE ... LIKE, CREATE OR REPLACE TABLE ... CLONE, CREATE TABLE (col defs...), CREATE SEQUENCE)",
+      "query_count": 524,
+      "pct_of_total_failed": 11.1,
+      "distinct_write_targets": 296,
+      "bucket": "fully_unparsed_by_metric_but_structurally_lineage_free",
+      "verdict": "fixed (measurement bug)",
+      "notes": "0/524 contain 'AS SELECT'. _extract_column_lineage already returns early for these (base.py L672-674 requires stmt.expression to be Select/Subquery). build_scope still returns None for them (Create is not Select-rooted), so parse_failed=True was set despite there being nothing to extract. _can_have_column_lineage() returns False (stmt.expression is not Select/Subquery)."
+    },
+    {
+      "shape": "kind=INSERT ... VALUES (no SELECT body)",
+      "query_count": 63,
+      "pct_of_total_failed": 1.3,
+      "distinct_write_targets": 4,
+      "bucket": "fully_unparsed_by_metric_but_structurally_lineage_free",
+      "verdict": "fixed (measurement bug)",
+      "notes": "63/63 contain VALUES, 0/63 contain SELECT. _can_have_column_lineage() returns False (stmt.expression is not exp.Select)."
+    },
+    {
+      "shape": "kind=UPDATE/DELETE/MERGE/CREATE_PROC (target_table mostly empty)",
+      "query_count": 183,
+      "pct_of_total_failed": 3.9,
+      "distinct_write_targets": 1,
+      "bucket": "structural_no_lineage_implementation",
+      "verdict": "structural -- out of scope (would require a new UPDATE/DELETE column-lineage extraction path, which is per-column work and a new parsing capability; MERGE lineage is already a tracked deferral T-07-06). parse_failed now correctly reads False for these too (build_scope is None for Update/Delete/Merge by design, not a degraded extraction), which removes them from the recall-failure count -- but they still emit ZERO column lineage edges (UPDATE/DELETE: 0/45+0/108 even when parse_failed was already False pre-fix; MERGE: 0/13). This is the real remaining recall gap, sized at 183 + the 45 UPDATE + 108 DELETE + 13 MERGE that were already parse_failed=False = 349 statements with zero column lineage by design. Tracked as a future T-07-XX item, not PR5."
+    }
+  ],
+  "fix_summary": {
+    "approach": "Add SqlParser._can_have_column_lineage(stmt) static helper (base.py, mirrors the exact type/body checks _extract_column_lineage already performs at L663/672-674/681). In ansi_parser.py _parse_statement, only set parse_failed=True (both the 'root_scope falsy' and 'exception' branches) when _can_have_column_lineage(stmt) is True. Dialect-agnostic, zero new hot-loop ops, no per-column work, no new qualify/build_scope/exp.expand/sg_lineage calls -- pure reclassification of an existing boolean.",
+    "covers_pct_of_degraded": 96.1,
+    "covers_query_count": 4544,
+    "remaining_genuinely_degraded": 183
+  },
+  "open_item_122_row_has_column_inconsistency": {
+    "measured_count_this_snapshot": 61,
+    "plan_baseline_count": 122,
+    "query": "SELECT count(*) FROM COLUMN_LINEAGE cl WHERE EXISTS (SELECT 1 FROM HAS_COLUMN hc WHERE hc.dst_key = cl.dst_key) AND NOT EXISTS (SELECT 1 FROM HAS_COLUMN hc WHERE hc.src_key = <left(cl.dst_key, len-instr(reverse(cl.dst_key),'.'))>)",
+    "root_cause": "coverage.py's _DST_TABLE macro derives a column-lineage edge's destination TABLE id by stripping everything after the LAST '.' in dst_key. This breaks when the COLUMN NAME ITSELF contains a literal '.' (e.g. Dutch BI column names like 'Omzet excl.', 'Gegeven korting incl.', 'Korting excl.') -- stripping after the last '.' removes only the trailing empty segment, yielding 'schema.table.omzet excl' instead of 'schema.table'. All 5 sampled rows are this exact shape (ia_tableau.kassatransactie/korting columns ending in '.').",
+    "verdict": "structural, NOT a one-line fix -- a purely syntactic 'strip after last dot' cannot disambiguate 'schema.table.col.with.dots' from 'schema.table.col' without a table-id lookup. A correct fix requires either (a) a HAS_COLUMN-keyed lookup that finds the longest src_key prefix of dst_key, or (b) storing table_id alongside dst_key in COLUMN_LINEAGE/HAS_COLUMN to avoid string-splitting entirely. Filed as a future PR1/coverage.py follow-up, not fixed in PR5 (out of scope per 'fix only if one-line')."
+  }
+}
