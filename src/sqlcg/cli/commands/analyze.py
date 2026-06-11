@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from sqlcg.core.queries import GET_TABLE_EXTERNAL_CONSUMERS_QUERY
-from sqlcg.server.read_client import run_read_routed
+from sqlcg.server.read_client import resolved_repo_root, run_read_routed
 
 if TYPE_CHECKING:
     from sqlcg.server.noise_filter import NoiseFilter
@@ -157,7 +157,7 @@ def upstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = _filter_column_results(results, nf)
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
@@ -194,7 +194,7 @@ def downstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = _filter_column_results(results, nf)
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
@@ -238,7 +238,7 @@ def impact(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = [r for r in results if not nf.is_noise(r.get("target", ""))]
     _print_table(results, ["id", "kind"])
 
@@ -287,7 +287,7 @@ def unused(
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = [r for r in results if not nf.is_noise(r["qualified"])]
     _print_table(results, ["qualified"])
 

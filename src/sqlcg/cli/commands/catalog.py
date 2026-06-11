@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 
 from sqlcg.core.config import get_backend, get_schema_aliases
+from sqlcg.core.graph_db import indexed_repo_root
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.utils.logging import getLogger
 
@@ -182,30 +183,6 @@ def load_catalog_csv(
     return table_rows, column_rows, has_column_edges, rows_read, malformed_skipped, folded_rows
 
 
-def _resolve_repo_root(backend: Any) -> Path:
-    """Return the indexed repo root, or ``Path.cwd()`` if no Repo row exists.
-
-    Reads the persisted ``Repo.path`` primary key via the already-open backend
-    handle (D2.1) — same query/fallback pattern as ``_indexed_root(db)`` in
-    [`tools.py`](../../server/tools.py), kept as a local copy here since
-    ``tools.py`` is server-side and ``catalog.py`` is CLI-side. PR 3 (Fix 3
-    Step 3.4) is expected to de-duplicate this against the shared helper.
-
-    Args:
-        backend: An open GraphBackend instance (DuckDBBackend).
-
-    Returns:
-        Absolute Path of the indexed root, or ``Path.cwd()``.
-    """
-    try:
-        rows = backend.run_read('SELECT path FROM "Repo" LIMIT 1', {})
-        if rows and rows[0].get("path"):
-            return Path(rows[0]["path"])
-    except Exception:
-        pass
-    return Path.cwd()
-
-
 def apply_catalog_to_backend(
     csv_path: Path,
     backend: Any,
@@ -279,7 +256,7 @@ def catalog_load(
 
     try:
         with get_backend() as backend:
-            repo_root = _resolve_repo_root(backend)
+            repo_root = indexed_repo_root(backend) or Path.cwd()
             schema_aliases = get_schema_aliases(repo_root)
             result = apply_catalog_to_backend(file, backend, schema_aliases=schema_aliases)
     except ValueError as exc:

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.freshness import compute_freshness
-from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.graph_db import GraphBackend, indexed_repo_root
 from sqlcg.core.queries import (
     ANALYZE_UNUSED_TABLES_QUERY,
     FIND_DEFINITION_QUERY,
@@ -273,29 +273,10 @@ def _assert_indexed(db: GraphBackend) -> None:
     raise NotIndexedError("No repos indexed. Run 'sqlcg db init' then 'sqlcg index <path>' first.")
 
 
-def _indexed_root(db: GraphBackend) -> Path | None:
-    """Return the indexed root path stored on the first Repo node, or None.
-
-    Reads the persisted ``Repo.path`` primary key (set at index time by ``index_cmd``).
-    Uses the same query pattern as ``db_info``'s freshness computation.  Returns ``None``
-    when no Repo node exists or the path field is empty — callers fall back to
-    ``Path.cwd()`` via ``_indexed_root(db) or Path.cwd()``.
-
-    Multi-Repo: first Repo node wins (LIMIT 1), matching the existing freshness path.
-
-    Args:
-        db: GraphBackend instance
-
-    Returns:
-        Absolute Path of the indexed root, or None if unavailable.
-    """
-    try:
-        rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
-        if rows and rows[0].get("path"):
-            return Path(rows[0]["path"])
-    except Exception:
-        pass
-    return None
+# Single backend-handle implementation lives in graph_db.py (v1.14.0 Fix 3
+# Step 3.4 de-duplication) — shared with sqlcg.cli.commands.catalog. Keep the
+# `_indexed_root` name here since it's used at 6 call sites below.
+_indexed_root = indexed_repo_root
 
 
 def _bare_ref(ref: str) -> str:
@@ -988,7 +969,8 @@ def find_definition(table_qualified: str) -> DefinitionResult:
         rows = db.run_read(FIND_DEFINITION_QUERY, {"table_qualified": target})
         producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
         producer_files = _dedup_preserve_order([r["file_path"] for r in producer_rows])
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         duplicate_ddl = len(rows) > 1
         definitions: list[DefinitionFile] = []
@@ -1048,7 +1030,8 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
     target = table_qualified.lower()
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         def_rows = db.run_read(GET_TABLE_DEFINING_FILES_QUERY, {"table_qualified": target})
         producer_rows = db.run_read(GET_PRODUCER_FILES_FOR_TABLE_QUERY, {"table_qualified": target})
@@ -1133,7 +1116,8 @@ def get_backfill_order(table_qualified: str) -> BackfillOrderResult:
     target = table_qualified.lower()
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": target})
         start_cols = [r["col_id"] for r in col_rows]
@@ -2037,7 +2021,8 @@ def get_hub_ranking(k: int = 10) -> HubRankingResult:
     """
     with _open_backend() as db:
         _assert_indexed(db)
-        noise_filter = NoiseFilter.from_config()
+        root = _indexed_root(db) or Path.cwd()
+        noise_filter = NoiseFilter.from_config(repo_root=root)
 
         # Single aggregation — no Python per-row graph calls.
         rows = db.run_read(HUB_RANKING_QUERY, {"k": k})

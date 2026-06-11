@@ -190,3 +190,35 @@ def run_read_routed(
 
     with get_backend(read_only=True) as backend:
         return backend.run_read(cypher, params)
+
+
+def resolved_repo_root() -> Path:
+    """Return the indexed repo root, or ``Path.cwd()`` if no Repo row exists.
+
+    Routed read of ``SELECT path FROM "Repo" LIMIT 1`` via
+    :func:`run_read_routed` — the same fallback path (live server, else direct
+    read-only open) every CLI read command already uses. This is the
+    routed-read counterpart to ``_indexed_root(db)``
+    ([`tools.py`](../server/tools.py)), for CLI commands that do not hold an
+    open backend handle.
+
+    Multi-Repo: first Repo node wins (``LIMIT 1``), matching ``_indexed_root``'s
+    convention — picking an arbitrary Repo row when a graph indexes more than
+    one repo root is pre-existing, documented behaviour, unchanged by this
+    helper.
+
+    Tolerates a graph with no Repo row (e.g. ``db init`` without ``index``):
+    ``run_read_routed`` returns ``[]`` and this returns ``Path.cwd()``, no
+    raise.
+
+    Returns:
+        Absolute Path of the indexed root, or ``Path.cwd()``.
+    """
+    try:
+        rows = run_read_routed('SELECT path FROM "Repo" LIMIT 1', {})
+    except typer.Exit:
+        # Server busy/error — degrade to cwd rather than crash a config lookup.
+        return Path.cwd()
+    if rows and rows[0].get("path"):
+        return Path(rows[0]["path"])
+    return Path.cwd()
