@@ -1,9 +1,78 @@
-## Current State [2026-06-10]
-ACTIVE AGENT: architect-planner (planning — idle after commit)
-FEATURE: dialect-and-query-config fix batch (post-graph-health DWH verification)
-PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md
-BRANCH: master (plan only; per-fix branches to follow)
-STATUS: PLAN WRITTEN — awaiting plan-reviewer gate
+## Current State [2026-06-11]
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: PR 4 of v1.14.0 batch — metrics/UX polish (Fix 4a+4b, v1.14.1)
+PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md (Fix 4)
+BRANCH: fix/metrics-ux-polish-blindspot-noise-notice
+PR: <to be filled after gh pr create>
+
+## Handoff — developer: metrics-ux-polish (PR 4, Fix 4a+4b) [2026-06-11]
+
+SUMMARY: Implemented Fix 4a (Step 4a.1) and Fix 4b (Steps 4b.1-4b.2).
+- Fix 4a: _Q_BLINDSPOT_WEIGHTED's bad_edges CTE now excludes dst tables with
+  kind IN ('cte','derived'), reusing _DST_TABLE, matching _Q_EDGE_HEALTH_SCOPED.
+  blindspot_tables_for_80pct is automatically recomputed since it derives from
+  the same filtered q4_weighted window-function result (no separate query).
+  Widened from the finding's kind='cte' to ('cte','derived') for KPI parity,
+  noted in coverage.py comment + PR body.
+- Fix 4b: added _print_noise_filtered_notice(pre_filter_count, post_filter_count)
+  helper in analyze.py, called from both upstream and downstream after
+  _filter_column_results. Fires "All N edge(s) were removed by the noise
+  filter (run with --raw to see them)." only when pre>0 and post==0. Existing
+  bare-name hint and --raw / "No results" behaviour unchanged.
+
+Both pre-written acceptance tests (test_Fix4a_blindspot_ranking_excludes_cte_and_derived,
+test_Fix4b_all_noise_filtered_notice_fires) now pass, plus 4 new tests added:
+test_Fix4a_blindspot_80pct_recomputed_on_filtered_set,
+test_Fix4b_genuinely_empty_trace_no_spurious_notice,
+test_Fix4b_raw_shows_unfiltered_rows_when_noise_filtered, and the
+pre-written test_Fix4b_notice_does_not_fire_when_results_survive.
+
+GATES: tests/unit 739 passed/1 skipped/1 xfailed; tests/integration 356
+passed/3 skipped (incl. all 18 Fix-batch tests); tests/e2e (excl. gitignored
+test_dwh_e2e.py) 86 passed/3 skipped; tests/benchmarks 3 passed. pyright 0
+errors. ruff clean. plan/measurements/sprint_08_*.json reverted post-run.
+
+VERSION: bumped 1.14.0 -> 1.14.1 (patch, single bump for bundled 4a+4b PR).
+Not tagged (house rule: user verifies/merges/tags).
+
+NO DEVIATIONS from plan.
+
+NEXT: open PR; architect-planner compliance check on "finished".
+
+---
+
+## Handoff — developer: repo-anchored-query-config (PR 3) [2026-06-11]
+
+SUMMARY: Implemented Fix 3 (Steps 3.1-3.4). Added resolved_repo_root() to
+read_client.py (routed read of Repo.path, cwd fallback, no params — matches
+pre-written test signatures). Updated all 6 CLI NoiseFilter.from_config()
+sites (analyze x4, find x2) to pass repo_root=resolved_repo_root(). Updated
+the 4 unparam'd tools.py sites (find_definition, get_change_scope,
+get_backfill_order, hub_ranking) to root = _indexed_root(db) or Path.cwd();
+repo_root=root, matching diff_impact/scope_change. De-duplicated:
+extracted indexed_repo_root(db) to graph_db.py; tools.py's _indexed_root is
+now an alias; catalog.py's _resolve_repo_root (PR 2) removed, catalog_load
+calls indexed_repo_root(backend) or Path.cwd(). _resolve_repo_root
+grep-confirmed gone from src/.
+
+Added 2 new regression tests (both verified fail-pre-fix/pass-post-fix):
+test_Fix3_analyze_unused_filters_using_indexed_repo_config_not_cwd and
+test_Fix3_tools_find_definition_filters_using_indexed_repo_config_not_cwd.
+The 3 pre-written Fix3 tests also pass.
+
+GATES:
+- Full suite: 1284 passed, 7 skipped, 3 xfailed, 2 failed (Fix4a/Fix4b only —
+  pre-existing PR-4 scope failures, unchanged from baseline).
+- pyright: 0 errors. ruff: all checks passed.
+- qualify_once / expand_excludes_schema_sources / upsert_batch_invariant /
+  PR-2 catalog tests all pass.
+
+VERSION: bumped 1.13.2 -> 1.14.0 (minor, per plan's PR-split table). Not
+tagged (house rule: user verifies/merges/tags).
+
+NO DEVIATIONS from plan.
+
+NEXT: open PR done (#75); architect-planner compliance check on "finished".
 
 ---
 
