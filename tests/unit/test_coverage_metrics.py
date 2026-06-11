@@ -74,6 +74,10 @@ _CANNED_ROWS = [
     # PR 4 — identity health counters
     [{"cte_collisions": 218}],
     [{"rescuable_unqualified": 828}],
+    # PR 4 Step 4.3 — info-schema row count
+    [{"info_schema_rows": 45000}],
+    # PR 4 Step 4.3 — Repo path (for catalog-path check)
+    [{"path": "/repo"}],
 ]
 
 
@@ -102,9 +106,12 @@ def test_coverage_metrics_collect_returns_populated_stats():
     Plan: collect_coverage() returns populated CoverageStats when run_read_routed
     is patched to return canned result sets (legacy 6 + PR 1 fields).
     """
-    with patch(
-        "sqlcg.cli.coverage.run_read_routed",
-        side_effect=_make_coverage_side_effect(_CANNED_ROWS),
+    with (
+        patch(
+            "sqlcg.cli.coverage.run_read_routed",
+            side_effect=_make_coverage_side_effect(_CANNED_ROWS),
+        ),
+        patch("sqlcg.cli.coverage.get_catalog_path", return_value=None),
     ):
         stats = collect_coverage()
 
@@ -201,10 +208,17 @@ def test_coverage_metrics_collect_handles_empty_graph():
         # PR 4 — identity health counters
         [{"cte_collisions": 0}],
         [{"rescuable_unqualified": 0}],
+        # PR 4 Step 4.3 — info-schema row count (zero for empty graph)
+        [{"info_schema_rows": 0}],
+        # PR 4 Step 4.3 — Repo path (empty for empty graph)
+        [],
     ]
-    with patch(
-        "sqlcg.cli.coverage.run_read_routed",
-        side_effect=_make_coverage_side_effect(empty_rows),
+    with (
+        patch(
+            "sqlcg.cli.coverage.run_read_routed",
+            side_effect=_make_coverage_side_effect(empty_rows),
+        ),
+        patch("sqlcg.cli.coverage.get_catalog_path", return_value=None),
     ):
         stats = collect_coverage()
 
