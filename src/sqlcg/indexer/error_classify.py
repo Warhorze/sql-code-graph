@@ -4,6 +4,8 @@ Maps structured error messages recorded during parsing into E-code buckets
 for measurement and summary reporting.
 """
 
+import json
+
 # Priority order when one file emits multiple distinct buckets.
 # Highest blast-radius / most severe failures first; pure_ddl_skip last
 # (non-degrading: a deliberate skip, not a failure).
@@ -149,3 +151,40 @@ def _classify_error(msg: str) -> str:
             return "E5"
 
     return "other"
+
+
+def skip_counts_json(errors: list[str]) -> str | None:
+    """Return a JSON-encoded {reason: count} map of col_lineage_skip:* reasons.
+
+    Groups ``col_lineage_skip:<reason>:<detail>`` strings by their reason prefix
+    (the segment between the first and second colon after 'col_lineage_skip:').
+    Other error strings are ignored.  Returns None when no skip entries are found
+    (the column stores NULL for clean files, which is cheaper than '{}').
+
+    Designed for persistence on the File node as the ``skip_counts`` column so
+    that §G accounting (converted vs dropped) is queryable via ``run_read`` JSON
+    extraction without log archaeology.
+
+    Args:
+        errors: List of structured error/skip strings from ParsedFile.errors.
+
+    Returns:
+        JSON string (e.g. '{"stage": 2, "unknown_sentinel": 5}') or None.
+
+    Examples:
+        >>> skip_counts_json(["col_lineage_skip:stage:/a.sql", "col_lineage_skip:stage:/b.sql"])
+        '{"stage": 2}'
+        >>> skip_counts_json([])
+        None
+    """
+    _PREFIX = "col_lineage_skip:"
+    counts: dict[str, int] = {}
+    for msg in errors:
+        if not msg.startswith(_PREFIX):
+            continue
+        rest = msg[len(_PREFIX) :]
+        # Extract the reason prefix (up to the next ':', or the whole remainder)
+        reason = rest.split(":", 1)[0]
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
+    return json.dumps(counts) if counts else None
