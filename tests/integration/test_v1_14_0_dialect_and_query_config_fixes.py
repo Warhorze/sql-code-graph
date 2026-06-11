@@ -676,3 +676,80 @@ def test_Fix4b_notice_does_not_fire_when_results_survive(capsys) -> None:
         f"The all-noise-filtered notice must not fire when results survive "
         f"post-filter. Got output: {combined!r}"
     )
+
+
+def test_Fix4a_blindspot_80pct_recomputed_on_filtered_set(fix4a_backend) -> None:
+    """blindspot_tables_for_80pct reflects only the post-exclusion bad-edge volume.
+
+    With the cte_node edge excluded, only the real_table edge remains, so the
+    80%-coverage count must be 1 (not 2). Plan: Fix 4a Test Strategy bullet 2
+    (plan/sprints/v1.14.0_dialect_and_query_config_fixes.md).
+    """
+    from sqlcg.cli.coverage import collect_coverage
+
+    def _routed(query: str, params: dict):
+        return fix4a_backend.run_read(query, params)
+
+    with patch("sqlcg.cli.coverage.run_read_routed", side_effect=_routed):
+        coverage = collect_coverage()
+
+    assert coverage.blindspot_tables_for_80pct == 1, (
+        f"Expected 80pct count of 1 (only mydb.sch.real_table survives the "
+        f"cte/derived exclusion), got {coverage.blindspot_tables_for_80pct}"
+    )
+
+
+def test_Fix4b_genuinely_empty_trace_no_spurious_notice(capsys) -> None:
+    """A genuinely-empty trace (no rows pre- or post-filter) keeps the
+    existing 'No results' behaviour with no all-noise-filtered notice.
+
+    Plan: Fix 4b Test Strategy — genuinely-empty trace (unchanged)
+    (plan/sprints/v1.14.0_dialect_and_query_config_fixes.md).
+    """
+    import sqlcg.cli.commands.analyze as analyze_mod
+
+    with (
+        patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=[]),
+        patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_from_config,
+    ):
+        nf = MagicMock()
+        nf.is_noise.return_value = False
+        mock_from_config.return_value = nf
+
+        analyze_mod.upstream("ba.foo.col1", depth=5, raw=False, include_intermediate=False)
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "removed by the noise filter" not in combined, (
+        f"A genuinely-empty trace must not print the all-noise-filtered "
+        f"notice. Got output: {combined!r}"
+    )
+    assert "no results" in combined, (
+        f"A genuinely-empty trace should still print 'No results'. Got: {combined!r}"
+    )
+
+
+def test_Fix4b_raw_shows_unfiltered_rows_when_noise_filtered(capsys) -> None:
+    """`--raw` bypasses the noise filter entirely, so rows that would be
+    all-noise-filtered are still shown and no notice is printed.
+
+    Plan: Fix 4b Test Strategy — `--raw` still shows the unfiltered rows
+    (plan/sprints/v1.14.0_dialect_and_query_config_fixes.md).
+    """
+    import sqlcg.cli.commands.analyze as analyze_mod
+
+    fake_rows = [
+        {"id": "ba_bck.foo.col1", "file_path": "/repo/x.sql", "start_line": 1},
+    ]
+
+    with patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=fake_rows):
+        analyze_mod.upstream("ba.foo.col1", depth=5, raw=True, include_intermediate=False)
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "ba_bck.foo.col1" in combined, (
+        f"--raw should display the unfiltered row(s). Got output: {combined!r}"
+    )
+    assert "removed by the noise filter" not in combined.lower(), (
+        f"--raw must not trigger the all-noise-filtered notice. Got: {combined!r}"
+    )
