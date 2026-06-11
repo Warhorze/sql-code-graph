@@ -460,12 +460,21 @@ class SqlParser(ABC):
         self._current_file_namespace: str | None = None
 
     @abstractmethod
-    def parse_file(self, path: Path, sql: str) -> ParsedFile:
+    def parse_file(
+        self,
+        path: Path,
+        sql: str,
+        rel_path: str | None = None,
+    ) -> ParsedFile:
         """Parse SQL text and return a ParsedFile with all statements.
 
         Args:
             path: Path to the source file
             sql: SQL text to parse
+            rel_path: Repo-relative posix path for CTE/derived namespace keying
+                (e.g. "etl/sql/fact/wtfa.sql").  Supplied by index_repo via the
+                task dict; falls back to str(path) when None.
+                See plan/sprints/sprint_postmortem_fixes.md §PR 3 Step 3.1.
 
         Returns:
             ParsedFile containing parsed statements and metadata

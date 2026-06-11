@@ -76,6 +76,7 @@ class AnsiParser(SqlParser):
         dependency_filter: set[str] | None = None,
         _precomputed_start_lines: list[int] | None = None,
         ddl_columns_by_bare: dict[str, list[str]] | None = None,
+        rel_path: str | None = None,
     ) -> ParsedFile:
         """Parse SQL file and extract table/column lineage.
 
@@ -111,11 +112,12 @@ class AnsiParser(SqlParser):
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
 
-        # PR 3 — CTE/derived namespacing: set the current-file namespace so that
-        # _extract_column_lineage can stamp CTE/derived TableRefs with it.
-        # Uses str(path) as the unique per-file identifier; cleared after parsing so
-        # no stale namespace leaks across calls to the same parser instance.
-        self._current_file_namespace = str(path)
+        # PR 3 (sprint_postmortem_fixes §PR 3 Step 3.1) — CTE/derived namespacing:
+        # use the repo-relative posix path when available (threaded from index_repo
+        # via the task dict) so graph keys are portable across machines and repos.
+        # Falls back to str(path) for single-file / reindex_file callers that do not
+        # supply rel_path; those callers should supply it for consistency.
+        self._current_file_namespace = rel_path if rel_path is not None else str(path)
 
         # Parse all statements in the file using the hook (allows subclass overrides)
         statements, parse_errors = self._do_parse(sql)
