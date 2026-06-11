@@ -1,5 +1,60 @@
 ## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: sprint_postmortem_fixes PR 3 — repo-relative CTE/derived namespaces (v1.18.3)
+PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 3 (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: fix/repo-relative-cte-namespaces
+PR: (opening)
+
+## Handoff — developer: sprint_postmortem_fixes PR 3 (v1.18.3) [2026-06-11]
+
+SUMMARY: Implemented Steps 3.0–3.2 of PR 3 from sprint_postmortem_fixes.md.
+Re-keys CTE/derived namespaces from absolute OS paths to repo-relative posix paths.
+
+Step 3.0 (A3) — consumer audit:
+  All consumers confirmed format-agnostic. All four use '"::" in key' string checks:
+  - indexer.py:137 _harvest_usage_catalog: '"::" in table_qualified' — no change.
+  - server/noise_filter.py:27: '"::" in table_qualified' — no change.
+  - server/tools.py:294,852,856: '"::" in' checks — no change.
+  - cli/commands/analyze.py:145,147,186,188,314: '"::" in' checks — no change.
+  No startswith('/') matching on :: keys found anywhere.
+
+Step 3.1 — Design A (preferred):
+  index_repo: root_resolved = Path(path).resolve(); _rel_posix() helper computes
+  fp.relative_to(root_resolved).as_posix() for each file; added to both p1_tasks
+  and p2_tasks as 'rel_path'.
+  pool._run_task: extracts rel_path from task, passes to parse_file.
+  AnsiParser.parse_file: new rel_path param; _current_file_namespace = rel_path
+    if rel_path is not None else str(path).
+  SnowflakeParser.parse_file: same; forwards rel_path to _parse_scripting_file.
+  _parse_scripting_file: same rel_path param and assignment.
+  SqlParser base: parse_file abstract signature updated with rel_path kwarg.
+  reindex_file: computes _reindex_rel_path from indexed_repo_root for consistency.
+
+  File node 'path' and all other path uses are UNCHANGED.
+
+Step 3.2 — no compat shim; re-index is the migration (CLAUDE.md house rule).
+
+TESTS: 10 new tests (7 unit + 3 integration), all passing.
+  Updated existing 2 tests in test_cte_key_namespacing_integration.py:
+  - test_file_a/b_cte_key_is_repo_relative: now asserts 'file_a.sql::final' not absolute.
+  Also updated stale '<abs_path>' comments in test_pr3_kind_tagging.py.
+
+GATES (final):
+  1214 passed, 4 skipped, 1 xfailed, 0 failures (unit+integration).
+  89 passed, 3 skipped (e2e+benchmarks, excl test_dwh_e2e.py).
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified (13/13).
+
+VERSION: 1.18.2 → 1.18.3 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Current State [2026-06-11]
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
 FEATURE: sprint_postmortem_fixes PR 2 — _qualify_bare_tables crash fix + worker-failure labelling (v1.18.2)
 PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 2 (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: fix/qualify-bare-tables-command-crash
