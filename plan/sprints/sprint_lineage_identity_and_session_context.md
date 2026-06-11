@@ -1,6 +1,7 @@
 # Sprint Plan: Lineage Identity & Session Context
 
-**Status**: PLANNED — awaiting plan-review gate
+**Status**: REVIEWED — plan-review gate passed 2026-06-11 with amendments (B1/B2
+blockers + W1–W3 incorporated below); cleared for implementation
 **Planned**: 2026-06-11 (architect-planner role)
 **Baseline**: v1.14.2 graph of the DWH corpus, `indexed_sha=d015f8c`, db `~/.sqlcg/graph.db`
 (1,379 files / 6,388 tables / 49,466 COLUMN_LINEAGE edges).
@@ -118,21 +119,35 @@ line 21 `use schema IA_OUTBOUND;`, line 419 `insert into DOORBELASTING` →
 `ia_outbound.doorbelasting` (all 4 dst column names exist verbatim in its DDL
 catalog). Generalizes to 828 edges / 593 files.
 
-**Design**:
-- In the statement loop of `parse_file` ([`ansi_parser.py`](src/sqlcg/parsers/ansi_parser.py)
-  and the SnowflakeParser scripting path in
-  [`snowflake_parser.py`](src/sqlcg/parsers/snowflake_parser.py)), detect
-  `exp.Use` statements (`use schema X`, `use database X`, `use X.Y`) and update a
-  file-local `current_schema` / `current_db`. sqlglot parses these as `exp.Use`;
-  in the Snowflake scripting regex path, `USE` statements inside procedure bodies
-  must be matched by `_EMBEDDED_DML` or a sibling pattern — verify and extend the
-  regex if `USE` is currently dropped.
-- Apply as default qualifier in `_convert_table_expr_to_ref` (threading the
-  current default through, or applying in `_parse_statement` right after ref
-  extraction): only when `ref.db is None` and the ref is a **real table** —
-  never CTE refs (lexically scoped, handled by F3) and never already-qualified
-  refs. Apply to both targets and sources, then `schema_aliases` on top (PR 1's
-  choke point makes ordering safe).
+**Design** (amended per plan review 2026-06-11 — B1/W3):
+- **Non-scripting Snowflake path: USE SCHEMA tracking ALREADY EXISTS.**
+  [`snowflake_parser.py:250`](src/sqlcg/parsers/snowflake_parser.py)
+  `_transform_statements` (P5) tracks `exp.Use` with `kind == SCHEMA` and
+  qualifies bare table refs via `_qualify_bare_tables`. Do NOT build parallel
+  state — extend P5. Two existing gaps to close in P5: (a) verify/cover the
+  two-part `USE SCHEMA db.schema` form; (b) support the bare `USE db.schema`
+  form (no SCHEMA keyword → `kind_str` is empty; set schema from
+  `stmt.this.name`).
+- **The primary F2 gap is the scripting path.** The doorbelasting anchor is a
+  stored-procedure file → `_has_scripting_block()` →
+  `_parse_scripting_file()`, which bypasses `_transform_statements` entirely,
+  and `_EMBEDDED_DML` matches only SELECT/INSERT/UPDATE/DELETE/MERGE — `USE`
+  statements are dropped. Fix: a **pre-scan/interleaved scan of the raw sql
+  text** for `USE SCHEMA <s>` (and `USE <d>.<s>`) statements that tracks the
+  active schema *by text position*, so each `_EMBEDDED_DML` match is qualified
+  with the schema context in force at its offset (apply via
+  `_qualify_bare_tables` on the parsed DML statement).
+- **`USE DATABASE X` alone is OUT of qualification scope** (decision, W3): with
+  only a database and no schema, no two-part `schema.table` key can be formed;
+  the existing code intentionally ignores it and that stays. The `use d.s`
+  two-part forms above DO set the schema (the part that matters for keys).
+- **ANSI parser**: base `_transform_statements` is a no-op. Add an override only
+  if the corpus shows `USE` statements in ANSI-parsed files (verify with a grep
+  over the fixture/DWH corpus; document the finding either way).
+- Qualification itself reuses `_qualify_bare_tables` semantics: only refs with
+  no db/catalog, never CTE alias names (lexically scoped, handled by F3),
+  targets and sources both, then `schema_aliases` on top (PR 1's choke point
+  makes ordering safe).
 - State resets at file end. No cross-statement state other than this string pair;
   zero hot-loop cost (one isinstance check per statement).
 - **`LIKE` inheritance** (small, same PR): extend the existing C1 clone capture
@@ -229,6 +244,17 @@ fields + pct properties), `collect_coverage()`, the §G renderer, and the
 a fresh small-fixture index to confirm the divergence points; document in PR.
 **Step 2.2**: Implement `normalize_keys` boundary pass; wire into indexer before
 row construction (both `index_repo` and `reindex_file` paths).
+- **Wiring constraint**: in `index_repo`, normalization must run on
+  `pass2_results` **before** `defined_table_registry` is built
+  ([`indexer.py:567`](src/sqlcg/indexer/indexer.py)) — wiring it inside
+  `_upsert_file_batch` would leave registry keys (and
+  `aggregator.canonical_by_bare` consumers) un-normalized.
+- **W1 (plan review)**: `QueryNode.ctes` is intentionally EXCLUDED from
+  normalization — it is parser-internal pass-2 state, never read by
+  key-construction consumers. The dataclass-introspection guard test must
+  enumerate the TableRef-bearing fields of `ParsedFile`/`QueryNode` and
+  explicitly skip `ctes` (with a comment), so a future field added without
+  normalization fails the test.
 - Files: `src/sqlcg/parsers/base.py`, `src/sqlcg/indexer/indexer.py`, tests.
 - Acceptance: unit test — a ParsedFile containing an aliased-schema target,
   un-aliased edge dst, un-aliased source, and a StarSource yields rows where
@@ -240,14 +266,21 @@ row construction (both `index_repo` and `reindex_file` paths).
   keys: 311 → 0 and the `qualified=''` SqlTable row is gone (stage edges either
   carry a `stage://…` key or are dropped with a logged skip — zero silent empty
   keys); strict edge health rises (expected ≈ +1.2pp); no perf-guard regression
-  (`test_perf_scaling_guard.py` green).
+  (`test_perf_scaling_guard.py` green). **N2 (plan review)**: the postmortem also
+  records `COUNT(*) WHERE src_key LIKE 'stage://%'` so the 311 leading-dot edges
+  are accounted for (converted vs. dropped), not just gone.
 
 ### Phase 3: Session context (PR 2)
-**Step 3.1**: `exp.Use` detection + file-local default schema/db state in both
-parsers' statement loops; verify the Snowflake scripting regex captures `USE`
-inside procedure bodies (the doorbelasting proc is the live test).
-**Step 3.2**: Default-qualification of unqualified real-table refs (targets and
-sources), ordered before alias application; CTE refs exempt.
+**Step 3.1** (amended — B1): scripting-path `USE` context. Position-aware
+pre-scan of the sql text in `_parse_scripting_file`; qualify each extracted DML
+statement with the schema context active at its text offset (reuse
+`_qualify_bare_tables`). The doorbelasting proc is the live test — it MUST gain
+`ia_outbound.*` dst keys.
+**Step 3.2** (amended — B1/W3): non-scripting P5 extension only: two-part
+`USE SCHEMA db.schema` + bare `USE db.schema` forms; `USE DATABASE` alone stays
+ignored (documented decision). ANSI override only if corpus grep shows `USE` in
+ANSI-parsed files. Targets and sources both, ordered before alias application;
+CTE refs exempt.
 **Step 3.3**: `LikeProperty` → `clone_source` capture.
 - Files: `src/sqlcg/parsers/ansi_parser.py`, `src/sqlcg/parsers/snowflake_parser.py`,
   tests.
@@ -265,9 +298,21 @@ sources), ordered before alias application; CTE refs exempt.
 `{namespace}::` when set; set it for `role in ("cte","derived")` at every CTE
 TableRef creation site (grep `role="cte"` / `role="derived"` — each site needs
 the file path in reach; thread via parser instance state set in `parse_file`).
-**Step 4.2**: Verify consumers: trace output, mermaid builder, noise filter,
-coverage `_DST_TABLE` strip, `find`/`analyze` CLI rendering. Fix any `::`
-handling issue found.
+**Step 4.2** (amended — B2/W2/N3): Verify consumers: trace output, mermaid
+builder, noise filter, coverage `_DST_TABLE` strip, `find`/`analyze` CLI
+rendering. Fix any `::` handling issue found. Known-affected consumers from the
+plan review (must be fixed, not just audited):
+- **[`noise_filter.py:75`](src/sqlcg/server/noise_filter.py)** (B2):
+  `table_qualified.split(".")[-1]` yields `sql::final` for a namespaced key.
+  Fix: a `::`-aware short-name helper — take the segment after the last `::`
+  when present, else after the last `.`.
+- **[`indexer.py`](src/sqlcg/indexer/indexer.py) `_harvest_usage_catalog`**
+  (W2): the `"." not in table_qualified` CTE guard (and its line-129 comment)
+  becomes a dead/wrong guard once namespaced keys contain `.sql`. Rely on the
+  `kind` guard; update guard + comment to match the post-PR3 key shape.
+- **[`tools.py`](src/sqlcg/server/tools.py) `_bare_ref`** (N3): splits on all
+  `.`; verify behaviour against namespaced keys (unlikely code path — CTE keys
+  have no schema prefix — but assert it in a test).
 - Files: `src/sqlcg/parsers/base.py`, possibly `src/sqlcg/server/noise_filter.py`,
   `src/sqlcg/server/tools.py` (display only), tests.
 - Acceptance (unit): two fixture files each defining a CTE `final` with one
