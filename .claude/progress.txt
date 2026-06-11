@@ -3,7 +3,7 @@ ACTIVE AGENT: developer (complete — ready for compliance check)
 FEATURE: PR 4 of v1.14.0 batch — metrics/UX polish (Fix 4a+4b, v1.14.1)
 PLAN: plan/sprints/v1.14.0_dialect_and_query_config_fixes.md (Fix 4)
 BRANCH: fix/metrics-ux-polish-blindspot-noise-notice
-PR: <to be filled after gh pr create>
+PR: https://github.com/Warhorze/sql-code-graph/pull/78
 
 ## Handoff — developer: metrics-ux-polish (PR 4, Fix 4a+4b) [2026-06-11]
 
