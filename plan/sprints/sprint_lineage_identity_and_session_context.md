@@ -66,6 +66,17 @@ collided trace is a false fact).
   itself un-aliased (90 edges). A second branch misses `_apply_table_alias`
   entirely (file is `use schema BA_TMP;` + `insert into BA_TMP.WTFA_LOONKOSTEN(...)`
   — column-list INSERT, `stmt.this` is `exp.Schema`).
+- **Empty-identity keys** (same class — keys that lie about identity): 311
+  `COLUMN_LINEAGE.src_key` rows have a *leading dot* (`.ean_code`, `.@1`,
+  `.metadata$filename`, `.file_name`, …) plus one `SqlTable` row whose
+  `qualified` is the empty string. Producers are Snowflake **stage reads**
+  (`SELECT $1, metadata$filename FROM @stage` in CTAS statements, e.g.
+  `etl/sql/da/hyb/rthyb_promotion_normal.sql`: 58 edges): the stage ref yields a
+  TableRef with an empty `name`, `full_id` renders as `''`, and
+  `ColumnRef.full_id` becomes `.{col}`. All 311 share one phantom "table" node,
+  so unrelated stage-loading pipelines are connected through it — a milder
+  sibling of the F3 collision, and a contributor to the `<unknown>` blindspot
+  bucket.
 
 **Design**: stop relying on every parser branch remembering to call
 `_apply_table_alias`. Normalize once, at the parse-output boundary:
@@ -83,6 +94,16 @@ collided trace is a false fact).
 - `LineageEdge` and `ColumnRef`/`TableRef` are frozen dataclasses — rewrite via
   `dataclasses.replace`; this is a once-per-file O(edges) pass, far outside the
   per-column hot loop. **No CLAUDE.md performance invariant is touched.**
+- **Empty-identity guard** (same choke point): the normalizer rejects any
+  TableRef whose `full_id` is empty. For stage reads, resolve the ref to a
+  stable synthetic identity instead of `''` — `stage://<stage_name>` when the
+  `@stage` name is recoverable from the AST, else drop the edge and append a
+  `col_lineage_skip:stage:<file>` entry to `ParsedFile.errors` (a dropped edge
+  is honest; an empty-keyed edge is a false join point). Never emit a graph key
+  with a leading dot, an empty table component, or an empty `SqlTable.qualified`.
+  Decision on representation (synthetic stage node vs. drop) is the developer's
+  call per what the AST exposes — both satisfy acceptance; document the choice
+  in the PR.
 
 **Developer investigation step (bounded)**: before writing the normalizer, confirm
 with the two anchors above that no *third* divergence source exists in pass-2
@@ -215,8 +236,11 @@ row construction (both `index_repo` and `reindex_file` paths).
   `schema_aliases={"ba_tmp": "ba"}` over a two-statement fixture mirroring the
   loonkosten pattern asserts zero `ba_tmp.*` keys in any graph table.
 **Step 2.3**: Reindex DWH, record `gain` before/after in the PR postmortem.
-- Acceptance: bad edges into `*_tmp.*` tables: 597 → 0; strict edge health rises
-  (expected ≈ +1.2pp); no perf-guard regression (`test_perf_scaling_guard.py` green).
+- Acceptance: bad edges into `*_tmp.*` tables: 597 → 0; leading-dot/empty-table
+  keys: 311 → 0 and the `qualified=''` SqlTable row is gone (stage edges either
+  carry a `stage://…` key or are dropped with a logged skip — zero silent empty
+  keys); strict edge health rises (expected ≈ +1.2pp); no perf-guard regression
+  (`test_perf_scaling_guard.py` green).
 
 ### Phase 3: Session context (PR 2)
 **Step 3.1**: `exp.Use` detection + file-local default schema/db state in both
@@ -277,6 +301,9 @@ handling issue found.
       (baselines 218 / 828 reproduced on the v1.14.2 graph).
 - [ ] After PR 1 + reindex: zero strict-bad edges into `*_tmp.*` tables whose
       base is catalogued (was 597).
+- [ ] After PR 1 + reindex: zero graph keys with a leading dot or empty table
+      component (was 311 edges + 1 empty `SqlTable` row); stage reads either
+      keyed `stage://<name>` or dropped with a logged skip.
 - [ ] After PR 2 + reindex: rescuable-unqualified ≤ 50 (was 828);
       `doorbelasting` out of blindspot top-10.
 - [ ] After PR 3 + reindex: CTE-collision counter = 0 (was 218); a trace through
@@ -316,6 +343,12 @@ WITH bad AS (SELECT cl.dst_key,
 SELECT COUNT(*) FROM bad WHERE dst_t LIKE '%_tmp.%'
   AND EXISTS (SELECT 1 FROM HAS_COLUMN hc WHERE hc.src_key = replace(dst_t,'_tmp.','.'));
 -- = 597
+-- empty-identity stage keys (leading dot) + the phantom empty table node:
+SELECT COUNT(*) FROM COLUMN_LINEAGE WHERE src_key LIKE '.%';   -- = 311
+SELECT COUNT(*) FROM SqlTable WHERE qualified = '';            -- = 1
+-- producers: etl/sql/da/hyb/rthyb_promotion_normal.sql (58), rthyb_product_concept.sql (45),
+-- rthyb_product_nonconcept.sql (45), etl/sql/da/dyn/rtdyn_factuur_regel.sql (23) — all
+-- CREATE_TABLE statements selecting $1 / metadata$filename from @stage refs.
 ```
 
 ### 7.2 F2 anchor
