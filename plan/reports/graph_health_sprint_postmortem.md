@@ -15,6 +15,12 @@ Executed in one day as 5 plan PRs + 1 salvage PR, all merged to master:
 
 ## Final measured state (fresh DWH index + catalog load, 2026-06-10)
 
+> **Superseded (2026-06-11):** the table below was measured on the silent ANSI
+> misparse fixed in v1.13.1 (bare `sqlcg index` ignored `.sqlcg.toml`'s dialect),
+> so it understates the graph. The canonical baseline is now
+> [`v1_14_dialect_query_config_postmortem.md`](v1_14_dialect_query_config_postmortem.md)
+> (83% strict / 97% scoped). Kept unedited for history.
+
 | Metric | Sprint start (stale live DB, table-level ruler) | Final |
 |---|---|---|
 | Strict edge health | not measurable (legacy 72% partly fictional) | **74%** (= structural unscoped ceiling; ~12.3k by-design CTE chain edges cap it) |
