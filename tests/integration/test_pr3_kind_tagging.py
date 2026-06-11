@@ -65,7 +65,9 @@ def test_scenario_a_cte_node_has_kind_cte(db, tmp_path):
     )
     table_by_qualified = {r["qualified"]: r["kind"] for r in rows}
 
-    # PR 3: CTE alias node is now namespaced — look for key ending in "::my_cte"
+    # PR 3 (sprint_postmortem_fixes §PR 3): CTE alias node is namespaced as
+    # "<repo-relative-path>::my_cte" (e.g. "fixture.sql::my_cte" when the file is
+    # at the root of the indexed directory).  Look for the key by its suffix.
     cte_key = next(
         (k for k in table_by_qualified if k.endswith("::my_cte")),
         None,
@@ -161,8 +163,9 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
         result_default = runner.invoke(app, ["downstream", "src.a", "--raw"])
 
     # CTE intermediate must be filtered by default.
-    # PR 3: CTE key is namespaced as "<abs_path>::my_cte"; verify it is absent from the
-    # filtered output by checking the fixture file path is not rendered in the id column.
+    # PR 3 (sprint_postmortem_fixes §PR 3): CTE key is now repo-relative
+    # ("fixture.sql::my_cte"); verify it is absent from the filtered output by
+    # checking that "fixture.sql" is not rendered in the id column.
     assert "fixture.sql" not in result_default.output, (
         f"Namespaced CTE key (containing 'fixture.sql') appeared in default downstream output "
         f"(should be filtered by kind=cte guard).\nOutput: {result_default.output}"
@@ -173,9 +176,8 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
     )
 
     # With --include-intermediate: CTE should appear.
-    # PR 3: the CTE key is namespaced as "<abs_path>::my_cte.a". Rich may truncate long ids
-    # in the table display, but the fixture file path ("fixture.sql") always appears since
-    # the key starts with the tmp_path which begins the id column text.
+    # PR 3 (sprint_postmortem_fixes §PR 3): the CTE key is now "fixture.sql::my_cte.a"
+    # (repo-relative, much shorter than the old absolute path, less likely to be truncated).
     with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db):
         result_intermediate = runner.invoke(
             app, ["downstream", "src.a", "--raw", "--include-intermediate"]
@@ -418,7 +420,7 @@ def test_scenario_f_trace_populates_table_kind(db, tmp_path):
         "No COLUMN_LINEAGE edges found with dst_key like '%::my_cte.a' — "
         "CTE projection edge missing after PR 3 namespacing."
     )
-    my_cte_a_key = cte_col_rows[0]["dst_key"]  # e.g. "/tmp/xxx/fixture.sql::my_cte.a"
+    my_cte_a_key = cte_col_rows[0]["dst_key"]  # e.g. "fixture.sql::my_cte.a" (repo-relative)
     rows_cte = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": my_cte_a_key})
     assert len(rows_cte) >= 1, (
         f"No COLUMN_LINEAGE edges found for {my_cte_a_key!r} — CTE projection edge missing."

@@ -113,36 +113,49 @@ class TestCteKeyNamespacingDisjointness:
             "A collision means two files write to the same CTE graph node."
         )
 
-    def test_file_a_cte_key_contains_file_a_path(self, indexed_db, tmp_path):
-        """The CTE 'final' node indexed from file_a.sql ends with 'file_a.sql::final'.
+    def test_file_a_cte_key_is_repo_relative(self, indexed_db, tmp_path):
+        """After PR 3 (sprint_postmortem_fixes §PR 3), the CTE 'final' node from file_a.sql
+        uses a repo-relative posix key ('file_a.sql::final'), not an absolute path.
 
-        Guards sprint_lineage_identity_and_session_context.md §PR 3.
+        Updated from the original absolute-path assertion to verify the new portable
+        key format.  Two different absolute roots produce the same relative key.
+        Guards sprint_postmortem_fixes.md §PR 3 Step 3.1.
         """
-        file_a_path = str(tmp_path / "file_a.sql")
         all_cte_rows = indexed_db.run_read(
             "SELECT qualified FROM \"SqlTable\" WHERE kind = 'cte'",
             {},
         )
-        file_a_key = file_a_path + "::final"
-        matching = [r for r in all_cte_rows if r["qualified"] == file_a_key]
+        # Repo-relative key: file is at the root of tmp_path, so it is just the filename.
+        expected_key = "file_a.sql::final"
+        matching = [r for r in all_cte_rows if r["qualified"] == expected_key]
         assert len(matching) == 1, (
-            f"Expected 1 CTE node with qualified='{file_a_key}', got: {all_cte_rows}"
+            f"Expected 1 CTE node with qualified='{expected_key}' (repo-relative), "
+            f"got: {all_cte_rows}. "
+            f"Absolute path prefix must NOT appear in CTE keys after sprint_postmortem_fixes §PR 3."
         )
+        # Verify no absolute path leaked into the key.
+        for row in all_cte_rows:
+            assert not row["qualified"].startswith("/"), (
+                f"CTE key contains absolute path: {row['qualified']!r}. "
+                f"Keys must be repo-relative after sprint_postmortem_fixes §PR 3."
+            )
 
-    def test_file_b_cte_key_contains_file_b_path(self, indexed_db, tmp_path):
-        """The CTE 'final' node indexed from file_b.sql ends with 'file_b.sql::final'.
+    def test_file_b_cte_key_is_repo_relative(self, indexed_db, tmp_path):
+        """After PR 3 (sprint_postmortem_fixes §PR 3), the CTE 'final' node from file_b.sql
+        uses a repo-relative posix key ('file_b.sql::final'), not an absolute path.
 
-        Guards sprint_lineage_identity_and_session_context.md §PR 3.
+        Guards sprint_postmortem_fixes.md §PR 3 Step 3.1.
         """
-        file_b_path = str(tmp_path / "file_b.sql")
         all_cte_rows = indexed_db.run_read(
             "SELECT qualified FROM \"SqlTable\" WHERE kind = 'cte'",
             {},
         )
-        file_b_key = file_b_path + "::final"
-        matching = [r for r in all_cte_rows if r["qualified"] == file_b_key]
+        expected_key = "file_b.sql::final"
+        matching = [r for r in all_cte_rows if r["qualified"] == expected_key]
         assert len(matching) == 1, (
-            f"Expected 1 CTE node with qualified='{file_b_key}', got: {all_cte_rows}"
+            f"Expected 1 CTE node with qualified='{expected_key}' (repo-relative), "
+            f"got: {all_cte_rows}. "
+            f"Absolute path prefix must NOT appear in CTE keys after sprint_postmortem_fixes §PR 3."
         )
 
 
