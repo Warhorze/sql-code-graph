@@ -8,6 +8,9 @@ Plan: plan/sprints/graph_health_catalog_and_metrics.md §3 (PR 1)
 Supersedes the four-query baseline from plan/sprints/gain_coverage_metrics.md —
 the original six fields are kept verbatim (legacy table-level numbers); all
 new fields are additive.
+
+PR 4 (sprint_lineage_identity_and_session_context.md §PR 4) adds two §G
+identity-health counters: CTE key collisions and rescuable unqualified edges.
 """
 
 from __future__ import annotations
@@ -229,6 +232,57 @@ WHERE kind IN ({_WRITE_KINDS_SQL})
 """
 
 
+# ---------------------------------------------------------------------------
+# Query §G-1 (PR 4): CTE key collisions — distinct CTE/derived dst column keys
+# in COLUMN_LINEAGE that receive edges from >1 distinct SqlQuery.file_path.
+# A non-zero count means traces through those keys return cross-file lineage
+# that does not exist (false identity, F3 in the sprint plan).
+# Baseline on DWH v1.14.2: 218. Target after PR 3 + reindex: 0.
+# Plan: plan/sprints/sprint_lineage_identity_and_session_context.md §PR 4
+# SQL shape mirrors §7.3 of the sprint plan (adapted to DuckDB double-quoted names).
+# ---------------------------------------------------------------------------
+_Q_CTE_COLLISIONS = f"""
+WITH cte_dst AS (
+    SELECT cl.dst_key, q.file_path
+    FROM "COLUMN_LINEAGE" cl
+    LEFT JOIN "SqlQuery" q ON q.id = cl.query_id
+    WHERE {_DST_TABLE.replace("dst_key", "cl.dst_key")}
+          IN (SELECT qualified FROM "SqlTable" WHERE kind IN ('cte', 'derived'))
+),
+per_key AS (
+    SELECT dst_key, COUNT(DISTINCT file_path) AS nf
+    FROM cte_dst
+    GROUP BY dst_key
+)
+SELECT COUNT(*) FILTER (WHERE nf > 1) AS cte_collisions
+FROM per_key
+"""
+
+# ---------------------------------------------------------------------------
+# Query §G-2 (PR 4): rescuable unqualified edges — strict-bad edges whose
+# dst table has no '.' (unqualified bare name) and whose bare name exists
+# schema-qualified in HAS_COLUMN (i.e. hc.src_key LIKE '%.' || dst_t).
+# These are mis-keyed edges recoverable by PR 2 USE SCHEMA tracking (F2).
+# Baseline on DWH v1.14.2: 828. Target after PR 2 + reindex: ~0.
+# Plan: plan/sprints/sprint_lineage_identity_and_session_context.md §PR 4
+# ---------------------------------------------------------------------------
+_Q_RESCUABLE_UNQUALIFIED = f"""
+WITH bad AS (
+    SELECT {_DST_TABLE.replace("dst_key", "cl.dst_key")} AS dst_t
+    FROM "COLUMN_LINEAGE" cl
+    WHERE NOT EXISTS (
+        SELECT 1 FROM "HAS_COLUMN" hc WHERE hc.dst_key = cl.dst_key
+    )
+)
+SELECT COUNT(*) AS rescuable_unqualified
+FROM bad
+WHERE instr(dst_t, '.') = 0
+  AND EXISTS (
+      SELECT 1 FROM "HAS_COLUMN" hc WHERE hc.src_key LIKE '%.' || dst_t
+  )
+"""
+
+
 @dataclass
 class BlindspotTable:
     """A single table in the edge-weighted blindspot ranking."""
@@ -284,6 +338,10 @@ class CoverageStats:
     degraded_parse_by_dir: dict[str, tuple[int, int]] = field(default_factory=dict)
     zero_edge_write_queries: int = 0
     total_write_queries: int = 0
+
+    # --- identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4) ---
+    cte_key_collisions: int = 0
+    rescuable_unqualified_edges: int = 0
 
     @property
     def catalog_pct(self) -> float:
@@ -357,6 +415,8 @@ def collect_coverage() -> CoverageStats | None:
         q_degraded = run_read_routed(_Q_DEGRADED_PARSE_OVERALL, {})
         q_degraded_dir = run_read_routed(_Q_DEGRADED_PARSE_BY_DIR, {})
         q_zero_edge = run_read_routed(_Q_ZERO_EDGE_WRITES, {})
+        q_cte_collisions = run_read_routed(_Q_CTE_COLLISIONS, {})
+        q_rescuable = run_read_routed(_Q_RESCUABLE_UNQUALIFIED, {})
 
         row1 = q1[0] if q1 else {}
         row2 = q2[0] if q2 else {}
@@ -368,6 +428,8 @@ def collect_coverage() -> CoverageStats | None:
         row_fp = q_fp[0] if q_fp else {}
         row_degraded = q_degraded[0] if q_degraded else {}
         row_zero_edge = q_zero_edge[0] if q_zero_edge else {}
+        row_cte_collisions = q_cte_collisions[0] if q_cte_collisions else {}
+        row_rescuable = q_rescuable[0] if q_rescuable else {}
 
         top_blindspot = [
             BlindspotTable(table=str(r["dst_table"]), bad_edges=int(r["bad_count"]))
@@ -419,6 +481,8 @@ def collect_coverage() -> CoverageStats | None:
             degraded_parse_by_dir=degraded_by_dir,
             zero_edge_write_queries=int(row_zero_edge.get("zero_edge_writes") or 0),
             total_write_queries=int(row_zero_edge.get("total_write_queries") or 0),
+            cte_key_collisions=int(row_cte_collisions.get("cte_collisions") or 0),
+            rescuable_unqualified_edges=int(row_rescuable.get("rescuable_unqualified") or 0),
         )
     except Exception:
         return None
@@ -575,6 +639,12 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f"{coverage.zero_edge_write_queries} / {coverage.total_write_queries}"
     )
 
+    # Identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4).
+    # Baseline DWH v1.14.2: CTE collisions=218, rescuable unqualified=828.
+    # Both should reach 0 after PR 3 (CTE namespacing) and PR 2 (USE SCHEMA) + reindex.
+    lines.append(f"{indent}CTE key collisions: {coverage.cte_key_collisions}")
+    lines.append(f"{indent}Rescuable unqualified edges: {coverage.rescuable_unqualified_edges}")
+
     return lines
 
 
@@ -621,4 +691,7 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         },
         "zero_edge_write_queries": coverage.zero_edge_write_queries,
         "total_write_queries": coverage.total_write_queries,
+        # identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4)
+        "cte_key_collisions": coverage.cte_key_collisions,
+        "rescuable_unqualified_edges": coverage.rescuable_unqualified_edges,
     }

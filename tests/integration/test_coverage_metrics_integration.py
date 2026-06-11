@@ -518,6 +518,10 @@ def test_coverage_json_exposes_new_keys_and_legacy_key_unchanged(pr1_fixture_bac
     ):
         assert key in payload, f"PR 1 key {key!r} missing from coverage_to_json"
 
+    # PR 4 identity health keys
+    for key in ("cte_key_collisions", "rescuable_unqualified_edges"):
+        assert key in payload, f"PR 4 key {key!r} missing from coverage_to_json"
+
     assert payload["good_edges_strict"] == 2
     assert payload["phantom_confirmed"] == 1
     assert payload["phantom_contradicted"] == 1
