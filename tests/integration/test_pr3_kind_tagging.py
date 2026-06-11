@@ -257,6 +257,7 @@ def test_scenario_d_impact_noise_filter_and_raw(db, tmp_path):
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
+        patch("sqlcg.cli.commands.analyze.resolved_repo_root", return_value=tmp_path),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
@@ -274,6 +275,7 @@ def test_scenario_d_impact_noise_filter_and_raw(db, tmp_path):
     # --raw: both queries must appear
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
+        patch("sqlcg.cli.commands.analyze.resolved_repo_root", return_value=tmp_path),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
@@ -326,6 +328,7 @@ def test_scenario_e_unused_noise_filter_and_raw(db, tmp_path):
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
+        patch("sqlcg.cli.commands.analyze.resolved_repo_root", return_value=tmp_path),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,
@@ -344,6 +347,7 @@ def test_scenario_e_unused_noise_filter_and_raw(db, tmp_path):
     # --raw: noise table must appear
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db),
+        patch("sqlcg.cli.commands.analyze.resolved_repo_root", return_value=tmp_path),
         patch(
             "sqlcg.server.noise_filter.NoiseFilter.from_config",
             return_value=noisy_filter,

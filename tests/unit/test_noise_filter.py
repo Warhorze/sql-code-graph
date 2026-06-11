@@ -395,6 +395,7 @@ class TestAnalyzeNoiseFilter:
         Uses a mock backend returning a backup node; verifies that with default
         NoiseFilter the node is excluded, and with --raw it is returned.
         """
+        from pathlib import Path
         from unittest.mock import MagicMock, patch
 
         from typer.testing import CliRunner
@@ -410,9 +411,15 @@ class TestAnalyzeNoiseFilter:
         backend.__exit__ = MagicMock(return_value=False)
         backend.run_read = MagicMock(return_value=[{"id": backup_id}, {"id": normal_id}])
 
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            return_value=[{"id": backup_id}, {"id": normal_id}],
+        with (
+            patch(
+                "sqlcg.cli.commands.analyze.resolved_repo_root",
+                return_value=Path("/tmp/fake-repo"),
+            ),
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                return_value=[{"id": backup_id}, {"id": normal_id}],
+            ),
         ):
             # Default: noise filtered out
             result_default = runner.invoke(app, ["analyze", "upstream", "ba.fact.col"])

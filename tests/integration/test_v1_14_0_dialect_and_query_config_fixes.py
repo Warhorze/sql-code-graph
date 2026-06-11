@@ -385,6 +385,10 @@ def test_Fix3_analyze_upstream_uses_resolved_root_for_noise_filter(tmp_path: Pat
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=[]),
+        patch(
+            "sqlcg.cli.commands.analyze.resolved_repo_root",
+            return_value=Path("/tmp/fake-repo"),
+        ),
         patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_from_config,
     ):
         mock_from_config.return_value.filter_nodes.return_value = ([], [])
@@ -622,6 +626,10 @@ def test_Fix4b_all_noise_filtered_notice_fires(capsys) -> None:
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=fake_rows),
+        patch(
+            "sqlcg.cli.commands.analyze.resolved_repo_root",
+            return_value=Path("/tmp/fake-repo"),
+        ),
         patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_from_config,
     ):
         nf = MagicMock()
@@ -658,6 +666,10 @@ def test_Fix4b_notice_does_not_fire_when_results_survive(capsys) -> None:
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=fake_rows),
+        patch(
+            "sqlcg.cli.commands.analyze.resolved_repo_root",
+            return_value=Path("/tmp/fake-repo"),
+        ),
         patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_from_config,
         patch(
             "sqlcg.cli.commands.analyze._filter_column_results",
@@ -710,6 +722,10 @@ def test_Fix4b_genuinely_empty_trace_no_spurious_notice(capsys) -> None:
 
     with (
         patch("sqlcg.cli.commands.analyze.run_read_routed", return_value=[]),
+        patch(
+            "sqlcg.cli.commands.analyze.resolved_repo_root",
+            return_value=Path("/tmp/fake-repo"),
+        ),
         patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_from_config,
     ):
         nf = MagicMock()

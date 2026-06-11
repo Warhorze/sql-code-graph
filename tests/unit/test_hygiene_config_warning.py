@@ -184,15 +184,23 @@ def test_hygiene_find_column_filters_noise_by_default() -> None:
     This test will FAIL before Phase 2 Step 2.1 is implemented because
     find_column has no --raw flag and no NoiseFilter call yet.
     """
+    from pathlib import Path
+
     # ba.foo_bck is a noise table (matches *_bck glob)
     noise_col = {"id": "ba.foo_bck.order_id"}
 
     nf_instance = MagicMock()
     nf_instance.is_noise.return_value = True  # foo_bck → noise
 
-    with patch("sqlcg.cli.commands.find.run_read_routed", return_value=[noise_col]):
-        with patch("sqlcg.server.noise_filter.NoiseFilter.from_config", return_value=nf_instance):
-            result = _runner.invoke(cli_app, ["find", "column", "foo_bck.order_id"])
+    with (
+        patch(
+            "sqlcg.cli.commands.find.resolved_repo_root",
+            return_value=Path("/tmp/fake-repo"),
+        ),
+        patch("sqlcg.cli.commands.find.run_read_routed", return_value=[noise_col]),
+        patch("sqlcg.server.noise_filter.NoiseFilter.from_config", return_value=nf_instance),
+    ):
+        result = _runner.invoke(cli_app, ["find", "column", "foo_bck.order_id"])
 
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
     # The noise column must NOT appear in output when filtering is on (default)

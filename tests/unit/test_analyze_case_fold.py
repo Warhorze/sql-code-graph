@@ -11,11 +11,22 @@ at the top of each command handler, before the first ``run_read_routed`` call.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
+
+# resolved_repo_root() is imported into analyze.py and calls run_read_routed
+# internally (SELECT path FROM "Repo") against the DB.  With the autouse DB-
+# isolation fixture the DB has no schema, so that query raises CatalogException
+# and the command exits with code 1.  Patch the name at its use site so these
+# unit tests never need a real graph.
+_PATCH_RESOLVED_ROOT = patch(
+    "sqlcg.cli.commands.analyze.resolved_repo_root",
+    return_value=Path("/tmp/fake-repo"),
+)
 
 runner = CliRunner()
 
@@ -56,10 +67,13 @@ class TestAnalyzeUpstreamCaseFold:
         Observable assertion: run_read_routed receives the lowercased ref AND
         returns a non-empty result set that is printed (not "No results").
         """
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            return_value=_UPSTREAM_ROWS,
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                return_value=_UPSTREAM_ROWS,
+            ) as mock_rrr,
+        ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
                 result = runner.invoke(app, ["analyze", "upstream", "BA.SRC_ORDERS.ORDER_ID"])
@@ -76,17 +90,23 @@ class TestAnalyzeUpstreamCaseFold:
 
     def test_lowercase_and_uppercase_return_same_result(self) -> None:
         """Lowercase and UPPERCASE anchors produce the same non-empty result set."""
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            return_value=_UPSTREAM_ROWS,
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                return_value=_UPSTREAM_ROWS,
+            ),
         ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
                 result_lower = runner.invoke(app, ["analyze", "upstream", "ba.src_orders.order_id"])
 
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            return_value=_UPSTREAM_ROWS,
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                return_value=_UPSTREAM_ROWS,
+            ),
         ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
@@ -120,10 +140,13 @@ class TestAnalyzeUpstreamCaseFold:
         bare (schema-stripped) lookup succeeds.  The bare ref must be lowercase.
         """
         # First call (qualified) → empty; second call (bare) → result.
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            side_effect=[[], _UPSTREAM_ROWS],
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                side_effect=[[], _UPSTREAM_ROWS],
+            ) as mock_rrr,
+        ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
                 result = runner.invoke(app, ["analyze", "upstream", "BA.SRC_ORDERS.ORDER_ID"])
@@ -145,11 +168,14 @@ class TestAnalyzeDownstreamCaseFold:
         downstream() also calls run_read_routed for external consumers after the
         main result; we return [] for those follow-up calls via side_effect.
         """
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            # First call: main downstream rows.  Subsequent calls (external consumers): [].
-            side_effect=[_DOWNSTREAM_ROWS, [], []],
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                # First call: main downstream rows.  Subsequent calls (external consumers): [].
+                side_effect=[_DOWNSTREAM_ROWS, [], []],
+            ) as mock_rrr,
+        ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
                 result = runner.invoke(app, ["analyze", "downstream", "BA.FACT_ORDERS.ORDER_ID"])
@@ -165,9 +191,12 @@ class TestAnalyzeDownstreamCaseFold:
 
     def test_lowercase_and_uppercase_return_same_result(self) -> None:
         """Lowercase and UPPERCASE anchors produce the same non-empty result set."""
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            side_effect=[_DOWNSTREAM_ROWS, [], []],
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                side_effect=[_DOWNSTREAM_ROWS, [], []],
+            ),
         ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
@@ -175,9 +204,12 @@ class TestAnalyzeDownstreamCaseFold:
                     app, ["analyze", "downstream", "ba.fact_orders.order_id"]
                 )
 
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            side_effect=[_DOWNSTREAM_ROWS, [], []],
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                side_effect=[_DOWNSTREAM_ROWS, [], []],
+            ),
         ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
@@ -207,11 +239,14 @@ class TestAnalyzeDownstreamCaseFold:
 
     def test_bare_ref_fallback_lowercased(self) -> None:
         """_bare_ref fallback path also passes a lowercased bare ref (downstream)."""
-        with patch(
-            "sqlcg.cli.commands.analyze.run_read_routed",
-            # qualified → empty, bare → downstream rows, then external consumer calls → [].
-            side_effect=[[], _DOWNSTREAM_ROWS, [], []],
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.analyze.run_read_routed",
+                # qualified → empty, bare → downstream rows, then external consumer calls → [].
+                side_effect=[[], _DOWNSTREAM_ROWS, [], []],
+            ) as mock_rrr,
+        ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 mock_nf.return_value = _make_nf_mock()
                 result = runner.invoke(app, ["analyze", "downstream", "BA.FACT_ORDERS.ORDER_ID"])
