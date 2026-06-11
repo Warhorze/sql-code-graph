@@ -205,13 +205,16 @@ def test_render_coverage_lines_includes_rescuable_unqualified_line():
     )
 
 
-def test_render_coverage_lines_identity_lines_appear_at_end_of_section():
-    """Identity health lines appear after the recall lines (bottom of §G).
+def test_render_coverage_lines_identity_lines_present_in_output():
+    """Identity health lines appear in the §G render output.
 
     Guards the identity-counter plan
     ([plan doc](plan/sprints/sprint_lineage_identity_and_session_context.md)).
 
-    The two identity lines are the last two lines in the render output.
+    Checks by content presence rather than positional index, because PR 4
+    (sprint_postmortem_fixes.md §Step 4.3) may append a catalog-missing warning
+    line after the identity counters when info_schema_has_column_rows=0.
+    Set info_schema_has_column_rows=1 to suppress the warning for this test.
     """
     stats = CoverageStats(
         catalogued_tables=10,
@@ -222,14 +225,18 @@ def test_render_coverage_lines_identity_lines_appear_at_end_of_section():
         blindspot_tables=3,
         cte_key_collisions=5,
         rescuable_unqualified_edges=12,
+        info_schema_has_column_rows=1,  # suppress catalog-missing warning
     )
     lines = render_coverage_lines(stats)
-    assert len(lines) >= 2
-    assert "CTE key collisions" in lines[-2], (
-        f"Expected 'CTE key collisions' as second-to-last line, got: {lines[-2]!r}"
+    cte_lines = [ln for ln in lines if "CTE key collisions" in ln]
+    rescuable_lines = [ln for ln in lines if "Rescuable unqualified edges" in ln]
+    assert cte_lines, f"Expected a 'CTE key collisions' line in render output, got:\n{lines}"
+    assert rescuable_lines, (
+        f"Expected a 'Rescuable unqualified edges' line in render output, got:\n{lines}"
     )
-    assert "Rescuable unqualified edges" in lines[-1], (
-        f"Expected 'Rescuable unqualified edges' as last line, got: {lines[-1]!r}"
+    assert "5" in cte_lines[0], f"Expected count 5 in CTE collisions line: {cte_lines[0]!r}"
+    assert "12" in rescuable_lines[0], (
+        f"Expected count 12 in rescuable line: {rescuable_lines[0]!r}"
     )
 
 

@@ -223,12 +223,20 @@ def apply_catalog_to_backend(
         has_column_edges,
     )
 
+    # Catalog-aware kind upgrade (A4, PR 4, sprint_postmortem_fixes.md §Step 4.2):
+    # After info-schema rows are upserted, upgrade any SqlTable rows that are still
+    # mis-kinded as 'derived' (DDL in un-indexed Liquibase XML etc.) to 'table'.
+    # WHERE kind='derived' guard ensures view/table rows are never touched.
+    catalogued_keys = [r["qualified"] for r in table_rows]
+    upgraded = backend.upgrade_derived_to_table_for_keys(catalogued_keys)
+
     return {
         "rows_read": rows_read,
         "malformed_skipped": malformed_skipped,
         "tables_loaded": len(table_rows),
         "columns_loaded": len(column_rows),
         "folded_rows": folded_rows,
+        "derived_upgraded": upgraded,
     }
 
 

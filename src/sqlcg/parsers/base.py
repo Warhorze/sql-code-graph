@@ -1326,18 +1326,14 @@ class SqlParser(ABC):
                                             table_cols = tcols
                                             break
                     if table_cols is not None and col_name not in table_cols:
-                        self._log.warning(
-                            "column %s not found in schema, emitting low-confidence edge",
+                        self._log.debug(
+                            "column %s not found in schema, skipping edge (unknown_sentinel)",
                             col_name,
                         )
-                        edges.append(
-                            LineageEdge(
-                                src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                                transform="UNKNOWN",
-                                confidence=0.5,
-                            )
-                        )
+                        # Honest drop: skip the self-edge rather than emitting a
+                        # <unknown>→<unknown> self-edge that carries no lineage
+                        # information (PR 4, sprint_postmortem_fixes.md §Step 4.1).
+                        out.errors.append(f"col_lineage_skip:unknown_sentinel:{col_name}")
                         continue
 
                 # Classify the transform kind once per column — AST-only, no serialization,
@@ -1409,15 +1405,10 @@ class SqlParser(ABC):
                         exc,
                     )
                     out.errors.append(f"col_lineage:{col_name}:{exc}")
-                    # Emit a zero-confidence placeholder edge
-                    edges.append(
-                        LineageEdge(
-                            src=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                            dst=ColumnRef(TableRef(None, None, "<unknown>"), col_name),
-                            transform="UNKNOWN",
-                            confidence=0.0,
-                        )
-                    )
+                    # Honest drop: skip the <unknown>→<unknown> self-edge; it carries
+                    # no lineage information and pollutes strict-bad-edge counts
+                    # (PR 4, sprint_postmortem_fixes.md §Step 4.1).
+                    out.errors.append(f"col_lineage_skip:unknown_sentinel:{col_name}")
 
             # NEW: Extract column lineage for CTE projections as additional destinations
             # (Step 2.1 of T-07-02 — FIX-E5-XFILE-CHAIN).

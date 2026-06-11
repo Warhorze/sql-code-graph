@@ -19,7 +19,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlcg.core.config import get_db_path
+from sqlcg.core.config import get_catalog_path, get_db_path
 from sqlcg.server.read_client import run_read_routed
 
 # DuckDB expression that strips the trailing ".<column>" from a COLUMN_LINEAGE
@@ -282,6 +282,18 @@ WHERE instr(dst_t, '.') = 0
   )
 """
 
+# ---------------------------------------------------------------------------
+# Query §G-3 (PR 4, sprint_postmortem_fixes.md §Step 4.3):
+# Count HAS_COLUMN rows sourced from information_schema.  Zero means the
+# operator has not run `sqlcg catalog load <csv>`, which degrades scoped and
+# strict edge-health metrics for graphs with Liquibase/XML DDL tables.
+# ---------------------------------------------------------------------------
+_Q_INFO_SCHEMA_ROWS = """
+SELECT COUNT(*) AS info_schema_rows
+FROM "HAS_COLUMN"
+WHERE source = 'information_schema'
+"""
+
 
 @dataclass
 class BlindspotTable:
@@ -342,6 +354,16 @@ class CoverageStats:
     # --- identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4) ---
     cte_key_collisions: int = 0
     rescuable_unqualified_edges: int = 0
+
+    # --- catalog-missing warning (PR 4, sprint_postmortem_fixes.md §Step 4.3) ---
+    # Count of HAS_COLUMN rows sourced from information_schema.  Zero triggers
+    # the §G catalog-missing warning line in render_coverage_lines.
+    info_schema_has_column_rows: int = 0
+
+    # Indexed root (optional) — set when an indexed Repo.path is available, used
+    # by render_coverage_lines to strengthen the catalog-missing warning when a
+    # catalog path is configured but no rows are present.
+    indexed_repo_root: str | None = None
 
     @property
     def catalog_pct(self) -> float:
@@ -417,6 +439,7 @@ def collect_coverage() -> CoverageStats | None:
         q_zero_edge = run_read_routed(_Q_ZERO_EDGE_WRITES, {})
         q_cte_collisions = run_read_routed(_Q_CTE_COLLISIONS, {})
         q_rescuable = run_read_routed(_Q_RESCUABLE_UNQUALIFIED, {})
+        q_info_schema = run_read_routed(_Q_INFO_SCHEMA_ROWS, {})
 
         row1 = q1[0] if q1 else {}
         row2 = q2[0] if q2 else {}
@@ -430,6 +453,7 @@ def collect_coverage() -> CoverageStats | None:
         row_zero_edge = q_zero_edge[0] if q_zero_edge else {}
         row_cte_collisions = q_cte_collisions[0] if q_cte_collisions else {}
         row_rescuable = q_rescuable[0] if q_rescuable else {}
+        row_info_schema = q_info_schema[0] if q_info_schema else {}
 
         top_blindspot = [
             BlindspotTable(table=str(r["dst_table"]), bad_edges=int(r["bad_count"]))
@@ -457,6 +481,24 @@ def collect_coverage() -> CoverageStats | None:
         except OSError:
             index_timestamp = None
 
+        # Indexed repo root — for the catalog-missing warning (N3).
+        # Re-uses the Repo table already present after any index; returns None
+        # when the Repo table is empty (fresh / never indexed graph).
+        q_repo = run_read_routed('SELECT path FROM "Repo" LIMIT 1', {})
+        indexed_root_str: str | None = None
+        if q_repo:
+            indexed_root_str = q_repo[0].get("path") or None
+
+        # Resolve whether a catalog path is configured for this root (N3).
+        catalog_configured = False
+        if indexed_root_str:
+            try:
+                from pathlib import Path as _Path
+
+                catalog_configured = get_catalog_path(_Path(indexed_root_str)) is not None
+            except Exception:
+                catalog_configured = False
+
         return CoverageStats(
             catalogued_tables=int(row1.get("catalogued_tables") or 0),
             total_tables=int(row1.get("total_tables") or 0),
@@ -483,6 +525,8 @@ def collect_coverage() -> CoverageStats | None:
             total_write_queries=int(row_zero_edge.get("total_write_queries") or 0),
             cte_key_collisions=int(row_cte_collisions.get("cte_collisions") or 0),
             rescuable_unqualified_edges=int(row_rescuable.get("rescuable_unqualified") or 0),
+            info_schema_has_column_rows=int(row_info_schema.get("info_schema_rows") or 0),
+            indexed_repo_root=indexed_root_str if catalog_configured else None,
         )
     except Exception:
         return None
@@ -645,6 +689,24 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
     lines.append(f"{indent}CTE key collisions: {coverage.cte_key_collisions}")
     lines.append(f"{indent}Rescuable unqualified edges: {coverage.rescuable_unqualified_edges}")
 
+    # §G catalog-missing warning (PR 4, sprint_postmortem_fixes.md §Step 4.3).
+    # Warn when the graph has zero information_schema-sourced HAS_COLUMN rows.
+    # When a catalog path is configured but no rows are present the wording is
+    # stronger (N3: use get_catalog_path result stored in indexed_repo_root).
+    if coverage.info_schema_has_column_rows == 0:
+        if coverage.indexed_repo_root is not None:
+            # A catalog path is configured in .sqlcg.toml but no rows are loaded.
+            lines.append(
+                f"{indent}[yellow]Warning:[/yellow] a catalog path is configured"
+                " but the graph has no information_schema rows —"
+                " run [bold]sqlcg catalog load <csv>[/bold] to enrich lineage coverage."
+            )
+        else:
+            lines.append(
+                f"{indent}[yellow]Hint:[/yellow] no information_schema-sourced catalog rows found —"
+                " run [bold]sqlcg catalog load <csv>[/bold] to improve lineage coverage."
+            )
+
     return lines
 
 
@@ -694,4 +756,6 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         # identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4)
         "cte_key_collisions": coverage.cte_key_collisions,
         "rescuable_unqualified_edges": coverage.rescuable_unqualified_edges,
+        # catalog-missing warning (PR 4, sprint_postmortem_fixes.md §Step 4.3)
+        "info_schema_has_column_rows": coverage.info_schema_has_column_rows,
     }

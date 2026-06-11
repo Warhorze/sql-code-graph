@@ -1,7 +1,67 @@
 ## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
-FEATURE: sprint_postmortem_fixes PR 3 — repo-relative CTE/derived namespaces (v1.18.3)
-PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 3 (REVIEWED/APPROVED-WITH-AMENDMENTS)
+FEATURE: sprint_postmortem_fixes PR 4 — <unknown> sentinel drop + kind upgrade + §G warning (v1.19.0)
+PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 4 (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: feat/unknown-edge-drop-kind-upgrade-gain-warning
+PR: (open — see below)
+
+## Handoff — developer: sprint_postmortem_fixes PR 4 (v1.19.0) [2026-06-11]
+
+SUMMARY: Implemented Steps 4.1–4.3 of PR 4 from sprint_postmortem_fixes.md.
+
+Step 4.1 — Stop emitting <unknown> sentinel self-edges:
+  Two emission sites in base.py (~lines 1328–1341 and ~1411–1419) replaced.
+  Both now append col_lineage_skip:unknown_sentinel:<col> and skip the edge.
+  Hot-path rule preserved: pure string/identity check only, no qualify/scope op.
+
+Step 4.2 — Catalog-aware derived→table kind upgrade (A4):
+  New method: DuckDBBackend.upgrade_derived_to_table_for_keys(keys)
+  Runs single bulk UPDATE WHERE kind='derived' AND qualified IN (<keys>).
+  WHERE kind='derived' guard is the sole precedence mechanism.
+  Wired in BOTH seams (A4):
+    Seam 1: apply_catalog_to_backend() in catalog.py (catalog load command)
+    Seam 2: _reapply_catalog_if_configured() → calls apply_catalog_to_backend
+  apply_catalog_to_backend return dict now includes 'derived_upgraded' count.
+
+Step 4.3 — §G catalog-missing warning (N3):
+  New query _Q_INFO_SCHEMA_ROWS added to coverage.py.
+  New CoverageStats fields: info_schema_has_column_rows, indexed_repo_root.
+  collect_coverage() queries Repo table for indexed root + calls get_catalog_path(root).
+  render_coverage_lines() appends a warning when info_schema_has_column_rows == 0:
+    - Stronger wording when indexed_repo_root is set (catalog configured but no rows).
+    - Plain hint wording otherwise.
+    - No line when rows >= 1.
+
+TESTS: 26 new tests across 3 new files:
+  tests/unit/test_unknown_sentinel_skip.py (6 tests)
+  tests/unit/test_catalog_missing_warning.py (7 tests)
+  tests/integration/test_catalog_kind_upgrade.py (10 tests + 3 more = 10 total)
+  Updated: test_base_parser.py (fixed test reflecting honest-drop),
+           test_coverage_metrics.py (added 2 canned rows for new queries),
+           test_identity_counters.py (fixed positional assertion → content-based).
+
+GATES (final):
+  1235 passed, 4 skipped, 1 xfailed, 0 failures (unit+integration).
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified (13/13).
+
+VERSION: 1.18.3 → 1.19.0 (minor — new user-visible surface: §G warning line).
+Tag user-gated per house rule.
+
+DWH expectations (operator-verified post-merge, not CI-gated):
+  - 0 sentinel self-edges (was 500)
+  - CTE collisions 0 (was 3) after catalog load upgrades ba.wtf* tables
+  - 41 edges scoped-eligible after kind upgrade
+  - §G warning absent from gain after catalog load
+
+DEVIATIONS: none.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Handoff — developer: sprint_postmortem_fixes PR 3 (v1.18.3) [2026-06-11]
+
 BRANCH: fix/repo-relative-cte-namespaces
 PR: https://github.com/Warhorze/sql-code-graph/pull/86
 

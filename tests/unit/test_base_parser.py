@@ -15,35 +15,42 @@ from sqlcg.parsers.base import ParsedFile
 class TestExtractColumnLineageExceptions:
     """Test column lineage exception handling in _extract_column_lineage."""
 
-    def test_sg_lineage_exception_recorded(self, caplog):
-        """Test that sg_lineage exceptions append to errors and emit zero-confidence edge."""
+    def test_sg_lineage_exception_skips_edge_records_reasons(self, caplog):
+        """sg_lineage exceptions record two skip reasons and emit NO edge.
+
+        PR 4 (sprint_postmortem_fixes.md §Step 4.1): the <unknown>→<unknown> sentinel
+        self-edge that was previously emitted on exception is dropped in favour of an
+        honest col_lineage_skip:unknown_sentinel:<col> reason — same convention as the
+        stage/merge_branch skips.  The col_lineage:<col>:<exc> error is still recorded
+        so the failure is auditable.
+
+        Guards the honest-drop behaviour introduced in PR 4.
+        ([plan doc](plan/sprints/sprint_postmortem_fixes.md) §Step 4.1)
+        """
         schema = SchemaResolver()
         parser = AnsiParser(schema)
 
-        # Construct a minimal SELECT statement
         stmt = parse_one("SELECT bad_col FROM t")
-
-        # Create a ParsedFile object to track errors
         out = ParsedFile(path=Path("test.sql"), dialect=None)
 
-        # Mock sg_lineage to raise an exception
         with patch("sqlglot.lineage.lineage") as mock_sg_lineage:
             mock_sg_lineage.side_effect = ValueError("mock lineage failure")
 
-            # Call _extract_column_lineage directly
             edges = parser._extract_column_lineage(stmt, Path("test.sql"), out, schema=None)
 
-            # Assert error was recorded with structured key
-            assert len(out.errors) > 0
+            # The original col_lineage error is still recorded.
             assert any("col_lineage:bad_col:mock lineage failure" in str(e) for e in out.errors)
 
-            # Note: T-09-06 demotes per-column errors to DEBUG.
-            # The actual logging is tested in test_T09_06_log_verbosity.py.
-            # This test primarily checks that the error is recorded in out.errors.
+            # The unknown-sentinel skip reason is recorded instead of an edge.
+            assert any(e == "col_lineage_skip:unknown_sentinel:bad_col" for e in out.errors), (
+                f"Expected unknown_sentinel skip reason, got: {out.errors}"
+            )
 
-            # Assert exactly one zero-confidence edge returned
-            assert len(edges.edges) == 1
-            assert edges.edges[0].confidence == 0.0
+            # NO edge is emitted — the honest-drop principle.
+            assert edges.edges == [], (
+                f"Expected zero edges on sg_lineage exception (honest drop), "
+                f"got {len(edges.edges)} edge(s): {edges.edges}"
+            )
 
     def test_outer_statement_exception_recorded(self, caplog):
         """Test that outer statement exceptions are recorded in col_lineage:statement."""
