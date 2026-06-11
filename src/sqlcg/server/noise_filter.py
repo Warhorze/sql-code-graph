@@ -12,6 +12,25 @@ from sqlcg.core.config import (
 )
 
 
+def _table_short_name(table_qualified: str) -> str:
+    """Extract the bare table name from a qualified key, handling CTE namespacing.
+
+    PR 3 (sprint_lineage_identity_and_session_context.md §PR 3) introduced
+    namespaced CTE keys of the form ``path/file.sql::cte_name``.  A naive
+    ``split(".")[-1]`` would yield ``sql::cte_name`` instead of ``cte_name``.
+
+    Resolution order:
+    1. If ``::`` is present, return the segment after the last ``::``.
+    2. Otherwise, return the segment after the last ``.``.
+    3. If neither delimiter is present, return the whole string.
+    """
+    if "::" in table_qualified:
+        return table_qualified.rsplit("::", 1)[-1]
+    if "." in table_qualified:
+        return table_qualified.rsplit(".", 1)[-1]
+    return table_qualified
+
+
 class NoiseFilter:
     """Config-driven filter for backup tables and schema-alias mirrors.
 
@@ -70,11 +89,10 @@ class NoiseFilter:
         if table_qualified.lower() in self.ignored_tables:
             return True
 
-        # Extract just the table part (after the last dot) for glob matching.
-        if "." in table_qualified:
-            table_name = table_qualified.split(".")[-1]
-        else:
-            table_name = table_qualified
+        # Extract just the table part for glob matching.
+        # PR 3: use _table_short_name to handle namespaced CTE keys
+        # (e.g. "a/b.sql::final" → "final"; "schema.table" → "table").
+        table_name = _table_short_name(table_qualified)
 
         for pattern in self.patterns:
             if fnmatch.fnmatch(table_name, pattern):

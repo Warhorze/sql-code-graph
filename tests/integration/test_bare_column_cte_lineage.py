@@ -110,6 +110,20 @@ def _raw_column_lineage_edges(db: DuckDBBackend) -> list[dict]:
     )
 
 
+def _cte_col_key(db: DuckDBBackend, cte_alias: str, col: str) -> str:
+    """Return the namespaced column key for a CTE alias, e.g. '/tmp/x.sql::base.m'.
+
+    PR 3 namespaces CTE keys as '<abs_path>::<cte_alias>'. This helper looks up the
+    actual key from the graph by suffix match so tests are independent of tmp_path.
+    """
+    rows = db.run_read(
+        f"SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::{cte_alias}'",
+        {},
+    )
+    assert rows, f"CTE alias '{cte_alias}' not found in SqlTable after indexing."
+    return f"{rows[0]['qualified']}.{col}"
+
+
 def _cli_upstream_ids(db: DuckDBBackend, col_id: str, depth: int = 5) -> set[str]:
     """Run the exact CLI filtered upstream query and return the id set."""
     query = _upstream_sql(depth, include_intermediate=False)
@@ -156,12 +170,14 @@ def test_correct_source_edge_is_present(indexed_db):
     This edge was absent in v1.4.0 (the bug): bare `m` was rebound to dim_time.
     After the fix, mart.fact_daily is one of the ≥2 candidate source tables and
     must appear with transform='CTE_PROJECTION_AMBIGUOUS', confidence=0.5.
+
+    PR 3: CTE key is namespaced. Look up the actual dst key from the graph.
     """
     db, _ = indexed_db
     edges = _raw_column_lineage_edges(db)
 
     correct_src = "mart.fact_daily.m"
-    correct_dst = "base.m"
+    correct_dst = _cte_col_key(db, "base", "m")  # e.g. "/tmp/xxx/02_enriched.sql::base.m"
     correct_edges = [
         e for e in edges if e["src_key"] == correct_src and e["dst_key"] == correct_dst
     ]
@@ -183,18 +199,21 @@ def test_ambiguous_edges_all_have_correct_transform_and_confidence(indexed_db):
 
     The fix emits one edge per candidate source table (at least fact_daily and
     dim_time) — every such edge must carry the correct transform and confidence.
+
+    PR 3: CTE key is namespaced. Look up the actual dst key from the graph.
     """
     db, _ = indexed_db
     edges = _raw_column_lineage_edges(db)
 
+    base_m_key = _cte_col_key(db, "base", "m")  # e.g. "/tmp/xxx/02_enriched.sql::base.m"
     ambiguous_to_base_m = [
         e
         for e in edges
-        if e["dst_key"] == "base.m" and e["transform"] == "CTE_PROJECTION_AMBIGUOUS"
+        if e["dst_key"] == base_m_key and e["transform"] == "CTE_PROJECTION_AMBIGUOUS"
     ]
     assert ambiguous_to_base_m, (
-        "No CTE_PROJECTION_AMBIGUOUS edges found pointing to base.m.\n"
-        f"All edges pointing to base.m: {[e for e in edges if e['dst_key'] == 'base.m']}"
+        f"No CTE_PROJECTION_AMBIGUOUS edges found pointing to {base_m_key}.\n"
+        f"All edges pointing to {base_m_key}: {[e for e in edges if e['dst_key'] == base_m_key]}"
     )
     for edge in ambiguous_to_base_m:
         assert abs(edge["confidence"] - 0.5) < 1e-6, (
@@ -204,7 +223,7 @@ def test_ambiguous_edges_all_have_correct_transform_and_confidence(indexed_db):
     # Must include the correct source
     src_keys = {e["src_key"] for e in ambiguous_to_base_m}
     assert "mart.fact_daily.m" in src_keys, (
-        f"mart.fact_daily.m is not among the ambiguous sources for base.m.\n"
+        f"mart.fact_daily.m is not among the ambiguous sources for {base_m_key}.\n"
         f"Ambiguous sources: {sorted(src_keys)}"
     )
 
@@ -215,22 +234,25 @@ def test_qualified_column_d_still_resolves_correctly(indexed_db):
     The fix only affects bare (unqualified) columns in ≥2-table bodies.
     The qualified projection f.d AS d must still emit a CTE_PROJECTION edge
     with confidence=1.0, not be affected by the ambiguity override.
+
+    PR 3: CTE key is namespaced. Look up the actual dst key from the graph.
     """
     db, _ = indexed_db
     edges = _raw_column_lineage_edges(db)
 
     # f.d is qualified → resolves to mart.fact_daily.d, normal CTE_PROJECTION
-    d_edges_to_base = [e for e in edges if e["dst_key"] == "base.d"]
+    base_d_key = _cte_col_key(db, "base", "d")  # e.g. "/tmp/xxx/02_enriched.sql::base.d"
+    d_edges_to_base = [e for e in edges if e["dst_key"] == base_d_key]
     assert d_edges_to_base, (
-        f"No edges found pointing to base.d (the qualified f.d projection).\n"
+        f"No edges found pointing to {base_d_key} (the qualified f.d projection).\n"
         f"All edges: {[(e['src_key'], e['dst_key'], e['transform']) for e in edges]}"
     )
     # At least one must be CTE_PROJECTION (the qualified path)
     cte_projection_d = [e for e in d_edges_to_base if e["transform"] == "CTE_PROJECTION"]
     assert cte_projection_d, (
-        f"No CTE_PROJECTION edge for base.d — qualified column was incorrectly "
+        f"No CTE_PROJECTION edge for {base_d_key} — qualified column was incorrectly "
         f"treated as ambiguous.\n"
-        f"Edges to base.d: {d_edges_to_base}"
+        f"Edges to {base_d_key}: {d_edges_to_base}"
     )
 
 
@@ -318,8 +340,16 @@ SELECT total FROM totals;
         'SELECT src_key, dst_key, transform, confidence FROM "COLUMN_LINEAGE" ORDER BY src_key',
         {},
     )
+    # PR 3: CTE 'totals' is namespaced as "<abs_path>::totals". Look up actual key.
+    totals_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::totals'",
+        {},
+    )
+    assert totals_rows, "CTE alias 'totals' not found in SqlTable after indexing."
+    totals_total_key = f"{totals_rows[0]['qualified']}.total"
+
     # totals.total edge must NOT be CTE_PROJECTION_AMBIGUOUS (single-table body)
-    totals_edges = [e for e in edges if e["dst_key"] == "totals.total"]
+    totals_edges = [e for e in edges if e["dst_key"] == totals_total_key]
     ambiguous = [e for e in totals_edges if e["transform"] == "CTE_PROJECTION_AMBIGUOUS"]
     assert not ambiguous, (
         f"Single-table CTE body incorrectly emitted CTE_PROJECTION_AMBIGUOUS edges: {ambiguous}"
@@ -328,5 +358,5 @@ SELECT total FROM totals;
     cte_proj = [e for e in totals_edges if e["transform"] == "CTE_PROJECTION"]
     assert cte_proj, (
         f"Single-table CTE body lost its CTE_PROJECTION edge.\n"
-        f"Edges to totals.total: {totals_edges}"
+        f"Edges to {totals_total_key}: {totals_edges}"
     )

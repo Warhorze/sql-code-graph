@@ -94,7 +94,8 @@ def test_P1_cte_destination_resolves_to_real_target_with_chain(tmp_path):
     try:
         edges = db.run_read(
             "SELECT dst_key FROM COLUMN_LINEAGE "
-            "WHERE dst_key LIKE 'ba.fact.%' OR dst_key LIKE 'base.%'",
+            # PR 3: CTE 'base' is now namespaced as '<path>::base.*'; use suffix match
+            "WHERE dst_key LIKE 'ba.fact.%' OR dst_key LIKE '%::base.%'",
             {},
         )
     finally:
@@ -106,8 +107,9 @@ def test_P1_cte_destination_resolves_to_real_target_with_chain(tmp_path):
         f"Expected lineage edges landing on ba.fact.*, got only: {sorted(dst_keys)}"
     )
     # CTE chain edges must also exist (ARCHITECTURE_REVIEW §3.2 — required for upstream traversal)
-    assert any(k.startswith("base.") for k in dst_keys), (
-        f"CTE chain edges (base.*) must EXIST for upstream traversal — "
+    # PR 3: CTE 'base' is namespaced as '<abs_path>::base.col'; check by suffix.
+    assert any("::base." in k for k in dst_keys), (
+        f"CTE chain edges (namespace::base.*) must EXIST for upstream traversal — "
         f"got dst_keys: {sorted(dst_keys)}"
     )
 
@@ -158,7 +160,8 @@ def test_P1_cte_chain_reaches_real_target_and_preserves_chain(tmp_path):
         edges = db.run_read(
             "SELECT dst_key FROM COLUMN_LINEAGE "
             "WHERE dst_key LIKE 'ba.kpi_fact.%' "
-            "OR dst_key LIKE 'cte_insert.%' OR dst_key LIKE 'cte_base.%'",
+            # PR 3: CTE keys are now namespaced as '<path>::cte_insert.*'; use suffix match
+            "OR dst_key LIKE '%::cte_insert.%' OR dst_key LIKE '%::cte_base.%'",
             {},
         )
     finally:
@@ -170,10 +173,11 @@ def test_P1_cte_chain_reaches_real_target_and_preserves_chain(tmp_path):
         f"Edges must land on ba.kpi_fact.*, got: {sorted(dst_keys)}"
     )
     # CTE chain intermediate edges must ALSO exist (required for upstream traversal)
-    cte_chain_edges = {k for k in dst_keys if k.startswith("cte_")}
+    # PR 3: CTE keys are namespaced; check by suffix pattern "::cte_*"
+    cte_chain_edges = {k for k in dst_keys if "::cte_" in k}
     assert cte_chain_edges, (
-        f"CTE chain edges (cte_insert.*, cte_base.*) must EXIST for upstream traversal — "
-        f"ARCHITECTURE_REVIEW §3.2. Got dst_keys: {sorted(dst_keys)}"
+        f"CTE chain edges (namespace::cte_insert.*, namespace::cte_base.*) must EXIST for "
+        f"upstream traversal — ARCHITECTURE_REVIEW §3.2. Got dst_keys: {sorted(dst_keys)}"
     )
 
 

@@ -137,19 +137,42 @@ def test_union_star_cte_gets_incoming_edges(db, tmp_path):
     GREEN after fix: Step 1.1 walks to the deepest left-branch Select (whose star
     qualify already expanded), and the EXISTING no-`sources=` sg_lineage call emits
     CTE_PROJECTION edges from the branch CTE columns — the hop is preserved.
+
+    PR 3: CTE keys are namespaced as "<abs_path>::cte_union". Look up the actual
+    dst_key from the graph by its '::cte_union.total_amt' suffix.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
+    # PR 3: look up the namespaced dst_key for cte_union.total_amt
+    dst_rows = db.run_read(
+        "SELECT dst_key FROM \"COLUMN_LINEAGE\" WHERE dst_key LIKE '%::cte_union.total_amt'"
+        " UNION SELECT qualified || '.total_amt' FROM \"SqlTable\""
+        " WHERE qualified LIKE '%::cte_union'",
+        {},
+    )
+    if not dst_rows:
+        # Fallback: look up cte_union in SqlTable
+        cte_rows = db.run_read(
+            "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::cte_union'",
+            {},
+        )
+        assert cte_rows, "CTE 'cte_union' not found in SqlTable — indexing may have failed."
+        cte_key = cte_rows[0]["qualified"]
+    else:
+        # Extract table key from the dst_key
+        cte_key = dst_rows[0]["dst_key"].rsplit(".", 1)[0]
+    cte_union_total_amt = f"{cte_key}.total_amt"
+
     q = (
         'SELECT cl.src_key AS id FROM "COLUMN_LINEAGE" cl '
-        "WHERE cl.dst_key = 'cte_union.total_amt'"
+        f"WHERE cl.dst_key = '{cte_union_total_amt}'"
     )
     rows = db.run_read(q, {})
     incoming_ids = {r["id"] for r in rows}
 
     assert len(incoming_ids) > 0, (
-        "cte_union.total_amt has 0 incoming COLUMN_LINEAGE edges — it is an island.\n"
+        f"{cte_union_total_amt} has 0 incoming COLUMN_LINEAGE edges — it is an island.\n"
         "This is the 3-branch UNION ALL star bug (plan/sprints/v1_1_3_union_cte_star.md).\n"
         "The fix must walk to the deepest left-branch Select (Step 1.1) and reuse the\n"
         "existing no-`sources=` sg_lineage call so the branch CTE columns are emitted."
@@ -177,40 +200,52 @@ def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
     RED TODAY: 0 edges (island), assertion on non-empty set fails.
     GUARD: if a future change reintroduces `sources=` and collapses the hop to
     staging.src_*, the branch-CTE-column assertion below reds.
+
+    PR 3: CTE keys are namespaced as "<abs_path>::cte_union". Look up the actual
+    key by suffix; branch CTE ids are checked by suffix as well.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
+    # PR 3: look up the namespaced key for cte_union
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::cte_union'",
+        {},
+    )
+    assert cte_rows, "CTE 'cte_union' not found in SqlTable — indexing may have failed."
+    cte_union_key = cte_rows[0]["qualified"]
+    cte_union_total_amt = f"{cte_union_key}.total_amt"
+
     q = (
         "SELECT cl.src_key AS id, cl.transform AS transform "
         'FROM "COLUMN_LINEAGE" cl '
-        "WHERE cl.dst_key = 'cte_union.total_amt'"
+        f"WHERE cl.dst_key = '{cte_union_total_amt}'"
     )
     rows = db.run_read(q, {})
 
     assert len(rows) > 0, (
-        "cte_union.total_amt has 0 incoming edges (island).\n"
+        f"{cte_union_total_amt} has 0 incoming edges (island).\n"
         "Expected CTE_PROJECTION edges from BRANCH CTE columns after the "
         "hop-preserving star-over-N-branch-union fix."
     )
 
     transforms = {r["transform"] for r in rows}
     assert "CTE_PROJECTION" in transforms, (
-        f"Expected transform='CTE_PROJECTION' on incoming edges to cte_union.total_amt, "
+        f"Expected transform='CTE_PROJECTION' on incoming edges to {cte_union_total_amt}, "
         f"got: {transforms}"
     )
 
     upstream_ids = {r["id"] for r in rows}
 
     # Hop-preservation: the direct upstream MUST be branch CTE columns, not physical sources.
+    # PR 3: branch CTE ids are also namespaced — match by suffix "::cte_a.total_amt" etc.
+    branch_cte_suffixes = {"::cte_a.total_amt", "::cte_b.total_amt", "::cte_c.total_amt"}
     branch_cte_ids = {
-        uid
-        for uid in upstream_ids
-        if uid in {"cte_a.total_amt", "cte_b.total_amt", "cte_c.total_amt"}
+        uid for uid in upstream_ids if any(uid.endswith(sfx) for sfx in branch_cte_suffixes)
     }
     assert len(branch_cte_ids) > 0, (
-        "Direct upstream of cte_union.total_amt contains no branch CTE column "
-        "(cte_a/cte_b/cte_c.total_amt).\n"
+        f"Direct upstream of {cte_union_total_amt} contains no branch CTE column "
+        "(cte_a/cte_b/cte_c.total_amt, namespaced).\n"
         f"Upstream ids: {sorted(upstream_ids)}\n"
         "The fix must PRESERVE the CTE hop (no `sources=`): the direct upstream is the "
         "branch CTE column, not a collapsed physical source."
@@ -219,7 +254,7 @@ def test_union_star_cte_incoming_edges_are_cte_projection(db, tmp_path):
     # Negative: the hop must NOT be collapsed — no physical source as a DIRECT upstream.
     physical_src_ids = {uid for uid in upstream_ids if "staging." in uid}
     assert not physical_src_ids, (
-        "A physical source appears as a DIRECT (1-hop) upstream of cte_union.total_amt: "
+        f"A physical source appears as a DIRECT (1-hop) upstream of {cte_union_total_amt}: "
         f"{sorted(physical_src_ids)}.\n"
         "This means the CTE hop was COLLAPSED (a `sources=` regression). The fix must keep "
         "the branch CTE columns as the direct upstream; physical sources are reached only "
@@ -256,15 +291,26 @@ def test_union_star_cte_mcp_upstream_reaches_physical_sources(db, tmp_path):
 
     Uses the production analyze._kind_filter (as the v1.1.2 guards do), so a filter
     regression also reds this test.
+
+    PR 3: CTE keys are namespaced. Look up the actual cte_union key from the graph.
     """
     (tmp_path / "fixture.sql").write_text(_UNION_ALL_STAR_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
 
-    rows = db.run_read(_upstream_query(depth=5), {"ref": "cte_union.total_amt"})
+    # PR 3: look up the namespaced key for cte_union
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::cte_union'",
+        {},
+    )
+    assert cte_rows, "CTE 'cte_union' not found in SqlTable — indexing may have failed."
+    cte_union_key = cte_rows[0]["qualified"]
+    cte_union_total_amt = f"{cte_union_key}.total_amt"
+
+    rows = db.run_read(_upstream_query(depth=5), {"ref": cte_union_total_amt})
     upstream_ids = {r["id"] for r in rows}
 
     assert len(upstream_ids) > 0, (
-        "Multi-hop upstream traversal returned 0 results for cte_union.total_amt.\n"
+        f"Multi-hop upstream traversal returned 0 results for {cte_union_total_amt}.\n"
         "The node is a lineage island — no incoming edges.\n"
         "After fix: the deepest-Select walk reconnects cte_union via the preserved CTE hop."
     )
@@ -272,7 +318,7 @@ def test_union_star_cte_mcp_upstream_reaches_physical_sources(db, tmp_path):
     # Physical sources must be reachable via multi-hop traversal THROUGH the cte_X hop.
     physical_sources = {uid for uid in upstream_ids if "staging." in uid}
     assert len(physical_sources) > 0, (
-        f"Multi-hop upstream of cte_union.total_amt did not reach any physical source.\n"
+        f"Multi-hop upstream of {cte_union_total_amt} did not reach any physical source.\n"
         f"Found: {sorted(upstream_ids)}\n"
         "After fix, the chain cte_union <- cte_X.total_amt <- staging.src_*.amount must be "
         "walkable; physical sources are reached via the preserved hop, not by collapsing it."

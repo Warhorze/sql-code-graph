@@ -285,7 +285,14 @@ def _bare_ref(ref: str) -> str:
     For a 3-part ref ("mart.fact_t.amount") this returns "fact_t.amount".
     For a 2-part ref ("fact_t.amount") this returns the ref unchanged.
     Never uses rsplit — that would yield only the column name for 3-part refs.
+
+    PR 3 (sprint_lineage_identity_and_session_context.md §PR 3): namespaced CTE
+    column keys carry ``::`` (e.g. "path/file.sql::final.col") and contain dots
+    from the file path.  They have no schema prefix to strip, so return them
+    unchanged when ``::`` is present.
     """
+    if "::" in ref:
+        return ref  # namespaced CTE key — no schema prefix to strip
     parts = ref.split(".")
     if len(parts) >= 3:
         return ".".join(parts[1:])  # drop schema, keep table.column
@@ -842,8 +849,11 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
         # Bare-name fallback: when the primary query returns empty and the ref has a
         # schema component (3+ parts), retry with the schema prefix stripped.
         # This handles unqualified INSERT targets indexed without a schema prefix.
+        # PR 3: namespaced CTE keys contain "::" and dots from the file path but have
+        # no schema prefix — _bare_ref returns them unchanged, so exclude them from
+        # the fallback to avoid a no-op retry.
         bare_fallback_used = False
-        if not lineage and len(table_col.split(".")) >= 3:
+        if not lineage and "::" not in table_col and len(table_col.split(".")) >= 3:
             bare = _bare_ref(table_col)
             bare_queue: deque[tuple[str, int]] = deque([(bare, 0)])
             bare_visited: set[str] = set()

@@ -270,11 +270,14 @@ def test_g4_cte_kind_nodes_exist_in_graph(indexed_db):
         "Expected CTE intermediates (a, b, u, j) to have kind='cte'."
     )
     structural_qualifieds = {r["qualified"] for r in rows}
-    # Specifically confirm at least one of the CTE aliases is present
+    # PR 3: CTE keys are now namespaced as "<abs_path>::<alias>".
+    # Check for the alias name as a suffix after "::" rather than a bare match.
     cte_aliases = {"a", "b", "u", "j"}
-    assert structural_qualifieds & cte_aliases, (
-        f"CTE aliases {cte_aliases} not found among structural-kind nodes.\n"
-        f"Found: {structural_qualifieds}"
+    found_suffixes = {q.split("::")[-1] for q in structural_qualifieds if "::" in q}
+    assert found_suffixes & cte_aliases, (
+        f"CTE aliases {cte_aliases} not found among structural-kind node suffixes.\n"
+        f"Found qualifieds: {structural_qualifieds}\n"
+        f"Found suffixes: {found_suffixes}"
     )
 
 
@@ -444,17 +447,29 @@ def test_g5_correct_source_edge_is_present(g5_indexed):
     """Guard 5: the correct source mart.fact_daily.m -> base.m MUST exist.
 
     This edge was absent in v1.4.0 (the bug). Reverting PR-3 removes it again.
+
+    PR 3: the CTE 'base' is now namespaced as '<abs_path>::base', so the dst_key
+    is '<abs_path>::base.m' rather than bare 'base.m'. Look up the namespaced key
+    from the graph to keep this guard path-independent.
     """
     db, _ = g5_indexed
     edges = db.run_read(
         'SELECT src_key, dst_key, transform, confidence FROM "COLUMN_LINEAGE"',
         {},
     )
+    # PR 3: look up the namespaced CTE key for 'base' from the graph.
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE kind = 'cte' AND qualified LIKE '%::base'",
+        {},
+    )
+    assert cte_rows, "Could not find namespaced CTE 'base' in SqlTable — fixture may have changed."
+    base_key = cte_rows[0]["qualified"]  # e.g. "/tmp/xxx/02_enriched.sql::base"
+
     correct_edges = [
-        e for e in edges if e["src_key"] == "mart.fact_daily.m" and e["dst_key"] == "base.m"
+        e for e in edges if e["src_key"] == "mart.fact_daily.m" and e["dst_key"] == f"{base_key}.m"
     ]
     assert correct_edges, (
-        f"Correct edge 'mart.fact_daily.m -> base.m' is ABSENT.\n"
+        f"Correct edge 'mart.fact_daily.m -> {base_key}.m' is ABSENT.\n"
         f"All edges: {[(e['src_key'], e['dst_key'], e['transform']) for e in edges]}"
     )
     edge = correct_edges[0]
