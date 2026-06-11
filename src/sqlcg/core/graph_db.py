@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlcg.core.schema import NodeLabel
@@ -260,3 +261,33 @@ class GraphBackend(ABC):
         this; returns the total STAR_EXPANSION edge count.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support expand_star_sources")
+
+
+def indexed_repo_root(db: "GraphBackend") -> Path | None:
+    """Return the indexed root path stored on the first Repo node, or None.
+
+    Reads the persisted ``Repo.path`` primary key (set at index time by
+    ``index_cmd``). Shared by ``sqlcg.server.tools`` (as ``_indexed_root``) and
+    ``sqlcg.cli.commands.catalog`` — the single backend-handle implementation
+    of this lookup (v1.14.0 Fix 3 Step 3.4 de-duplication; the routed-read
+    counterpart for handle-less CLI commands is
+    :func:`sqlcg.server.read_client.resolved_repo_root`).
+
+    Multi-Repo: first Repo node wins (LIMIT 1) — picking an arbitrary Repo row
+    when a graph indexes more than one repo root is pre-existing, documented
+    behaviour, unchanged by this helper.
+
+    Args:
+        db: GraphBackend instance.
+
+    Returns:
+        Absolute Path of the indexed root, or None if unavailable. Callers
+        fall back to ``Path.cwd()`` via ``indexed_repo_root(db) or Path.cwd()``.
+    """
+    try:
+        rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
+        if rows and rows[0].get("path"):
+            return Path(rows[0]["path"])
+    except Exception:
+        pass
+    return None
