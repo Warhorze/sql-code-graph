@@ -9,6 +9,7 @@ for measurement and summary reporting.
 # (non-degrading: a deliberate skip, not a failure).
 _CAUSE_PRIORITY: list[str] = [
     "timeout",
+    "worker_error",
     "E8",
     "E3",
     "E2",
@@ -22,7 +23,7 @@ _CAUSE_PRIORITY: list[str] = [
 # Buckets that represent a genuine parse degradation (as opposed to a
 # deliberate skip or fully unclassifiable noise).
 _DEGRADING: frozenset[str] = frozenset(
-    ["E1", "E2", "E3", "E5", "E8", "timeout", "func_fallback", "qualify_failed"]
+    ["E1", "E2", "E3", "E5", "E8", "timeout", "worker_error", "func_fallback", "qualify_failed"]
 )
 
 
@@ -79,6 +80,7 @@ def _classify_error(msg: str) -> str:
       - "E5": col_lineage:...:Cannot find column (plain identifier)
       - "E8": col_lineage_skip:dynamic_source
       - "timeout": timeout:Ns
+      - "worker_error": worker_error:* (pool worker returned an exception object)
       - "pure_ddl_skip": col_lineage_skip:pure_ddl_file
       - "func_fallback": col_lineage_skip:func_fallback:*
       - "qualify_failed": col_lineage_skip:qualify_failed:*
@@ -100,6 +102,11 @@ def _classify_error(msg: str) -> str:
     # Poison-retry: file repeatedly timed out in pool worker; treat as timeout bucket
     if msg.startswith("skipped:poison"):
         return "timeout"
+
+    # Worker-level exception returned via pool (e.g. _error_file / pipe errors)
+    # Format: "worker_error:<ExcType>:<message>" or "worker_error:send_failed"
+    if msg.startswith("worker_error:"):
+        return "worker_error"
 
     # Skip markers
     if msg.startswith("col_lineage_skip:"):
