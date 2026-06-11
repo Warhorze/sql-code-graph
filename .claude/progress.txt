@@ -3,7 +3,7 @@ ACTIVE AGENT: developer — HANDOFF (PR ready for review)
 FEATURE: sprint_postmortem_fixes PR 3 — repo-relative CTE/derived namespaces (v1.18.3)
 PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 3 (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: fix/repo-relative-cte-namespaces
-PR: (opening)
+PR: https://github.com/Warhorze/sql-code-graph/pull/86
 
 ## Handoff — developer: sprint_postmortem_fixes PR 3 (v1.18.3) [2026-06-11]
 
