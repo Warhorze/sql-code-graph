@@ -3,7 +3,7 @@ ACTIVE AGENT: developer — HANDOFF (PR ready for review)
 FEATURE: sprint_postmortem_fixes PR 2 — _qualify_bare_tables crash fix + worker-failure labelling (v1.18.2)
 PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 2 (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: fix/qualify-bare-tables-command-crash
-PR: (opening now)
+PR: https://github.com/Warhorze/sql-code-graph/pull/85
 
 ## Handoff — developer: sprint_postmortem_fixes PR 2 (v1.18.2) [2026-06-11]
 
