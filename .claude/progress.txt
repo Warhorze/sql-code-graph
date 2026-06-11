@@ -1,5 +1,82 @@
 ## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: sprint_postmortem_fixes PR 5 — persist col_lineage_skip:* reasons queryably (v1.19.1)
+PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 5 (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: feat/persist-skip-reasons
+PR: (open — see below)
+
+## Handoff — developer: sprint_postmortem_fixes PR 5 (v1.19.1) [2026-06-11]
+
+SUMMARY: Implemented Steps 5.1–5.2 of PR 5 from sprint_postmortem_fixes.md.
+
+Step 5.1 — Persistence shape (Option A chosen):
+  skip_counts VARCHAR JSON column added to File node in duckdb_backend.py.
+  _NODE_COLUMNS[NodeLabel.FILE] updated to include skip_counts.
+  SCHEMA_VERSION bumped 7→8 (N4 mandatory — any queryable shape is a schema
+  change; re-index is the migration, no compat shim).
+
+Step 5.1 (cont) — skip_counts_json helper:
+  New function skip_counts_json(errors) in error_classify.py.
+  Groups col_lineage_skip:<reason>:<detail> strings by reason prefix (the
+  segment after 'col_lineage_skip:' before the next ':').
+  Returns None for clean files (NULL in DB, not '{}') so WHERE skip_counts IS
+  NOT NULL is selective.
+  Call site: _build_file_rows in indexer.py includes skip_counts key in every
+  File row dict (grep-confirmed call site).
+
+Step 5.2 — §G accounting reachability:
+  Persistence + working run_read query shipped.  §G gain rendering NOT added
+  (plan says optional polish — documented in PR body with working query).
+
+RATIONALE for Option A over Option B:
+  §G accounting needs per-file {reason: count} — a flat JSON map is sufficient.
+  No per-(file,reason) joins required at this tier. Option B (dedicated table)
+  would be heavier with no query benefit for the current use case.
+
+TESTS: 13 new tests across 2 new files:
+  tests/unit/test_skip_counts_persistence.py (8 tests):
+    - skip_counts_json groups by prefix, returns None for empty/no-skip errors,
+      ignores non-skip entries, handles all known reason prefixes including
+      pure_ddl_file (no trailing detail).
+    - _build_file_rows wiring: skip_counts key present with correct counts;
+      None for clean files.
+  tests/integration/test_skip_counts_integration.py (5 tests):
+    - stage + unknown_sentinel skips persisted with correct counts (observable
+      via run_read, not log scraping).
+    - Clean file stores NULL (not '{}').
+    - §G working query pattern (WHERE skip_counts IS NOT NULL) returns only
+      files with skips, counts match emitted strings.
+    - End-to-end: index_repo on MERGE fixture persists merge_branch >= 1.
+    - Schema gate: v7 graph rejected (stored='7' != SCHEMA_VERSION='8').
+
+Updated 9 existing tests that pinned SCHEMA_VERSION='7' mock return values
+or hardcoded version assertions.
+
+GATES (final):
+  1248 passed, 4 skipped, 1 xfailed, 0 failures (up from 1235).
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified (13/13).
+
+SCHEMA_VERSION: 7 → 8 (File.skip_counts column addition).
+VERSION: 1.19.0 → 1.19.1 (patch — schema-only change, no new CLI surface).
+Tag user-gated per house rule.
+
+WORKING QUERY (§G accounting):
+  SELECT path, skip_counts FROM "File"
+  WHERE skip_counts IS NOT NULL ORDER BY path;
+
+  Per-reason extraction:
+  SELECT json_extract_string(skip_counts, '$.stage')::INT AS stage_skips
+  FROM "File" WHERE path = '/path/to/file.sql';
+
+DEVIATIONS: none from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Current State [2026-06-11]
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
 FEATURE: sprint_postmortem_fixes PR 4 — <unknown> sentinel drop + kind upgrade + §G warning (v1.19.0)
 PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 4 (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: feat/unknown-edge-drop-kind-upgrade-gain-warning

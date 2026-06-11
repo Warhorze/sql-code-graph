@@ -110,13 +110,14 @@ def test_parse_cause_column_queryable_after_init(fresh_db):
 def test_schema_version_matches_current_migration():
     """SCHEMA_VERSION gates the re-index migration path (no backward compatibility).
 
-    Most recently bumped 6 -> 7 for `COLUMN_LINEAGE.inferred_from_source_name`
-    (plan/sprints/positional_insert_clone_blindspot.md Part A2). Update this
-    literal in lockstep whenever schema.py bumps the constant.
+    Bumped 7 -> 8 for ``File.skip_counts`` column added by
+    plan/sprints/sprint_postmortem_fixes.md §PR 5 (persist col_lineage_skip:*
+    reasons queryably). Update this literal in lockstep whenever schema.py bumps
+    the constant.
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "7", f"Expected SCHEMA_VERSION='7', got {SCHEMA_VERSION!r}"
+    assert SCHEMA_VERSION == "8", f"Expected SCHEMA_VERSION='8', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------

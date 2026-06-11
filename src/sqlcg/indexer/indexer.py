@@ -10,7 +10,7 @@ from pathlib import Path
 from sqlcg.core.config import get_catalog_path, get_external_consumers, get_presentation_prefixes
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.schema import NodeLabel, RelType
-from sqlcg.indexer.error_classify import _classify_error, dominant_cause
+from sqlcg.indexer.error_classify import _classify_error, dominant_cause, skip_counts_json
 from sqlcg.indexer.pool import HardKillPool
 from sqlcg.indexer.walker import walk_sql_files
 from sqlcg.lineage.aggregator import CrossFileAggregator
@@ -1262,6 +1262,7 @@ class Indexer:
                 "dialect": parsed.dialect or "",
                 "parse_failed": failed,
                 "parse_cause": cause,
+                "skip_counts": skip_counts_json(parsed.errors),
             }
         )
 
