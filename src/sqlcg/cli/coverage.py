@@ -134,6 +134,11 @@ WHERE NOT EXISTS (
 # Query 4-weighted: top-10 blindspot tables by bad-edge count (strict
 # definition — edge bad iff cl.dst_key has no exact HAS_COLUMN row), plus
 # the number of tables covering 80% of total bad-edge volume.
+#
+# Excludes CTE/derived dst tables (kind IN ('cte', 'derived')) — same set as
+# _Q_EDGE_HEALTH_SCOPED — so the blindspot ranking surfaces real catalog gaps
+# instead of structural CTE/derived nodes (Fix 4a). The original finding said
+# kind='cte' only; widened to ('cte','derived') for parity with the scoped KPI.
 # ---------------------------------------------------------------------------
 _Q_BLINDSPOT_WEIGHTED = f"""
 WITH bad_edges AS (
@@ -141,6 +146,11 @@ WITH bad_edges AS (
     FROM "COLUMN_LINEAGE" cl
     WHERE NOT EXISTS (
         SELECT 1 FROM "HAS_COLUMN" hc WHERE hc.dst_key = cl.dst_key
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM "SqlTable" t
+        WHERE t.qualified = {_DST_TABLE.replace("dst_key", "cl.dst_key")}
+          AND t.kind IN ('cte', 'derived')
     )
 ),
 per_table AS (

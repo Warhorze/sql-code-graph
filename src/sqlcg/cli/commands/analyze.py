@@ -157,8 +157,10 @@ def upstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
+        pre_filter_count = len(results)
         nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = _filter_column_results(results, nf)
+        _print_noise_filtered_notice(pre_filter_count, len(results))
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
 
@@ -194,8 +196,10 @@ def downstream(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
+        pre_filter_count = len(results)
         nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = _filter_column_results(results, nf)
+        _print_noise_filtered_notice(pre_filter_count, len(results))
     _print_table(_add_file_line_col(results), ["id", "file:line"])
 
     # Append external consumer rows for terminal tables (scalar query, one per terminal).
@@ -317,6 +321,21 @@ def _filter_column_results(
 ) -> list[dict]:
     """Filter column-ID result rows by NoiseFilter."""
     return [r for r in results if not nf.is_noise(_col_id_to_table(r["id"]))]
+
+
+def _print_noise_filtered_notice(pre_filter_count: int, post_filter_count: int) -> None:
+    """Print a notice when the noise filter removed every result row.
+
+    Shared by `upstream` and `downstream` (Fix 4b) to avoid drift. Fires only
+    when the canonical/fallback query returned rows but the noise filter
+    dropped all of them — a genuinely empty trace (pre_filter_count == 0)
+    keeps the existing "No results" behaviour with no spurious notice.
+    """
+    if pre_filter_count > 0 and post_filter_count == 0:
+        console.print(
+            f"[yellow]Notice:[/yellow] All {pre_filter_count} edge(s) were "
+            "removed by the noise filter (run with --raw to see them)."
+        )
 
 
 def _add_file_line_col(rows: list[dict]) -> list[dict]:
