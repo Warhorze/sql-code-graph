@@ -53,7 +53,8 @@ _NODE_DDLS = [
         sha VARCHAR,
         dialect VARCHAR,
         parse_failed BOOLEAN,
-        parse_cause VARCHAR
+        parse_cause VARCHAR,
+        skip_counts VARCHAR
     )
     """,
     """
@@ -229,7 +230,15 @@ _INDEX_DDLS = [
 # Node label → column list (all columns of that table, in order)
 _NODE_COLUMNS: dict[str, list[str]] = {
     NodeLabel.REPO: ["path", "name"],
-    NodeLabel.FILE: ["path", "repo_path", "sha", "dialect", "parse_failed", "parse_cause"],
+    NodeLabel.FILE: [
+        "path",
+        "repo_path",
+        "sha",
+        "dialect",
+        "parse_failed",
+        "parse_cause",
+        "skip_counts",
+    ],
     NodeLabel.TABLE: ["qualified", "catalog", "db", "name", "kind", "defined_in_file"],
     NodeLabel.COLUMN: ["id", "catalog", "db", "table_name", "col_name", "table_qualified"],
     NodeLabel.QUERY: [
