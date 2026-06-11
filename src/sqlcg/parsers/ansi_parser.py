@@ -313,11 +313,23 @@ class AnsiParser(SqlParser):
         elif isinstance(stmt, exp.Insert):
             target = self._apply_table_alias(self._extract_insert_target(stmt))
 
-        # C1 — capture the CLONE source TableRef for `CREATE TABLE t CLONE src`.
-        # Metadata-only: one `args.get` per CREATE statement, no body/lineage impact
-        # (a CLONE create has no SELECT body — defined_body stays None, defined_columns
-        # stays empty). Zero per-column hot-path cost
-        # (plan/sprints/positional_insert_clone_blindspot.md Part C1).
+        # C1 — capture the CLONE/LIKE source TableRef for:
+        #   CREATE TABLE t CLONE src     → args['clone'] is exp.Clone
+        #   CREATE TABLE t LIKE src      → args['properties'] contains exp.LikeProperty
+        #
+        # Both set clone_source so the existing resolve_clone_catalogs pass in the
+        # indexer inherits src's DDL catalog columns for t automatically.
+        #
+        # Metadata-only: one args.get (CLONE) or one properties-list walk (LIKE) per
+        # CREATE statement; no body/lineage impact (these statements have no SELECT body
+        # — defined_body stays None, defined_columns stays empty).  Zero per-column
+        # hot-path cost (plan/sprints/sprint_lineage_identity_and_session_context.md §PR 2,
+        # Step 3.3; plan/sprints/positional_insert_clone_blindspot.md Part C1).
+        #
+        # Note on sqlglot dialect: in the Snowflake dialect, CREATE TABLE x LIKE y
+        # parses LikeProperty into stmt.args['properties'], NOT into args['clone']
+        # (verified during plan review 2026-06-11).  Standard ANSI also uses
+        # LikeProperty for LIKE; CLONE is Snowflake-only and stays in args['clone'].
         clone_source: TableRef | None = None
         if isinstance(stmt, exp.Create) and stmt.kind == "TABLE":
             clone_arg = stmt.args.get("clone")
@@ -325,6 +337,16 @@ class AnsiParser(SqlParser):
                 clone_source = self._apply_table_alias(
                     self._convert_table_expr_to_ref(clone_arg.this)
                 )
+            elif clone_source is None:
+                # LIKE: look for LikeProperty in the properties list.
+                props = stmt.args.get("properties")
+                if props is not None:
+                    for prop in getattr(props, "expressions", []):
+                        if isinstance(prop, exp.LikeProperty) and isinstance(prop.this, exp.Table):
+                            clone_source = self._apply_table_alias(
+                                self._convert_table_expr_to_ref(prop.this)
+                            )
+                            break  # only one LIKE source is valid
 
         # Extract source tables
         sources = []

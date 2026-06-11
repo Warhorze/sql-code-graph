@@ -26,6 +26,30 @@ _EMBEDDED_DML = re.compile(
     re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
 
+# Regex for scanning USE SCHEMA / USE db.schema statements in scripting blocks
+# by raw text position.  Captures the schema name (last dot-segment) so we can
+# determine which schema was active at each DML match offset.
+#
+# Matches:
+#   USE SCHEMA <schema>;
+#   USE SCHEMA <db>.<schema>;
+#   USE <db>.<schema>;
+#
+# Excludes:
+#   USE DATABASE <db>;  — guarded by _USE_DATABASE_RE check below.
+#   USE <bare_name>;   — treated as schema (Snowflake semantics; harmless over-capture).
+#
+# False-positive risk: a USE statement inside a string literal or comment will be
+# captured.  This is acceptable — it is bounded (at most one spurious schema per
+# occurrence, and real USE statements are common while USE-in-strings is rare in
+# ETL code).
+_USE_SCHEMA_RE = re.compile(
+    r"\bUSE\s+(?:SCHEMA\s+)?(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)\s*;",
+    re.IGNORECASE,
+)
+# Guard to skip "USE DATABASE x;" — only a database, no schema context.
+_USE_DATABASE_RE = re.compile(r"\bUSE\s+DATABASE\b", re.IGNORECASE)
+
 
 @register("snowflake")
 class SnowflakeParser(AnsiParser):
@@ -250,11 +274,19 @@ class SnowflakeParser(AnsiParser):
     def _transform_statements(self, statements: list[Any]) -> list[Any]:
         """Snowflake P5: track USE SCHEMA context and qualify bare table references.
 
-        Walks the statement list once (O(N_statements)).  When a ``USE SCHEMA <s>``
-        statement is encountered it becomes the active schema context for all
+        Walks the statement list once (O(N_statements)).  When a USE statement that
+        sets a schema context is encountered it becomes the active schema for all
         subsequent statements in the file.  For each subsequent statement, bare
         table references (no db/catalog prefix) are qualified to ``<schema>.<name>``
         via an in-place AST mutation — ``exp.Table.db`` is set to the schema identifier.
+
+        Supported USE forms that set the active schema:
+          - ``USE SCHEMA <schema>``          — kind='SCHEMA'
+          - ``USE SCHEMA <db>.<schema>``     — kind='SCHEMA', two-part name
+          - ``USE <db>.<schema>``            — kind='', two-part name (W3 plan decision)
+
+        Explicitly ignored:
+          - ``USE DATABASE <db>``            — kind='DATABASE'; no schema derivable
 
         CTE alias names defined within each statement are excluded from qualification
         so that CTE-internal references stay unqualified and sqlglot can resolve them
@@ -268,8 +300,8 @@ class SnowflakeParser(AnsiParser):
             statements: List of parsed sqlglot AST nodes from ``_do_parse``.
 
         Returns:
-            The same list with ``USE SCHEMA`` nodes replaced by ``None`` (to skip them
-            in the statement loop) and bare table refs in subsequent nodes qualified.
+            The same list with USE context-setter nodes replaced by ``None`` (to skip
+            them in the statement loop) and bare table refs in subsequent nodes qualified.
         """
         current_schema: str | None = None
         result: list[Any] = []
@@ -281,14 +313,31 @@ class SnowflakeParser(AnsiParser):
 
             # Detect USE SCHEMA / USE DATABASE statements (Snowflake context setters).
             # sqlglot parses these as exp.Use with args['kind'] = Var('SCHEMA') or
-            # Var('DATABASE').  We track SCHEMA context; DATABASE context is ignored
-            # (the full db.schema qualifier in the db field would require more state).
+            # Var('DATABASE').  We track SCHEMA context; DATABASE-only context is
+            # ignored (no schema can be derived from a bare database name).
+            #
+            # Supported forms (all set current_schema to the schema name):
+            #   USE SCHEMA <schema>       → kind='SCHEMA', stmt.this.name = schema
+            #   USE SCHEMA <db>.<schema>  → kind='SCHEMA', stmt.this.name = schema
+            #   USE <db>.<schema>         → kind='',       stmt.this.name = schema,
+            #                                              stmt.this.db   = db
+            #
+            # Ignored forms (not a schema setter):
+            #   USE DATABASE <db>         → kind='DATABASE' — stay on current schema
             if isinstance(stmt, exp.Use):
                 kind_var = stmt.args.get("kind")
                 kind_str = (kind_var.name if kind_var else "").upper()
-                if kind_str == "SCHEMA" and stmt.this is not None:
+                if kind_str != "DATABASE" and stmt.this is not None:
                     schema_table = stmt.this
-                    current_schema = schema_table.name.lower() if schema_table.name else None
+                    # For "USE SCHEMA <schema>": name is the schema name directly.
+                    # For "USE SCHEMA <db>.<schema>" or "USE <db>.<schema>": name is
+                    # still the schema part (the rightmost component), which is what
+                    # sqlglot places in Table.name when a db qualifier is present.
+                    # For "USE <bare_name>" (no db, no SCHEMA keyword): kind_str == ''
+                    # and no db qualifier — treat it as a schema name (Snowflake allows
+                    # USE <schema_name> as a shorthand; no precision loss vs. ignoring).
+                    if schema_table.name:
+                        current_schema = schema_table.name.lower()
                 # Suppress the USE statement — it is not a real query node.
                 result.append(None)
                 continue
@@ -359,6 +408,19 @@ class SnowflakeParser(AnsiParser):
     def _parse_scripting_file(self, path: Path, sql: str) -> ParsedFile:
         """Parse a Snowflake file with scripting blocks using DML extraction.
 
+        USE SCHEMA context (Step 3.1, plan/sprints/sprint_lineage_identity_and_session_context.md):
+        The scripting path bypasses ``_transform_statements`` because sqlglot cannot
+        parse ``USE`` inside a ``BEGIN…END`` block.  Instead, this method performs a
+        position-aware pre-scan of the raw SQL text for USE schema-setter statements
+        (``_USE_SCHEMA_RE``), building a list of ``(offset, schema)`` pairs.  For each
+        ``_EMBEDDED_DML`` match, the schema active at that text offset is looked up and
+        ``_qualify_bare_tables`` is called on the parsed AST before ``_parse_statement``
+        extracts table references.
+
+        USE DATABASE <x> alone is ignored (no schema can be derived; ``_USE_DATABASE_RE``
+        guards this).  False positives (USE inside a string/comment) are bounded and
+        acceptable for ETL code (see module-level ``_USE_SCHEMA_RE`` comment).
+
         Args:
             path: Path to the source file
             sql: SQL text to parse
@@ -374,19 +436,43 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
+        # --- Step 3.1: build position-aware USE schema context map ---
+        # Scan the raw SQL for USE schema-setter statements and record (offset, schema).
+        # The list is sorted by offset (finditer guarantees left-to-right order).
+        # For each DML match we pick the last entry whose offset is < match.start().
+        use_contexts: list[tuple[int, str]] = []
+        for use_m in _USE_SCHEMA_RE.finditer(sql):
+            # Guard: skip "USE DATABASE x;" — those do not set a schema context.
+            if _USE_DATABASE_RE.match(use_m.group(0)):
+                continue
+            schema_name = use_m.group(1).lower()
+            use_contexts.append((use_m.start(), schema_name))
+
+        def _active_schema(offset: int) -> str | None:
+            """Return the schema name active at ``offset``, or None."""
+            active: str | None = None
+            for pos, name in use_contexts:
+                if pos < offset:
+                    active = name
+                else:
+                    break
+            return active
+
         # Initialize sources_map for temp table resolution.
         # Seed with cross-file CTAS bodies from pass 1 (intra-file overrides).
         xfile_sources = dict(self._schema.cross_file_sources()) if self._schema else {}
         sources_map: dict[str, Any] = xfile_sources
 
         # Extract DML statements using regex
-        dml_matches = _EMBEDDED_DML.finditer(sql)
         stmt_index = 0
 
-        for match in dml_matches:
+        for match in _EMBEDDED_DML.finditer(sql):
             dml_sql = match.group(1).strip()
             if not dml_sql:
                 continue
+
+            # Determine USE schema context active at this DML statement's offset.
+            active_schema = _active_schema(match.start())
 
             try:
                 # Try to parse the extracted DML
@@ -394,6 +480,11 @@ class SnowflakeParser(AnsiParser):
                 for stmt in statements:
                     if stmt is None:
                         continue
+
+                    # Apply USE SCHEMA qualification before _parse_statement so that
+                    # table-ref extraction sees the qualified names.
+                    if active_schema:
+                        self._qualify_bare_tables(stmt, active_schema)
 
                     try:
                         # Call parent's _parse_statement method
