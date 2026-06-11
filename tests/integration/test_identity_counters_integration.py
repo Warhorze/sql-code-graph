@@ -145,8 +145,8 @@ def test_cte_collision_counter_ignores_non_cte_edges(cte_collision_backend):
     assert stats is not None
     # Total CTE dst edges: cte_shared.x (×2) + cte_shared.y (×1) = 3.
     # Only cte_shared.x has nf>1, so cte_collisions=1 — not 2 (cte_shared.y is single-file).
-    assert stats.cte_key_collisions < 2, (
-        f"Expected < 2 collisions (cte_shared.y must not be counted), "
+    assert stats.cte_key_collisions == 1, (
+        f"Expected exactly 1 collision (cte_shared.y must not be counted), "
         f"got {stats.cte_key_collisions}"
     )
 
@@ -252,9 +252,10 @@ def test_rescuable_unqualified_counter_excludes_strict_good_edges(rescuable_unqu
     stats = _collect_with(rescuable_unqualified_backend)
 
     assert stats is not None
-    # If strict-good edges were counted, the total would be >= 2.
-    assert stats.rescuable_unqualified_edges < 2, (
-        f"Expected < 2 (strict-good edge b must be excluded), "
+    # If strict-good edges were counted, the total would be >= 2; the rescuable
+    # edge (a) alone yields exactly 1.
+    assert stats.rescuable_unqualified_edges == 1, (
+        f"Expected exactly 1 (strict-good edge b must be excluded), "
         f"got {stats.rescuable_unqualified_edges}"
     )
 
