@@ -1,6 +1,7 @@
 # Sprint Plan: Lineage-Identity Postmortem Fixes
 
-**Status: DRAFT** — gates with `plan-reviewer` before any implementation.
+**Status: REVIEWED** — plan-reviewer verdict APPROVE-WITH-AMENDMENTS (2026-06-11);
+amendments A1–A4 and refinements N1–N4 applied below.
 
 Source of truth: [`lineage_identity_sprint_postmortem.md`](../reports/lineage_identity_sprint_postmortem.md)
 (Findings 1–5 + "Recommended fix plan"). Honours the performance-invariant table and
@@ -136,12 +137,19 @@ Patch `sqlcg.cli.commands.index._try_route_index_via_server` to `return_value=Fa
 [`test_index_flags.py`](../../tests/unit/test_index_flags.py) (lines 42–45, 105–108). Also
 change its `get_db_path` patch away from `Path.home() / ".sqlcg" / "graph.db"` to a
 `tmp_path`-based value so even the routing-resolution step cannot reach the real socket.
+- **(A2)** The test has a SECOND hardcoded home reference: the `mock_config` construction at
+  [`test_pr07_observability.py:114`](../../tests/unit/test_pr07_observability.py) builds
+  `KuzuConfig(db_path=Path.home() / ".sqlcg" / "graph.db")` directly, bypassing
+  `DbConfig.from_env()` (so the autouse env fixture cannot protect it). Both the
+  `get_db_path` patch (line 147) **and** this `KuzuConfig(db_path=…)` construction must be
+  changed to `tmp_path`-based values.
 - Files affected: `test_pr07_observability.py`.
 - Acceptance: the test forces the direct-write path; with a live MCP server present on the
   host it can no longer route the index through the socket. Assert observable: the patched
   `_try_route_index_via_server` is called and the indexer mock (not a real server) handles
-  the call. The test must still verify its original behaviour (clean exit, configured log
-  path) — do not weaken its assertions.
+  the call. **No `Path.home()` reference remains in the test** (both the patch value and the
+  `KuzuConfig` construction use `tmp_path`). The test must still verify its original
+  behaviour (clean exit, configured log path) — do not weaken its assertions.
 
 ### Step 1.3 — uninstall tests patch `Path.home()`
 `test_uninstall_cmd_with_force_flag` (and any sibling exercising the force path) must patch
@@ -154,10 +162,12 @@ never touched. The production code at
   patching alone, route the metrics path through config instead of a bare `Path.home()` —
   but only if needed; the fallback must still match `DbConfig`'s `~/.sqlcg` convention
   (CLAUDE.md: "Path/constant fallbacks must match `KuzuConfig`").
-- Acceptance: running the full uninstall test module leaves a real `~/.sqlcg/metrics.db`
-  untouched. Verified by a test that creates a sentinel file at the patched home's
-  `metrics.db`, runs the force path, and asserts only the *patched* (tmp) metrics file was
-  removed — the real home is never referenced (assert the patch target was called).
+- Acceptance **(N1, observable output — not mock-interaction)**: create a sentinel file at
+  the *real* home's `~/.sqlcg/metrics.db` location is NOT acceptable in CI; instead, with
+  `Path.home()` patched to a tmp dir, create a sentinel `metrics.db` under the patched home
+  AND a second sentinel under a distinct "real-home stand-in" dir; run the force path and
+  assert the patched-home `metrics.db` is **absent** afterwards while the stand-in sentinel
+  **still exists**. The assertion is on filesystem state, not "the patch target was called".
 
 ### Step 1.4 — server-side empty-index rollback guard
 In [`writer.py`](../../src/sqlcg/server/writer.py) `_do_index` (~line 356–370): the drain
@@ -168,12 +178,15 @@ populated one. `index_repo` returns a summary dict with `files_parsed`
 ([`indexer.py`](../../src/sqlcg/indexer/indexer.py) `total_files = len(files)`); the guard
 keys off the file count, not `files_parsed` (a file can parse to zero rows legitimately —
 the wipe signature is *zero files walked*).
-- **Decision**: surface the count the guard needs. If the summary already exposes the
-  walked-file count, use it; otherwise add a `files_found` key to the `index_repo` summary
-  (grep-confirm the new key is read in `_do_index`). The raise must produce a clear error to
-  the waiters ("refusing to index empty root — graph preserved") and leave the prior graph
-  intact via rollback.
-- Files affected: `writer.py`; possibly `indexer.py` (summary key only).
+- **(A1, definitive)**: the current `index_repo` summary dict
+  ([`indexer.py:705-722`](../../src/sqlcg/indexer/indexer.py)) has **no walked-file count**
+  (`files_parsed`, `pass2_skipped`, `parse_errors`, … only); `total_files = len(files)` is a
+  local at line 386 never placed in the summary. The developer **must add a `files_found`
+  key** (value: `total_files`, computed before the pool opens) and the `_do_index` guard
+  reads `summary["files_found"] == 0`. Grep-confirm the key is read in `_do_index` before
+  the PR opens. The raise must produce a clear error to the waiters ("refusing to index
+  empty root — graph preserved") and leave the prior graph intact via rollback.
+- Files affected: `writer.py`; `indexer.py` (summary key).
 - Acceptance (measurable): indexing an empty directory through the MCP drain leaves an
   existing populated graph **unchanged** (row counts in `SqlTable`/`COLUMN_LINEAGE` before
   == after); the waiter receives an error. Counterpart: indexing a non-empty directory
@@ -222,7 +235,9 @@ in the file. Fix: skip any candidate that is not a `sqlglot.exp.Expression`
 (`if not isinstance(candidate, exp.Expression): continue`). Also guard the outer
 `stmt.find_all(exp.Table)` path so a `Command` `stmt` itself is handled (Command supports
 `find_all`, but confirm it returns no `exp.Table` and does not raise).
-- Acceptance (measurable, from Finding 4): the 67 previously-crashing files (trigger
+- Acceptance (measurable, from Finding 4; **N2 count note**: 63 files are
+  confirmed-reproducible, 67 is the heuristic crash-pattern total — gate on the fixture,
+  report both numbers in the postmortem follow-up): the previously-crashing files (trigger
   pattern `USE SCHEMA x;` followed by `ALTER EXTERNAL TABLE … REFRESH` / `CALL` /
   `ALTER WAREHOUSE` / `PUT` / `REMOVE`) parse without raising; re-indexing the DWH yields
   ~411 additional `SqlQuery` rows, ~3,563 additional edges, and ~105 previously-absent
@@ -287,6 +302,19 @@ PR #83 keyed CTE/derived namespaces with the **absolute** path
 (`self._current_file_namespace = str(path)`), so graph keys are machine-dependent
 (`/home/ignwrad/Projects/dwh/...sql::cte`). The plan required `<repo-relative-path>::<cte>`.
 
+### Step 3.0 — consumer audit (A3, do before coding)
+Consumers of `::` keys, verified at review time — the developer re-confirms each and
+documents any deviation in the PR description:
+- [`indexer.py:129-142`](../../src/sqlcg/indexer/indexer.py) `_harvest_usage_catalog`:
+  guards on `"::" in table_qualified` — string-identity check, format-agnostic.
+  **No change needed.**
+- [`server/noise_filter.py`](../../src/sqlcg/server/noise_filter.py): `"::" in` string
+  filter — format-agnostic. **No change needed.**
+- [`server/tools.py`](../../src/sqlcg/server/tools.py) /
+  [`cli/commands/analyze.py`](../../src/sqlcg/cli/commands/analyze.py): filter by graph
+  `kind`, not by key-string inspection. **No change needed** — confirm no path-prefix
+  matching (e.g. `startswith('/')`) exists anywhere on `::` keys before opening the PR.
+
 ### Step 3.1 — thread the repo root to the parser
 The walker yields **absolute** paths ([`walker.py:45`](../../src/sqlcg/indexer/walker.py)
 `root = Path(root).resolve()`), so the parser cannot relativize on its own. Two viable
@@ -316,6 +344,9 @@ re-indexed (CLAUDE.md house rule).
 - Integration: index a small corpus, query `COLUMN_LINEAGE` / `SqlTable`, assert no key
   contains an absolute path segment (`grep`-equivalent assertion: no `::` key starts with
   `/` or a drive letter).
+- **(A3) Consumer round-trip**: after re-keying, assert `_harvest_usage_catalog` still
+  excludes the relative-namespaced CTE keys from HAS_COLUMN (zero `::` keys harvested) and
+  the noise filter still filters them — consumer behaviour, not just key shape.
 - Perf guards unmodified (namespace string change must not alter call counts).
 
 ### Acceptance criteria (PR 3)
@@ -366,11 +397,14 @@ XML get `kind='derived'` at [`indexer.py:1476`](../../src/sqlcg/indexer/indexer.
 `'table'` (do not leave it `'derived'`). This is a post-index reconciliation (the catalog is
 loaded post-index per ARCHITECTURE_REVIEW §3.2b), so the upgrade belongs where the catalog
 is applied / reconciled, NOT in the parse-time `target_kind` assignment.
-- **Decision for developer**: the cleanest seam is the `catalog load` / `_reapply_catalog`
-  path — after info-schema rows are upserted, run a single bulk `UPDATE "SqlTable" SET
-  kind='table' WHERE kind='derived' AND qualified IN (<catalogued keys>)`. Confirm precedence
-  (`ddl > information_schema > usage`) is not violated — only `derived`→`table`, never
-  downgrading a `view`/`table`. Grep-confirm the call site.
+- **(A4) Seam, definitive**: the upgrade runs in **both** catalog-application paths — the
+  standalone `sqlcg catalog load <csv>` command AND the `_reapply_catalog_if_configured`
+  post-index hook (they are separate code paths; a manual `catalog load` without a re-index
+  must still fire the upgrade). After info-schema rows are upserted, run a single bulk
+  `UPDATE "SqlTable" SET kind='table' WHERE kind='derived' AND qualified IN
+  (<catalogued keys>)`. The `WHERE kind='derived'` guard is the **sole** mechanism
+  preserving the `ddl > information_schema` precedence for the `kind` field — only
+  `derived`→`table`, never touching a `view`/`table`. Grep-confirm the call site(s).
 - Acceptance (measurable): after `catalog load`, `ba.wtfv_cyclische_telling` and
   `ba.wtfi_promotie_afzet` have `kind='table'`; `_Q_CTE_COLLISIONS` returns **0** (was 3,
   the counter artifact); the 41 previously scoped-excluded edges into these tables become
@@ -386,10 +420,11 @@ query for it; `render_coverage_lines` emits the warning when the count is 0.
   previously present")**: gating the warning on prior presence is hard to detect reliably
   on a fresh graph. Ship the simpler, always-correct rule: **warn whenever
   `information_schema`-sourced rows == 0**, since a DWH that needs the catalog always wants
-  this reminder and a small repo with no catalog can ignore it. If the developer can cheaply
-  detect "a catalog path is configured" (via `get_catalog_path` on the indexed repo root),
-  prefer wording the warning more strongly in that case — but the count==0 trigger is the
-  baseline requirement.
+  this reminder and a small repo with no catalog can ignore it. **(N3, not optional)**:
+  `get_catalog_path(root)` already exists in [`config.py`](../../src/sqlcg/core/config.py) —
+  when an indexed root is available, use it and word the warning more strongly ("a catalog
+  path is configured but the graph has no information_schema rows"); fall back to the
+  unconditional count==0 wording when no root is available.
 - Acceptance (measurable): on a graph with zero info-schema rows, `gain` §G prints a warning
   line containing the catalog-load hint; on a graph with ≥1 info-schema row, the line is
   absent.
@@ -400,7 +435,9 @@ query for it; `render_coverage_lines` emits the warning when the count is 0.
   appended instead. Use a focused fixture that previously produced a self-edge.
 - Unit/integration (indexer + backend): seed a `derived`-kinded table, load an info-schema
   catalog row for it, run the reconcile; assert its `kind` flips to `'table'` and the
-  collision query returns 0.
+  collision query returns 0. **(A4)** Run the upgrade via BOTH seams (`catalog load` command
+  and `_reapply_catalog_if_configured`) and assert a table already kinded `'table'` (from
+  DDL) is **not touched** by the catalog-triggered upgrade.
 - Integration (coverage): build a graph with no info-schema rows → §G warning present; add
   an info-schema row → warning absent. Assert on the rendered line text (observable output).
 - Behavioural perf assertion: the `<unknown>` skip adds no per-column qualify/scope op —
@@ -463,7 +500,9 @@ sufficient for this sprint; rendering it in §G is optional polish — call it o
 - [ ] `col_lineage_skip:*` reasons are persisted per-file and queryable via `run_read`
       (not log-only).
 - [ ] Counts match the emitted skip strings on a fixture.
-- [ ] `SCHEMA_VERSION` bumped if a schema change is made; re-index is the migration.
+- [ ] `SCHEMA_VERSION` bumped — **(N4) mandatory, not conditional**: both option A (new
+      column) and option B (new table) are schema changes, and any shape satisfying the
+      "queryable via `run_read`" requirement necessarily is one. Re-index is the migration.
 - [ ] Perf guards unmodified.
 
 ---
