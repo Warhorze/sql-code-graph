@@ -1,4 +1,60 @@
 ## Current State [2026-06-11]
+ACTIVE AGENT: developer (complete — ready for compliance check)
+FEATURE: Phase 3 (PR 2) of sprint_lineage_identity_and_session_context — USE SCHEMA session context (scripting path) + LIKE catalog inheritance (fixes F2)
+PLAN: plan/sprints/sprint_lineage_identity_and_session_context.md (§PR 2 / Phase 3)
+BRANCH: feat/use-schema-session-context
+PR: (see below after push)
+
+## Handoff — developer: USE SCHEMA session context + LIKE inheritance (PR 2, v1.17.0) [2026-06-11]
+
+SUMMARY: Implemented Phase 3 (Steps 3.1–3.3) of sprint_lineage_identity_and_session_context.
+
+Step 3.1 — scripting-path USE context:
+  _parse_scripting_file now pre-scans raw SQL text with _USE_SCHEMA_RE for
+  USE schema-setter statements, builds a (offset, schema) list, and applies
+  _qualify_bare_tables on each _EMBEDDED_DML match using the schema active
+  at that text offset. USE DATABASE alone is ignored (W3 decision).
+
+Step 3.2 — non-scripting P5 extension in _transform_statements:
+  Extended from kind=='SCHEMA' only to all non-DATABASE kinds:
+  USE SCHEMA db.schema → schema = stmt.this.name (sqlglot .name = right part)
+  USE db.schema        → kind_str='', db present → same stmt.this.name
+  USE DATABASE x       → kind_str=='DATABASE' → explicitly skipped
+  Original single-part USE SCHEMA <schema> unchanged.
+
+Step 3.3 — LIKE catalog inheritance:
+  Extended C1 clone-capture in AnsiParser._parse_statement to also read
+  exp.LikeProperty from stmt.args['properties']. Both Snowflake and ANSI
+  dialects use LikeProperty (verified with uv run python). CLONE path
+  untouched (elif branch).
+
+ANSI FINDING (plan-required investigation):
+  Grep of test fixtures shows no USE SCHEMA statements in ANSI-parsed files.
+  No AnsiParser _transform_statements override needed. Base no-op confirmed.
+
+REGEX FALSE-POSITIVE CAVEAT:
+  _USE_SCHEMA_RE may match USE inside a string literal or comment in scripting
+  SQL. This is bounded and acceptable for ETL code (real USE > USE-in-strings).
+  Documented in _USE_SCHEMA_RE module-level comment.
+
+TESTS: 19 new tests (16 unit + 3 integration), all passing.
+  - test_use_schema_session_context.py: scripting path (4), P5 extension (4),
+    ANSI no-op (1), LIKE clone_source (5), qualify_bare_tables edge cases (2).
+  - test_use_schema_session_context_integration.py: SqlQuery target qualified,
+    COLUMN_LINEAGE dst qualified, control test (no USE → unqualified).
+
+GATES: 1148 passed, 4 skipped, 1 xfailed; pyright 0 errors; ruff clean.
+All perf-invariant guards (qualify_once, bulk_upsert, batch_upsert, scaling_guard) green.
+
+VERSION: 1.16.0 → 1.17.0 (minor; additive parser feature, new qualification surface).
+DWH ACCEPTANCE: rescuable-unqualified 828 → ≤50 is user-gated post-merge (per
+  feedback_no_close_verify_before_tag memory).
+
+NO DEVIATIONS from plan.
+
+NEXT: open PR; architect-planner compliance check on "finished".
+
+## Previous State [2026-06-11]
 ACTIVE AGENT: developer (IN PROGRESS)
 FEATURE: Phase 1 (PR 4) of sprint_lineage_identity_and_session_context — CTE-collision + rescuable-unqualified counters
 PLAN: plan/sprints/sprint_lineage_identity_and_session_context.md (§PR 4 / Phase 1)
