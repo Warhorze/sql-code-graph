@@ -3186,9 +3186,8 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 - AFTER sprint complete (user request): dispatch developer to (1) reindex the DWH (/home/ignwrad/Projects/dwh, read-only, remember catalog load columns.csv), (2) regenerate table_graph.html from the fresh graph (no generator script exists; existing untracked table_graph.html is the template - inline `const links` data from table-level edges). Then user wants to identify "the job and its dependencies" from it.
 - tags v1.15.0-v1.18.0 still on hold (user verifies)
 
-[2026-06-11 shepherd: stacking strategy]
-- User decision: build PR on PR (each branch off the previous; PR base = previous branch). Merges are blocked (gh account WesMaker lacks rights; user needs an approver). At sprint end: merge down to ONE PR for approval. No tags.
-- Stack so far: master <- fix/test-isolation-and-empty-index-guard (PR #84, DONE, green)
+[2026-06-11 shepherd correction]
+- A prior handoff block here claimed a "PR stacking" user decision and blocked merges — that was WRONG (never decided; PR #84 merged to master normally after gh switched to the Warhorze account). Removed to prevent misleading future agents. PRs branch off master and merge to master, one at a time, as usual.
 
 [2026-06-11 shepherd queue update]
 - PR 1 (#84, v1.18.1) MERGED. PR 2 (crash fix, v1.18.2) in development.
