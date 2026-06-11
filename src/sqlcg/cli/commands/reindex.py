@@ -237,6 +237,20 @@ def _hook_resync_log_path() -> Path:
     return get_db_path().parent / "hook-resync.log"
 
 
+def _respawn_argv() -> list[str]:
+    """Build the argv to re-exec for the detached hook resync (#77).
+
+    ``sys.argv[0]`` is normally the resolved ``sqlcg`` console-script path
+    the hook invoked directly — re-exec it as-is. When ``sys.argv[0]`` is a
+    non-executable module entry point (``python -m sqlcg`` -> ``__main__.py``,
+    used in tests/dev), re-exec via ``sys.executable -m sqlcg`` instead.
+    """
+    argv0 = Path(sys.argv[0])
+    if argv0.name == "__main__.py" or not os.access(argv0, os.X_OK):
+        return [sys.executable, "-m", "sqlcg", *sys.argv[1:]]
+    return [sys.argv[0], *sys.argv[1:]]
+
+
 def _spawn_detached_hook_resync(path: Path) -> None:
     """Re-spawn this reindex invocation as a detached background process (#77).
 
@@ -250,15 +264,16 @@ def _spawn_detached_hook_resync(path: Path) -> None:
     returns immediately after printing a single status line — git checkout/
     merge is not blocked.
 
-    ``sys.argv[0]`` is the resolved ``sqlcg`` console-script path the hook
-    invoked (see ``_resolve_sqlcg_bin`` in git.py); a bare ``python -m sqlcg``
-    invocation is not supported here because the hook itself is generated to
-    call the resolved binary, never ``python -m``.
+    ``sys.argv[0]`` is normally the resolved ``sqlcg`` console-script path
+    the hook invoked (see ``_resolve_sqlcg_bin`` in git.py). When invoked via
+    ``python -m sqlcg`` (e.g. in tests/dev), ``sys.argv[0]`` is the
+    non-executable ``__main__.py`` — re-exec via ``sys.executable -m sqlcg``
+    instead so Popen does not hit ``PermissionError``.
     """
     log_path = _hook_resync_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    argv = [sys.argv[0], *sys.argv[1:]]
+    argv = _respawn_argv()
     env = dict(os.environ)
     env[_HOOK_DETACHED_ENV] = "1"
 
