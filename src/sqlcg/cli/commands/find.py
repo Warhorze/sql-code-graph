@@ -4,7 +4,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from sqlcg.server.read_client import run_read_routed
+from sqlcg.server.read_client import resolved_repo_root, run_read_routed
 
 app = typer.Typer(help="Search the graph")
 console = Console()
@@ -24,7 +24,7 @@ def find_table(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         ids = [r["qualified"] for r in results]
         kept, _ = nf.filter_nodes(ids)
         kept_set = set(kept)
@@ -46,7 +46,7 @@ def find_column(  # noqa: B008
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
-        nf = NoiseFilter.from_config()
+        nf = NoiseFilter.from_config(repo_root=resolved_repo_root())
         results = [r for r in results if not nf.is_noise(r["id"].rsplit(".", 1)[0])]
     _print_table(results, ["id"])
 
