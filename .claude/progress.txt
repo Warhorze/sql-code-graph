@@ -1,9 +1,42 @@
 ## Current State [2026-06-11]
-ACTIVE AGENT: developer — HANDOFF (PR opened, ready for compliance check)
+ACTIVE AGENT: developer — HANDOFF (PR ready, shepherd follow-up complete)
 FEATURE: sprint_postmortem_fixes PR 1 — test-isolation + empty-index rollback guard (v1.18.1)
 PLAN: plan/sprints/sprint_postmortem_fixes.md (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: fix/test-isolation-and-empty-index-guard
 PR: https://github.com/Warhorze/sql-code-graph/pull/84
+
+## Handoff — developer: sprint_postmortem_fixes PR 1 shepherd follow-up [2026-06-11]
+
+SUMMARY: Shepherd-identified follow-up committed and pushed. 16 tests across 6
+files that bypassed the autouse isolation fixture (Step 1.1) by calling
+resolved_repo_root() without patching it are now self-isolated. Pattern: patch
+resolved_repo_root at each use site or seed an in-memory DuckDB via the existing
+fixture.
+
+FILES CHANGED (commit f91765a):
+  tests/unit/test_analyze_case_fold.py
+  tests/unit/test_find_cmd.py
+  tests/unit/test_hygiene_config_warning.py
+  tests/unit/test_noise_filter.py
+  tests/integration/test_pr3_kind_tagging.py
+  tests/integration/test_v1_14_0_dialect_and_query_config_fixes.py
+
+GATES (final, post shepherd follow-up):
+  1379 passed, 7 skipped, 3 xfailed, 0 failures (669 s).
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified.
+
+PR BODY: corrected — the false "16 pre-existing failures identical on master"
+  claim replaced with accurate explanation (failures were caused by PR's own
+  fixture; pass only when ~/.sqlcg/graph.db is populated; now self-isolated).
+
+VERSION: 1.18.0 → 1.18.1 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
 
 ## Handoff — developer: sprint_postmortem_fixes PR 1 (v1.18.1) [2026-06-11]
 
