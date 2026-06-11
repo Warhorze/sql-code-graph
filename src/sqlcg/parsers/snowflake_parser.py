@@ -87,6 +87,7 @@ class SnowflakeParser(AnsiParser):
         sql: str,
         dependency_filter: set[str] | None = None,
         ddl_columns_by_bare: dict[str, list[str]] | None = None,
+        rel_path: str | None = None,
     ) -> ParsedFile:
         """Parse Snowflake SQL file with scripting block detection.
 
@@ -97,6 +98,10 @@ class SnowflakeParser(AnsiParser):
                 (passed to AnsiParser.parse_file; see that method for full documentation)
             ddl_columns_by_bare: optional bare-name → ordered DDL column list, filtered
                 and forwarded to AnsiParser.parse_file (see that method for full documentation)
+            rel_path: repo-relative posix path string (e.g. "etl/sql/fact/wtfa.sql") used to
+                key CTE/derived namespaces portably.  Threaded from index_repo via the task dict.
+                Falls back to str(path) when None (single-file / reindex_file callers).
+                See sprint_postmortem_fixes.md §PR 3 Step 3.1.
 
         Returns:
             ParsedFile with parsed statements and metadata
@@ -109,7 +114,7 @@ class SnowflakeParser(AnsiParser):
             logger.debug("Snowflake scripting block detected in %s, using DML extraction", path)
             # Scripting path uses regex DML extraction; original line positions are lost.
             # QueryNode.start_line defaults to 0 (unknown sentinel) for these nodes.
-            return self._parse_scripting_file(path, sql)
+            return self._parse_scripting_file(path, sql, rel_path=rel_path)
 
         # Compute start-line map from the PREPROCESSED SQL.
         # _preprocess_snowflake_sql preserves line count via lambda replacements:
@@ -131,6 +136,7 @@ class SnowflakeParser(AnsiParser):
             dependency_filter=dependency_filter,  # type: ignore[call-arg]
             ddl_columns_by_bare=ddl_columns_by_bare,  # type: ignore[call-arg]
             _precomputed_start_lines=preprocessed_start_lines,  # type: ignore[call-arg]
+            rel_path=rel_path,  # type: ignore[call-arg]
         )
 
     @staticmethod
@@ -415,7 +421,9 @@ class SnowflakeParser(AnsiParser):
             # Fallback to regex if tokenization fails
             return bool(_SCRIPTING_BLOCK.search(sql))
 
-    def _parse_scripting_file(self, path: Path, sql: str) -> ParsedFile:
+    def _parse_scripting_file(
+        self, path: Path, sql: str, rel_path: str | None = None
+    ) -> ParsedFile:
         """Parse a Snowflake file with scripting blocks using DML extraction.
 
         USE SCHEMA context (Step 3.1, plan/sprints/sprint_lineage_identity_and_session_context.md):
@@ -447,8 +455,10 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
-        # PR 3 — CTE/derived namespacing: set namespace for the duration of this parse call.
-        self._current_file_namespace = str(path)
+        # PR 3 (sprint_postmortem_fixes §PR 3 Step 3.1) — use repo-relative posix path when
+        # available so CTE/derived keys are portable.  Falls back to str(path) for single-file
+        # callers that do not supply rel_path.
+        self._current_file_namespace = rel_path if rel_path is not None else str(path)
 
         # --- Step 3.1: build position-aware USE schema context map ---
         # Scan the raw SQL for USE schema-setter statements and record (offset, schema).

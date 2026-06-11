@@ -380,6 +380,11 @@ class Indexer:
         spec = load_ignore_spec(path)
         aggregator = CrossFileAggregator()
 
+        # PR 3 (sprint_postmortem_fixes §PR 3): resolve the repo root once so
+        # every file task carries a repo-relative path for CTE/derived namespace
+        # keying.  The walker also resolves to absolute, so relative_to is safe.
+        root_resolved = Path(path).resolve()
+
         files = list(walk_sql_files(path, spec, use_git=use_git))
         pass1_results: list[ParsedFile] = []
         parse_errors = 0
@@ -403,7 +408,23 @@ class Indexer:
 
         schema_aliases = get_schema_aliases(path)
 
-        p1_tasks = [{"type": "parse_pass1", "path": str(fp), "sql": sql} for fp, sql in file_sqls]
+        # Design A (sprint_postmortem_fixes §PR 3 Step 3.1): compute the repo-relative
+        # posix path once per file here and thread it through the task dict.  The pool
+        # forwards it to parse_file so the parser can set _current_file_namespace to
+        # a portable relative string instead of an absolute OS path.
+        # The File node `path` and all other path uses are unchanged.
+        def _rel_posix(fp: Path) -> str:
+            try:
+                return fp.relative_to(root_resolved).as_posix()
+            except ValueError:
+                # Fallback: file is outside the resolved root (should not happen for
+                # well-formed corpora, but be defensive).
+                return fp.as_posix()
+
+        p1_tasks = [
+            {"type": "parse_pass1", "path": str(fp), "sql": sql, "rel_path": _rel_posix(fp)}
+            for fp, sql in file_sqls
+        ]
 
         p1_done = 0
         # Per-file parse times collected when profile=True.
@@ -531,6 +552,9 @@ class Indexer:
                         {
                             "type": "parse_pass2",
                             "path": str(parsed.path),
+                            # PR 3: thread rel_path from p1_tasks so pass-2 namespaces
+                            # are also repo-relative (same file, same key expected).
+                            "rel_path": p1_tasks[i].get("rel_path"),
                             "sql": file_sqls[i][1],
                             "dependency_filter": dep_names,
                             "xfile_sql": xfile_sql,
@@ -1098,16 +1122,27 @@ class Indexer:
             schema_resolver = SchemaResolver(dialect=dialect)
             parser = get_parser(dialect, schema_resolver)
             sql = Path(file_path).read_text(encoding="utf-8")
-            parsed = parser.parse_file(Path(file_path), sql)
 
-            # PR 1 key-normalisation choke point — same pass as index_repo.
-            # Derive the repo root from the indexed Repo node so we can read
-            # .sqlcg.toml without a separate path parameter.
+            # PR 3 (sprint_postmortem_fixes §PR 3 Step 3.1): compute a repo-relative
+            # path for CTE/derived namespace keying (same logic as index_repo).
+            # _repo_root is resolved below; derive rel_path before calling parse_file.
             from sqlcg.core.config import get_schema_aliases
             from sqlcg.core.graph_db import indexed_repo_root
             from sqlcg.parsers.base import normalize_keys as _normalize_keys
 
             _repo_root = indexed_repo_root(db) or Path(file_path).parent
+            _abs_file = Path(file_path).resolve()
+            _repo_root_resolved = _repo_root.resolve()
+            try:
+                _reindex_rel_path: str | None = _abs_file.relative_to(
+                    _repo_root_resolved
+                ).as_posix()
+            except ValueError:
+                _reindex_rel_path = None
+
+            parsed = parser.parse_file(Path(file_path), sql, rel_path=_reindex_rel_path)
+
+            # PR 1 key-normalisation choke point — same pass as index_repo.
             _reindex_aliases = get_schema_aliases(_repo_root)
             _normalize_keys(parsed, _reindex_aliases)
 

@@ -104,9 +104,12 @@ def _run_task(
     """Dispatch a single task to the appropriate parser."""
     path = Path(task["path"])
     sql: str = task["sql"]
+    # PR 3 (sprint_postmortem_fixes §PR 3 Step 3.1): forward the repo-relative
+    # path string so parse_file sets _current_file_namespace to a portable key.
+    rel_path: str | None = task.get("rel_path")
 
     if task["type"] == "parse_pass1":
-        return parser_p1.parse_file(path, sql)
+        return parser_p1.parse_file(path, sql, rel_path=rel_path)
 
     # parse_pass2
     dep_filter: set[str] | None = task.get("dependency_filter")
@@ -132,6 +135,7 @@ def _run_task(
             sql,
             dependency_filter=dep_filter,
             ddl_columns_by_bare=ddl_columns_by_bare,
+            rel_path=rel_path,
         )
     finally:
         if xfile_sql:
