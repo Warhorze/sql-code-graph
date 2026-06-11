@@ -362,12 +362,23 @@ async def drain_loop(
                         # internal per-batch transactions join this outer one.
                         with _b.transaction():
                             _b.clear_all_tables()
-                            return _i.index_repo(
+                            summary = _i.index_repo(
                                 _P(_r.root),
                                 _r.dialect,
                                 _b,
                                 progress_callback=_q.update_progress,
                             )
+                            # Empty-root guard (PR-1, A1): if the walker found
+                            # zero SQL files, raise inside the transaction so
+                            # DuckDB rolls back the clear_all_tables() call and
+                            # the prior graph is preserved intact.  We key off
+                            # files_found (files walked), NOT files_parsed — a
+                            # file can legitimately parse to zero rows; the
+                            # signature of an accidental wipe is zero files
+                            # walked.
+                            if summary.get("files_found", 0) == 0:
+                                raise ValueError("refusing to index empty root — graph preserved")
+                            return summary
 
                     summary = await _to_thread.run_sync(_do_index)
                 elif req.op == "reindex":
