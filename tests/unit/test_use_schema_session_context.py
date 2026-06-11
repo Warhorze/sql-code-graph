@@ -155,6 +155,29 @@ END;
                     f"bare_table should not be schema-qualified after USE DATABASE only: {t}"
                 )
 
+    def test_scripting_use_bare_one_part_does_not_qualify(self):
+        """Bare one-part ``USE mydb;`` does not set a schema context in scripting mode.
+
+        Snowflake semantics: a one-part USE sets the DATABASE, not the schema —
+        qualifying with it would put a database name in the schema slot of graph
+        keys. Guards plan/sprints/sprint_lineage_identity_and_session_context.md
+        §PR 2 (W3 decision).
+        """
+        sql = """\
+CREATE PROCEDURE bare_use()
+BEGIN
+  USE mydb;
+  INSERT INTO bare_table (id) SELECT id FROM src;
+END;
+"""
+        result = _parse_snowflake(sql)
+        nodes = [s for s in result.statements if s.parsing_mode == "scripting" and s.target]
+        targets = [s.target.full_id for s in nodes if "bare_table" in s.target.full_id]
+        assert targets, "Expected the bare_table INSERT to be extracted"
+        assert targets == ["bare_table"], (
+            f"bare_table must stay unqualified after a one-part USE, got: {targets}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step 3.2 — non-scripting P5 extension: two-part USE SCHEMA / USE db.schema
@@ -220,6 +243,25 @@ INSERT INTO bare_table (id) SELECT id FROM src;
         assert "." not in stmt.target.full_id, (
             f"bare_table should not be qualified after USE DATABASE only, "
             f"got: {stmt.target.full_id!r}"
+        )
+
+    def test_use_bare_one_part_ignored_in_non_scripting(self):
+        """Bare one-part ``USE mydb;`` does not set a schema context (non-scripting).
+
+        Snowflake semantics: a one-part USE sets the DATABASE, not the schema.
+        Guards plan/sprints/sprint_lineage_identity_and_session_context.md §PR 2
+        (W3 decision).
+        """
+        sql = """\
+USE mydb;
+INSERT INTO bare_table (id) SELECT id FROM src;
+"""
+        result = _parse_snowflake(sql)
+        assert result.statements, "Expected at least one statement"
+        stmt = result.statements[0]
+        assert stmt.target is not None
+        assert stmt.target.full_id == "bare_table", (
+            f"bare_table must stay unqualified after a one-part USE, got: {stmt.target.full_id!r}"
         )
 
     def test_use_schema_single_part_still_works(self):

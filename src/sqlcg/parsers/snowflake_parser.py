@@ -30,25 +30,26 @@ _EMBEDDED_DML = re.compile(
 # by raw text position.  Captures the schema name (last dot-segment) so we can
 # determine which schema was active at each DML match offset.
 #
-# Matches:
+# Matches (schema = group 1 or group 2):
 #   USE SCHEMA <schema>;
 #   USE SCHEMA <db>.<schema>;
 #   USE <db>.<schema>;
 #
-# Excludes:
-#   USE DATABASE <db>;  — guarded by _USE_DATABASE_RE check below.
-#   USE <bare_name>;   — treated as schema (Snowflake semantics; harmless over-capture).
+# Excludes (no schema derivable):
+#   USE DATABASE <db>;  — multi-word form never matches (SCHEMA keyword or a
+#                         dotted two-part name is required)
+#   USE <bare_name>;    — Snowflake semantics: a one-part USE sets the DATABASE,
+#                         not the schema; qualifying with it would put a database
+#                         name in the schema slot of graph keys (plan W3)
 #
 # False-positive risk: a USE statement inside a string literal or comment will be
 # captured.  This is acceptable — it is bounded (at most one spurious schema per
 # occurrence, and real USE statements are common while USE-in-strings is rare in
 # ETL code).
 _USE_SCHEMA_RE = re.compile(
-    r"\bUSE\s+(?:SCHEMA\s+)?(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)\s*;",
+    r"\bUSE\s+(?:SCHEMA\s+(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)|[A-Za-z_]\w*\.([A-Za-z_]\w*))\s*;",
     re.IGNORECASE,
 )
-# Guard to skip "USE DATABASE x;" — only a database, no schema context.
-_USE_DATABASE_RE = re.compile(r"\bUSE\s+DATABASE\b", re.IGNORECASE)
 
 
 @register("snowflake")
@@ -324,18 +325,21 @@ class SnowflakeParser(AnsiParser):
             #
             # Ignored forms (not a schema setter):
             #   USE DATABASE <db>         → kind='DATABASE' — stay on current schema
+            #   USE <bare_name>           → kind='', no db — Snowflake semantics:
+            #                               a one-part USE sets the DATABASE; treating
+            #                               it as a schema would put a database name in
+            #                               the schema slot of graph keys (plan W3)
             if isinstance(stmt, exp.Use):
                 kind_var = stmt.args.get("kind")
                 kind_str = (kind_var.name if kind_var else "").upper()
-                if kind_str != "DATABASE" and stmt.this is not None:
+                if stmt.this is not None and (
+                    kind_str == "SCHEMA" or (not kind_str and stmt.this.db)
+                ):
                     schema_table = stmt.this
                     # For "USE SCHEMA <schema>": name is the schema name directly.
                     # For "USE SCHEMA <db>.<schema>" or "USE <db>.<schema>": name is
                     # still the schema part (the rightmost component), which is what
                     # sqlglot places in Table.name when a db qualifier is present.
-                    # For "USE <bare_name>" (no db, no SCHEMA keyword): kind_str == ''
-                    # and no db qualifier — treat it as a schema name (Snowflake allows
-                    # USE <schema_name> as a shorthand; no precision loss vs. ignoring).
                     if schema_table.name:
                         current_schema = schema_table.name.lower()
                 # Suppress the USE statement — it is not a real query node.
@@ -417,9 +421,10 @@ class SnowflakeParser(AnsiParser):
         ``_qualify_bare_tables`` is called on the parsed AST before ``_parse_statement``
         extracts table references.
 
-        USE DATABASE <x> alone is ignored (no schema can be derived; ``_USE_DATABASE_RE``
-        guards this).  False positives (USE inside a string/comment) are bounded and
-        acceptable for ETL code (see module-level ``_USE_SCHEMA_RE`` comment).
+        USE DATABASE <x> and bare one-part USE <x> are ignored (a one-part USE sets
+        the database in Snowflake — no schema is derivable).  False positives (USE
+        inside a string/comment) are bounded and acceptable for ETL code (see
+        module-level ``_USE_SCHEMA_RE`` comment).
 
         Args:
             path: Path to the source file
@@ -442,10 +447,9 @@ class SnowflakeParser(AnsiParser):
         # For each DML match we pick the last entry whose offset is < match.start().
         use_contexts: list[tuple[int, str]] = []
         for use_m in _USE_SCHEMA_RE.finditer(sql):
-            # Guard: skip "USE DATABASE x;" — those do not set a schema context.
-            if _USE_DATABASE_RE.match(use_m.group(0)):
-                continue
-            schema_name = use_m.group(1).lower()
+            # Schema is in group 1 (SCHEMA-keyword form) or group 2 (USE db.schema).
+            # USE DATABASE / bare one-part USE never match the regex (see its comment).
+            schema_name = (use_m.group(1) or use_m.group(2)).lower()
             use_contexts.append((use_m.start(), schema_name))
 
         def _active_schema(offset: int) -> str | None:
