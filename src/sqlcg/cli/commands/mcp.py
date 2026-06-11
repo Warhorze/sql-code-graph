@@ -8,6 +8,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from sqlcg.server.selfheal import read_ondisk_version
+
 app = typer.Typer(help="MCP server commands")
 console = Console()
 
@@ -130,14 +132,27 @@ def mcp_status() -> None:
 
         status = json.loads(data.decode())
 
-        # Drift detection: compare the *running* server's reported version (read
-        # over the socket, from the live process) against the *installed*
-        # sqlcg.__version__ (the version of the CLI process you just invoked).
-        from sqlcg import __version__
-
+        # Drift detection (W1 / Step 1.4): compare the *running* server's
+        # reported version (read over the socket, from the live process) against
+        # the *on-disk* installed version (read fresh via read_ondisk_version()).
+        # Using the on-disk version — not the CLI's baked-in __version__ — means
+        # stale_by_version is correct even when the CLI process itself is freshly
+        # reinstalled to a different version than the running server.
         running_version = status.get("version")
-        stale = running_version is not None and running_version != __version__
-        status = {**status, "version": running_version, "stale_by_version": stale}
+        ondisk_version = read_ondisk_version()
+        # F1 guard: if ondisk_version is None the distribution is unreadable;
+        # never treat that as a skew — same safety rule as detect_skew().
+        stale = (
+            running_version is not None
+            and ondisk_version is not None
+            and running_version != ondisk_version
+        )
+        status = {
+            **status,
+            "version": running_version,
+            "ondisk_version": ondisk_version,
+            "stale_by_version": stale,
+        }
 
         # Pretty-print the base fields.
         console.print_json(json.dumps({k: v for k, v in status.items() if k != "writer_queue"}))
@@ -145,8 +160,8 @@ def mcp_status() -> None:
         if stale:
             console.print(
                 f"[yellow]Warning:[/yellow] running MCP server is v{running_version}, "
-                f"installed sqlcg is v{__version__} — restart the MCP server via your "
-                "editor (or run `sqlcg install`, which stops the stale server for you)."
+                f"installed (on-disk) sqlcg is v{ondisk_version} — restart the MCP server via "
+                "your editor (or run `sqlcg install`, which stops the stale server for you)."
             )
 
         # Render the writer_queue block separately for readability.
@@ -276,16 +291,19 @@ def mcp_stop() -> None:
 
 @app.command("restart")
 def mcp_restart() -> None:
-    """Stop the server. The client (editor) must respawn.
+    """Stop the server. Use only when the process is wedged.
 
-    v1.1 cannot re-parent an editor-spawned stdio process.  This command
-    stops the current server and prints guidance for the user to restart
-    the MCP server via their editor's MCP configuration.
+    As of v1.20.0 the server self-heals automatically: on the next MCP tool
+    call after a reinstall it detects the version skew and re-execs itself
+    in place (same PID, same stdio pipe) — no editor reconnect needed.
 
-    True auto-restart (re-parenting stdio) is deferred to v1.2.
+    Manual restart is only needed when the process is unresponsive or you
+    want to force an immediate pick-up of the new build without waiting for
+    the next tool call.  In Claude Code run /mcp → reconnect sql-code-graph
+    (or restart the session) after stopping.
     """
     mcp_stop()
     console.print(
-        "[yellow]Server stopped. Please restart via your editor's MCP configuration.[/yellow]"
+        "[yellow]Server stopped.[/yellow] In Claude Code run [bold]/mcp[/bold] → reconnect "
+        "[italic]sql-code-graph[/italic] (or restart the session) to pick up the new build."
     )
-    console.print("[dim]True auto-restart (re-parenting stdio) is deferred to v1.2.[/dim]")

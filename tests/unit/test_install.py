@@ -262,7 +262,14 @@ def test_install_stops_server_on_claude_cli_success(fake_home: Path) -> None:
     assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"
     mock_stop.assert_called_once()
     assert "Stopped running MCP server" in result.output
-    assert "respawn it on the new build" in result.output
+    # The message must provide /mcp reconnect guidance (Step 1.1 of mcp_server_self_healing)
+    assert "/mcp" in result.output or "reconnect" in result.output.lower(), (
+        f"Expected /mcp reconnect guidance in output; got:\n{result.output}"
+    )
+    # Must NOT promise automatic respawn (old overpromise removed)
+    assert "will respawn" not in result.output.lower(), (
+        f"Output must not promise automatic respawn; got:\n{result.output}"
+    )
     # The message must drop the (vX) suffix — stop_server() returns only a bool.
     assert "(v" not in result.output
 
