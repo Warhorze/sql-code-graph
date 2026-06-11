@@ -564,6 +564,16 @@ class Indexer:
             else:
                 pass2_results[orig_idx] = r
 
+        # PR 1 key-normalisation choke point: apply schema_aliases + empty-identity guard
+        # to EVERY parse result BEFORE defined_table_registry is built.  Running this here
+        # (not inside _upsert_file_batch) ensures that the registry keys, and any
+        # aggregator.canonical_by_bare consumers, all see the normalised full_ids.
+        # Cost: O(edges) per file, once per index_repo call — outside the hot loop.
+        from sqlcg.parsers.base import normalize_keys as _normalize_keys
+
+        for pf in pass2_results:
+            _normalize_keys(pf, schema_aliases)
+
         # Build duplicate-DDL registry from in-memory results so _upsert_parsed_file
         # can detect conflicts with a dict lookup instead of a per-table graph read.
         defined_table_registry: dict[str, str] = {}
@@ -1082,6 +1092,17 @@ class Indexer:
             parser = get_parser(dialect, schema_resolver)
             sql = Path(file_path).read_text(encoding="utf-8")
             parsed = parser.parse_file(Path(file_path), sql)
+
+            # PR 1 key-normalisation choke point — same pass as index_repo.
+            # Derive the repo root from the indexed Repo node so we can read
+            # .sqlcg.toml without a separate path parameter.
+            from sqlcg.core.config import get_schema_aliases
+            from sqlcg.core.graph_db import indexed_repo_root
+            from sqlcg.parsers.base import normalize_keys as _normalize_keys
+
+            _repo_root = indexed_repo_root(db) or Path(file_path).parent
+            _reindex_aliases = get_schema_aliases(_repo_root)
+            _normalize_keys(parsed, _reindex_aliases)
 
             self._upsert_parsed_file(parsed, db)
 
