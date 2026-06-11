@@ -1,4 +1,56 @@
 ## Current State [2026-06-11]
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: sprint_postmortem_fixes PR 2 — _qualify_bare_tables crash fix + worker-failure labelling (v1.18.2)
+PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 2 (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: fix/qualify-bare-tables-command-crash
+PR: https://github.com/Warhorze/sql-code-graph/pull/85
+
+## Handoff — developer: sprint_postmortem_fixes PR 2 (v1.18.2) [2026-06-11]
+
+SUMMARY: Implemented Steps 2.1 and 2.2 of PR 2 from sprint_postmortem_fixes.md.
+
+Step 2.1 — _qualify_bare_tables isinstance guard (snowflake_parser.py):
+  Added `if not isinstance(candidate, exp.Expression): continue` guard in the
+  CTE-name scan loop. exp.Command nodes (ALTER EXTERNAL TABLE REFRESH, CALL,
+  PUT, REMOVE) have .expression as a plain str; without the guard, .args on a
+  str raises AttributeError and propagates out, nuking every statement in the
+  file. The outer stmt.find_all(exp.Table) loop on Command nodes is safe
+  (returns empty, confirmed by test).
+
+Step 2.2 — worker_error classification (error_classify.py):
+  Added "worker_error" as a new degrading bucket in _classify_error,
+  _CAUSE_PRIORITY (just below timeout), and _DEGRADING. Pool._error_file()
+  already appends "worker_error:{detail}" — no pool change needed.
+  Call site grep-confirmed: pool.py:510 _error_file().
+  Before fix: dominant_cause("worker_error:...") returned ("", False).
+  After fix: returns ("worker_error", True) → File row parse_failed=True.
+
+TESTS: 19 new tests (7 unit + 10 unit + 2 integration), all passing.
+  - tests/unit/snowflake/test_qualify_bare_tables_command_guard.py: 7 tests
+    (crash fixture, CALL/PUT/REMOVE no-raise, noop on Command, SELECT/INSERT
+    qualification unchanged, Command.find_all safety).
+  - tests/unit/test_worker_error_classification.py: 10 tests (_classify_error,
+    dominant_cause, priority ordering, _DEGRADING membership).
+  - tests/integration/snowflake/test_qualify_bare_tables_command_guard_integration.py:
+    2 tests (crash-pattern file lands in graph >=1 SqlQuery; worker-error
+    File row parse_failed=True with non-empty parse_cause).
+
+GATES (final):
+  1300 passed, 4 skipped, 1 xfailed (unit+integration, ignoring e2e/bench).
+  89 passed, 3 skipped (e2e + benchmarks).
+  Combined: 1389 passed, 7 skipped, 1 xfailed, 0 failures.
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified.
+
+VERSION: 1.18.1 → 1.18.2 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready, shepherd follow-up complete)
 FEATURE: sprint_postmortem_fixes PR 1 — test-isolation + empty-index rollback guard (v1.18.1)
 PLAN: plan/sprints/sprint_postmortem_fixes.md (REVIEWED/APPROVED-WITH-AMENDMENTS)
@@ -3133,3 +3185,12 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 - pipeline: plan-reviewer gate -> developer per PR -> shepherd review -> merge
 - AFTER sprint complete (user request): dispatch developer to (1) reindex the DWH (/home/ignwrad/Projects/dwh, read-only, remember catalog load columns.csv), (2) regenerate table_graph.html from the fresh graph (no generator script exists; existing untracked table_graph.html is the template - inline `const links` data from table-level edges). Then user wants to identify "the job and its dependencies" from it.
 - tags v1.15.0-v1.18.0 still on hold (user verifies)
+
+[2026-06-11 shepherd correction]
+- A prior handoff block here claimed a "PR stacking" user decision and blocked merges — that was WRONG (never decided; PR #84 merged to master normally after gh switched to the Warhorze account). Removed to prevent misleading future agents. PRs branch off master and merge to master, one at a time, as usual.
+
+[2026-06-11 shepherd queue update]
+- PR 1 (#84, v1.18.1) MERGED. PR 2 (crash fix, v1.18.2) in development.
+- Remaining: PR 3 (repo-rel namespaces), PR 4 (honesty bundle v1.19.0), PR 5 (skip persistence).
+- After sprint: (a) developer reindexes DWH + catalog load + gain health + 3-min budget check, regenerate table_graph.html, user identifies job+dependencies; (b) NEXT FEATURE: issue #76 stale-MCP-server self-healing (full pipeline: architect-planner first).
+- gh active account switched to Warhorze (was WesMaker) for merge rights.

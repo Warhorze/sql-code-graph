@@ -369,8 +369,14 @@ class SnowflakeParser(AnsiParser):
         cte_names: set[str] = set()
         # CTEs may appear on the stmt itself (exp.Select with WITH) or on the
         # expression body (exp.Insert whose SELECT body carries WITH).
+        # Guard: exp.Command nodes (unsupported syntax like ALTER EXTERNAL TABLE
+        # … REFRESH, CALL, PUT, REMOVE) have .expression as a *str*, not an
+        # exp.Expression, so .args would raise AttributeError.  Skip any
+        # candidate that is not a proper exp.Expression node.
         for candidate in (stmt, getattr(stmt, "expression", None)):
             if candidate is None:
+                continue
+            if not isinstance(candidate, exp.Expression):  # type: ignore[attr-defined]
                 continue
             with_clause = candidate.args.get("with_") or candidate.args.get("with")
             if with_clause is not None:
