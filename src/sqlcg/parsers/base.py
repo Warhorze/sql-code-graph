@@ -1,5 +1,6 @@
 """Base data models and abstract parser for SQL parsing and lineage extraction."""
 
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -276,6 +277,141 @@ class ParsedFile:
         return str(self.path)
 
 
+# ---------------------------------------------------------------------------
+# Key-normalisation boundary pass (PR 1 — sprint_lineage_identity_and_session_context)
+# ---------------------------------------------------------------------------
+
+
+def _apply_alias_to_ref(ref: "TableRef", aliases: dict[str, str]) -> "TableRef":
+    """Rewrite ref.db through the alias map; return the same ref if unchanged.
+
+    Only rewrites when ref.db matches an alias key.  Never rewrites CTE/derived
+    refs that have no db (their identity is the bare name, not a schema).
+    Does NOT rewrite refs whose full_id is already empty — those are handled by
+    the empty-identity guard in normalize_keys.
+    """
+    if not aliases or not ref.db:
+        return ref
+    aliased = aliases.get(ref.db.lower())
+    if aliased is None:
+        return ref
+    return dataclasses.replace(ref, db=aliased)
+
+
+def normalize_keys(parsed: "ParsedFile", aliases: dict[str, str]) -> None:
+    """Normalize every TableRef-bearing field in *parsed* through *aliases* in-place.
+
+    This is the key-normalization boundary pass (PR 1 of the lineage-identity sprint,
+    plan/sprints/sprint_lineage_identity_and_session_context.md §PR 1).
+
+    Responsibilities:
+    1. Apply schema_aliases to every TableRef in the parse result so that no un-aliased
+       key can reach the graph, regardless of which parser branch produced the ref.
+    2. Reject any TableRef whose full_id is empty (stage reads — the stage name does
+       not survive parsing): drop the ref/edge and log a ``col_lineage_skip:stage:``
+       error. Never emit a key with a leading dot, an empty table component, or an
+       empty SqlTable.qualified.
+
+    Fields rewritten (all TableRef-bearing fields in ParsedFile and QueryNode):
+    - ParsedFile.defined_tables  (list[TableRef])
+    - ParsedFile.referenced_tables  (list[TableRef])
+    - QueryNode.target  (TableRef | None)
+    - QueryNode.sources  (list[TableRef])
+    - QueryNode.star_sources  (list[StarSource] — via StarSource.source)
+    - QueryNode.clone_source  (TableRef | None)
+    - LineageEdge.src.table and .dst.table  (via ColumnRef, via dataclasses.replace)
+
+    Intentionally EXCLUDED (see W1 note in the plan):
+    - QueryNode.ctes  (dict[str, TableRef]): parser-internal pass-2 state; never read
+      by key-construction consumers; excluded deliberately.  The introspection guard
+      (TestNormalizeKeysIntrospectionGuard in tests/unit/test_normalize_keys.py)
+      enumerates all TableRef-bearing fields and explicitly skips ``ctes``.
+
+    This function mutates *parsed* in-place.  It is O(edges) and runs once per file,
+    far outside the per-column hot loop — no perf invariant is affected.
+
+    Args:
+        parsed: ParsedFile to normalise (mutated in-place).
+        aliases: Schema-alias map from .sqlcg.toml (e.g. ``{"ba_tmp": "ba"}``).
+            May be empty; the function is a no-op on empty aliases but still applies
+            the empty-identity guard.
+    """
+    file_path = parsed.path_str
+
+    # ---- ParsedFile-level TableRef lists ------------------------------------
+
+    def _norm_ref(ref: "TableRef") -> "TableRef | None":
+        """Alias + empty-identity guard for a single TableRef.
+
+        full_id is empty only when every identity component (catalog, db, name)
+        is empty — true for Snowflake stage reads (``FROM @stage``), where the
+        stage name does not survive parsing.  The honest representation is to
+        drop the ref and log a skip: an empty-keyed node would falsely join
+        unrelated stage-loading pipelines.  (The plan's alternative
+        ``stage://<name>`` key requires a recoverable name; there is none —
+        see PR body §Stage-key decision.)
+        """
+        ref = _apply_alias_to_ref(ref, aliases)
+        if not ref.full_id:
+            parsed.errors.append(f"col_lineage_skip:stage:{file_path}")
+            return None
+        return ref
+
+    parsed.defined_tables = [
+        r for ref in parsed.defined_tables if (r := _norm_ref(ref)) is not None
+    ]
+    parsed.referenced_tables = [
+        r for ref in parsed.referenced_tables if (r := _norm_ref(ref)) is not None
+    ]
+
+    # ---- QueryNode-level fields ---------------------------------------------
+
+    for stmt in parsed.statements:
+        # target
+        if stmt.target is not None:
+            new_target = _norm_ref(stmt.target)
+            stmt.target = new_target  # None is valid (target was a phantom ref)
+
+        # sources
+        stmt.sources = [r for ref in stmt.sources if (r := _norm_ref(ref)) is not None]
+
+        # star_sources (StarSource.source is a TableRef)
+        new_star_sources: list[StarSource] = []
+        for ss in stmt.star_sources:
+            new_src = _norm_ref(ss.source)
+            if new_src is not None:
+                new_star_sources.append(dataclasses.replace(ss, source=new_src))
+            # else: drop the star source silently (edge will be absent from graph)
+        stmt.star_sources = new_star_sources
+
+        # clone_source
+        if stmt.clone_source is not None:
+            stmt.clone_source = _norm_ref(stmt.clone_source)
+
+        # column_lineage — LineageEdge and ColumnRef are frozen; rewrite via replace
+        new_edges: list[LineageEdge] = []
+        for edge in stmt.column_lineage:
+            new_src_table = _norm_ref(edge.src.table)
+            new_dst_table = _norm_ref(edge.dst.table)
+            if new_src_table is None or new_dst_table is None:
+                # At least one endpoint resolved to an empty-identity ref; drop edge.
+                # The skip was already logged by _guard_stage_ref above.
+                continue
+            # Rebuild ColumnRef and LineageEdge only when something changed.
+            if new_src_table is not edge.src.table or new_dst_table is not edge.dst.table:
+                new_src = dataclasses.replace(edge.src, table=new_src_table)
+                new_dst = dataclasses.replace(edge.dst, table=new_dst_table)
+                edge = dataclasses.replace(edge, src=new_src, dst=new_dst)
+            new_edges.append(edge)
+        stmt.column_lineage = new_edges
+
+        # NOTE: QueryNode.ctes is intentionally excluded — it is parser-internal
+        # pass-2 state (CTE name → TableRef mapping) that is never read by
+        # key-construction consumers.  A new TableRef-bearing field added to
+        # QueryNode or ParsedFile in the future MUST be added here too; the
+        # dataclass-introspection guard test enforces this.
+
+
 class SqlParser(ABC):
     """Abstract base class for SQL parsers.
 
@@ -487,8 +623,6 @@ class SqlParser(ABC):
         aliased = self._schema_aliases.get(ref.db.lower())
         if aliased is None:
             return ref
-        import dataclasses
-
         return dataclasses.replace(ref, db=aliased)
 
     @staticmethod
