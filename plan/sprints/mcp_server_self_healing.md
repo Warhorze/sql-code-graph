@@ -1,6 +1,7 @@
 # Feature Plan: MCP Server Self-Healing on Reinstall (issue #76)
 
-**Status: DRAFT** — plan-reviewer gates next. No implementation until reviewed.
+**Status: APPROVED** (plan-reviewer 2026-06-11, APPROVE-WITH-AMENDMENTS — all A1–A6 /
+W1–W4 amendments incorporated; see Review Trail). Ready for developer.
 
 **Target version: 1.20.0** (new runtime surface — additive, nothing breaks → minor per CLAUDE.md SemVer rule. master is at 1.19.1).
 
@@ -62,8 +63,8 @@ A process that has already imported `sqlcg` caches `importlib.metadata` results:
 in-memory `PathDistribution` cache, defeating the whole feature. We must force a fresh
 read from disk on every check.
 
-**Decision:** read via a freshly constructed `MetadataPathFinder` scan rather than the
-cached top-level helper.
+**Decision (resolved by plan-reviewer, A1):** invalidate the metadata finder cache, then
+scan `im.distributions()`.
 
 ```python
 import importlib.metadata as im
@@ -71,14 +72,18 @@ import importlib.metadata as im
 def read_ondisk_version() -> str | None:
     """Version of the sql-code-graph distribution on disk RIGHT NOW.
 
-    A long-lived process caches distribution metadata; this re-scans sys.path
-    so a reinstall under the running interpreter is observed. Returns None if
-    the distribution cannot be located (treated as "no skew" — never re-exec
-    on an unreadable version; see failure mode F1).
+    A long-lived process caches distribution metadata so the on-disk version
+    can be observed stale. We invalidate the finder cache first, then re-scan,
+    so a reinstall under the running interpreter is observed regardless of the
+    .dist-info mtime. Returns None if the distribution cannot be located
+    (treated as "no skew" — never re-exec on an unreadable version; see F1).
     """
     try:
-        # importlib.metadata.distributions() re-walks the finders on each call;
-        # it is NOT memoised the way the module-level version() helper is.
+        # Clears the @lru_cache on FastPath.__new__ so the path list is re-read
+        # from disk even when the .dist-info was replaced with the SAME mtime
+        # (coarse-grained FS, same-second CI write). Without this, the mtime-keyed
+        # FastPath.lookup cache could return the stale child list.
+        im.MetadataPathFinder.invalidate_caches()
         for dist in im.distributions():
             if (dist.metadata["Name"] or "").lower() == "sql-code-graph":
                 return dist.version
@@ -87,9 +92,20 @@ def read_ondisk_version() -> str | None:
     return None
 ```
 
-- `im.distributions()` re-walks `sys.path` / the meta-path finders each call (verified:
-  it constructs fresh `PathDistribution` objects), so it observes a reinstall that
-  replaced the `.dist-info` directory under the same `sys.path` entry.
+- **Correct mechanism (verified on Python 3.12.3):** `im.distributions()` →
+  `Distribution.discover()` → `MetadataPathFinder._search_paths()` maps `FastPath` over
+  each `sys.path` entry. `FastPath.__new__` is `@functools.lru_cache`'d per path string,
+  and `FastPath.lookup` is a `@method_cache` keyed on the directory `mtime`. When
+  `uv tool install --force` rewrites the `.dist-info` in place the directory mtime
+  changes, so `lookup` re-keys and the child scan runs fresh — a reinstall IS observed
+  WITHOUT any explicit cache bust in the common case. (The earlier "constructs fresh
+  PathDistribution objects" rationale was wrong; the real lever is the mtime-keyed
+  lookup cache.)
+- **Why `invalidate_caches()` is still required:** if the `.dist-info` is replaced with
+  the SAME mtime (coarse-grained filesystem or a same-second write in CI/tests), the
+  mtime-keyed lookup would not re-key. `im.MetadataPathFinder.invalidate_caches()` clears
+  the `FastPath.__new__` lru_cache, forcing a fresh path-list read regardless of mtime.
+  This is the defensive call the developer MUST place before the scan.
 - We compare against `from sqlcg import __version__` (the constant baked into the running
   module at import — it does NOT change when disk changes; that asymmetry is the whole
   skew signal).
@@ -98,11 +114,6 @@ def read_ondisk_version() -> str | None:
   re-exec. The console-script shim re-resolves the venv on the *next* spawn, so the
   re-exec'd process gets the new code — this is why we re-exec the **console-script
   path**, not `sys.executable -m` against the stale `sys.path`. See D4.
-
-> The reviewer must confirm `im.distributions()` is not memoised in the target Python
-> (3.12). If it is, fall back to clearing `im.MetadataPathFinder.invalidate_caches()` +
-> `importlib.invalidate_caches()` before the scan. This is a **blocking item for the
-> reviewer** — pin the exact mechanism before the developer codes it.
 
 ### D2 — Check cadence (off every hot path)
 
@@ -120,21 +131,31 @@ def read_ondisk_version() -> str | None:
 
 ### D3 — MCP tool-entry wiring point (grep-confirmed call site required)
 
-The cleanest single hook is FastMCP's tool dispatch. Two candidate sites — the developer
-picks whichever is grep-confirmed to wrap **every** `@mcp.tool()` invocation exactly once:
+**Resolved by plan-reviewer (A2).** `mcp._mcp_server.call_tool` is a **decorator
+factory** (it registers a handler), NOT a runtime callable — wrapping it does nothing at
+dispatch time. The single runtime dispatch point is the registered handler in
+`mcp._mcp_server.request_handlers[types.CallToolRequest]`: FastMCP installs exactly one
+handler there (via `call_tool(...)(self.call_tool)` in `FastMCP.__init__`), and every
+`@mcp.tool()` invocation flows through it.
 
-1. **Preferred:** wrap `mcp._mcp_server.call_tool` (the low-level handler FastMCP routes
-   every tool through) with a thin async pre-check that calls `maybe_self_heal()` then
-   delegates. Register this in `server.py` `main()` after tools import, before
-   `anyio.run`.
-2. **Fallback (if call_tool is not a single interception point):** add one
-   `maybe_self_heal()` line at the top of `_get_backend()` in `tools.py` — every tool
-   that touches the graph calls it. Downside: tools that don't hit the backend skip the
-   check; acceptable because the `status` op also checks.
+**Wiring (the only approved pattern):** in `server.py` `main()`, AFTER
+`import sqlcg.server.tools` (which triggers tool registration):
 
-> **Reviewer decision required:** confirm via grep which interception point wraps all
-> tool calls once. Do not ship a hook that double-fires or misses tools. The developer
-> must show the grep output for the chosen site in the PR.
+```python
+import mcp.types as types
+_orig_handler = mcp._mcp_server.request_handlers[types.CallToolRequest]
+
+async def _self_heal_then_dispatch(req):
+    maybe_self_heal()           # throttled; sets the event on skew
+    return await _orig_handler(req)
+
+mcp._mcp_server.request_handlers[types.CallToolRequest] = _self_heal_then_dispatch
+```
+
+This wraps every tool exactly once. The developer MUST show grep output confirming
+`request_handlers[types.CallToolRequest]` is the sole registered dispatch path and that
+the wrap is installed once. Do NOT use the `_get_backend()` fallback (it misses tools
+that never touch the backend and is fragile).
 
 `maybe_self_heal()` is **synchronous and non-blocking** in the common (no-skew) path. On
 skew it must hand off to the async re-exec sequence (D5) because draining requires
@@ -147,26 +168,46 @@ acquiring the anyio `backend_lock`. Implementation: the detector sets a module-l
 ```python
 import os, sys
 
+# Resolved ONCE at server startup in main(), BEFORE any chdir / arg mutation.
+# Module-level so _reexec uses the absolute launch path, not a relative sys.argv[0].
+_resolved_argv0: str | None = None  # set in main(): os.path.abspath(sys.argv[0])
+
 def _reexec() -> None:
-    # argv[0]: prefer the console-script path the editor actually launched, so
-    # the re-exec'd process re-resolves the (possibly relocated) venv. sys.argv[0]
-    # is that path for an installed `sqlcg` entry point.
-    script = sys.argv[0]
-    os.execv(script, [script, *sys.argv[1:]])
+    # A4 loop guard: refuse after 3 generations (corrupt/partial install).
+    gen = int(os.environ.get("SQLCG_SELF_HEAL_GENERATION", "0"))
+    if gen >= 3:
+        logger.error(
+            "self-heal re-exec refused: SQLCG_SELF_HEAL_GENERATION=%d — "
+            "the new build still reports a skew; restart the MCP server manually",
+            gen,
+        )
+        return
+    # A5: use the absolute launch path captured at startup; verify it is executable.
+    if not (_resolved_argv0 and os.path.isfile(_resolved_argv0) and os.access(_resolved_argv0, os.X_OK)):
+        logger.error("self-heal re-exec refused: argv0 %r is not an executable file", _resolved_argv0)
+        return  # caller (F2 path) re-opens the backend and keeps serving
+    os.environ["SQLCG_SELF_HEAL_GENERATION"] = str(gen + 1)
+    os.execv(_resolved_argv0, [_resolved_argv0, *sys.argv[1:]])
 ```
 
-- **argv[0] resolution:** use `sys.argv[0]` (the console-script path the editor
-  configured, e.g. the `sqlcg` shim), **not** `sys.executable -m sqlcg.server`. The shim
-  re-resolves the active distribution at spawn, which is exactly what picks up a
-  force-reinstalled venv. We pass the original argv tail unchanged so the new process
-  starts in the identical server mode (`sqlcg mcp serve` or whatever the editor launched).
-- **stdio:** `os.execv` replaces the process image but **keeps all open file descriptors**
-  by default (no `close_on_exec` is set on fds 0/1/2). The MCP JSON-RPC pipe on fd 1 (and
-  stdin fd 0, stderr fd 2) survives the exec untouched, so the client's pipe never breaks.
-  **Guard:** the developer must confirm no code sets `O_CLOEXEC` on the duped fd in
-  `server.py` (`_real_stdout_buffer = os.fdopen(os.dup(1), ...)` — `os.dup` does NOT set
-  CLOEXEC, and that buffer is process-local, discarded by the exec). The *real* fds 0/1/2
-  are inherited by the new image.
+- **argv[0] resolution (A5):** `main()` stores
+  `_resolved_argv0 = os.path.abspath(sys.argv[0])` at startup (the console-script shim the
+  editor launched, e.g. `/home/…/.local/bin/sqlcg`, which re-resolves the active
+  distribution on spawn — exactly what picks up a force-reinstalled venv). We use the
+  absolute path, **not** `sys.argv[0]` at exec time (which could be relative after a
+  chdir) and **not** `sys.executable -m sqlcg.server`. The argv tail is passed unchanged
+  so the new process starts in the identical server mode. If `_resolved_argv0` is not an
+  executable file at exec time, `_reexec` refuses and the F2 path keeps serving.
+- **stdio (A3 — corrected):** `os.execv` replaces the process image but inherited fds keep
+  their `close_on_exec` flag. The **real fd 1** (the MCP JSON-RPC pipe), fd 0 (stdin) and
+  fd 2 (stderr) are `CLOEXEC=False` (verified) and survive the exec untouched, so the
+  client's pipe never breaks. The process-local `_real_stdout_buffer = os.fdopen(os.dup(1), …)`
+  IS `CLOEXEC=True` on Python 3.12/Linux (`os.dup` returns a CLOEXEC fd) and is therefore
+  **closed by the exec** — that is fine and intended, because the re-exec'd image re-runs
+  module scope and re-creates `_real_stdout_buffer` from the still-open fd 1.
+  **Guard:** the developer must confirm fds 0/1/2 are `CLOEXEC=False` at exec time (e.g.
+  via `os.get_inheritable(1)` returning True). Do NOT "confirm no CLOEXEC on the dup
+  buffer" — that buffer is CLOEXEC=True by design and discarded by exec.
 - **env:** `os.execv` (no `e`) inherits the current environment, which is correct —
   `SQLCG_DB_PATH` etc. carry over. We deliberately do **not** use `execve` with a curated
   env; the inherited env is what the editor set.
@@ -187,19 +228,35 @@ existing `stop_event`, and a watcher task `_self_heal_watcher` that mirrors
    transaction (same guarantee `_stop_watcher` relies on).
 4. `_tools.shutdown_backend()` under the lock — **closes the DuckDB connection, releasing
    the exclusive lock** so the re-exec'd process's `init_backend` can open it.
-5. `cleanup_control_files(db_path)` — remove `.sock` and `.pid` (the new process rewrites
+5. Relay terminal frames to pending waiters (A6, below), then
+   `cleanup_control_files(db_path)` — remove `.sock` and `.pid` (the new process rewrites
    `.pid` with the *same* PID and re-binds the socket; see D6).
-6. `_reexec()`.
+6. `_reexec()`. (If `_reexec` returns without exec'ing — A4 generation cap or A5 bad
+   argv0 — fall through to the F2 recovery path: re-open the backend and resume. See
+   W2 for the lock-release ordering.)
 
 **Mid-drain new request arrival:** `shutdown_requested.set()` (step 2) makes the drain
 loop's `while not shutdown_requested.is_set()` exit after the active drain; new enqueues
 sit in `_pending` and are simply dropped by the exec — acceptable, because the new
 process is the *same* server the client talks to, and a `wait=false` enqueue is
-fire-and-forget. A `wait=true` client would lose its stream; **mitigation:** the watcher
-relays a terminal `{"ok": false, "done": true, "error": "server self-healing — re-issue"}`
-frame to any pending `_waiters` before exec (reuse the coalesce-notify pattern already in
-`WriterQueue.enqueue`). The reviewer should confirm this is reachable for `wait=true`
-index/reindex.
+fire-and-forget.
+
+**Waiter relay under the queue lock (A6):** a `wait=true` client would otherwise lose its
+stream. After step 2 (`shutdown_requested.set()`), the watcher MUST drain `_pending`
+waiters safely by acquiring `writer_queue._lock` (the same lock `enqueue`/`pop_next` use)
+and, for each `req` in `writer_queue._pending`, `await ch.send({"ok": false, "done": true,
+"error": "server self-healing — re-issue"})` for every `ch` in `req._waiters` (mirroring
+the coalesce-notify pattern inside `WriterQueue.enqueue`, which sends under `self._lock`).
+Direct unsynchronised access to `_pending`/`_waiters` is racy and forbidden. The active
+request's waiter is handled by the drain loop's own terminal frame when it commits in
+step 3, so it is not double-notified here.
+
+**W3 — throttle vs drain are independent.** `maybe_self_heal()` runs at MCP tool entry on
+the event loop (the throttle is on the *disk check*, not on the drain), never inside
+`drain_loop` (which runs off-thread via `to_thread.run_sync`). The re-exec does not race
+the drain: `shutdown_requested.set()` (step 2) + `async with backend_lock` (step 3)
+guarantee any active drain has committed before `shutdown_backend`/exec. The 30 s throttle
+and the drain ordering do not interact.
 
 ### D6 — Control socket + pidfile across exec (same PID)
 
@@ -217,13 +274,13 @@ index/reindex.
   is a sub-millisecond window where `mcp status` would see no socket → it already falls
   through to the PID probe (R3), which finds the same live PID. Acceptable, documented.
 
-### D7 — Fallback scope (if execv proves too risky in review)
+### D7 — Fallback scope
 
-If the reviewer judges re-exec too risky for 1.20.0, the **minimum** shipped scope is
-PR 1 alone (below): correct the `install.py` message and the `mcp restart` docstring,
-and document the reinstall flow. This still closes the "overpromising message" half of
-issue #76. The skew **detector** (D1) ships regardless because `mcp status` already
-consumes a version-skew signal — it is low-risk and useful standalone.
+**Plan-reviewer resolution (BQ3): PR 2 ships in 1.20.0** after the A1–A6/W1–W2 amendments
+are applied — none requires a design change. PR 1 remains the fallback if PR 2 is later
+rejected: correct the `install.py` message + `mcp restart` docstring, document the
+reinstall flow, and ship the skew detector (which `mcp status` consumes). The detector
+ships regardless — low-risk and useful standalone.
 
 ---
 
@@ -275,13 +332,20 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
   comparing `__version__` to the on-disk read. Returns `(False, ...)` when on-disk is None.
 - Acceptance: unit tests (T1–T3 below).
 
-**Step 1.4** — Use the on-disk read in `mcp status`.
+**Step 1.4** — Use the on-disk read in `mcp status` (W1 — corrected).
 - Files: [`src/sqlcg/cli/commands/mcp.py`](src/sqlcg/cli/commands/mcp.py) ~133–140.
-- The CLI-side compare currently uses the CLI process's `__version__`; for an out-of-band
-  reinstall the CLI process IS the new version, so that compare already works. Keep it,
-  but route through `detect_skew()` for a single source of truth on the comparison logic.
+- **W1 clarification:** `mcp status` compares the *running server's* reported version
+  (read over the socket) against the *installed package* version. These are two different
+  comparisons from `detect_skew()` (which compares the on-disk version against the calling
+  process's baked-in `__version__`). Do NOT route the CLI status through `detect_skew()`.
+  Instead, the CLI should call `read_ondisk_version()` directly and compare it to
+  `running_version` (from the socket): `stale = running_version is not None and
+  running_version != read_ondisk_version()`. This makes `stale_by_version` correct even
+  when the CLI process itself is the freshly reinstalled build. `read_ondisk_version()` is
+  the single source of truth for "what is installed on disk now".
 - Acceptance: `TestMcpStatusVersionDrift` in `test_mcp_control.py` still passes; assert
-  `stale_by_version` reflects a simulated skew.
+  `stale_by_version` is `true` when the socket reports an older version than on disk and
+  `false` when they match (simulate via monkeypatched `read_ondisk_version`).
 
 **Step 1.5** — Version bump to 1.20.0.
 - Files: [`pyproject.toml`](pyproject.toml), [`src/sqlcg/__init__.py`](src/sqlcg/__init__.py), `uv lock`.
@@ -299,21 +363,37 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
 
 **Step 2.2** — `_reexec()` + `_self_heal_watcher`.
 - Files: [`src/sqlcg/server/server.py`](src/sqlcg/server/server.py).
+- In `main()`, set the module-level `_resolved_argv0 = os.path.abspath(sys.argv[0])`
+  **before** `anyio.run` (A5 — captured once at startup, never re-read at exec time).
+- `_reexec()` per D4: A4 generation guard (`SQLCG_SELF_HEAL_GENERATION >= 3` → log ERROR,
+  return without exec), A5 argv0 executability check, then bump the generation env var and
+  `os.execv(_resolved_argv0, [_resolved_argv0, *sys.argv[1:]])`.
 - Add `_self_heal_event`, register it with `selfheal`, spawn `_self_heal_watcher` in
-  `_run_with_control`'s task group (next to `_stop_watcher`). Watcher follows D5 ordering,
-  relays terminal frames to `_waiters`, ends in `_reexec()`.
-- **Failure handling (F2):** wrap `_reexec()` in try/except. If `os.execv` raises
-  (`OSError`), log at ERROR (`self-heal re-exec FAILED, continuing on old build vX: <err>`),
-  **re-open the backend** (`init_backend(db_path)`) so the server keeps serving, clear
-  `shutdown_requested`, and resume the drain loop. The server MUST keep working on the old
-  build rather than dying. This is the explicit "keep serving on the old build, log
-  loudly" requirement.
-- Acceptance: T7 (watcher ordering: drain finishes before backend close), T-E2E.
+  `_run_with_control`'s task group (next to `_stop_watcher`). Watcher follows D5 ordering.
+- **Waiter relay (A6):** after `shutdown_requested.set()` the watcher acquires
+  `writer_queue._lock` and sends the terminal "self-healing — re-issue" frame to every
+  `ch` in each pending `req._waiters`. Never touch `_pending`/`_waiters` without the lock.
+- **Failure handling (F2 + W2):** wrap the re-exec in try/except, AND handle the case where
+  `_reexec()` returns without exec'ing (A4 cap / A5 bad argv0). In both cases the server
+  must keep serving the old build. **W2 — lock-release ordering:** the F2 recovery
+  (`init_backend(db_path)` + clear `shutdown_requested` + resume drain) MUST run AFTER the
+  `async with backend_lock:` block has exited — the drain loop re-acquires `backend_lock`,
+  so re-opening the backend while still holding it would deadlock. Structure: do
+  `shutdown_backend()` and the waiter relay inside the lock; exit the lock; call `_reexec()`;
+  if it returns / raises, re-open the backend and clear `shutdown_requested` OUTSIDE the
+  lock. Log ERROR (`self-heal re-exec FAILED, continuing on old build vX: <err>`).
+- Acceptance: T7 (watcher ordering: drain finishes before backend close), T-F2/F8
+  (re-exec refusal keeps serving without deadlock), T-E2E.
 
-**Step 2.3** — Tool-entry hook.
-- Files: [`src/sqlcg/server/server.py`](src/sqlcg/server/server.py) main()/wiring, or
-  [`src/sqlcg/server/tools.py`](src/sqlcg/server/tools.py) `_get_backend()` per D3.
-- Grep-confirm the single interception point; show grep in the PR.
+**Step 2.3** — Tool-entry hook (A2).
+- Files: [`src/sqlcg/server/server.py`](src/sqlcg/server/server.py) `main()`.
+- Per D3: after `import sqlcg.server.tools`, wrap
+  `mcp._mcp_server.request_handlers[types.CallToolRequest]` with an async shim that calls
+  `maybe_self_heal()` then delegates to the saved original. Do NOT wrap
+  `mcp._mcp_server.call_tool` (a decorator factory) and do NOT use the `_get_backend()`
+  fallback.
+- Grep-confirm `request_handlers[types.CallToolRequest]` is the sole registered dispatch
+  path and the wrap installs once; show grep in the PR.
 - Acceptance: T-E2E (a tool call after a swap triggers re-exec).
 
 ---
@@ -323,12 +403,13 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
 | # | Mode | Handling |
 |---|------|----------|
 | F1 | On-disk version unreadable (`distributions()` returns None) | `detect_skew` returns `(False, …)`; never re-exec on an unknown version. |
-| F2 | `os.execv` raises | Catch `OSError`; log ERROR loudly; re-open backend, clear `shutdown_requested`, keep serving old build. Server never dies on a failed re-exec. |
+| F2 | `os.execv` raises (or `_reexec` returns without exec'ing) | Catch `OSError`; log ERROR loudly; **after exiting `backend_lock` (W2)** re-open backend, clear `shutdown_requested`, keep serving old build. Server never dies on a failed re-exec; never deadlocks on the lock. |
 | F3 | New request arrives mid-drain | `shutdown_requested` stops new drains; pending `wait=true` waiters get a terminal "self-healing — re-issue" frame; `wait=false` enqueues are dropped (fire-and-forget, re-issuable). |
 | F4 | DuckDB exclusive lock held across exec (issue #63) | Step D5.4 closes the connection under `backend_lock` BEFORE exec; the new image opens the DB cleanly. Covered by T-E2E asserting the re-exec'd server answers a query. |
 | F5 | Stale socket window during exec | `cleanup_control_files` unlinks `.sock`; new process re-binds. `mcp status` falls through to PID probe (R3) and finds the same live PID. |
 | F6 | WSL2 specifics | No WSL2-specific syscall is used; `os.execv` + `AF_UNIX` behave identically to native Linux. The only WSL2 note: file-watch/inode timing on the `.dist-info` swap — the 30 s throttle + lazy check absorb any filesystem latency. No special handling needed; documented so the reviewer doesn't expect a WSL2 branch. |
 | F7 | Windows | Self-heal path is `sys.platform != "win32"`-gated (matches existing control-socket gating). On Windows the detector still powers `mcp status`; the message/doc fallback applies. |
+| F8 | Re-exec loop (corrupt/partial install: new build still reports a skew → re-exec storm) | `SQLCG_SELF_HEAL_GENERATION` env counter incremented before each exec; `_reexec` refuses at `>= 3`, logs ERROR with a manual-restart instruction, and falls through to F2 (keep serving). Covered by T-F8. |
 
 ---
 
@@ -360,6 +441,11 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
   watcher does not call `shutdown_backend` until the lock is released (use a fake backend
   recording call order; assert `clear_all_tables`/commit precedes `close`). Mirrors the
   `_stop_watcher` test harness if one exists.
+- **T-F8** `_reexec()` with `SQLCG_SELF_HEAL_GENERATION=3` in env logs an ERROR and does
+  NOT call `os.execv` (monkeypatch `os.execv` to a recording stub; assert it was never
+  called and the generation guard message is logged).
+- **T-F2-argv0** `_reexec()` with `_resolved_argv0` pointing at a non-executable path logs
+  ERROR and does not call `os.execv` (A5 guard).
 
 ### E2E (PR 2) — subprocess, the hard part
 - **T-E2E** `test_selfheal_e2e.py` (under `tests/e2e/`):
@@ -372,8 +458,10 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
      B without re-importing).
   4. Send another tool call (or `status`); assert: (a) the response **still arrives** on
      the same stdio pipe — the client never reconnected — and (b) the server now reports
-     `version == B` (re-exec'd in place, same PID).
-  5. Assert the DB is openable by the re-exec'd process (proves F4 — lock released).
+     `version == B` (re-exec'd in place).
+  5. **PID preservation (W4):** read the pidfile before the swap and after the re-exec;
+     assert they contain the **same** PID (proves in-place `os.execv`, not a respawn).
+  6. Assert the DB is openable by the re-exec'd process (proves F4 — lock released).
 - **Note on the swap mechanism:** building a second real wheel is heavy; the reviewer
   should confirm whether the e2e edits the `.dist-info` METADATA Version (cheap, exercises
   the real `distributions()` read path) or stands up two wheels. Editing METADATA is the
@@ -391,9 +479,12 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
       reports B — no `/mcp` reconnect performed (T-E2E).
 - [ ] The re-exec'd process opens the DuckDB file successfully (no "could not set lock"
       error) — proving the connection was closed before exec (T-E2E, F4).
-- [ ] When `os.execv` fails, the server logs an ERROR naming both versions and continues
-      answering tool calls on the old build (T-F2 / observable log + a follow-up tool call
-      succeeds).
+- [ ] The re-exec'd process has the **same PID** as the pre-swap server (T-E2E, W4).
+- [ ] When `os.execv` fails or `_reexec` refuses, the server logs an ERROR and continues
+      answering tool calls on the old build with no deadlock (T-F2 / observable log + a
+      follow-up tool call succeeds).
+- [ ] `_reexec` refuses to loop more than 3 generations (`SQLCG_SELF_HEAL_GENERATION`),
+      logging a manual-restart instruction (T-F8).
 - [ ] `maybe_self_heal` scans disk at most once per `_SKEW_CHECK_INTERVAL_S` (T4).
 - [ ] `sqlcg install` prints the corrected reconnect message; no string promises
       automatic respawn (T-install).
@@ -411,10 +502,11 @@ scope (D7) ship as PR 1 if PR 2 is rejected.
 
 | Risk | Mitigation |
 |------|------------|
-| `importlib.metadata` caching returns stale on-disk version → never re-execs | D1 uses `distributions()` (re-walks finders); reviewer pins the exact non-memoised mechanism before coding. **Blocking item.** |
-| `os.execv` on a relocated venv re-resolves to old code | Re-exec the console-script path (`sys.argv[0]`), not `sys.executable -m`; the shim re-resolves the active venv. |
+| `importlib.metadata` caching returns stale on-disk version → never re-execs | RESOLVED (A1): `im.MetadataPathFinder.invalidate_caches()` before the `distributions()` scan clears the mtime-keyed `FastPath` cache, so a same-mtime `.dist-info` replacement is still observed. |
+| `os.execv` on a relocated venv re-resolves to old code | Re-exec the **absolute** console-script path captured at startup (`_resolved_argv0`, A5), not `sys.executable -m`; the shim re-resolves the active venv. |
 | Re-exec mid-drain corrupts the graph | Drain commits under `backend_lock` before `shutdown_backend`; DuckDB transaction is atomic — a not-yet-started drain is simply dropped. |
-| CLOEXEC on a server fd breaks the client pipe after exec | Developer confirms no `O_CLOEXEC` is set on fds 0/1/2; `os.dup` buffer is process-local and discarded by exec. |
+| CLOEXEC on a server fd breaks the client pipe after exec | RESOLVED (A3): fds 0/1/2 are CLOEXEC=False (verified) and survive exec; the `os.dup(1)` buffer is CLOEXEC=True by design and discarded by exec, then re-created at module scope. Developer asserts `os.get_inheritable(1) is True`. |
+| Re-exec storm on a corrupt install | RESOLVED (A4): `SQLCG_SELF_HEAL_GENERATION` env counter; `_reexec` refuses at `>= 3` (F8). |
 | Throttle masks a needed re-exec on a fully idle server | Acceptable: an idle server has no client traffic to serve stale; the next tool call re-execs within 30 s. Documented non-goal (no background timer). |
 | Scope too large for one PR | Split into PR 1 (message + detector) and PR 2 (re-exec); PR 1 is the fallback scope. |
 
@@ -431,12 +523,24 @@ unverified/untagged.
 
 ---
 
-## Blocking Questions (resolve before plan-reviewer sign-off)
+## Blocking Questions — RESOLVED by plan-reviewer (2026-06-11)
 
-1. **(D1)** Confirm `importlib.metadata.distributions()` is non-memoised on Python 3.12 in
-   this environment so a reinstall under the running interpreter is observed without an
-   explicit `invalidate_caches()`. If memoised, pin the cache-busting call.
-2. **(D3)** Confirm via grep the single tool-dispatch interception point that wraps every
-   `@mcp.tool()` call exactly once (FastMCP `_mcp_server.call_tool` vs `_get_backend()`).
-3. **(D7)** Decide whether PR 2 (re-exec) is in-scope for 1.20.0 or deferred, leaving PR 1
-   as the shipped scope.
+1. **(BQ1 / D1)** RESOLVED. `im.distributions()` re-reads disk via the mtime-keyed
+   `FastPath.lookup` cache, so an in-place `.dist-info` rewrite IS observed; the
+   defensive `im.MetadataPathFinder.invalidate_caches()` call (A1) handles same-mtime
+   replacements. Mechanism pinned in D1.
+2. **(BQ2 / D3)** RESOLVED. The single dispatch point is
+   `mcp._mcp_server.request_handlers[types.CallToolRequest]` (NOT `call_tool`, a decorator
+   factory). Wrap-the-handler pattern pinned in D3 / Step 2.3 (A2).
+3. **(BQ3 / D7)** RESOLVED. PR 2 (re-exec) ships in 1.20.0 after the A1–A6/W1–W2
+   amendments (all incorporated above); none requires a design change. PR 1 remains the
+   fallback if PR 2 is rejected.
+
+## Review Trail
+
+- **2026-06-11 — plan-reviewer: APPROVE-WITH-AMENDMENTS.** Amendments A1 (invalidate_caches
+  + corrected mechanism), A2 (request_handlers interception), A3 (CLOEXEC correction),
+  A4 (re-exec generation guard / F8), A5 (absolute argv0 captured at startup), A6 (waiter
+  relay under `writer_queue._lock`), and warnings W1 (mcp status uses `read_ondisk_version`
+  directly), W2 (F2 backend re-open outside `backend_lock`), W4 (PID-preservation e2e
+  assertion) all incorporated. Notes N1–N3 required no change. Plan is ready for developer.
