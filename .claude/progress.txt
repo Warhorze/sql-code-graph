@@ -1,9 +1,90 @@
 ## Current State [2026-06-11]
-ACTIVE AGENT: developer (complete — ready for compliance check)
-FEATURE: Phase 3 (PR 2) of sprint_lineage_identity_and_session_context — USE SCHEMA session context (scripting path) + LIKE catalog inheritance (fixes F2)
-PLAN: plan/sprints/sprint_lineage_identity_and_session_context.md (§PR 2 / Phase 3)
-BRANCH: feat/use-schema-session-context
-PR: (see below after push)
+ACTIVE AGENT: developer — HANDOFF (PR ready, shepherd follow-up complete)
+FEATURE: sprint_postmortem_fixes PR 1 — test-isolation + empty-index rollback guard (v1.18.1)
+PLAN: plan/sprints/sprint_postmortem_fixes.md (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: fix/test-isolation-and-empty-index-guard
+PR: https://github.com/Warhorze/sql-code-graph/pull/84
+
+## Handoff — developer: sprint_postmortem_fixes PR 1 shepherd follow-up [2026-06-11]
+
+SUMMARY: Shepherd-identified follow-up committed and pushed. 16 tests across 6
+files that bypassed the autouse isolation fixture (Step 1.1) by calling
+resolved_repo_root() without patching it are now self-isolated. Pattern: patch
+resolved_repo_root at each use site or seed an in-memory DuckDB via the existing
+fixture.
+
+FILES CHANGED (commit f91765a):
+  tests/unit/test_analyze_case_fold.py
+  tests/unit/test_find_cmd.py
+  tests/unit/test_hygiene_config_warning.py
+  tests/unit/test_noise_filter.py
+  tests/integration/test_pr3_kind_tagging.py
+  tests/integration/test_v1_14_0_dialect_and_query_config_fixes.py
+
+GATES (final, post shepherd follow-up):
+  1379 passed, 7 skipped, 3 xfailed, 0 failures (669 s).
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified.
+
+PR BODY: corrected — the false "16 pre-existing failures identical on master"
+  claim replaced with accurate explanation (failures were caused by PR's own
+  fixture; pass only when ~/.sqlcg/graph.db is populated; now self-isolated).
+
+VERSION: 1.18.0 → 1.18.1 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Handoff — developer: sprint_postmortem_fixes PR 1 (v1.18.1) [2026-06-11]
+
+SUMMARY: Implemented all 4 steps of PR 1 from sprint_postmortem_fixes.md.
+
+Step 1.1 — autouse DB-path isolation fixture:
+  NEW tests/conftest.py: autouse function-scoped fixture sets SQLCG_DB_PATH
+  and SQLCG_LOG_PATH under tmp_path for every test via monkeypatch.setenv.
+  Meta-tests: test_db_path_isolation_fixture.py verifies get_db_path() and
+  DbConfig.from_env() resolve under tmp_path, never Path.home().
+
+Step 1.2 (A2) — test_scenario_c route-helper patch:
+  Patched _try_route_index_via_server → return_value=False (mirrors pattern
+  at test_index_flags.py:43,108). Both Path.home() references removed:
+  - mock_config db_path was Path.home()/.sqlcg/graph.db → tmp_path/graph.db
+  - get_db_path patch value → tmp_path/graph.db
+  Asserts _try_route_index_via_server was called (observable wiring check).
+  No Path.home() reference remains in the test.
+
+Step 1.3 (N1) — uninstall force-path test isolation:
+  test_scenario_d_force_flag and test_uninstall_cmd_with_force_flag now:
+  - Redirect Path.home() via monkeypatch.setenv("HOME") to fake_home
+  - Create sentinel metrics.db under patched home (deleted by --force)
+  - Create stand-in sentinel under distinct directory (survives)
+  - Assert filesystem state: patched-home metrics.db absent, stand-in present.
+
+Step 1.4 (A1) — empty-index rollback guard:
+  indexer.py: 'files_found' key (= total_files) added to index_repo() summary.
+  writer._do_index: raises ValueError("refusing to index empty root — graph
+  preserved") when summary["files_found"] == 0, inside the open transaction()
+  so clear_all_tables() is rolled back. Error propagates to waiters via W7.
+  Integration tests in test_empty_index_rollback_guard.py:
+  - Empty-root drain rolls back; SqlTable count pre == post (observable).
+  - Non-empty drain commits normally (regression guard).
+  - Summary 'files_found' key correct for empty and non-empty roots.
+
+GATES: 1350 passed (1264 unit+integration + 86 e2e), 16 pre-existing failures
+  (confirmed identical on master), 7 skipped, 1 xfailed.
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified.
+
+VERSION: 1.18.0 → 1.18.1 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
 
 ## Handoff — developer: USE SCHEMA session context + LIKE inheritance (PR 2, v1.17.0) [2026-06-11]
 
@@ -3046,3 +3127,9 @@ GATES:
 
 NEXT: open PR against master; architect-planner compliance check on "finished".
 2026-06-11T10:42:49+02:00 architect-planner(main session): planned sprint_lineage_identity_and_session_context (F1 alias choke point, F2 USE SCHEMA+LIKE, F3 CTE namespacing, metrics-first). Next: plan-reviewer gate.
+
+[2026-06-11 shepherd: postmortem fix sprint]
+- architect-planner drafting plan/sprints/sprint_postmortem_fixes.md (P0-P3 from lineage_identity_sprint_postmortem.md)
+- pipeline: plan-reviewer gate -> developer per PR -> shepherd review -> merge
+- AFTER sprint complete (user request): dispatch developer to (1) reindex the DWH (/home/ignwrad/Projects/dwh, read-only, remember catalog load columns.csv), (2) regenerate table_graph.html from the fresh graph (no generator script exists; existing untracked table_graph.html is the template - inline `const links` data from table-level edges). Then user wants to identify "the job and its dependencies" from it.
+- tags v1.15.0-v1.18.0 still on hold (user verifies)

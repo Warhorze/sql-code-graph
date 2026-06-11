@@ -101,6 +101,16 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
 
     Patches KuzuConfig.from_env() to return a config with a tmp log_path;
     asserts that the FileHandler targets the configured path, not a hardcoded one.
+
+    A2 fix: both Path.home() references (mock_config db_path and get_db_path patch)
+    are replaced with tmp_path-based values so neither routing resolution nor the
+    KuzuConfig construction can reach the real ~/.sqlcg/ path.
+
+    Also patches _try_route_index_via_server → return_value=False (mirrors the
+    pattern at tests/unit/test_index_flags.py:43,108) so a live MCP server on the
+    host cannot route the index through the socket and bypass the mocks.
+
+    Guards plan/sprints/sprint_postmortem_fixes.md §PR-1 Step 1.2 (A2).
     """
     from unittest.mock import MagicMock, patch
 
@@ -110,8 +120,9 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
     from sqlcg.core.config import DbConfig as KuzuConfig
 
     log_file = tmp_path / "custom_index.log"
+    tmp_db_path = tmp_path / "graph.db"
     mock_config = KuzuConfig(
-        db_path=Path.home() / ".sqlcg" / "graph.db",
+        db_path=tmp_db_path,
         log_path=log_file,
     )
 
@@ -139,27 +150,38 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
         }
     )
 
+    route_mock = MagicMock(return_value=False)
+
     with (
         patch("sqlcg.cli.commands.index.DbConfig.from_env", return_value=mock_config),
         patch("sqlcg.cli.commands.index.get_backend", return_value=backend),
         patch(
             "sqlcg.cli.commands.index.get_db_path",
-            return_value=Path.home() / ".sqlcg" / "graph.db",
+            return_value=tmp_db_path,
         ),
         patch("sqlcg.cli.commands.index.Indexer", return_value=indexer_mock),
+        # Force the direct-write path: a live sqlcg server on the host machine
+        # would otherwise route this through the socket and bypass every mock
+        # below, making the test depend on host runtime state — and potentially
+        # wipe the real ~/.sqlcg/graph.db (Finding 5 / postmortem scenario C).
+        patch(
+            "sqlcg.cli.commands.index._try_route_index_via_server",
+            route_mock,
+        ),
     ):
         result = runner.invoke(app, ["index", str(tmp_path)])
 
     assert result.exit_code == 0, (
         f"index_cmd must exit cleanly. exit_code={result.exit_code}: {result.output}"
     )
-    # The FileHandler must have been created at the configured path
-    # (log file is created by FileHandler even when no warnings are emitted)
-    # We verify by checking that no hardcoded "index.log" reference exists in index.py
-    # The test passes if the command ran without error and no hardcoded path was used.
-    # Wiring verification: grep -n "index\.log" src/sqlcg/cli/commands/index.py must
-    # return zero results — path comes from KuzuConfig (verified by the patch above).
-    assert result.exit_code == 0
+    # _try_route_index_via_server must have been called (verifying wiring), and
+    # returned False so the direct-write path was taken.
+    assert route_mock.called, "_try_route_index_via_server must have been called by index_cmd."
+    # No Path.home() reference remains in the mock config; confirm it resolved
+    # under tmp_path only.
+    assert str(Path.home()) not in str(mock_config.db_path), (
+        "mock_config.db_path must not reference Path.home() — A2 fix applied."
+    )
 
 
 # ---------------------------------------------------------------------------

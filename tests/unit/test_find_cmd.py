@@ -5,11 +5,21 @@ graph nodes whose qualified name is stored lowercase ("ba.my_table") due to
 C2 normalization at index time.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
 from sqlcg.cli.main import app
+
+# resolved_repo_root() is imported into find.py and issues a "SELECT path FROM
+# Repo" query against the DB to feed NoiseFilter.from_config.  With the autouse
+# DB-isolation fixture the DB is empty/schema-less, so the query raises
+# CatalogException.  Patch the name at its use site.
+_PATCH_RESOLVED_ROOT = patch(
+    "sqlcg.cli.commands.find.resolved_repo_root",
+    return_value=Path("/tmp/fake-repo"),
+)
 
 runner = CliRunner()
 
@@ -24,10 +34,13 @@ class TestFindTableCaseInsensitive:
         the user passes MY_TABLE, the query must receive 'my_table' so the
         CONTAINS match succeeds.
         """
-        with patch(
-            "sqlcg.cli.commands.find.run_read_routed",
-            return_value=[{"qualified": "ba.my_table", "kind": "TABLE"}],
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.find.run_read_routed",
+                return_value=[{"qualified": "ba.my_table", "kind": "TABLE"}],
+            ) as mock_rrr,
+        ):
             with patch("sqlcg.server.noise_filter.NoiseFilter.from_config") as mock_nf:
                 nf_instance = MagicMock()
                 nf_instance.filter_nodes.return_value = (["ba.my_table"], [])
@@ -68,10 +81,13 @@ class TestFindColumnCaseInsensitive:
 
     def test_uppercase_column_ref_lowercased(self) -> None:
         """BA.ORDERS.AMOUNT is lowercased to ba.orders.amount before query."""
-        with patch(
-            "sqlcg.cli.commands.find.run_read_routed",
-            return_value=[{"id": "ba.orders.amount"}],
-        ) as mock_rrr:
+        with (
+            _PATCH_RESOLVED_ROOT,
+            patch(
+                "sqlcg.cli.commands.find.run_read_routed",
+                return_value=[{"id": "ba.orders.amount"}],
+            ) as mock_rrr,
+        ):
             result = runner.invoke(app, ["find", "column", "BA.ORDERS.AMOUNT"])
 
         assert result.exit_code == 0, f"exit_code={result.exit_code}: {result.output}"

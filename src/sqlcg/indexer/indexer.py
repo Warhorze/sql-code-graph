@@ -703,6 +703,7 @@ class Indexer:
         )
 
         result: dict = {
+            "files_found": total_files,
             "files_parsed": len(pass2_results),
             "pass2_skipped": pass2_skipped,
             "parse_errors": parse_errors,

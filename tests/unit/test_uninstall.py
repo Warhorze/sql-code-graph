@@ -106,7 +106,15 @@ class TestDatabaseDeletion:
         assert db_file.exists()
 
     def test_scenario_d_force_flag(self, tmp_path, monkeypatch):
-        """Scenario D: --force flag deletes without prompting."""
+        """Scenario D: --force flag deletes without prompting.
+
+        Patched-home sentinel is removed; a stand-in sentinel under a distinct
+        directory survives (proving only the patched home is touched, not some
+        real-home analog).
+
+        N1: assertion is on filesystem state, not "the patch target was called".
+        Guards plan/sprints/sprint_postmortem_fixes.md §PR-1 Step 1.3.
+        """
         db_file = tmp_path / "graph.db"
         db_file.write_text("fake-db")
 
@@ -118,14 +126,31 @@ class TestDatabaseDeletion:
         metrics_file = metrics_dir / "metrics.db"
         metrics_file.write_text("metrics")
 
+        # A "real-home stand-in" that must NOT be touched by the force delete.
+        standin_home = tmp_path / "standin_home"
+        standin_home.mkdir()
+        standin_metrics_dir = standin_home / ".sqlcg"
+        standin_metrics_dir.mkdir(parents=True)
+        standin_metrics_file = standin_metrics_dir / "metrics.db"
+        standin_metrics_file.write_text("standin-metrics")
+
         monkeypatch.setenv("HOME", str(fake_home))
 
         with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
             uninstall._step2_delete_database(force=True)
 
-        # Verify database file and metrics were deleted
+        # Verify database file and patched-home metrics were deleted.
         assert not db_file.exists()
-        assert not metrics_file.exists()
+        assert not metrics_file.exists(), (
+            "metrics.db under patched home must be deleted by --force."
+        )
+        # The stand-in sentinel under a distinct dir must still exist — this
+        # proves the production code only reaches Path.home() (which was
+        # redirected), not any other path.
+        assert standin_metrics_file.exists(), (
+            "metrics.db under the stand-in home must survive — only the "
+            "patched home is affected by the force-delete path."
+        )
 
     def test_scenario_d_force_flag_also_deletes_wal(self, tmp_path, monkeypatch):
         """Scenario D+: --force flag also deletes the .wal sibling if present."""
@@ -248,8 +273,16 @@ class TestUninstallCmdFunction:
 
         assert db_file.exists()  # Database should be kept
 
-    def test_uninstall_cmd_with_force_flag(self, tmp_path):
-        """Test uninstall with --force flag."""
+    def test_uninstall_cmd_with_force_flag(self, tmp_path, monkeypatch):
+        """Test uninstall with --force flag.
+
+        Patches Path.home() so the real ~/.sqlcg/metrics.db is never touched.
+        Filesystem assertion: patched-home metrics.db is absent after the run;
+        a stand-in sentinel under a distinct directory survives.
+
+        N1: assertion is on filesystem state, not "the patch target was called".
+        Guards plan/sprints/sprint_postmortem_fixes.md §PR-1 Step 1.3.
+        """
         settings_file = tmp_path / "settings.json"
         settings_data = {
             "mcpServers": {"sql-code-graph": {"command": "sqlcg", "args": ["mcp", "start"]}}
@@ -259,8 +292,36 @@ class TestUninstallCmdFunction:
         db_file = tmp_path / "graph.db"
         db_file.write_text("fake-db")
 
+        # Create a sentinel metrics.db under a fake home that the force-delete
+        # should remove.
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        fake_sqlcg = fake_home / ".sqlcg"
+        fake_sqlcg.mkdir(parents=True)
+        fake_metrics = fake_sqlcg / "metrics.db"
+        fake_metrics.write_text("fake-metrics")
+
+        # Create a stand-in under a *different* directory that must survive.
+        standin_home = tmp_path / "standin_home"
+        standin_home.mkdir()
+        standin_sqlcg = standin_home / ".sqlcg"
+        standin_sqlcg.mkdir(parents=True)
+        standin_metrics = standin_sqlcg / "metrics.db"
+        standin_metrics.write_text("standin-metrics")
+
+        # Redirect Path.home() to fake_home so the real ~/.sqlcg/metrics.db
+        # is never reached.  monkeypatch.setenv("HOME") achieves this without
+        # needing to patch the Path class itself.
+        monkeypatch.setenv("HOME", str(fake_home))
+
         with patch.object(uninstall, "_SETTINGS_PATH", settings_file):
             with patch.object(uninstall, "_get_db_path", return_value=str(db_file)):
                 uninstall.uninstall_cmd(keep_db=False, force=True, repo=tmp_path)
 
-        assert not db_file.exists()  # Database should be deleted
+        assert not db_file.exists(), "Database file must be deleted with --force."
+        assert not fake_metrics.exists(), (
+            "metrics.db under patched home must be removed by the force-delete path."
+        )
+        assert standin_metrics.exists(), (
+            "metrics.db under the stand-in home must survive — only the patched home is affected."
+        )
