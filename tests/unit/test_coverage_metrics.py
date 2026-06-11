@@ -35,7 +35,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 #
-# collect_coverage() issues 12 run_read_routed calls in this order (PR 1):
+# collect_coverage() issues 14 run_read_routed calls in this order (PR 1 + PR 4):
 #   1  catalog_coverage          {catalogued_tables, total_tables}
 #   2  edge_health (legacy)      {good_edges, total_edges}
 #   3  edge_health_strict        {good_edges_strict, total_edges}
@@ -48,6 +48,8 @@ except ImportError:
 #   10 degraded_parse_overall    {degraded, total}
 #   11 degraded_parse_by_dir     list of {top_dir, degraded, total}
 #   12 zero_edge_writes          {zero_edge_writes, total_write_queries}
+#   13 cte_collisions            {cte_collisions}   <- PR 4
+#   14 rescuable_unqualified     {rescuable_unqualified}  <- PR 4
 # ---------------------------------------------------------------------------
 
 _CANNED_ROWS = [
@@ -69,6 +71,9 @@ _CANNED_ROWS = [
         {"top_dir": "ddl", "degraded": 100, "total": 130},
     ],
     [{"zero_edge_writes": 92, "total_write_queries": 500}],
+    # PR 4 — identity health counters
+    [{"cte_collisions": 218}],
+    [{"rescuable_unqualified": 828}],
 ]
 
 
@@ -193,6 +198,9 @@ def test_coverage_metrics_collect_handles_empty_graph():
         [{"degraded": 0, "total": 0}],
         [],
         [{"zero_edge_writes": 0, "total_write_queries": 0}],
+        # PR 4 — identity health counters
+        [{"cte_collisions": 0}],
+        [{"rescuable_unqualified": 0}],
     ]
     with patch(
         "sqlcg.cli.coverage.run_read_routed",
