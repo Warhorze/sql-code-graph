@@ -1,9 +1,9 @@
 ## Current State [2026-06-11]
-ACTIVE AGENT: developer (complete — ready for compliance check)
-FEATURE: Phase 3 (PR 2) of sprint_lineage_identity_and_session_context — USE SCHEMA session context (scripting path) + LIKE catalog inheritance (fixes F2)
-PLAN: plan/sprints/sprint_lineage_identity_and_session_context.md (§PR 2 / Phase 3)
-BRANCH: feat/use-schema-session-context
-PR: (see below after push)
+ACTIVE AGENT: developer
+FEATURE: sprint_postmortem_fixes PR 1 — test-isolation + empty-index rollback guard (v1.18.1)
+PLAN: plan/sprints/sprint_postmortem_fixes.md (REVIEWED/APPROVED-WITH-AMENDMENTS)
+BRANCH: fix/test-isolation-and-empty-index-guard
+PR: n/a (in progress)
 
 ## Handoff — developer: USE SCHEMA session context + LIKE inheritance (PR 2, v1.17.0) [2026-06-11]
 
@@ -3046,3 +3046,9 @@ GATES:
 
 NEXT: open PR against master; architect-planner compliance check on "finished".
 2026-06-11T10:42:49+02:00 architect-planner(main session): planned sprint_lineage_identity_and_session_context (F1 alias choke point, F2 USE SCHEMA+LIKE, F3 CTE namespacing, metrics-first). Next: plan-reviewer gate.
+
+[2026-06-11 shepherd: postmortem fix sprint]
+- architect-planner drafting plan/sprints/sprint_postmortem_fixes.md (P0-P3 from lineage_identity_sprint_postmortem.md)
+- pipeline: plan-reviewer gate -> developer per PR -> shepherd review -> merge
+- AFTER sprint complete (user request): dispatch developer to (1) reindex the DWH (/home/ignwrad/Projects/dwh, read-only, remember catalog load columns.csv), (2) regenerate table_graph.html from the fresh graph (no generator script exists; existing untracked table_graph.html is the template - inline `const links` data from table-level edges). Then user wants to identify "the job and its dependencies" from it.
+- tags v1.15.0-v1.18.0 still on hold (user verifies)
