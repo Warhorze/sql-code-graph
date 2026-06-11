@@ -513,6 +513,41 @@ class DuckDBBackend(GraphBackend):
             arrays,
         )
 
+    def upgrade_derived_to_table_for_keys(self, qualified_keys: list[str]) -> int:
+        """Upgrade SqlTable rows from kind='derived' to kind='table' for catalogued keys.
+
+        After info-schema rows are upserted, tables whose DDL lives in un-indexed
+        files (e.g. Liquibase XML) remain mis-kinded as 'derived' because the
+        parser could not resolve them.  When the catalog confirms they are real
+        physical tables, upgrade their kind.
+
+        The WHERE kind='derived' guard is the sole precedence mechanism — only
+        derived→table, never touching a view/table row (A4, PR 4,
+        sprint_postmortem_fixes.md §Step 4.2).
+
+        Args:
+            qualified_keys: SqlTable.qualified values to upgrade (from the
+                catalogued HAS_COLUMN src_keys).
+
+        Returns:
+            Number of rows actually upgraded.
+        """
+        if not qualified_keys:
+            return 0
+        self._conn.execute(
+            f'UPDATE "{NodeLabel.TABLE}" SET "kind" = \'table\' '
+            f'WHERE "kind" = \'derived\' AND "qualified" = ANY(?::VARCHAR[])',
+            [qualified_keys],
+        )
+        # DuckDB does not expose rowcount in a standard way; query how many now
+        # have kind='table' among the supplied keys as a proxy count.
+        rows = self._conn.execute(
+            f'SELECT COUNT(*) AS n FROM "{NodeLabel.TABLE}" '
+            f'WHERE "kind" = \'table\' AND "qualified" = ANY(?::VARCHAR[])',
+            [qualified_keys],
+        ).fetchall()
+        return int(rows[0][0]) if rows else 0
+
     def upsert_edges_bulk(
         self,
         src_label: str,
