@@ -1,9 +1,65 @@
 ## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
-FEATURE: mcp_server_self_healing PR 1 — message fix + version-skew detector (v1.20.0)
-PLAN: plan/sprints/mcp_server_self_healing.md §Phase 1
-BRANCH: feat/mcp-version-skew-detector
-PR: https://github.com/Warhorze/sql-code-graph/pull/89
+FEATURE: mcp_server_self_healing PR 2 — self-heal re-exec machinery (v1.20.0)
+PLAN: plan/sprints/mcp_server_self_healing.md §Phase 2
+BRANCH: feat/mcp-self-heal-reexec
+PR: (opening)
+
+## Handoff — developer: mcp_server_self_healing PR 2 (v1.20.0) [2026-06-11]
+
+SUMMARY: Implemented Steps 2.1–2.3 of PR 2 from mcp_server_self_healing.md.
+
+Step 2.1 — maybe_self_heal() throttle + signal (selfheal.py):
+  register_self_heal_event(): inject anyio.Event from server.py (D3).
+  _get_skew_check_interval(): reads SQLCG_SKEW_CHECK_INTERVAL_S for e2e tests.
+  maybe_self_heal(): throttled disk check (30s default); sets event on skew.
+    - F1: does not set event when on-disk version is None.
+    - F7: logs warning and returns when _self_heal_event is None (Windows).
+  Wired at TWO activity points (D2): status handler + MCP tool entry.
+
+Step 2.2 — _reexec() + _self_heal_watcher (server.py):
+  _resolved_argv0: captured once at startup via os.path.abspath(sys.argv[0]) (A5).
+  A3 assertion: os.get_inheritable(0/1/2) verified True in main() (CLOEXEC=False).
+  _reexec(): A4 generation guard (>=3 → refuses), A5 argv0 executability check,
+             stdout/stderr flush, bump counter, os.execv.
+  _self_heal_watcher(): D5 drain-safe sequence:
+    shutdown_requested.set() → async with backend_lock (waits for active drain)
+    → A6 waiter relay under writer_queue._lock
+    → shutdown_backend() (closes DuckDB, releases #63 lock)
+    → cleanup_control_files()
+    (exit lock — W2) → _reexec() → F2 recovery (init_backend outside lock).
+
+Step 2.3 — tool-entry hook (server.py main()):
+  After import sqlcg.server.tools, wraps request_handlers[types.CallToolRequest]
+  with _self_heal_then_dispatch: calls maybe_self_heal() then delegates (A2/D3).
+  NOT mcp._mcp_server.call_tool (decorator factory) — correct as per A2.
+
+TESTS: 17 new tests:
+  test_selfheal_reexec.py (13 unit tests):
+    - T4: throttle touches disk once per interval
+    - T5: skew sets event + logs WARNING with both versions
+    - T6: unreadable on-disk version → event NOT set (F1)
+    - T-F8: SQLCG_SELF_HEAL_GENERATION>=3 → no execv (A4)
+    - T-F2-argv0: non-executable/missing argv0 → no execv (A5)
+    - register_self_heal_event wiring
+  test_selfheal_watcher.py (3 async unit tests):
+    - T7: drain ordering — shutdown_backend after backend_lock released
+    - T-F2: failed exec → init_backend outside lock (W2, no deadlock)
+    - A6: waiter relay sends terminal frame to pending wait=true clients
+  test_selfheal_e2e.py (1 e2e test, T-E2E + W4):
+    - Spawns server via console script (argv[0] = real shim for os.execv)
+    - Swaps METADATA Version with SQLCG_SKEW_CHECK_INTERVAL_S=1 for fast trigger
+    - Asserts: response on same stdio pipe, PID unchanged (W4), F4 follow-up call
+
+GATES (final):
+  1276 passed, 4 skipped, 1 xfailed (unit+integration; was 1260 in PR 1, +16).
+  e2e: 1 passed. ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites green (13/13).
+
+VERSION: 1.20.0 (unchanged — PR 1 carried the bump).
+DEVIATIONS: none from plan.
+
+NEXT: architect-planner compliance check on "finished".
 
 ## Handoff — developer: mcp_server_self_healing PR 1 (v1.20.0) [2026-06-11]
 

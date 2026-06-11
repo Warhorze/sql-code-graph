@@ -1,17 +1,90 @@
-"""Version-skew detector for the MCP server self-healing feature (issue #76).
+"""Version-skew detector and self-heal trigger for the MCP server (issue #76).
 
-PR 1 ships `read_ondisk_version()` and `detect_skew()` — pure detection, no
-re-exec machinery.  The re-exec path (`maybe_self_heal`, `_self_heal_watcher`,
-`_reexec`) ships in PR 2 under the same 1.20.0 version.
+PR 1 shipped ``read_ondisk_version()`` and ``detect_skew()`` — pure detection,
+no re-exec machinery.  PR 2 adds ``maybe_self_heal()`` (throttled trigger) and
+the ``register_self_heal_event()`` injection point used by ``server.py``.
 
-See plan/sprints/mcp_server_self_healing.md §Design D1.
+The re-exec sequence itself (``_reexec``, ``_self_heal_watcher``) lives in
+``server.py`` because it needs direct access to ``backend_lock``,
+``shutdown_requested``, and the ``writer_queue``.
+
+See plan/sprints/mcp_server_self_healing.md §Design D1–D3.
 """
 
 from __future__ import annotations
 
 import importlib.metadata as im
+import os
+import time
+from typing import TYPE_CHECKING
 
 from sqlcg import __version__
+from sqlcg.utils.logging import getLogger
+
+if TYPE_CHECKING:
+    import anyio
+
+logger = getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Throttle constant
+# ---------------------------------------------------------------------------
+
+
+def _get_skew_check_interval() -> float:
+    """Return the skew check interval in seconds.
+
+    Reads ``SQLCG_SKEW_CHECK_INTERVAL_S`` env var for testing overrides;
+    falls back to the production default of 30 s (D2).
+    """
+    try:
+        return float(os.environ.get("SQLCG_SKEW_CHECK_INTERVAL_S", "30.0"))
+    except (ValueError, TypeError):
+        return 30.0
+
+
+_SKEW_CHECK_INTERVAL_S: float = 30.0
+"""Minimum seconds between on-disk version checks (D2).
+
+A ``distributions()`` scan takes ~1–5 ms; bounding it to once / 30 s makes
+it invisible even under rapid tool-call bursts, while still re-execing
+within 30 s of a reinstall on the next activity.
+
+Override with ``SQLCG_SKEW_CHECK_INTERVAL_S`` env var (used in e2e tests).
+"""
+
+# ---------------------------------------------------------------------------
+# Module-level state
+# ---------------------------------------------------------------------------
+
+_last_skew_check: float = 0.0
+"""Monotonic timestamp of the last on-disk version scan."""
+
+_self_heal_event: anyio.Event | None = None
+"""Injected by server.py once the anyio event loop is running (D3).
+
+``maybe_self_heal()`` sets this event to signal ``_self_heal_watcher``
+to begin the drain-safe quiescence + re-exec sequence.
+"""
+
+
+def register_self_heal_event(event: anyio.Event) -> None:
+    """Inject the anyio.Event that maybe_self_heal() will set on detected skew.
+
+    Called by ``server.py`` ``main()`` after ``anyio.run`` starts the event loop
+    (before the task group is created), so ``maybe_self_heal()`` can signal
+    ``_self_heal_watcher`` without blocking the event loop.
+
+    Args:
+        event: The ``anyio.Event`` whose ``.set()`` triggers the self-heal watcher.
+    """
+    global _self_heal_event
+    _self_heal_event = event
+
+
+# ---------------------------------------------------------------------------
+# On-disk version reader (D1, A1)
+# ---------------------------------------------------------------------------
 
 
 def read_ondisk_version() -> str | None:
@@ -53,6 +126,11 @@ def read_ondisk_version() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Skew detector (D1)
+# ---------------------------------------------------------------------------
+
+
 def detect_skew() -> tuple[bool, str, str | None]:
     """Compare the on-disk distribution version against the running process's baked-in version.
 
@@ -64,10 +142,68 @@ def detect_skew() -> tuple[bool, str, str | None]:
       skew signal).
     - ``ondisk_version`` is the result of ``read_ondisk_version()``.
 
-    Guards PR-plan/sprints/mcp_server_self_healing.md §D1 / Step 1.3.
+    Guards plan/sprints/mcp_server_self_healing.md §D1 / Step 1.3.
     """
     ondisk = read_ondisk_version()
     if ondisk is None:
         return (False, __version__, None)
     skew = ondisk != __version__
     return (skew, __version__, ondisk)
+
+
+# ---------------------------------------------------------------------------
+# Throttled trigger (D2, D3, Step 2.1)
+# ---------------------------------------------------------------------------
+
+
+def maybe_self_heal() -> None:
+    """Throttled version-skew check called at MCP tool entry and control-socket status.
+
+    **Common (no-skew) path** — returns immediately with one monotonic subtract.
+    Scans disk at most once per ``_SKEW_CHECK_INTERVAL_S`` seconds (D2).
+
+    On detected skew: logs at WARNING with both versions and sets
+    ``_self_heal_event`` to signal ``_self_heal_watcher`` in ``server.py`` to
+    begin the drain-safe quiescence + re-exec sequence (D3, D5).
+
+    **Threading safety:** this function is synchronous and non-blocking.  It
+    only sets an ``anyio.Event``; the heavy drain + exec happens in the async
+    ``_self_heal_watcher`` task.  Never call this from inside the drain body.
+
+    F1 guard: if ``read_ondisk_version()`` returns ``None`` (distribution
+    unreadable), no event is set — never re-exec on an unknown version.
+
+    F7: on Windows, ``_self_heal_event`` is ``None`` (watcher not started).
+    The disk check still fires (and is throttled) so ``mcp status`` can observe
+    skew; we just cannot act on it with re-exec.  We log at WARNING and return.
+
+    Guards plan/sprints/mcp_server_self_healing.md §D2 / §Step 2.1.
+    """
+    global _last_skew_check
+
+    # Throttle — first statement so a hot caller pays only a monotonic subtract.
+    now = time.monotonic()
+    if now - _last_skew_check < _get_skew_check_interval():
+        return
+    _last_skew_check = now
+
+    skew, running, ondisk = detect_skew()
+    if not skew:
+        return
+
+    # Skew detected.
+    logger.warning(
+        "version skew detected: running=%s ondisk=%s — scheduling re-exec",
+        running,
+        ondisk,
+    )
+
+    if _self_heal_event is None:
+        # Windows or event not yet registered — cannot re-exec; log and return.
+        logger.warning(
+            "self-heal event not registered (Windows or pre-startup call) — "
+            "re-exec skipped; restart the MCP server manually"
+        )
+        return
+
+    _self_heal_event.set()

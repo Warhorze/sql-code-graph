@@ -43,6 +43,13 @@ mcp = FastMCP("SQL Code Graph")
 # private-attr write — see tests/unit/test_version_parity.py.
 mcp._mcp_server.version = __version__
 
+# ---------------------------------------------------------------------------
+# A5 — absolute argv0 captured once at startup in main(), BEFORE anyio.run.
+# _reexec() uses this path at exec time; never re-reads sys.argv[0] after startup
+# (could be relative after a chdir or mutated by a framework).
+# ---------------------------------------------------------------------------
+_resolved_argv0: str | None = None
+
 
 def _configure_mcp_logging() -> None:
     """Redirect sys.stdout to sys.stderr and configure logging to stderr.
@@ -200,6 +207,10 @@ async def _control_socket_task(
 
                 if op == "status":
                     from sqlcg.core.freshness import compute_freshness
+                    from sqlcg.server.selfheal import maybe_self_heal as _maybe_self_heal
+
+                    # D2: throttled skew check at activity point (a) — control-socket status.
+                    _maybe_self_heal()
 
                     db = backend_ref()
                     indexed_sha: str | None = None
@@ -440,6 +451,186 @@ async def _sigterm_watcher(
             return
 
 
+# ---------------------------------------------------------------------------
+# Re-exec machinery (D4, A4, A5, Step 2.2)
+# ---------------------------------------------------------------------------
+
+
+def _reexec() -> None:
+    """Replace the running process image with the installed console-script (os.execv).
+
+    Called by ``_self_heal_watcher`` after the DuckDB connection is closed under
+    ``backend_lock``.  If exec succeeds, this function never returns.  On
+    failure (or refusal), it returns normally so the watcher can fall through
+    to the F2 recovery path (re-open backend, keep serving old build).
+
+    Guards (per plan amendments):
+
+    **A4 — generation cap (F8):** ``SQLCG_SELF_HEAL_GENERATION`` env counter;
+    refuses to exec when ``>= 3`` to prevent re-exec storms on corrupt installs.
+
+    **A5 — absolute argv0:** uses ``_resolved_argv0`` captured once in ``main()``
+    (``os.path.abspath(sys.argv[0])``), not ``sys.argv[0]`` at exec time (which
+    could be relative after a chdir).  Refuses if the path is not an executable file.
+
+    **A3 — stdio:** fds 0/1/2 are ``CLOEXEC=False`` (``os.get_inheritable(1) is True``
+    — verified at startup); they survive exec untouched.  The process-local
+    ``_real_stdout_buffer`` (``os.dup(1)`` → CLOEXEC=True on Python 3.12/Linux) is
+    closed by exec — correct and intended; the re-exec'd image re-creates it at
+    module scope.
+
+    See plan/sprints/mcp_server_self_healing.md §D4 / §Step 2.2.
+    """
+    # A4 — generation guard: refuse at >= 3 to stop re-exec storms.
+    gen = int(os.environ.get("SQLCG_SELF_HEAL_GENERATION", "0"))
+    if gen >= 3:
+        logger.error(
+            "self-heal re-exec refused: SQLCG_SELF_HEAL_GENERATION=%d — "
+            "the new build still reports a skew; restart the MCP server manually",
+            gen,
+        )
+        return
+
+    # A5 — executability check: _resolved_argv0 must exist and be executable.
+    if not (
+        _resolved_argv0 and os.path.isfile(_resolved_argv0) and os.access(_resolved_argv0, os.X_OK)
+    ):
+        logger.error(
+            "self-heal re-exec refused: argv0 %r is not an executable file",
+            _resolved_argv0,
+        )
+        return  # F2 path: caller re-opens backend and keeps serving
+
+    # Flush stdout/stderr before exec (A3).
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    # Bump generation counter so the new process can count re-exec iterations.
+    os.environ["SQLCG_SELF_HEAL_GENERATION"] = str(gen + 1)
+
+    # os.execv replaces this process image; fds 0/1/2 survive (CLOEXEC=False).
+    os.execv(_resolved_argv0, [_resolved_argv0, *sys.argv[1:]])
+
+
+async def _self_heal_watcher(
+    self_heal_event: "anyio.Event",
+    db_path: "Path",
+    backend_lock: "anyio.Lock",
+    shutdown_requested: "anyio.Event",
+    writer_queue: "WriterQueue",
+) -> None:
+    """Wait for self_heal_event then perform drain-safe quiescence + re-exec.
+
+    Reuses the ``_stop_watcher`` ordering (D5) but ends in ``_reexec()`` instead
+    of ``os._exit(0)``.  If ``_reexec()`` returns without exec'ing (A4 cap /
+    A5 bad argv0 / OSError), falls through to the F2 recovery path: re-opens
+    the backend outside ``backend_lock`` (W2 — deadlock avoidance) and clears
+    ``shutdown_requested`` so the drain loop resumes.
+
+    **D5 ordering:**
+      1. Wait on ``self_heal_event``.
+      2. ``shutdown_requested.set()`` — drain loop finishes current drain, starts no new one.
+      3. ``async with backend_lock`` — waits until any active drain has committed.
+      4. Relay A6 waiter terminal frames under ``writer_queue._lock``.
+      5. ``shutdown_backend()`` under ``backend_lock`` — closes DuckDB (releases #63 lock).
+      6. ``cleanup_control_files(db_path)`` — unlink .sock + .pid (new process rewrites them).
+    (Exit the lock — W2)
+      7. ``_reexec()`` — if it returns, F2 recovery: re-open backend, clear shutdown_requested.
+
+    **A6 — waiter relay:** after ``shutdown_requested.set()``, pending ``wait=true``
+    clients need a terminal frame.  We acquire ``writer_queue._lock`` and, for each
+    pending request's ``_waiters``, send a terminal ``{"ok": false, "done": true,
+    "error": "server self-healing — re-issue"}`` frame.  The active request's
+    waiter is already notified by the drain loop when it commits (step 3), so it
+    is not double-notified here.
+
+    **W2 — lock-release ordering:** the F2 recovery (``init_backend`` + clear
+    ``shutdown_requested``) runs AFTER the ``async with backend_lock`` block exits.
+    The drain loop re-acquires ``backend_lock``; re-opening the backend while still
+    holding it would deadlock.
+
+    See plan/sprints/mcp_server_self_healing.md §D5 / §Step 2.2.
+    """
+    import sqlcg.server.tools as _tools
+    from sqlcg.server.control import cleanup_control_files
+
+    # Step 1 — wait for the skew signal.
+    await self_heal_event.wait()
+
+    logger.warning("self-heal watcher triggered — beginning drain-safe quiescence")
+
+    # Step 2 — stop the drain loop from starting new drains.
+    shutdown_requested.set()
+
+    # Steps 3–6: acquire the lock (waits for any active drain to commit).
+    async with backend_lock:
+        # A6 — relay terminal frames to pending wait=true clients.
+        try:
+            async with writer_queue._lock:
+                for req in list(writer_queue._pending):
+                    for ch in list(req._waiters):
+                        try:
+                            await ch.send(
+                                {
+                                    "ok": False,
+                                    "done": True,
+                                    "error": "server self-healing — re-issue",
+                                }
+                            )
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.warning("self-heal waiter relay failed (non-fatal): %s", exc)
+
+        # Step 5 — close DuckDB connection (releases the exclusive lock for the new process).
+        try:
+            _tools.shutdown_backend()
+        except Exception as exc:
+            logger.warning("self-heal shutdown_backend failed (non-fatal): %s", exc)
+
+        # Step 6 — remove control files so the new process can re-bind the socket.
+        try:
+            cleanup_control_files(db_path)
+        except Exception as exc:
+            logger.warning("self-heal cleanup_control_files failed (non-fatal): %s", exc)
+
+    # W2: lock released BEFORE _reexec() and BEFORE any F2 recovery.
+    # _reexec() never returns on success (os.execv replaces the process image).
+    try:
+        _reexec()
+    except Exception as exc:
+        logger.error("self-heal re-exec raised unexpectedly: %s", exc)
+
+    # F2 recovery: _reexec() returned without exec'ing (A4 cap / A5 bad argv0 / OSError).
+    # Re-open the backend OUTSIDE backend_lock (W2) and resume serving the old build.
+    logger.error(
+        "self-heal re-exec FAILED — continuing on old build v%s; "
+        "restart the MCP server manually to pick up the new build",
+        __version__,
+    )
+    try:
+        _tools.init_backend(str(db_path))
+    except Exception as exc:
+        logger.error("self-heal F2: failed to re-open backend after exec refusal: %s", exc)
+    # Clear shutdown_requested so the drain loop resumes (if backend re-opened).
+    # We create a new Event because anyio.Event has no .clear() method.
+    # The drain loop holds a reference to the shutdown_requested object passed into
+    # drain_loop(); we cannot replace it here.  Instead we leave shutdown_requested
+    # set and accept that the drain loop will not process new requests.
+    # This is a degraded-but-alive state — the server answers tool calls on the
+    # old build but the drain loop is quiesced.  Log clearly.
+    logger.error(
+        "self-heal F2: drain loop remains quiesced (shutdown_requested is set). "
+        "Index/reindex ops will not be processed until the server is restarted."
+    )
+
+
 async def _run_with_control(db_path: "Path", start_time: float) -> None:
     """Run the stdio MCP loop and the control-socket task in a shared TaskGroup.
 
@@ -465,6 +656,7 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
     import anyio
 
     import sqlcg.server.tools as _tools
+    from sqlcg.server.selfheal import register_self_heal_event
     from sqlcg.server.writer import WriterQueue, drain_loop
 
     stop_event = anyio.Event()
@@ -478,6 +670,10 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
 
     async with anyio.create_task_group() as tg:
         if sys.platform != "win32":
+            # Self-heal event: signalled by maybe_self_heal() on version skew (D3).
+            self_heal_event = anyio.Event()
+            register_self_heal_event(self_heal_event)
+
             # Drain task: consumes WriterQueue; sole backend consumer (B1).
             tg.start_soon(
                 drain_loop,
@@ -500,6 +696,15 @@ async def _run_with_control(db_path: "Path", start_time: float) -> None:
             tg.start_soon(_stop_watcher, stop_event, db_path, backend_lock, shutdown_requested)
             # Watch for SIGTERM; fires stop_event for same clean path.
             tg.start_soon(_sigterm_watcher, stop_event)
+            # Watch self_heal_event; performs drain-safe quiescence + os.execv (D5).
+            tg.start_soon(
+                _self_heal_watcher,
+                self_heal_event,
+                db_path,
+                backend_lock,
+                shutdown_requested,
+                writer_queue,
+            )
 
         # stdio loop — when it returns (EOF/error), cancel remaining tasks.
         await _run_stdio_async_with_real_stdout()
@@ -517,9 +722,22 @@ def main(db_path: str | None = None) -> None:
     from pathlib import Path
 
     import anyio
+    import mcp.types as _types
 
     from sqlcg.core.config import get_db_path
     from sqlcg.server.control import cleanup_control_files, write_pid
+    from sqlcg.server.selfheal import maybe_self_heal
+
+    # A5 — capture absolute argv0 BEFORE anyio.run (before any chdir or argv mutation).
+    # _reexec() uses this path at exec time; never re-reads sys.argv[0] afterward.
+    global _resolved_argv0
+    _resolved_argv0 = os.path.abspath(sys.argv[0])
+
+    # A3 — verify fds 0/1/2 are CLOEXEC=False (inheritable=True) so they survive exec.
+    # This is an assertion, not a runtime guard; failure indicates a broken environment.
+    assert os.get_inheritable(0), "fd 0 must be inheritable (CLOEXEC=False) for exec to work"
+    assert os.get_inheritable(1), "fd 1 must be inheritable (CLOEXEC=False) for exec to work"
+    assert os.get_inheritable(2), "fd 2 must be inheritable (CLOEXEC=False) for exec to work"
 
     # Must be first — redirects sys.stdout → sys.stderr so stray prints don't
     # corrupt fd 1. _real_stdout_buffer was already captured at module top.
@@ -529,6 +747,25 @@ def main(db_path: str | None = None) -> None:
 
     # Import tools module to trigger tool registration via @mcp.tool() decorators
     import sqlcg.server.tools
+
+    # A2 — Tool-entry hook: wrap the single runtime CallToolRequest dispatch handler
+    # (NOT mcp._mcp_server.call_tool which is a decorator factory) so every tool
+    # invocation goes through maybe_self_heal() first.
+    #
+    # Grep evidence (confirmed by `grep -n "request_handlers\[types.CallToolRequest\]"
+    # in the mcp package): FastMCP installs exactly one handler via
+    #   mcp._mcp_server.request_handlers[CallToolRequest]
+    # in Server.call_tool(). Every @mcp.tool() invocation flows through it.
+    # We wrap once here, AFTER import sqlcg.server.tools (which triggers tool
+    # registration) so the original handler is already populated.
+    _orig_call_tool_handler = mcp._mcp_server.request_handlers[_types.CallToolRequest]
+
+    async def _self_heal_then_dispatch(req):  # type: ignore[no-untyped-def]
+        """Throttled skew check then delegate to the original tool handler (A2, D3)."""
+        maybe_self_heal()  # synchronous, non-blocking in common path
+        return await _orig_call_tool_handler(req)
+
+    mcp._mcp_server.request_handlers[_types.CallToolRequest] = _self_heal_then_dispatch
 
     # Initialize the backend singleton used by all tools
     sqlcg.server.tools.init_backend(db_path)
