@@ -10,11 +10,18 @@ Two modes:
 Gates on schema version like the watch command (same reset+reinit message).
 """
 
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from sqlcg.core.graph_db import GraphBackend
 
 console = Console()
 
@@ -23,6 +30,20 @@ console = Console()
 # 300 s covers that with headroom while keeping the wait bounded on a wedged server.
 # This is a CLI transport bound, NOT a DbConfig/indexer constant.
 _NOTIFY_SOCKET_TIMEOUT_S = 300
+
+# Set by the parent (foreground hook) process on the re-spawned detached child so it
+# does not detach again — the child runs the direct synchronous path to completion
+# inside its own session (#77). Absence means "spawn a detached child if needed".
+_HOOK_DETACHED_ENV = "SQLCG_HOOK_DETACHED"
+
+# Bounded retry/backoff for the detached child hitting "Database is locked" because
+# the *previous* hook resync (e.g. from a rapid second checkout) is still finishing.
+# 5 attempts with 1/2/4/8/16s sleeps cover ~31s — comfortably above the ~89s p50 but
+# this targets the short window where two checkouts overlap, not a wedged process;
+# a still-locked DB after this exhausts visibly logs failure (#77 requirement 4/5)
+# rather than silently leaving the graph stale.
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BACKOFF_BASE_S = 1
 
 
 def reindex_cmd(  # noqa: B008
@@ -101,6 +122,16 @@ def reindex_cmd(  # noqa: B008
     if _routed:
         return
 
+    # #77 — no server is live and this is the hook path (--notify): the direct
+    # synchronous resync below would run in the foreground of `git checkout`/
+    # `git merge` and block it for the full resync time. Detach into a background
+    # process that runs the same invocation to completion (with the lock-retry
+    # below) and return to git immediately. The respawn guard env var prevents
+    # the detached child from detaching again.
+    if _is_hook_path and os.environ.get(_HOOK_DETACHED_ENV) != "1":
+        _spawn_detached_hook_resync(path)
+        return
+
     if not quiet and not config_file_present(path):
         console.print(
             f"[yellow]No .sqlcg.toml found at {path}/.sqlcg.toml — "
@@ -111,7 +142,8 @@ def reindex_cmd(  # noqa: B008
     db_path = get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with get_backend() as backend:
+    backend = _open_backend_with_lock_retry() if _is_hook_path else get_backend()
+    with backend:
         backend.init_schema()
 
         # Schema-version gate (mirrors watch.py)
@@ -191,6 +223,106 @@ def reindex_cmd(  # noqa: B008
                     f"-{summary['deleted']} deleted, "
                     f"{summary['closure_resolved']} closure files re-resolved"
                 )
+
+
+def _hook_resync_log_path() -> Path:
+    """Return the log file path for detached hook resyncs.
+
+    Derived from ``get_db_path()``'s parent directory (CLAUDE.md: never hardcode
+    a path independently of the config module) — same directory as the DB file,
+    e.g. ``~/.sqlcg/hook-resync.log``.
+    """
+    from sqlcg.core.config import get_db_path
+
+    return get_db_path().parent / "hook-resync.log"
+
+
+def _respawn_argv() -> list[str]:
+    """Build the argv to re-exec for the detached hook resync (#77).
+
+    ``sys.argv[0]`` is normally the resolved ``sqlcg`` console-script path
+    the hook invoked directly — re-exec it as-is. When ``sys.argv[0]`` is a
+    non-executable module entry point (``python -m sqlcg`` -> ``__main__.py``,
+    used in tests/dev), re-exec via ``sys.executable -m sqlcg`` instead.
+    """
+    argv0 = Path(sys.argv[0])
+    if argv0.name == "__main__.py" or not os.access(argv0, os.X_OK):
+        return [sys.executable, "-m", "sqlcg", *sys.argv[1:]]
+    return [sys.argv[0], *sys.argv[1:]]
+
+
+def _spawn_detached_hook_resync(path: Path) -> None:
+    """Re-spawn this reindex invocation as a detached background process (#77).
+
+    Re-execs ``sys.argv`` (the same ``sqlcg reindex --notify ...`` command the
+    hook invoked) in a new session, with stdin from ``/dev/null`` and
+    stdout/stderr appended to the hook-resync log file. The respawn guard env
+    var (``SQLCG_HOOK_DETACHED=1``) is set on the child so it runs the direct
+    synchronous path to completion instead of detaching again.
+
+    The parent (this process, running in the foreground of the git hook)
+    returns immediately after printing a single status line — git checkout/
+    merge is not blocked.
+
+    ``sys.argv[0]`` is normally the resolved ``sqlcg`` console-script path
+    the hook invoked (see ``_resolve_sqlcg_bin`` in git.py). When invoked via
+    ``python -m sqlcg`` (e.g. in tests/dev), ``sys.argv[0]`` is the
+    non-executable ``__main__.py`` — re-exec via ``sys.executable -m sqlcg``
+    instead so Popen does not hit ``PermissionError``.
+    """
+    log_path = _hook_resync_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    argv = _respawn_argv()
+    env = dict(os.environ)
+    env[_HOOK_DETACHED_ENV] = "1"
+
+    with open(log_path, "ab") as log_file:
+        subprocess.Popen(  # noqa: S603
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            env=env,
+            cwd=str(path),
+            start_new_session=True,
+        )
+
+    console.print(f"sqlcg: resyncing graph in background (log: {log_path})")
+
+
+def _open_backend_with_lock_retry() -> "GraphBackend":
+    """Open the DuckDB backend, retrying with backoff if it is locked.
+
+    The detached hook-resync child can race a previous hook resync that is
+    still finishing (e.g. two rapid checkouts). ``get_backend()`` raises
+    ``duckdb.IOException`` synchronously when the file is locked by another
+    process. Retry a bounded number of times with exponential backoff
+    (``_LOCK_RETRY_ATTEMPTS`` attempts, ``_LOCK_RETRY_BACKOFF_BASE_S * 2**n``
+    seconds between attempts — ~31 s total).
+
+    If the lock is still held after all retries, log the failure clearly to
+    the hook-resync log (so a stale graph is never silent — #77 requirement 5)
+    and exit non-zero.
+    """
+    import duckdb
+
+    from sqlcg.core.config import get_backend
+
+    last_exc: duckdb.IOException | None = None
+    for attempt in range(_LOCK_RETRY_ATTEMPTS):
+        try:
+            return get_backend()
+        except duckdb.IOException as exc:
+            last_exc = exc
+            if attempt < _LOCK_RETRY_ATTEMPTS - 1:
+                time.sleep(_LOCK_RETRY_BACKOFF_BASE_S * (2**attempt))
+
+    console.print(
+        f"[red]sqlcg: hook resync failed — database still locked after "
+        f"{_LOCK_RETRY_ATTEMPTS} attempts: {last_exc}[/red]"
+    )
+    raise typer.Exit(1)
 
 
 def _try_route_reindex_via_server(
