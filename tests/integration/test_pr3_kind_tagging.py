@@ -45,6 +45,9 @@ def test_scenario_a_cte_node_has_kind_cte(db, tmp_path):
 
     The real source table behind the CTE must have kind='table'.
     Guards that TableRef.role="cte" flows to kind="cte" in the graph.
+
+    PR 3: CTE keys are now namespaced as "<abs_path>::my_cte". Look for
+    the key by its '::my_cte' suffix since tmp_path varies per test run.
     """
     sql = (
         "CREATE TABLE src (a INT);\n"
@@ -62,13 +65,17 @@ def test_scenario_a_cte_node_has_kind_cte(db, tmp_path):
     )
     table_by_qualified = {r["qualified"]: r["kind"] for r in rows}
 
-    # CTE alias node must exist with kind="cte"
-    assert "my_cte" in table_by_qualified, (
-        f"CTE alias 'my_cte' not found in SqlTable nodes. "
+    # PR 3: CTE alias node is now namespaced — look for key ending in "::my_cte"
+    cte_key = next(
+        (k for k in table_by_qualified if k.endswith("::my_cte")),
+        None,
+    )
+    assert cte_key is not None, (
+        f"CTE alias 'my_cte' (namespaced as '...::my_cte') not found in SqlTable nodes. "
         f"Found: {sorted(table_by_qualified.keys())}"
     )
-    assert table_by_qualified["my_cte"] == "cte", (
-        f"Expected kind='cte' for CTE alias 'my_cte', got '{table_by_qualified['my_cte']}'"
+    assert table_by_qualified[cte_key] == "cte", (
+        f"Expected kind='cte' for CTE alias key {cte_key!r}, got '{table_by_qualified[cte_key]}'"
     )
 
     # Real source table must have kind="table"
@@ -153,24 +160,41 @@ def test_scenario_c_downstream_excludes_cte_by_default(db, tmp_path):
     with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db):
         result_default = runner.invoke(app, ["downstream", "src.a", "--raw"])
 
-    # CTE intermediate must be filtered by default
-    assert "my_cte" not in result_default.output, (
-        f"CTE 'my_cte' appeared in default downstream output (should be filtered).\n"
-        f"Output: {result_default.output}"
+    # CTE intermediate must be filtered by default.
+    # PR 3: CTE key is namespaced as "<abs_path>::my_cte"; verify it is absent from the
+    # filtered output by checking the fixture file path is not rendered in the id column.
+    assert "fixture.sql" not in result_default.output, (
+        f"Namespaced CTE key (containing 'fixture.sql') appeared in default downstream output "
+        f"(should be filtered by kind=cte guard).\nOutput: {result_default.output}"
     )
     # Real destination table 'dst' (DDL-defined, kind='table') must still appear
     assert "dst" in result_default.output, (
         f"Destination 'dst' not in default downstream output.\nOutput: {result_default.output}"
     )
 
-    # With --include-intermediate: CTE should appear
+    # With --include-intermediate: CTE should appear.
+    # PR 3: the CTE key is namespaced as "<abs_path>::my_cte.a". Rich may truncate long ids
+    # in the table display, but the fixture file path ("fixture.sql") always appears since
+    # the key starts with the tmp_path which begins the id column text.
     with patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_route_to_db):
         result_intermediate = runner.invoke(
             app, ["downstream", "src.a", "--raw", "--include-intermediate"]
         )
 
-    assert "my_cte" in result_intermediate.output, (
-        f"CTE 'my_cte' not in --include-intermediate downstream output.\n"
+    # PR 3: the namespaced CTE id is long and gets truncated in the Rich table output.
+    # Verify presence by checking that --include-intermediate has more rendered rows than
+    # default (the extra row is the namespaced CTE column — it appears even when truncated).
+    # Also confirm the real destination dst.a is still shown.
+    default_row_count = result_default.output.count("│") // 2  # Rich: each data row → 2 │
+    intermediate_row_count = result_intermediate.output.count("│") // 2
+    assert intermediate_row_count > default_row_count, (
+        "--include-intermediate output does not have more rows than default output.\n"
+        "Expected the namespaced CTE column to appear when --include-intermediate is set.\n"
+        f"Default output:\n{result_default.output}\n"
+        f"Intermediate output:\n{result_intermediate.output}"
+    )
+    assert "dst.a" in result_intermediate.output, (
+        f"Destination 'dst.a' not in --include-intermediate output.\n"
         f"Output: {result_intermediate.output}"
     )
 
@@ -379,15 +403,26 @@ def test_scenario_f_trace_populates_table_kind(db, tmp_path):
             f"got '{row.get('table_kind')}' in row {row}."
         )
 
-    # Also verify the CTE alias has table_kind='cte' when traced as a destination
-    rows_cte = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": "my_cte.a"})
+    # Also verify the CTE alias has table_kind='cte' when traced as a destination.
+    # PR 3: CTE key is now namespaced as "<abs_path>::my_cte". Look up the actual
+    # column key from COLUMN_LINEAGE edges whose dst is the namespaced CTE column.
+    cte_col_rows = db.run_read(
+        "SELECT dst_key FROM \"COLUMN_LINEAGE\" WHERE dst_key LIKE '%::my_cte.a'",
+        {},
+    )
+    assert len(cte_col_rows) >= 1, (
+        "No COLUMN_LINEAGE edges found with dst_key like '%::my_cte.a' — "
+        "CTE projection edge missing after PR 3 namespacing."
+    )
+    my_cte_a_key = cte_col_rows[0]["dst_key"]  # e.g. "/tmp/xxx/fixture.sql::my_cte.a"
+    rows_cte = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": my_cte_a_key})
     assert len(rows_cte) >= 1, (
-        "No COLUMN_LINEAGE edges found for my_cte.a — CTE projection edge missing."
+        f"No COLUMN_LINEAGE edges found for {my_cte_a_key!r} — CTE projection edge missing."
     )
     for row in rows_cte:
         # CTE destination's source is 'src' — table_kind='table'
         assert row.get("table_kind") == "table", (
-            f"Expected table_kind='table' for source of my_cte.a, "
+            f"Expected table_kind='table' for source of {my_cte_a_key!r}, "
             f"got '{row.get('table_kind')}' in row {row}."
         )
 

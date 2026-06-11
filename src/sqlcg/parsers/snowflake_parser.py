@@ -441,6 +441,9 @@ class SnowflakeParser(AnsiParser):
         out.parse_quality = ParseQuality.SCRIPTING_FALLBACK
         out.errors.append("parse_mode:scripting_block")
 
+        # PR 3 — CTE/derived namespacing: set namespace for the duration of this parse call.
+        self._current_file_namespace = str(path)
+
         # --- Step 3.1: build position-aware USE schema context map ---
         # Scan the raw SQL for USE schema-setter statements and record (offset, schema).
         # The list is sorted by offset (finditer guarantees left-to-right order).
@@ -538,4 +541,6 @@ class SnowflakeParser(AnsiParser):
                 logger.debug("Failed to parse extracted DML from %s: %s", path, exc)
                 out.errors.append(f"dml_extraction_error:{exc}")
 
+        # PR 3 — clear namespace after parsing
+        self._current_file_namespace = None
         return out

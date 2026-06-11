@@ -57,13 +57,16 @@ class TableRef:
     name: str = ""
     alias: str | None = None
     role: str = "table"
+    namespace: str | None = None  # PR 3: per-file CTE/derived namespacing
 
     def __post_init__(self) -> None:
         """Normalize identity components to lowercase.
 
         C2 design: lowercase catalog, db, and name so that full_id and graph keys
         are lowercase, matching the schema side (ARCHITECTURE_REVIEW §2.6).
-        alias is NOT lowercased — it is not an identity field.
+        alias and namespace are NOT lowercased — they are not identity components
+        that need case-folding (namespace is a file path, already lowercase-safe;
+        alias is not an identity field).
         """
         if self.catalog is not None:
             object.__setattr__(self, "catalog", self.catalog.lower())
@@ -76,11 +79,21 @@ class TableRef:
     def full_id(self) -> str:
         """Return the fully qualified table identifier.
 
-        Includes all non-None components: catalog.db.name or db.name or name.
-        Used as the Table.qualified key in the graph.
+        For real tables: catalog.db.name or db.name or name.
+        For CTE/derived nodes (role in ("cte", "derived")) with a namespace set:
+        prefixes ``{namespace}::`` to produce a per-file-scoped key, e.g.
+        ``etl/sql/fact/wtfa_loonkosten.sql::final``.  This prevents same-named
+        CTEs in different files from sharing a graph node (F3 trust defect,
+        sprint_lineage_identity_and_session_context.md §PR 3).
+
+        ``db/catalog`` semantics are untouched — namespace only fires when
+        role != "table" so physical tables remain fully-qualified as before.
         """
         parts = [p for p in (self.catalog, self.db, self.name) if p]
-        return ".".join(parts)
+        bare = ".".join(parts)
+        if self.namespace and self.role != "table":
+            return f"{self.namespace}::{bare}"
+        return bare
 
     @property
     def qualified(self) -> str:
@@ -440,6 +453,11 @@ class SqlParser(ABC):
         self._schema = schema_resolver
         self._schema_aliases: dict[str, str] = schema_aliases or {}
         self._log = getLogger(f"{__name__}.{self.__class__.__name__}")
+        # PR 3 — CTE/derived namespacing: repo-relative path of the file currently
+        # being parsed.  Set at the start of parse_file; consumed by
+        # _extract_column_lineage when constructing CTE/derived TableRefs.
+        # None outside of an active parse_file call.
+        self._current_file_namespace: str | None = None
 
     @abstractmethod
     def parse_file(self, path: Path, sql: str) -> ParsedFile:
@@ -675,6 +693,7 @@ class SqlParser(ABC):
         out: ParsedFile,
         inferred_from_source_name: bool = False,
         transform: str = "SELECT",
+        cte_alias_names: frozenset[str] | None = None,
     ) -> list[LineageEdge]:
         """Walk the sqlglot LineageNode tree and emit LineageEdge objects.
 
@@ -685,6 +704,15 @@ class SqlParser(ABC):
 
         Each leaf in the tree represents a source column. The walk stops at
         nodes whose source is a Table (a real table reference, not a CTE alias).
+
+        Args (new):
+            cte_alias_names: names of CTEs defined in the same statement body.
+                When provided and a leaf source matches a CTE alias name, the
+                TableRef is constructed with role="cte" and namespace=
+                self._current_file_namespace (PR 3). This ensures that when
+                scope-building fails and sg_lineage returns a CTE name as an
+                opaque table, the emitted src key uses the same namespaced form
+                as the CTE projection edges — keeping the chain joinable.
 
         Args:
             root: The LineageNode returned by sg_lineage()
@@ -716,7 +744,9 @@ class SqlParser(ABC):
             else:
                 # Leaf node — extract the source table and column
                 try:
-                    src_table_ref = self._lineage_node_to_table_ref(node)
+                    src_table_ref = self._lineage_node_to_table_ref(
+                        node, cte_alias_names=cte_alias_names
+                    )
                     if src_table_ref is None:
                         return
                     src_col_name = (
@@ -772,14 +802,25 @@ class SqlParser(ABC):
             )
         )
 
-    def _lineage_node_to_table_ref(self, node: Any) -> "TableRef | None":
+    def _lineage_node_to_table_ref(
+        self,
+        node: Any,
+        cte_alias_names: "frozenset[str] | None" = None,
+    ) -> "TableRef | None":
         """Extract a TableRef from a sqlglot LineageNode's source attribute.
 
         Args:
             node: sqlglot.lineage.Node instance
+            cte_alias_names: Optional set of CTE alias names in the current statement.
+                When provided, a leaf source whose name matches a CTE alias is returned
+                as a namespaced CTE TableRef (role="cte", namespace=
+                self._current_file_namespace) rather than a plain table ref.
+                This ensures outer-SELECT edges use the same namespaced key as the
+                CTE projection edges, keeping the hop chain joinable (PR 3).
 
         Returns:
-            TableRef if source is a real Table, None for subqueries or CTEs
+            TableRef if source is a real Table (or a CTE alias when cte_alias_names
+            is given), None for subqueries or anonymous CTEs
         """
         import sqlglot.expressions as exp
 
@@ -787,11 +828,25 @@ class SqlParser(ABC):
         if source is None:
             return None
         if isinstance(source, exp.Table):
+            name = source.name if hasattr(source, "name") else str(source)
+            # PR 3: if this table name matches a CTE alias in the current statement
+            # AND we have a namespace, produce a namespaced CTE TableRef so the
+            # outer-SELECT edge key matches the CTE projection edge's dst key.
+            if (
+                cte_alias_names is not None
+                and name.lower() in cte_alias_names
+                and self._current_file_namespace is not None
+            ):
+                return TableRef(
+                    name=name,
+                    role="cte",
+                    namespace=self._current_file_namespace,
+                )
             return self._apply_table_alias(
                 TableRef(
                     catalog=source.catalog if hasattr(source, "catalog") else None,
                     db=source.db if hasattr(source, "db") else None,
-                    name=source.name if hasattr(source, "name") else str(source),
+                    name=name,
                 )
             )
         # Subquery or CTE — return None (cannot resolve to a concrete table)
@@ -897,11 +952,15 @@ class SqlParser(ABC):
             # Example: WITH x AS (SELECT a FROM src), y AS (SELECT a FROM x)
             # When processing the outer SELECT referencing y, we need both x and y
             # to be in combined_sources so sqlglot can expand them.
+            # PR 3: track CTE alias names so _lineage_node_to_edges can namespace them
+            # when sg_lineage returns a CTE name as an opaque table source (fallback path).
+            cte_alias_names: frozenset[str] = frozenset()
             if isinstance(body, exp.Select) and body.args.get("with_"):
                 with_clause = body.args.get("with_")
                 if with_clause and hasattr(with_clause, "expressions"):
                     cte_expressions = getattr(with_clause, "expressions", None)
                     if cte_expressions:
+                        _cte_names: set[str] = set()
                         for cte in cte_expressions:
                             cte_alias = cte.alias
                             # Accept both Select and Union as CTE bodies
@@ -909,6 +968,8 @@ class SqlParser(ABC):
                                 # Use lowercase key to match the sources_map convention
                                 key = cte_alias.lower()
                                 combined_sources[key] = cte.this
+                                _cte_names.add(key)
+                        cte_alias_names = frozenset(_cte_names)
 
             # Build body_scope ONCE per statement, before the column loop, and reuse
             # it for every column (CLAUDE.md invariant: "body_scope built once per
@@ -1071,6 +1132,7 @@ class SqlParser(ABC):
                                 path=path,
                                 out=out,
                                 transform=_ins_transform,
+                                cte_alias_names=cte_alias_names,
                             )
                             edges.extend(_new_edges)
                     except Exception:
@@ -1183,6 +1245,7 @@ class SqlParser(ABC):
                                     out=out,
                                     inferred_from_source_name=False,
                                     transform=_b_transform,
+                                    cte_alias_names=cte_alias_names,
                                 )
                                 edges.extend(_b_new_edges)
                         except Exception:
@@ -1319,6 +1382,7 @@ class SqlParser(ABC):
                             out=out,
                             inferred_from_source_name=_is_unmapped_no_list_insert,
                             transform=col_transform,
+                            cte_alias_names=cte_alias_names,
                         )
                         edges.extend(new_edges)
                         if not new_edges:
@@ -1362,8 +1426,15 @@ class SqlParser(ABC):
                             cte_alias = cte.alias
                             if not cte_alias:
                                 continue
-                            # Treat the CTE as a synthetic destination table (role="cte")
-                            cte_dst_table = TableRef(name=cte_alias, role="cte")
+                            # Treat the CTE as a synthetic destination table (role="cte").
+                            # PR 3: set namespace so each CTE gets a per-file-scoped key
+                            # (e.g. "etl/sql/fact/wtfa.sql::final") preventing same-named
+                            # CTEs in different files from sharing one graph node.
+                            cte_dst_table = TableRef(
+                                name=cte_alias,
+                                role="cte",
+                                namespace=self._current_file_namespace,
+                            )
                             # The CTE's body is its SELECT expression (or UNION ALL, etc.)
                             cte_body = cte.this
                             # Accept both Select and Union (UNION ALL / UNION DISTINCT)
@@ -1396,13 +1467,29 @@ class SqlParser(ABC):
                             # call qualify/build_scope, preserving O(1) per CTE body.
                             # This set is reused across all projections to detect ambiguity
                             # (#49 mis-bind override).
-                            cte_source_tables: list[TableRef] = [
-                                ref
-                                for t in cte_body.find_all(exp.Table)
-                                if t.name  # skip anonymous / subquery placeholders
-                                for ref in (self._table_node_to_ref(t),)
-                                if ref is not None
-                            ]
+                            # PR 3: when a table name matches a CTE alias, produce a
+                            # namespaced CTE TableRef so the ambiguous-edge src key matches
+                            # the CTE projection's dst key (keeping the chain joinable).
+                            cte_source_tables: list[TableRef] = []
+                            for _t in cte_body.find_all(exp.Table):
+                                if not _t.name:
+                                    continue
+                                _tname = _t.name.lower()
+                                if (
+                                    _tname in cte_alias_names
+                                    and self._current_file_namespace is not None
+                                ):
+                                    cte_source_tables.append(
+                                        TableRef(
+                                            name=_t.name,
+                                            role="cte",
+                                            namespace=self._current_file_namespace,
+                                        )
+                                    )
+                                else:
+                                    _ref = self._table_node_to_ref(_t)
+                                    if _ref is not None:
+                                        cte_source_tables.append(_ref)
 
                             # For each projection in the CTE, extract lineage.
                             # Only iterate projections from left branch for column names, but pass
@@ -1479,13 +1566,18 @@ class SqlParser(ABC):
                                         dialect=self.DIALECT,
                                     )
                                     if root:
-                                        # Emit edges with dst = CTE name
+                                        # Emit edges with dst = CTE name.
+                                        # PR 3: pass cte_alias_names so that CTE-to-CTE
+                                        # source refs in this body are namespaced, keeping
+                                        # the chain joinable (e.g. j's body references u →
+                                        # src key must be namespace::u.m not bare u.m).
                                         cte_edges = self._lineage_node_to_edges(
                                             root,
                                             dst_col_name=cte_col_name,
                                             dst_table=cte_dst_table,
                                             path=path,
                                             out=out,
+                                            cte_alias_names=cte_alias_names,
                                         )
                                         # Tag edges as CTE projections
                                         # (transform is read-only, so create new edges)

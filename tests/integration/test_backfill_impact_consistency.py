@@ -173,29 +173,55 @@ def test_raw_topology_two_hop_relay_through_synthetic_cte_nodes(indexed_db):
     as an earlier draft of the plan assumed and Phase 1 found does not
     reproduce). Also pins the empty-SELECTS_FROM signature that is the root
     cause of defect 1.
+
+    PR 3 (sprint_lineage_identity_and_session_context.md §PR 3): CTE keys are
+    now namespaced with the defining file path (e.g. "/tmp/.../01_insert_b.sql::cte_b").
+    The two-hop relay topology is unchanged; only the key format changed.
     """
-    db, _ = indexed_db
+    db, tmp_path = indexed_db
     edges = _raw_lineage_edges(db)
     pairs = {(e["src_key"], e["dst_key"]) for e in edges}
 
+    # PR 3: look up the actual namespaced CTE qualified keys from the graph.
+    # The keys are now "{abs_path_to_file}::cte_alias" rather than bare "cte_b".
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE kind = 'cte' ORDER BY qualified",
+        {},
+    )
+    cte_keys = {r["qualified"] for r in cte_rows}
+    cte_b_key = next(k for k in cte_keys if k.endswith("::cte_b"))
+    cte_c_key = next(k for k in cte_keys if k.endswith("::cte_c"))
+
     # Two-hop relay for the tableA -> tableB link: tablea -> cte_b -> tableb.
-    assert ("s.tablea.id", "cte_b.id") in pairs, "producer -> cte_b leg missing"
-    assert ("cte_b.id", "s.tableb.id") in pairs, "cte_b -> consumer leg missing"
+    assert ("s.tablea.id", f"{cte_b_key}.id") in pairs, (
+        f"producer -> cte_b leg missing. cte_b_key={cte_b_key!r}, pairs={sorted(pairs)[:10]}"
+    )
+    assert (f"{cte_b_key}.id", "s.tableb.id") in pairs, (
+        f"cte_b -> consumer leg missing. cte_b_key={cte_b_key!r}"
+    )
     # NOT a parallel direct edge (the unreproduced "topology fact" — Deviation 1).
     assert ("s.tablea.id", "s.tableb.id") not in pairs, (
         "no direct producer->consumer edge exists; the bridge is two-hop through cte_b"
     )
 
     # Two-hop relay for the tableB -> tableC link: tableb -> cte_c -> tablec.
-    assert ("s.tableb.id", "cte_c.id") in pairs, "producer -> cte_c leg missing"
-    assert ("cte_c.id", "s.tablec.id") in pairs, "cte_c -> consumer leg missing"
+    assert ("s.tableb.id", f"{cte_c_key}.id") in pairs, (
+        f"producer -> cte_c leg missing. cte_c_key={cte_c_key!r}"
+    )
+    assert (f"{cte_c_key}.id", "s.tablec.id") in pairs, (
+        f"cte_c -> consumer leg missing. cte_c_key={cte_c_key!r}"
+    )
     assert ("s.tableb.id", "s.tablec.id") not in pairs, (
         "no direct producer->consumer edge exists; the bridge is two-hop through cte_c"
     )
 
     # The synthetic nodes are RELAYS (have outgoing edges), not dead-end leaves.
-    assert _has_outgoing_lineage(edges, _CTE_B), "cte_b must have an outgoing edge (it is a relay)"
-    assert _has_outgoing_lineage(edges, _CTE_C), "cte_c must have an outgoing edge (it is a relay)"
+    assert _has_outgoing_lineage(edges, cte_b_key), (
+        "cte_b must have an outgoing edge (it is a relay)"
+    )
+    assert _has_outgoing_lineage(edges, cte_c_key), (
+        "cte_c must have an outgoing edge (it is a relay)"
+    )
 
     # Control: the direct view edge exists (proves the corpus has a non-CTE consumer).
     assert ("s.tablea.id", "s.v_consumer.id") in pairs, "control view edge missing"
@@ -212,14 +238,22 @@ def test_raw_topology_two_hop_relay_through_synthetic_cte_nodes(indexed_db):
 
 def test_raw_topology_synthetic_nodes_are_cte_kind(indexed_db):
     """The synthetic nodes carry the authoritative kind="cte" marker
-    (the basis for _exclude_synthetic_tables — never alias-string matching)."""
+    (the basis for _exclude_synthetic_tables — never alias-string matching).
+
+    PR 3: keys are now namespaced; look them up from the graph rather than
+    comparing to the static bare-name constants.
+    Guards sprint_lineage_identity_and_session_context.md §PR 3.
+    """
     db, _ = indexed_db
     rows = db.run_read(
-        'SELECT qualified, kind FROM "SqlTable" WHERE qualified = ANY(?)',
-        {"qualifieds": [_CTE_B, _CTE_C]},
+        "SELECT qualified, kind FROM \"SqlTable\" WHERE kind = 'cte' "
+        "AND (qualified LIKE '%::cte_b' OR qualified LIKE '%::cte_c')",
+        {},
     )
-    kinds = {r["qualified"]: r["kind"] for r in rows}
-    assert kinds == {_CTE_B: "cte", _CTE_C: "cte"}
+    kinds = {r["qualified"].split("::")[-1]: r["kind"] for r in rows}
+    assert kinds == {"cte_b": "cte", "cte_c": "cte"}, (
+        f"Expected two CTE nodes with kind='cte', got: {rows}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,11 +287,17 @@ def test_backfill_order_is_causal_not_alphabetical(indexed_db):
 def test_synthetic_cte_nodes_excluded_from_change_scope_and_backfill(indexed_db):
     """The synthetic cte_b/cte_c nodes appear in NEITHER get_change_scope's
     affected_tables NOR get_backfill_order's backfill_order — and ARE
-    reported under noise_excluded so the information is not silently dropped."""
+    reported under noise_excluded so the information is not silently dropped.
+
+    PR 3: CTE keys are now namespaced (e.g. "/tmp/.../01_insert_b.sql::cte_b"),
+    so we check noise_excluded using suffix matching instead of bare-name equality.
+    Guards sprint_lineage_identity_and_session_context.md §PR 3.
+    """
     scope = tools.get_change_scope(_TARGET)
     backfill = tools.get_backfill_order(_TARGET)
 
     for synthetic in (_CTE_B, _CTE_C):
+        # bare name must not appear (neither bare nor namespaced should surface as rebuildable)
         assert synthetic not in scope.affected_tables, (
             f"{synthetic} (kind=cte) must not surface as a rebuildable table: "
             f"{scope.affected_tables}"
@@ -265,8 +305,17 @@ def test_synthetic_cte_nodes_excluded_from_change_scope_and_backfill(indexed_db)
         assert synthetic not in backfill.backfill_order, (
             f"{synthetic} (kind=cte) must not surface in backfill order: {backfill.backfill_order}"
         )
-        assert synthetic in scope.noise_excluded
-        assert synthetic in backfill.noise_excluded
+        # PR 3: noise_excluded contains namespaced keys; check by suffix
+        assert any(k == synthetic or k.endswith(f"::{synthetic}") for k in scope.noise_excluded), (
+            f"Expected '{synthetic}' (or namespaced variant) in "
+            f"noise_excluded: {scope.noise_excluded}"
+        )
+        assert any(
+            k == synthetic or k.endswith(f"::{synthetic}") for k in backfill.noise_excluded
+        ), (
+            f"Expected '{synthetic}' (or namespaced variant) in backfill.noise_excluded: "
+            f"{backfill.noise_excluded}"
+        )
 
     # Real downstream members and the control view ARE present (not over-excluded).
     assert _PRODUCER in scope.affected_tables
@@ -333,10 +382,14 @@ def test_scope_change_shares_and_resolves_both_defects_transitively(indexed_db):
     assert result.backfill_order.index(_PRODUCER) < result.backfill_order.index(_CONSUMER)
 
     # Synthetic exclusion, both directions.
+    # PR 3: noise_excluded contains namespaced keys; check by suffix
     for synthetic in (_CTE_B, _CTE_C):
         assert synthetic not in result.downstream_blast_radius
         assert synthetic not in result.backfill_order
-        assert synthetic in result.noise_excluded
+        assert any(k == synthetic or k.endswith(f"::{synthetic}") for k in result.noise_excluded), (
+            f"Expected '{synthetic}' (or namespaced variant) in "
+            f"scope_change.noise_excluded: {result.noise_excluded}"
+        )
 
 
 def test_diff_impact_shares_and_resolves_both_defects(indexed_db):
@@ -356,13 +409,17 @@ def test_diff_impact_shares_and_resolves_both_defects(indexed_db):
         f"producer must precede consumer: {result.backfill_order}"
     )
 
+    # PR 3: noise_excluded contains namespaced keys; check by suffix
     for synthetic in (_CTE_B, _CTE_C):
         assert synthetic not in result.affected_tables, (
             f"{synthetic} (kind=cte) must not surface in diff_impact.affected_tables: "
             f"{result.affected_tables}"
         )
         assert synthetic not in result.backfill_order
-        assert synthetic in result.noise_excluded
+        assert any(k == synthetic or k.endswith(f"::{synthetic}") for k in result.noise_excluded), (
+            f"Expected '{synthetic}' (or namespaced variant) in "
+            f"diff_impact.noise_excluded: {result.noise_excluded}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -423,5 +480,8 @@ def test_multi_producer_fanin_introduces_no_spurious_cycle(indexed_fanin_db):
         f"benign multi-producer fan-in must not degrade to the cycle fallback: {result.hint}"
     )
     # The synthetic merge-CTE node must still be excluded from this radius too.
+    # PR 3: noise_excluded contains namespaced keys; check by suffix.
     assert "cte_m" not in result.backfill_order
-    assert "cte_m" in result.noise_excluded
+    assert any(k == "cte_m" or k.endswith("::cte_m") for k in result.noise_excluded), (
+        f"Expected 'cte_m' (or namespaced variant) in noise_excluded: {result.noise_excluded}"
+    )

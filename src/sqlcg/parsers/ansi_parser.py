@@ -111,6 +111,12 @@ class AnsiParser(SqlParser):
         """
         out = ParsedFile(path=path, dialect=self.DIALECT)
 
+        # PR 3 — CTE/derived namespacing: set the current-file namespace so that
+        # _extract_column_lineage can stamp CTE/derived TableRefs with it.
+        # Uses str(path) as the unique per-file identifier; cleared after parsing so
+        # no stale namespace leaks across calls to the same parser instance.
+        self._current_file_namespace = str(path)
+
         # Parse all statements in the file using the hook (allows subclass overrides)
         statements, parse_errors = self._do_parse(sql)
         out.errors.extend(parse_errors)
@@ -234,6 +240,8 @@ class AnsiParser(SqlParser):
                 logger.warning("Failed to process statement %d in %s: %s", stmt_index, path, exc)
                 out.errors.append(f"statement_error:{stmt_index}:{exc}")
 
+        # PR 3 — clear namespace after parsing to avoid stale state on reuse
+        self._current_file_namespace = None
         return out
 
     def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:

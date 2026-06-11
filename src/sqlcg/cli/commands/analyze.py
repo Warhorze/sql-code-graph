@@ -142,7 +142,9 @@ def upstream(  # noqa: B008
     ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
     sql = _upstream_sql(depth, include_intermediate)
     results = run_read_routed(sql, {"ref": ref})
-    if not results and len(ref.split(".")) >= 3:
+    # Bare-name fallback: PR 3 namespaced CTE keys contain "::" and dots from the
+    # file path but have no schema prefix — exclude them to avoid a no-op retry.
+    if not results and "::" not in ref and len(ref.split(".")) >= 3:
         bare = _bare_ref(ref)
         fallback_results = run_read_routed(sql, {"bare": bare})
         if fallback_results:
@@ -181,7 +183,9 @@ def downstream(  # noqa: B008
     ref = ref.lower()  # graph keys are lowercased at index time (C2 normalization)
     sql = _downstream_sql(depth, include_intermediate)
     results = run_read_routed(sql, {"ref": ref})
-    if not results and len(ref.split(".")) >= 3:
+    # Bare-name fallback: PR 3 namespaced CTE keys contain "::" and dots from the
+    # file path but have no schema prefix — exclude them to avoid a no-op retry.
+    if not results and "::" not in ref and len(ref.split(".")) >= 3:
         bare = _bare_ref(ref)
         fallback_results = run_read_routed(sql, {"bare": bare})
         if fallback_results:
@@ -301,8 +305,14 @@ def _bare_ref(ref: str) -> str:
 
     Lowercases defensively so this is safe to call even if the caller did not
     first fold the ref — graph keys are lowercased at index time (C2 normalization).
+
+    PR 3 (sprint_lineage_identity_and_session_context.md §PR 3): namespaced CTE
+    keys carry ``::`` and dots from the file path but have no schema prefix;
+    return them unchanged.
     """
     ref = ref.lower()
+    if "::" in ref:
+        return ref  # namespaced CTE key — no schema prefix to strip
     parts = ref.split(".")
     if len(parts) >= 3:
         return ".".join(parts[1:])

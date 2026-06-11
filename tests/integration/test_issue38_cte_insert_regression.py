@@ -107,18 +107,28 @@ def test_issue38_cte_node_is_not_dead_end(indexed_db):
     The v1.1.0 bug: agg.m had 0 incoming COLUMN_LINEAGE edges — it was an island.
     With --include-intermediate the walker reached agg.m but could go no further.
     This test asserts the CTE node is connected to its source.
+
+    PR 3: CTE key is namespaced as "<abs_path>::agg". Look up the actual column key.
     """
     db, _ = indexed_db
-    rows = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": "agg.m"})
+    # PR 3: look up the namespaced CTE column key for agg.m
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::agg'",
+        {},
+    )
+    assert cte_rows, "CTE alias 'agg' not found in SqlTable — indexing may have failed."
+    agg_m_key = f"{cte_rows[0]['qualified']}.m"  # e.g. "/tmp/xxx/etl_cte.sql::agg.m"
+
+    rows = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": agg_m_key})
     upstream_ids = {r["id"] for r in rows}
 
     assert upstream_ids, (
-        "agg.m has no upstream nodes via TRACE_COLUMN_LINEAGE — it is a dead-end.\n"
+        f"{agg_m_key} has no upstream nodes via TRACE_COLUMN_LINEAGE — it is a dead-end.\n"
         "This reproduces the exact v1.1.0 bug reported in issue #38.\n"
         "Returned: []"
     )
     assert "staging.src.x" in upstream_ids, (
-        f"agg.m upstream via TRACE_COLUMN_LINEAGE does not include staging.src.x.\n"
+        f"{agg_m_key} upstream via TRACE_COLUMN_LINEAGE does not include staging.src.x.\n"
         f"Returned: {sorted(upstream_ids)}"
     )
 
@@ -128,15 +138,25 @@ def test_issue38_include_intermediate_shows_agg_and_source(indexed_db):
 
     In v1.1.0 with --include-intermediate --raw, only agg.m appeared (then traversal
     stopped).  Now both the CTE node and its source must be present.
+
+    PR 3: CTE key is namespaced. Look up the actual column key from the graph.
     """
     db, _ = indexed_db
+    # PR 3: look up the namespaced CTE column key for agg.m
+    cte_rows = db.run_read(
+        "SELECT qualified FROM \"SqlTable\" WHERE qualified LIKE '%::agg'",
+        {},
+    )
+    assert cte_rows, "CTE alias 'agg' not found in SqlTable — indexing may have failed."
+    agg_m_key = f"{cte_rows[0]['qualified']}.m"  # e.g. "/tmp/xxx/etl_cte.sql::agg.m"
+
     query = _upstream_sql(5, include_intermediate=True)
     rows = db.run_read(query, {"ref": "mart.fact_t.m"})
     ids = {r["id"] for r in rows}
 
     assert ids, "Upstream with include_intermediate=True returned no results for mart.fact_t.m."
-    assert "agg.m" in ids, (
-        f"CTE intermediate agg.m missing from include_intermediate upstream.\n"
+    assert agg_m_key in ids, (
+        f"CTE intermediate {agg_m_key} missing from include_intermediate upstream.\n"
         f"Returned: {sorted(ids)}"
     )
     assert "staging.src.x" in ids, (

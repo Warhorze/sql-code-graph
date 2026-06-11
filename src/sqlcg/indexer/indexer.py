@@ -126,14 +126,20 @@ def _harvest_usage_catalog(
         col_name = src_key[dot_pos + 1 :]
 
         # Only harvest for physical tables/views, never cte/derived.
-        # Schema-qualification guard: bare names (no dots) are CTE aliases —
-        # the parser emits CTE aliases with role='table' when used as FROM sources,
-        # so we cannot rely on kind alone.
+        # PR 3: CTE/derived keys now carry a "::" namespace prefix
+        # (e.g. "a/b.sql::final") so the old bare-name guard
+        # ("." not in table_qualified) would incorrectly pass them through
+        # (they do contain dots in the path component).  Rely on the kind
+        # guard first; then exclude both bare names AND namespaced CTE keys.
         kind = table_kind_map.get(table_qualified)
         if kind not in _USAGE_ELIGIBLE_KINDS:
             continue
+        if "::" in table_qualified:
+            # Namespaced CTE/derived key — skip (path contains dots, cannot
+            # use the plain-dot guard post-PR3)
+            continue
         if "." not in table_qualified:
-            # Bare name — treat as CTE alias, skip
+            # Bare name without namespace — legacy CTE alias form, skip
             continue
 
         col_id = src_key  # src_key IS the column id
