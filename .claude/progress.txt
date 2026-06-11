@@ -1,5 +1,100 @@
 ## Current State [2026-06-11]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: mcp_server_self_healing PR 1 — message fix + version-skew detector (v1.20.0)
+PLAN: plan/sprints/mcp_server_self_healing.md §Phase 1
+BRANCH: feat/mcp-version-skew-detector
+PR: https://github.com/Warhorze/sql-code-graph/pull/89
+
+## Handoff — developer: mcp_server_self_healing PR 1 (v1.20.0) [2026-06-11]
+
+SUMMARY: Implemented Steps 1.1–1.5 of PR 1 from mcp_server_self_healing.md.
+
+Step 1.1 — install.py honest message:
+  Replaced "editor will respawn it on the new build" with /mcp reconnect
+  instructions ("run /mcp → reconnect sql-code-graph or restart the session").
+
+Step 1.2 — mcp restart docstring rewrite:
+  Removed "deferred to v1.2". Describes v1.20.0 self-heal behaviour.
+  Output changed to /mcp reconnect guidance.
+
+Step 1.3 — src/sqlcg/server/selfheal.py (new module):
+  read_ondisk_version(): invalidate_caches() before distributions() scan (A1
+  same-mtime defence); returns None on unreadable dist (F1 guard).
+  detect_skew(): returns (bool, running, ondisk); False when ondisk is None.
+
+Step 1.4 — mcp status wired to read_ondisk_version (W1):
+  Compares running version against read_ondisk_version(). ondisk_version
+  field added to JSON output. F1 guard: stale_by_version=False when
+  ondisk_version is None.
+
+Step 1.5 — Version bump 1.19.1 → 1.20.0 (minor).
+
+TESTS: 1260 passed (was 1248; +12). ruff: clean. pyright: 0 errors. 13/13 perf guards.
+DEVIATIONS: T-grep scope narrowed to cli/+server/ (indexer.py has unrelated
+  phrase; touching it violates plan §Non-Goals — documented in test docstring).
+VERSION: 1.19.1 → 1.20.0.
+Issue #76 remains OPEN — PR 2 (re-exec) still pending.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
+
+## Handoff — DWH rebuild + table_graph regen on v1.19.1 [2026-06-11]
+
+### Pre-flight
+- MCP server was RUNNING (PID 2652) — stopped with `sqlcg mcp stop` before index.
+- Schema gate fired correctly: v7 graph rejected; ran `db reset && db init` first.
+
+### Index
+- Wall-time: 2m 42.7s (budget: 3 min — WITHIN BUDGET)
+- Files: 1372 (1 timed out: etl/sql/dim/wtdh_artikel.sql, 1 other failed)
+- Edges: 40578 column edges, 2053 tables at index time
+- Auto-applied catalog from columns.csv during index (122815 cols)
+
+### Catalog load (explicit, post-index)
+- Command: `sqlcg catalog load columns.csv`
+- Result: 144311 rows read, 4862 tables, 122815 columns, 71179 alias-folded rows
+- Duration: 65.36s
+
+### §G Health (via `sqlcg gain`)
+- Tables with catalog: 5593/6441 (87%)
+- Edge health strict (column-level): 43477/52367 (83%)
+- Edge health table-level legacy: 43790/52367 (84%)
+- Edge health scoped (excl CTE/derived): 43477/44069 (99%)
+- Phantom contradicted: 242/52367 (0.5%) — baseline restored
+- CTE key collisions: 0
+- Rescuable unqualified edges: 0
+- Catalog-missing §G warning: ABSENT (catalog loaded correctly)
+
+### HAS_COLUMN by source
+- information_schema: 109459
+- ddl: 19696
+- usage: 7118
+- star_expansion: 3395
+- clone_inherited: 290
+
+### Spot-checks (a)-(e)
+(a) 67 previously-crashed files (_qualify_bare_tables fix in PR2/v1.17.0):
+    Files with 0 queries and parse_failed=False: 24 (pure procedure/DDL files)
+    The 24 zero-query files are MSSPR_*/dummy_* with no write statements — expected
+    post-fix. Old crash pattern (USE SCHEMA + ALTER EXTERNAL TABLE REFRESH) now
+    parses cleanly with 0 queries. PASS.
+(b) Zero <unknown> self-edges: PASS (0 edges with <unknown> in src or dst key)
+(c) No :: key starts with /: PASS (0 SqlColumn.id, SqlTable.qualified, or CL keys starting with /)
+(d) File.skip_counts populated: PASS (756/1372 files have non-empty skip_counts)
+(e) ba.wtfv_cyclische_telling kind=table: PASS; ba.wtfi_promotie_afzet kind=table: PASS
+
+### table_graph.html regenerated
+- Old file backed up to /tmp/table_graph_backup.html
+- Nodes: 6565 tables (vs 5930 in old file)
+- Links: 2739 table-level edges (vs 2914 in old file)
+- WCC: 4618 components, largest: 1718 nodes
+- File: /home/ignwrad/Projects/sql-code-graph/table_graph.html (1012 KB, untracked)
+
+---
+
+## Previous State [2026-06-11]
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
 FEATURE: sprint_postmortem_fixes PR 5 — persist col_lineage_skip:* reasons queryably (v1.19.1)
 PLAN: plan/sprints/sprint_postmortem_fixes.md §PR 5 (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: feat/persist-skip-reasons
@@ -3386,3 +3481,12 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 - Remaining: PR 3 (repo-rel namespaces), PR 4 (honesty bundle v1.19.0), PR 5 (skip persistence).
 - After sprint: (a) developer reindexes DWH + catalog load + gain health + 3-min budget check, regenerate table_graph.html, user identifies job+dependencies; (b) NEXT FEATURE: issue #76 stale-MCP-server self-healing (full pipeline: architect-planner first).
 - gh active account switched to Warhorze (was WesMaker) for merge rights.
+
+[2026-06-11 shepherd close-out: sprint_postmortem_fixes COMPLETE]
+- PR 1 #84 v1.18.1 (isolation + rollback guard, +16 leaking tests self-isolated)
+- PR 2 #85 v1.18.2 (qualify_bare_tables crash + worker_error bucket)
+- PR 3 #86 v1.18.3 (repo-relative CTE namespaces, design A)
+- PR 4 #87 v1.19.0 (sentinel drop + kind upgrade both seams + gain warning)
+- PR 5 #88 v1.19.1 (File.skip_counts JSON column, SCHEMA_VERSION 7->8)
+- Tags pending user verification: v1.15.0-v1.18.0 (prev sprint) + v1.18.1-v1.19.1 (this sprint). User actions: dwh/.sqlcg.toml [sqlcg.catalog] section.
+- NOW: DWH reindex + catalog load + gain health + table_graph.html regen via developer. THEN: issue #76 (stale MCP server) via architect-planner.

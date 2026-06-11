@@ -269,17 +269,30 @@ def _run_mcp_status_against_payload(
 
 
 class TestMcpStatusVersionDrift:
-    """`mcp status` surfaces the running server's version and drift vs installed."""
+    """`mcp status` surfaces the running server's version and drift vs on-disk installed.
+
+    Since Step 1.4 (mcp_server_self_healing.md W1), stale_by_version compares the
+    running server's version against ``read_ondisk_version()`` — not against the CLI
+    process's baked-in ``__version__``.  Tests monkeypatch ``read_ondisk_version``
+    so the comparison is deterministic regardless of what is installed in the test env.
+    """
 
     def test_status_matching_version_no_drift(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """Running version == installed version → stale_by_version is False, no warning."""
-        from sqlcg import __version__
+        """Running version == on-disk version → stale_by_version is False, no warning.
+
+        Guards plan/sprints/mcp_server_self_healing.md Step 1.4 / W1.
+        """
+        ondisk_version = "1.20.0"
+        monkeypatch.setattr(
+            "sqlcg.cli.commands.mcp.read_ondisk_version",
+            lambda: ondisk_version,
+        )
 
         payload = {
             "running": True,
-            "version": __version__,
+            "version": ondisk_version,
             "pid": 12345,
             "db_path": str(tmp_path / "test.db"),
             "indexed_sha": None,
@@ -291,8 +304,9 @@ class TestMcpStatusVersionDrift:
         }
         data, mock_console = _run_mcp_status_against_payload(tmp_path, monkeypatch, payload)
 
-        assert data["version"] == __version__
+        assert data["version"] == ondisk_version
         assert data["stale_by_version"] is False
+        assert data["ondisk_version"] == ondisk_version
 
         warning_calls = [c for c in mock_console.print.call_args_list if "Warning" in str(c)]
         assert not warning_calls, f"No drift warning expected; got: {warning_calls}"
@@ -300,10 +314,18 @@ class TestMcpStatusVersionDrift:
     def test_status_mismatched_version_reports_drift(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """Running version != installed version → stale_by_version is True + warning."""
-        from sqlcg import __version__
+        """Running version != on-disk version → stale_by_version is True + warning.
 
+        Guards plan/sprints/mcp_server_self_healing.md Step 1.4 / W1.
+        The warning must name both the running version and the on-disk installed version.
+        """
         running_version = "0.0.1-stale"
+        ondisk_version = "1.20.0"
+        monkeypatch.setattr(
+            "sqlcg.cli.commands.mcp.read_ondisk_version",
+            lambda: ondisk_version,
+        )
+
         payload = {
             "running": True,
             "version": running_version,
@@ -320,12 +342,49 @@ class TestMcpStatusVersionDrift:
 
         assert data["version"] == running_version
         assert data["stale_by_version"] is True
-        assert running_version != __version__
+        assert data["ondisk_version"] == ondisk_version
 
         warning_text = " ".join(str(c) for c in mock_console.print.call_args_list)
         assert "Warning" in warning_text
         assert running_version in warning_text
-        assert __version__ in warning_text
+        assert ondisk_version in warning_text
+
+    def test_status_ondisk_version_none_no_drift(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When read_ondisk_version returns None → stale_by_version is False (F1 guard).
+
+        Guards plan/sprints/mcp_server_self_healing.md §F1: never treat an
+        unreadable on-disk version as a skew.
+        """
+        monkeypatch.setattr(
+            "sqlcg.cli.commands.mcp.read_ondisk_version",
+            lambda: None,
+        )
+
+        running_version = "1.19.0"
+        payload = {
+            "running": True,
+            "version": running_version,
+            "pid": 12345,
+            "db_path": str(tmp_path / "test.db"),
+            "indexed_sha": None,
+            "head_sha": None,
+            "stale_by_commits": None,
+            "connected_clients": 1,
+            "uptime": 1.0,
+            "writer_queue": {},
+        }
+        data, mock_console = _run_mcp_status_against_payload(tmp_path, monkeypatch, payload)
+
+        # stale_by_version must be False when ondisk is None (unreadable = no skew)
+        assert data["stale_by_version"] is False
+        assert data["ondisk_version"] is None
+
+        warning_calls = [c for c in mock_console.print.call_args_list if "Warning" in str(c)]
+        assert not warning_calls, (
+            f"No drift warning expected when ondisk is None; got: {warning_calls}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -409,10 +468,15 @@ class TestMcpStopNoServer:
 
 
 class TestMcpRestart:
-    def test_restart_prints_respawn_caveat(
+    def test_restart_prints_reconnect_guidance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):
-        """mcp_restart prints the v1.1 client-respawn caveat (no true restart)."""
+        """mcp_restart prints /mcp reconnect guidance (v1.20.0 self-heal docstring).
+
+        The old 'deferred to v1.2' message is gone; the new message instructs the
+        user to run /mcp → reconnect in Claude Code.
+        Guards plan/sprints/mcp_server_self_healing.md Step 1.2.
+        """
         db = tmp_path / "noserver.db"
         monkeypatch.setenv("SQLCG_DB_PATH", str(db))
 
@@ -420,6 +484,11 @@ class TestMcpRestart:
 
         mcp_restart()
         captured = capsys.readouterr()
-        # Must mention restarting via editor and reference v1.2 deferral
-        assert "editor" in captured.out.lower() or "MCP" in captured.out
-        assert "v1.2" in captured.out
+        # Must contain /mcp reconnect guidance
+        assert "/mcp" in captured.out or "reconnect" in captured.out.lower(), (
+            f"Expected /mcp reconnect guidance; got:\n{captured.out}"
+        )
+        # Must NOT contain the old 'deferred to v1.2' promise
+        assert "deferred to v1.2" not in captured.out, (
+            f"Output must not contain 'deferred to v1.2'; got:\n{captured.out}"
+        )

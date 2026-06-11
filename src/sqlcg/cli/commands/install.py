@@ -144,7 +144,10 @@ def install_cmd(
     # so the editor respawns the freshly-installed build.
     stopped = stop_server()
     if stopped:
-        console.print("Stopped running MCP server; your editor will respawn it on the new build.")
+        console.print(
+            "Stopped running MCP server. In Claude Code run [bold]/mcp[/bold] → reconnect "
+            "[italic]sql-code-graph[/italic] (or restart the session) to pick up the new build."
+        )
     else:
         console.print("No running MCP server to refresh.")
     _provision_skill(resolved_scope, repo, dry_run=False)
