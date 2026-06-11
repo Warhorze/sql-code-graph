@@ -84,7 +84,7 @@ def _run_index_cmd(tmp_path: Path, *, quiet: bool = False) -> list[str]:
     ):
         mock_console.print = _capture
         mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "7"
+        mock_backend.get_schema_version.return_value = "8"
         mock_get_backend.return_value.__enter__.return_value = mock_backend
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer

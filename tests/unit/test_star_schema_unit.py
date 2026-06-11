@@ -21,17 +21,17 @@ def test_rel_type_star_source_enum_value():
 
 
 def test_schema_version_matches_current_migration():
-    """SCHEMA_VERSION must be '7' after the COLUMN_LINEAGE.inferred_from_source_name bump.
+    """SCHEMA_VERSION must be '8' after the File.skip_counts column addition (PR 5).
 
     Each schema-shape change forces a re-index (no backward compatibility — CLAUDE.md);
-    bumping this constant is the gate. Most recently bumped 6 -> 7 for the
-    `inferred_from_source_name` column added by
-    plan/sprints/positional_insert_clone_blindspot.md Part A2.
+    bumping this constant is the gate. Bumped 7 -> 8 for the ``skip_counts`` column
+    added by plan/sprints/sprint_postmortem_fixes.md §PR 5 (persist col_lineage_skip:*
+    reasons queryably).
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "7", (
-        f"Expected SCHEMA_VERSION='7', got {SCHEMA_VERSION!r}. "
+    assert SCHEMA_VERSION == "8", (
+        f"Expected SCHEMA_VERSION='8', got {SCHEMA_VERSION!r}. "
         "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py when the schema shape changes."
     )
 
