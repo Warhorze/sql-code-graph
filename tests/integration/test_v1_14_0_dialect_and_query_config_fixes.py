@@ -410,6 +410,131 @@ def test_Fix3_analyze_upstream_uses_resolved_root_for_noise_filter(tmp_path: Pat
         )
 
 
+def test_Fix3_analyze_unused_filters_using_indexed_repo_config_not_cwd(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`analyze unused` run from outside the indexed repo still applies the
+    indexed repo's `.sqlcg.toml` noise filter (the measured bug).
+
+    A graph is "indexed" at ``repo_dir`` (Repo.path = repo_dir, which has a
+    `.sqlcg.toml` declaring ``ma.special_clone`` as an ignored table). The CLI
+    is invoked from a *different* cwd (``other_dir``, no config file). With the
+    old bare-`Path.cwd()` fallback, ``ma.special_clone`` would survive the
+    filter (no config found at ``other_dir``). With Fix 3, it must be dropped.
+    """
+    import sqlcg.cli.commands.analyze as analyze_mod
+
+    repo_dir = tmp_path / "indexed_repo"
+    other_dir = tmp_path / "elsewhere"
+    repo_dir.mkdir()
+    other_dir.mkdir()
+
+    (repo_dir / ".sqlcg.toml").write_text(
+        '[sqlcg.noise_filter]\nignored_tables = ["ma.special_clone"]\n'
+    )
+
+    backend = DuckDBBackend(":memory:")
+    backend.init_schema()
+    backend.upsert_node(
+        NodeLabel.REPO, str(repo_dir), {"path": str(repo_dir), "name": repo_dir.name}
+    )
+    backend.run_write(
+        'INSERT INTO "SqlTable" (qualified, name, catalog, db, kind) VALUES (?, ?, ?, ?, ?)',
+        {
+            "qualified": "ma.special_clone",
+            "name": "special_clone",
+            "catalog": "ma",
+            "db": "ma",
+            "kind": "table",
+        },
+    )
+    backend.run_write(
+        'INSERT INTO "SqlTable" (qualified, name, catalog, db, kind) VALUES (?, ?, ?, ?, ?)',
+        {
+            "qualified": "ma.real_table",
+            "name": "real_table",
+            "catalog": "ma",
+            "db": "ma",
+            "kind": "table",
+        },
+    )
+
+    def _routed(query: str, params: dict):
+        return backend.run_read(query, params)
+
+    monkeypatch.chdir(other_dir)
+
+    with (
+        patch("sqlcg.cli.commands.analyze.run_read_routed", side_effect=_routed),
+        patch("sqlcg.server.read_client.run_read_routed", side_effect=_routed),
+    ):
+        analyze_mod.unused(threshold=0, raw=False)
+
+    combined = capsys.readouterr().out
+    assert "ma.real_table" in combined, (
+        f"Expected unfiltered table 'ma.real_table' to appear in output. Got: {combined!r}"
+    )
+    assert "special_clone" not in combined, (
+        "ma.special_clone is declared in the indexed repo's .sqlcg.toml "
+        "ignored_tables, but the CLI is invoked from a different cwd with no "
+        "config file. With the pre-Fix-3 bare-cwd fallback, NoiseFilter.from_config() "
+        "would find no .sqlcg.toml at the cwd and 'ma.special_clone' would survive "
+        f"the filter. Fix 3 must resolve the indexed repo's root and drop it. Got: {combined!r}"
+    )
+
+
+def test_Fix3_tools_find_definition_filters_using_indexed_repo_config_not_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The four unparam'd `tools.py` `NoiseFilter.from_config()` sites
+    (991, 1051, 1136, 2040) resolve the indexed repo's `.sqlcg.toml`, not cwd.
+
+    Exercises the ``find_definition`` tool (tools.py:991): a backup-named
+    table defined only via a custom `.sqlcg.toml` `ignore_table_regexes`
+    pattern (not the built-in `*_bck` defaults) is flagged `is_backup` even
+    though the MCP server process's cwd is a different, config-less directory.
+    """
+    import sqlcg.server.tools as tools
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+    from sqlcg.indexer.indexer import Indexer
+
+    repo_dir = tmp_path / "indexed_repo"
+    other_dir = tmp_path / "elsewhere"
+    repo_dir.mkdir()
+    other_dir.mkdir()
+
+    # Custom regex not in the built-in default pattern list (CLAUDE.md: globs
+    # cover *_bck-style suffixes; this regex matches a "_clone" marker anywhere).
+    (repo_dir / ".sqlcg.toml").write_text(
+        '[sqlcg.noise_filter]\nignore_table_regexes = ["_clone"]\n'
+    )
+    (repo_dir / "dim_date.sql").write_text("CREATE TABLE ba.dim_date_clone (id INT);")
+
+    backend = DuckDBBackend(":memory:")
+    backend.init_schema()
+    backend.upsert_node(
+        NodeLabel.REPO, str(repo_dir), {"path": str(repo_dir), "name": repo_dir.name}
+    )
+    Indexer().index_repo(repo_dir, dialect=None, db=backend)
+
+    tools._backend = backend
+    tools._metrics = None
+    monkeypatch.chdir(other_dir)
+
+    result = tools.find_definition("ba.dim_date_clone")
+
+    assert len(result.definitions) == 1, f"expected 1 definition, got {result.definitions}"
+    assert result.definitions[0].is_backup is True, (
+        "ba.dim_date_clone matches the indexed repo's .sqlcg.toml "
+        "ignore_table_regexes=['_clone'], but the MCP server process's cwd "
+        "(other_dir) has no config file. With the pre-Fix-3 bare "
+        "NoiseFilter.from_config() call, this table would NOT be flagged as "
+        "backup. Fix 3 must resolve _indexed_root(db) so the indexed repo's "
+        f".sqlcg.toml is used. Got definitions: {result.definitions!r}"
+    )
+    assert any(p.endswith("dim_date.sql") for p in result.noise_excluded)
+
+
 # ---------------------------------------------------------------------------
 # Fix 4a — blindspot ranking excludes kind IN ('cte', 'derived')
 # ---------------------------------------------------------------------------
