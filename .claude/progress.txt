@@ -1,9 +1,57 @@
 ## Current State [2026-06-11]
-ACTIVE AGENT: developer
+ACTIVE AGENT: developer — HANDOFF (PR opened, ready for compliance check)
 FEATURE: sprint_postmortem_fixes PR 1 — test-isolation + empty-index rollback guard (v1.18.1)
 PLAN: plan/sprints/sprint_postmortem_fixes.md (REVIEWED/APPROVED-WITH-AMENDMENTS)
 BRANCH: fix/test-isolation-and-empty-index-guard
-PR: n/a (in progress)
+PR: https://github.com/Warhorze/sql-code-graph/pull/84
+
+## Handoff — developer: sprint_postmortem_fixes PR 1 (v1.18.1) [2026-06-11]
+
+SUMMARY: Implemented all 4 steps of PR 1 from sprint_postmortem_fixes.md.
+
+Step 1.1 — autouse DB-path isolation fixture:
+  NEW tests/conftest.py: autouse function-scoped fixture sets SQLCG_DB_PATH
+  and SQLCG_LOG_PATH under tmp_path for every test via monkeypatch.setenv.
+  Meta-tests: test_db_path_isolation_fixture.py verifies get_db_path() and
+  DbConfig.from_env() resolve under tmp_path, never Path.home().
+
+Step 1.2 (A2) — test_scenario_c route-helper patch:
+  Patched _try_route_index_via_server → return_value=False (mirrors pattern
+  at test_index_flags.py:43,108). Both Path.home() references removed:
+  - mock_config db_path was Path.home()/.sqlcg/graph.db → tmp_path/graph.db
+  - get_db_path patch value → tmp_path/graph.db
+  Asserts _try_route_index_via_server was called (observable wiring check).
+  No Path.home() reference remains in the test.
+
+Step 1.3 (N1) — uninstall force-path test isolation:
+  test_scenario_d_force_flag and test_uninstall_cmd_with_force_flag now:
+  - Redirect Path.home() via monkeypatch.setenv("HOME") to fake_home
+  - Create sentinel metrics.db under patched home (deleted by --force)
+  - Create stand-in sentinel under distinct directory (survives)
+  - Assert filesystem state: patched-home metrics.db absent, stand-in present.
+
+Step 1.4 (A1) — empty-index rollback guard:
+  indexer.py: 'files_found' key (= total_files) added to index_repo() summary.
+  writer._do_index: raises ValueError("refusing to index empty root — graph
+  preserved") when summary["files_found"] == 0, inside the open transaction()
+  so clear_all_tables() is rolled back. Error propagates to waiters via W7.
+  Integration tests in test_empty_index_rollback_guard.py:
+  - Empty-root drain rolls back; SqlTable count pre == post (observable).
+  - Non-empty drain commits normally (regression guard).
+  - Summary 'files_found' key correct for empty and non-empty roots.
+
+GATES: 1350 passed (1264 unit+integration + 86 e2e), 16 pre-existing failures
+  (confirmed identical on master), 7 skipped, 1 xfailed.
+  ruff: clean. pyright: 0 errors.
+  All 4 perf-guard suites pass unmodified.
+
+VERSION: 1.18.0 → 1.18.1 (patch). Tag user-gated per house rule.
+
+NO DEVIATIONS from plan.
+
+NEXT: architect-planner compliance check on "finished".
+
+---
 
 ## Handoff — developer: USE SCHEMA session context + LIKE inheritance (PR 2, v1.17.0) [2026-06-11]
 
