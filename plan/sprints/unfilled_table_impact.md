@@ -1,5 +1,16 @@
-# Feature Plan: Data-Loss Impact Analysis (three sequenced PRs)
+# Feature Plan: Data-Loss Impact Analysis (three sequenced PRs) + one standalone correctness bugfix
 
+> **Shepherd-directed addition (2026-06-12): PR 4 added** — a STANDALONE `SELECTS_FROM`-
+> completeness CORRECTNESS bugfix for the existing `analyze unused` (HIGH severity,
+> actively misleading) and `find_table_usages` (MEDIUM, under-counts) commands. Surfaced
+> by the SAME M1 insight that drove the reframe (`SELECTS_FROM` = 4,944 vs
+> `COLUMN_LINEAGE` = 53,285 — ~90% of reads are CTE/column-lineage routed). PR 4 is
+> INDEPENDENT of PR 1/2/3's engine (existing relations only) but edits `analyze.py` +
+> `queries.sql` which PR 1 also touches, so its DEVELOPMENT is sequenced AFTER PR 1
+> merges (rebase on master) — a file-overlap sequencing, NOT a code dependency. Version:
+> PATCH (target `1.24.1`; `1.21.3` if it merges first). PR 1/2/3 sections are UNTOUCHED.
+> NOT re-looped through the plan-reviewer per shepherd instruction; shepherd verifies.
+>
 > Status: REVIEWED (shepherd-verified 2026-06-12 — M1/M6 blockers confirmed
 > resolved by reading the revised §"two views" and §"PR 2 Detection mechanism"
 > against the tree; gate passed). **PR 1 is in development.** Ready for implementation,
@@ -33,12 +44,14 @@
 > and rebuilds View 1 as a supplement whose genuine value-add is the direct
 > gating-join reader tables, with a documented residual gap.
 
-## Feature Summary (three PRs)
+## Feature Summary (three feature PRs + one standalone bugfix = four PRs)
 
 Answer the operational question "a job failed and left table(s) empty — what
 downstream is at risk?" in three stages (PR 1 the engine; PR 2 the change-detection
 front-end; PR 3 retrofits PR 1's gating-join supplement into the existing impact tools
-so they answer consistently):
+so they answer consistently). **PR 4 is a separate, standalone correctness bugfix** (not
+part of the feature) that fixes two existing `SELECTS_FROM`-only commands surfaced by the
+same M1 insight:
 
 - **PR 1 — Blast-radius core (the engine).** Given user-NAMED empty table(s),
   report the downstream blast radius. **View 2 (column-lineage closure) is the
@@ -63,8 +76,21 @@ so they answer consistently):
   reusing PR 1's `_table_row_reachability` so the existing tools and the new one give
   consistent answers about direct gating-join readers. Ships after PR 1, independent of
   PR 2. No new MCP tool, no new traversal code.
+- **PR 4 — `SELECTS_FROM`-completeness bugfix (standalone correctness; NOT the feature).**
+  Redefine "is this table read/used" in `analyze unused` + `find_table_usages` to count the
+  column-lineage path (D3) and `STAR_SOURCE` (D2), not just direct `SELECTS_FROM` (D1) —
+  so a CTE-only-consumed table stops being falsely reported "unused". INDEPENDENT of the
+  engine; develops AFTER PR 1 for file-overlap reasons only; PATCH version. Entry points:
+  existing `sqlcg analyze unused` CLI + existing MCP `find_table_usages` tool (augmented).
 
 ## Shared design (built by PR 1, reused by PR 2 + PR 3 — no duplication)
+
+> **PR 4 shares NO new symbols with PR 1/2/3.** It does not use
+> `_compute_empty_propagation`, `_table_row_reachability`, `EmptyPropagationResult`, or
+> `GET_TABLE_READS_ADJACENCY`. It reads only the existing `SELECTS_FROM` / `STAR_SOURCE` /
+> `COLUMN_LINEAGE` / `SqlColumn` relations. Its ONLY coupling to PR 1 is the shared FILES
+> `analyze.py` + `queries.sql` — hence the develop-after-PR-1 sequencing (rebase), not a
+> dependency-gate.
 
 PR 2 and PR 3 MUST NOT reimplement any blast-radius / reachability logic. PR 1 builds,
 and PR 2 / PR 3 reuse:
@@ -1252,6 +1278,300 @@ Tests assert **observable output** (specific table ids + caveat strings), never 
 
 ---
 
+# PR 4 — SELECTS_FROM-completeness fix for the existing dependency-insight commands (CORRECTNESS bugfix; standalone; develop after PR 1 lands)
+
+## PR 4 Goal
+
+Two SHIPPED dependency-insight commands answer "is this table read/used?" using
+`SELECTS_FROM` **alone**, and are therefore WRONG on this corpus. Per the M1 corpus
+measurement (plan header): on the DWH `SELECTS_FROM = 4,944` edges vs
+`COLUMN_LINEAGE = 53,285` — **~90% of cross-table reads are CTE/column-lineage routed
+and emit NO top-level `SELECTS_FROM` edge** (the parser's `_real_tables` excludes
+CTE-sourced names — [`base.py` L604](../../src/sqlcg/parsers/base.py), out of scope,
+M1). A table read ONLY inside CTEs has no `SELECTS_FROM` edge, so:
+
+1. **`analyze unused` (HIGH severity — actively misleading / DANGEROUS).** A
+   CTE-only-consumed table is falsely reported "unused" even when heavily read. A user
+   pruning "dead" tables on this signal could DROP a live, CTE-fed table.
+2. **`find_table_usages` (MEDIUM — under-counts).** Misses CTE-wrapped usages and its
+   empty-result hint MISATTRIBUTES the cause ("not referenced … or consumed externally")
+   when the real reason is CTE/column-lineage routing.
+
+> **This is a correctness bugfix, NOT part of the empty-impact feature.** It is
+> INDEPENDENT of PR 1/2/3's engine (it needs only the existing `COLUMN_LINEAGE`,
+> `SELECTS_FROM`, `STAR_SOURCE` relations — no `_compute_empty_propagation`, no
+> `_table_row_reachability`, no `EmptyPropagationResult`). **But it edits
+> [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py) and
+> [`queries.sql`](../../src/sqlcg/core/queries.sql), which PR 1 also edits**, so to avoid
+> merge conflicts its DEVELOPMENT must be sequenced **AFTER PR 1 merges** — branch off
+> master and rebase on PR 1's landed `analyze.py`/`queries.sql`. It is NOT a dependency
+> of PR 1 and shares NONE of PR 1's new symbols.
+
+## PR 4 The bug (verified against the tree)
+
+- **`analyze unused` CLI** ([`analyze.py` L283-300](../../src/sqlcg/cli/commands/analyze.py)):
+  `SELECT DISTINCT qualified FROM "SqlTable" WHERE qualified NOT IN (SELECT DISTINCT
+  dst_key FROM "SELECTS_FROM") LIMIT 100`. Verified `SELECTS_FROM`-only.
+- **`ANALYZE_UNUSED_TABLES` query** ([`queries.sql` L262-267](../../src/sqlcg/core/queries.sql)):
+  `SELECT t.qualified FROM "SqlTable" t WHERE t.qualified NOT IN (SELECT DISTINCT dst_key
+  FROM "SELECTS_FROM") ORDER BY t.qualified`. Same shape; same blind spot. (Note: the CLI
+  command inlines its own SQL and does NOT currently call `ANALYZE_UNUSED_TABLES`; both
+  the inlined CLI SQL AND the named query are fixed so neither carries the bug.)
+- **`find_table_usages` tool** ([`tools.py` L915-959](../../src/sqlcg/server/tools.py))
+  runs `FIND_TABLE_USAGES` ([`queries.sql` L51-59](../../src/sqlcg/core/queries.sql)):
+  `JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified` — `SELECTS_FROM`-only. Misleading
+  empty hint at [`tools.py` L953-956](../../src/sqlcg/server/tools.py).
+
+## PR 4 The fix to spec — redefine "is this table read/used"
+
+A table is **USED** if ANY of the following holds:
+- (D1) it has an incoming `SELECTS_FROM` edge (`dst_key = t.qualified`) — direct read;
+- (D2) it has an incoming `STAR_SOURCE` edge (`dst_key = t.qualified`) — `SELECT *` read;
+- (D3) any of its columns is the SOURCE of a `COLUMN_LINEAGE` edge — i.e. a VALUE flows
+  out of the table (captures CTE-wrapped *derived* reads, the dominant corpus case).
+
+**The column-lineage rollup (D3) — exact relations/keys VERIFIED against the tree.**
+A `COLUMN_LINEAGE` edge's `src_key` is a `SqlColumn.id`
+([`queries.sql` L46](../../src/sqlcg/core/queries.sql) `JOIN "SqlColumn" src ON
+src.id = cl.src_key`). `SqlColumn` carries a denormalized `table_qualified` column
+([`duckdb_backend.py` L77](../../src/sqlcg/core/duckdb_backend.py); selected in the
+COLUMN node projection [L243](../../src/sqlcg/core/duckdb_backend.py)). So the
+column→table rollup is `COLUMN_LINEAGE.src_key → SqlColumn.id → SqlColumn.table_qualified`
+— this is the SAME rollup mechanism the existing `_rollup_to_tables` / lineage queries
+use (denormalized `table_qualified`, no `HAS_COLUMN` join needed). The set of
+"tables a value flows OUT of" is therefore:
+```sql
+-- the column-lineage source-table rollup (the D3 set)
+SELECT DISTINCT src.table_qualified AS table_qualified
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" src ON src.id = cl.src_key
+WHERE src.table_qualified IS NOT NULL AND src.table_qualified <> ''
+```
+> The original task framing mentioned a `HAS_COLUMN` join; the tree's actual,
+> already-used mechanism is the denormalized `SqlColumn.table_qualified` column — the
+> developer MUST use `table_qualified` (matching `FIND_COLUMN_LINEAGE` / the COLUMN node
+> projection), NOT introduce a `HAS_COLUMN` join, and MUST verify the exact relation/key
+> names (`COLUMN_LINEAGE.src_key`, `SqlColumn.id`, `SqlColumn.table_qualified`,
+> `STAR_SOURCE.dst_key`) against the backend before finalising the SQL.
+
+The **read-set** (every table read by any signal) is the UNION:
+```sql
+-- READ_TABLES (the "used" set) — UNION of the three signals
+SELECT DISTINCT dst_key AS table_qualified FROM "SELECTS_FROM"
+UNION
+SELECT DISTINCT dst_key AS table_qualified FROM "STAR_SOURCE"
+UNION
+SELECT DISTINCT src.table_qualified AS table_qualified
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlColumn" src ON src.id = cl.src_key
+WHERE src.table_qualified IS NOT NULL AND src.table_qualified <> ''
+```
+
+### Apply to BOTH commands
+
+- **`unused` (CLI inlined SQL) + `ANALYZE_UNUSED_TABLES` (named query):** redefine
+  "unused" as `SqlTable.qualified NOT IN (READ_TABLES)`, i.e. `NOT IN` the UNION above
+  rather than `NOT IN (SELECT dst_key FROM "SELECTS_FROM")`. Rewrite BOTH the inlined CLI
+  SQL and `ANALYZE_UNUSED_TABLES` (keep them in sync; both are fixed even though the CLI
+  does not currently call the named one — leaving the named query buggy would re-introduce
+  the trap for any future caller).
+- **`find_table_usages` (augment):** in addition to the `SELECTS_FROM` rows from
+  `FIND_TABLE_USAGES`, ADD usages discovered via the column-lineage path (a query whose
+  output column is `COLUMN_LINEAGE`-derived from a column of the target table), and LABEL
+  their kind so the caller distinguishes **read-via-lineage** from **direct read**. Do NOT
+  silently merge them into the existing rows — the caller must be able to see which usages
+  are direct `SELECTS_FROM`/`STAR_SOURCE` and which are CTE/column-lineage routed.
+  - Mechanism: a new `FIND_TABLE_USAGES_VIA_LINEAGE` query joining
+    `COLUMN_LINEAGE.src_key → SqlColumn (src.table_qualified = target)` →
+    `SqlQuery q ON q.id = cl.query_id` → `QUERY_DEFINED_IN` → `File`, returning the same
+    `file`/`sql`/`kind` shape so the existing `TableUsage` row builder is reused. Developer
+    verifies `COLUMN_LINEAGE.query_id` is populated (it is the LEFT-joined `q.id` in
+    `FIND_COLUMN_LINEAGE`, [`queries.sql` L47](../../src/sqlcg/core/queries.sql)) — if a
+    lineage row has a null `query_id`, fall back to surfacing the source-column attribution
+    so the usage is still reported, not dropped.
+  - **Label the distinction.** Add a `usage_kind: Literal["direct", "via_lineage"]` field
+    to [`TableUsage`](../../src/sqlcg/server/models.py) (L100), defaulting to `"direct"`
+    (additive, backward-safe) so direct `SELECTS_FROM` usages keep their meaning and the
+    new lineage-routed rows are explicitly `"via_lineage"`. Do NOT overload the existing
+    `kind` field (that is the SQL statement kind, SELECT/INSERT/…).
+
+### Document the SAME residual gap as PR 1
+
+A **CTE-wrapped PURE-gating read** (reads X inside a CTE, derives NO column from it —
+`INSERT INTO d WITH cte AS (SELECT 1 AS k FROM x) SELECT other.y FROM other JOIN cte ON
+…`) emits NEITHER a top-level `SELECTS_FROM` edge to `x` (parser `_real_tables`, M1) NOR a
+`COLUMN_LINEAGE` edge sourced at `x` (no value derives from it). It is invisible to ALL
+THREE signals. Therefore:
+- The `unused` command help/output MUST read honestly: **"unused = no read of any kind
+  detected (direct SELECTS_FROM/STAR_SOURCE or column-lineage value flow); a table read
+  ONLY inside a CTE without deriving any column — a pure-gating read — is NOT detected
+  (known gap)."**
+- `find_table_usages`' empty hint MUST be FIXED to stop misattributing: replace the
+  current "not referenced … or consumed externally" line with one that states the real
+  causes in order — direct reads, column-lineage-routed reads, the CTE-pure-gating known
+  gap, then external consumption — so a user does not conclude "unused" when the true cause
+  is CTE routing.
+
+## PR 4 Scope
+
+### In Scope
+- Rewrite the `unused` CLI inlined SQL ([`analyze.py` L289-293](../../src/sqlcg/cli/commands/analyze.py))
+  and `ANALYZE_UNUSED_TABLES` ([`queries.sql` L262-267](../../src/sqlcg/core/queries.sql))
+  to the `NOT IN (READ_TABLES UNION)` definition.
+- Add `FIND_TABLE_USAGES_VIA_LINEAGE` query + augment `find_table_usages`
+  ([`tools.py` L915-959](../../src/sqlcg/server/tools.py)) to include via-lineage usages,
+  labelled.
+- Add `usage_kind` to `TableUsage` ([`models.py` L100](../../src/sqlcg/server/models.py)).
+- Fix the `find_table_usages` empty hint and the `unused` command help/output caveat.
+
+### Non-Goals
+- **No parser change.** `_real_tables` / the CTE-pure-gating gap is OUT OF SCOPE
+  (CLAUDE.md performance invariant + M1). The gap is documented, not closed.
+- **No new MCP tool** (augments the existing `find_table_usages`; no tool-count change).
+- **No reuse of / dependency on PR 1/2/3's engine.** Pure read-side SQL over existing
+  relations.
+- **No join-type / NULL-rate modelling.** Binary read / not-read.
+
+## PR 4 Implementation Steps (ranked — build first → last)
+
+### Phase 1: Query layer
+**Step 4.1 — Rewrite the "unused" definition (both copies).**
+- Files: `ANALYZE_UNUSED_TABLES` in [`queries.sql`](../../src/sqlcg/core/queries.sql);
+  inlined SQL in `unused` in [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py).
+- Replace `NOT IN (SELECT DISTINCT dst_key FROM "SELECTS_FROM")` with `NOT IN
+  (<READ_TABLES UNION>)` (the three-signal union above). Keep both copies identical in
+  intent; developer verifies the exact `STAR_SOURCE.dst_key`, `COLUMN_LINEAGE.src_key`,
+  `SqlColumn.id`/`table_qualified` names against the backend.
+- Acceptance: on a hand-built/integration graph, a table read ONLY via a CTE-wrapped
+  *derived* SELECT (D3) is NO LONGER returned by `unused`; a genuinely unreferenced table
+  still is; a direct-`SELECTS_FROM` table still is not.
+
+**Step 4.2 — Add `FIND_TABLE_USAGES_VIA_LINEAGE` query.**
+- File: [`queries.sql`](../../src/sqlcg/core/queries.sql) (named block) + constant in
+  [`queries.py`](../../src/sqlcg/core/queries.py).
+- Returns `file`/`sql`/`kind` for queries whose output is column-lineage-derived from the
+  target table's columns (join chain in §The fix). Verifies `COLUMN_LINEAGE.query_id`
+  availability with the documented fallback.
+- Acceptance: on the T0c fixture (below) returns the CTE-routed consuming query for the
+  target; on a direct-only fixture returns nothing extra (the direct usage already comes
+  from `FIND_TABLE_USAGES`).
+
+### Phase 2: Model + tool
+**Step 4.3 — Add `usage_kind` to `TableUsage`; augment `find_table_usages`.**
+- File: [`models.py`](../../src/sqlcg/server/models.py) — `usage_kind:
+  Literal["direct", "via_lineage"] = "direct"` (additive default).
+- File: [`tools.py`](../../src/sqlcg/server/tools.py) `find_table_usages` — after the
+  existing `FIND_TABLE_USAGES` rows (labelled `usage_kind="direct"`), run
+  `FIND_TABLE_USAGES_VIA_LINEAGE` and append its rows labelled `usage_kind="via_lineage"`;
+  dedup on `(query_file, sql)` so a query that is BOTH a direct and a lineage source is
+  reported once (prefer `"direct"`). Fix the empty hint (§residual gap).
+- Acceptance: registered tool returns both direct and via_lineage usages with correct
+  labels; CTE-only-consumed target now returns ≥1 `via_lineage` usage (was empty before);
+  the empty hint, when truly empty, lists the CTE-pure-gating known gap.
+
+### Phase 3: CLI caveat
+**Step 4.4 — `unused` help/output honest caveat.**
+- File: [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py) — update the command
+  docstring/help and printed output to carry the "no read of any kind detected … CTE
+  pure-gating NOT detected (known gap)" caveat.
+- Acceptance: `uv run sqlcg analyze unused` output/help contains the caveat string.
+
+### Phase 4: Docs + version
+**Step 4.5 — Version bump (PATCH) + changelog note.**
+- **SemVer: bug fix → PATCH** (CLAUDE.md). Pick a NON-COLLIDING version by the rule:
+  **a patch on top of the latest FEATURE version that has merged at PR 4's merge time.**
+  Assuming PR 4 merges after PR 1–3 (1.22.0 / 1.23.0 / 1.24.0), the target is
+  **`1.24.1`**. State the RULE rather than hard-pinning, because merge order may shift —
+  if PR 4 somehow merges BEFORE the feature PRs, it would be **`1.21.3`** (patch on the
+  current master `1.21.2`); if it merges after only PR 1, it would be `1.22.1`; etc.
+  Bump `pyproject.toml` + [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py); `uv lock`.
+- **No MCP tool-count change** (augments an existing tool). `ARCHITECTURE_REVIEW.md` L87
+  is NOT touched by PR 4.
+
+## PR 4 Test Strategy
+
+Tests assert **observable output** (specific table ids / usage rows / labels), never just
+"no exception". Name `test_<unit>_<scenario>_<expected>`, link this plan in the docstring.
+Fixtures use aliased / schema-qualified statement shapes matching the live corpus.
+
+- **Integration (real in-memory DuckDB, `tests/integration/`):**
+  - **T0c — CTE-wrapped derived read is COUNTED (the headline fix).** Fixture: a table
+    `x` read ONLY via a CTE-wrapped derived SELECT that lands a `COLUMN_LINEAGE` edge
+    sourced at `x` (e.g. `INSERT INTO d WITH cte AS (SELECT x.a FROM x) SELECT cte.a FROM
+    cte` — `d.a` derives from `x.a`, `x` has NO top-level `SELECTS_FROM` edge). Assert: `x`
+    is NOT returned by the `unused` query; `find_table_usages("x")` returns ≥1 usage with
+    `usage_kind == "via_lineage"`. This proves the column-lineage path is counted.
+  - **Direct-read table still works.** A table read via a plain top-level `SELECTS_FROM`
+    is NOT in `unused`, and `find_table_usages` returns it with `usage_kind == "direct"`.
+  - **Genuinely-unreferenced table still appears in `unused`.** A table with NO
+    `SELECTS_FROM`, NO `STAR_SOURCE`, NO outgoing-value `COLUMN_LINEAGE` is still returned
+    by `unused` (the bugfix does not hide real dead tables).
+  - **Star-source read counted.** A `SELECT *` from `x` (STAR_SOURCE) keeps `x` out of
+    `unused` (D2).
+  - **T0d — CTE-wrapped PURE-gating read is the documented gap.** Fixture mirrors PR 1
+    Test T0b (`INSERT INTO d WITH cte AS (SELECT 1 AS k FROM x) SELECT other.y FROM other
+    JOIN cte ON …`): `x` is read only inside a CTE and derives no column. Assert `x` IS
+    STILL returned by `unused` (invisible to all three signals) AND `find_table_usages("x")`
+    is empty — and assert the empty hint contains the CTE-pure-gating known-gap string. The
+    test docstring states this is an accepted known gap (parser out of scope, M1).
+- **Unit:**
+  - The `unused` command help/output string contains the known-gap caveat.
+  - `TableUsage(usage_kind=...)` defaults to `"direct"` and round-trips `"via_lineage"`.
+- **E2E (`tests/e2e/`):** `uv run sqlcg analyze unused` on a small indexed fixture repo
+  where a table is CTE-only-consumed does NOT list that table, and prints the caveat.
+
+## PR 4 Acceptance Criteria
+- [ ] A table read ONLY via a CTE-wrapped *derived* SELECT (column-lineage path, D3) does
+      NOT appear in `analyze unused` / `ANALYZE_UNUSED_TABLES` (table-id assertion, T0c).
+- [ ] The SAME table appears in `find_table_usages` with `usage_kind == "via_lineage"`
+      (proving the column-lineage path is now counted; was empty pre-fix).
+- [ ] A direct-`SELECTS_FROM` table still does NOT appear in `unused` and is returned by
+      `find_table_usages` with `usage_kind == "direct"`.
+- [ ] A `STAR_SOURCE` (`SELECT *`) read keeps its source out of `unused` (D2).
+- [ ] A genuinely-unreferenced table (no read of any kind) STILL appears in `unused`.
+- [ ] A CTE-wrapped PURE-gating read (T0d) STILL appears in `unused` and yields no
+      `find_table_usages` rows — and the empty hint + `unused` caveat document this residual
+      gap (string assertions).
+- [ ] `unused` help/output and the `find_table_usages` empty hint carry the honest
+      "CTE pure-gating NOT detected (known gap)" wording; the hint no longer misattributes
+      CTE routing as "not referenced / external".
+- [ ] Both the inlined `unused` CLI SQL AND `ANALYZE_UNUSED_TABLES` are rewritten (kept in
+      sync); neither carries the `SELECTS_FROM`-only definition.
+- [ ] `usage_kind` added to `TableUsage`, defaulting to `"direct"` (additive, no break).
+- [ ] Version bumped per the PATCH rule (target `1.24.1`; `1.21.3` if it merges first) in
+      `pyproject.toml`, `__init__.py`, `uv.lock`; ARCHITECTURE_REVIEW.md tool-count UNCHANGED.
+- [ ] Every new query/field has a grep-confirmed call site
+      (`FIND_TABLE_USAGES_VIA_LINEAGE` ← `find_table_usages`; `usage_kind` ← the
+      `TableUsage` row builder; rewritten `unused` SQL ← the CLI command).
+- [ ] **Live-DWH re-acceptance (the HEADLINE acceptance — directly verifies the bug is
+      fixed on the real corpus):** run `sqlcg analyze unused` on the DWH and confirm
+      known-hot DA tables (heavily CTE-fed) NO LONGER falsely appear as unused; spot-check a
+      previously-"unused" table with `find_table_usages` and confirm `via_lineage` usages
+      now surface. Record before/after table lists in the postmortem.
+
+## PR 4 Risks and Mitigations
+- **R14 — wrong column→table rollup relation.** The rollup MUST use the denormalized
+  `SqlColumn.table_qualified` (as `FIND_COLUMN_LINEAGE` does), NOT a `HAS_COLUMN` join.
+  Pinned by T0c (the CTE-derived table must drop out of `unused`).
+- **R15 — `COLUMN_LINEAGE.query_id` null on some rows** would lose a via-lineage usage.
+  Mitigated by the documented source-column-attribution fallback so the usage is still
+  surfaced, and by T0c asserting a non-empty `via_lineage` result.
+- **R16 — over-correcting (a real dead table hidden).** Mitigated by the
+  genuinely-unreferenced-table test (still appears) and the T0d gap test (pure-gating does
+  NOT silently make a table "used").
+- **R17 — merge conflict with PR 1** on `analyze.py`/`queries.sql`. Mitigated by sequencing
+  development AFTER PR 1 merges + rebasing on master (not a code dependency, a file-overlap
+  one).
+- **R18 — live correctness (lineage-class).** CI green is necessary but not sufficient;
+  the DWH re-acceptance (known-hot DA tables no longer "unused") is the authoritative gate.
+
+## PR 4 Version & Release
+- Bug fix → **PATCH**, by the rule above (target `1.24.1`; `1.21.3` if it merges before the
+  feature PRs). Agent does NOT close issues or tag; user verifies live + tags the chosen
+  patch version.
+
+---
+
 ## Cross-cutting build order + gating
 
 - **Within each PR:** model → helper/engine → MCP tool → CLI → docs/version.
@@ -1260,8 +1580,13 @@ Tests assert **observable output** (specific table ids + caveat strings), never 
   `_table_row_reachability` + `GET_TABLE_READS_ADJACENCY` merge** (PR 3 reuses them
   verbatim). PR 2 and PR 3 are independent of each other and may proceed in either
   order once PR 1 lands.
-- Both PRs: grep-confirmed call sites; observable-output tests (not "no exception");
-  ARCHITECTURE_REVIEW.md tool-count updates; live-DWH re-acceptance before tag.
+- **PR 4** is a STANDALONE bugfix, NOT engine-dependent. It must DEVELOP after PR 1 merges
+  to avoid `analyze.py`/`queries.sql` conflicts (rebase on master), but it is independent
+  of PR 2 and PR 3 and may land in any order relative to them once PR 1 is in. No
+  tool-count change; PATCH version.
+- All PRs: grep-confirmed call sites; observable-output tests (not "no exception");
+  ARCHITECTURE_REVIEW.md tool-count updates (PR 1/2 only; PR 3/4 none); live-DWH
+  re-acceptance before tag.
 
 ## Open Questions
 - **O1 — CLI backend acquisition — RESOLVED** (W2). Both PRs open a backend directly via
