@@ -590,3 +590,78 @@ class EmptyPropagationResult(BaseModel):
             "a cycle was detected, or the 50k cap was hit."
         ),
     )
+
+
+class PrImpactResult(BaseModel):
+    """Result of get_pr_impact — detects tables that LOSE their producer between two
+    git refs (base_ref → HEAD after resync) and returns the PR 1 blast-radius result.
+
+    IMPORTANT: This tool detects CODE REGRESSIONS only, NOT runtime emptiness.
+    An edge disappears only when the SQL that produced it is removed/renamed/broken.
+    If a job runs and produces 0 rows while the SQL is unchanged, NO edge disappears
+    and this tool detects nothing. Runtime row-count monitoring is OUT OF SCOPE.
+
+    Rename handling: raw ``producers(base) − producers(head)`` would mis-report every
+    rename as total data loss. This tool classifies renames into ``renamed_tables``
+    (using BOTH column-set AND downstream-consumer Jaccard ≥ 0.6) and EXCLUDES them
+    from ``lost_producer_tables`` and the blast radius. A rename is NOT data loss.
+    The rename classifier is a heuristic — callers should verify ``renamed_tables``.
+    """
+
+    base_ref: str = Field(..., description="Echoed base ref (branch, SHA, or tag).")
+    base_sha: str | None = Field(
+        None,
+        description="Resolved base SHA (None if unresolvable — see hint).",
+    )
+    head_sha: str | None = Field(
+        None,
+        description="HEAD SHA at time of detection (None if unresolvable).",
+    )
+    lost_producer_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "GENUINE lost producers (renames excluded) — tables that had a feeding "
+            "query at base_ref but have none after resync to HEAD."
+        ),
+    )
+    renamed_tables: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "old_name → new_name pairs classified as RENAMES (EXCLUDED from "
+            "lost_producer_tables and from blast_radius). Classified using BOTH "
+            "column-set AND downstream-consumer Jaccard ≥ 0.6 (heuristic — verify). "
+            "Covers file renames (git delete+add) AND in-file table renames "
+            "(structural detection, no git rename signal required). "
+            "A rename is NOT data loss — it appears under 'verify consumers updated'."
+        ),
+    )
+    attribution: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "lost_table → list of files that dropped its producer (Option C attribution "
+            "from git diff --name-status on the changed-file set)."
+        ),
+    )
+    blast_radius: EmptyPropagationResult = Field(
+        default_factory=lambda: EmptyPropagationResult(),  # type: ignore[call-arg]
+        description=(
+            "PR 1 engine output (two-view: row_empty_tables + value_* columns/tables) "
+            "for lost_producer_tables ONLY. Renamed tables contribute NO blast radius."
+        ),
+    )
+    detection_only_code_regression: bool = Field(
+        True,
+        description=(
+            "Always True — documents the runtime-blind contract. This tool detects "
+            "CODE REGRESSIONS (SQL that produced a table was removed/modified away) "
+            "only. It CANNOT detect runtime emptiness (a job that runs but produces "
+            "0 rows while the SQL is unchanged will NOT be flagged here)."
+        ),
+    )
+    hint: str | None = Field(
+        None,
+        description=(
+            "Diagnostic hint — set when base_ref is unresolvable, the graph is not "
+            "indexed at base_ref (index first), or no producers were lost."
+        ),
+    )

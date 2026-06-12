@@ -482,3 +482,164 @@ def empty_impact(  # noqa: B008
             f"[dim]{len(result.noise_excluded)} table(s) excluded as backup/noise/synthetic "
             "(use --raw to include them).[/dim]"
         )
+
+
+# ---------------------------------------------------------------------------
+# pr-impact command (PR 2 — v1.23.0)
+# ---------------------------------------------------------------------------
+
+_PR_IMPACT_RUNTIME_BLIND_CAVEAT = (
+    "NOTE: This tool detects CODE REGRESSIONS only (SQL that produced a table was "
+    "removed/renamed/broken). It CANNOT detect runtime emptiness — a job that runs "
+    "and produces 0 rows while the SQL is unchanged will NOT be flagged here."
+)
+
+
+@app.command("pr-impact")
+def pr_impact(  # noqa: B008
+    base: str = typer.Option(  # noqa: B008
+        ..., "--base", help="Base git ref (branch, tag, or SHA) the graph is indexed at"
+    ),
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering"),  # noqa: B008
+    max_depth: int | None = typer.Option(  # noqa: B008
+        None,
+        "--max-depth",
+        help="Maximum traversal depth (1-100). Default: unbounded.",
+    ),
+) -> None:
+    """Detect tables that lose their producer between base ref and HEAD.
+
+    Resyncs the graph from ``base`` to HEAD (same as ``sqlcg reindex``), then
+    shows which tables had their producer SQL removed/modified away, their
+    attribution, and the PR 1 two-view blast radius for genuine losses.
+
+    CODE REGRESSION DETECTION ONLY — see printed caveat for the runtime-blind
+    limitation.  Rename handling: tables whose producer was renamed (both
+    column-set AND consumer Jaccard ≥ 0.6) are shown under "verify consumers
+    updated" and produce no blast-radius warning.
+    """
+    # N2 — validate max_depth.
+    if max_depth is not None and (max_depth < 1 or max_depth > 100):
+        console.print("[red]Error: --max-depth must be between 1 and 100[/red]")
+        raise typer.Exit(1)
+
+    # W2 / O1 — get_pr_impact manages the backend internally (it calls _open_backend).
+    # The resync step requires a writable backend, so we do not open read_only here.
+    from sqlcg.server.tools import get_pr_impact as _get_pr_impact
+
+    result = _get_pr_impact(base_ref=base, max_depth=max_depth)
+
+    # --- Render ---
+    console.print()
+    console.print(f"[bold]PR Impact: [cyan]{base}[/cyan] → HEAD[/bold]")
+    console.print()
+
+    # Runtime-blind caveat (prominently at the top).
+    console.print(f"[yellow]{_PR_IMPACT_RUNTIME_BLIND_CAVEAT}[/yellow]")
+    console.print()
+
+    # Hint (unresolvable ref / mismatch / no changes).
+    if result.hint:
+        console.print(f"[yellow]Hint:[/yellow] {result.hint}")
+        console.print()
+
+    if result.base_sha is None or result.head_sha is None:
+        # Could not resolve refs — nothing more to show.
+        return
+
+    console.print(
+        f"[dim]Base: {result.base_sha[:8] if result.base_sha else '?'} → "
+        f"Head: {result.head_sha[:8] if result.head_sha else '?'}[/dim]"
+    )
+    console.print()
+
+    # --- Renamed tables ---
+    if result.renamed_tables:
+        console.print("[bold yellow]Renamed producers — verify consumers updated:[/bold yellow]")
+        console.print("  (These are EXCLUDED from the data-loss blast radius.)")
+        console.print(
+            "  (Classification is a heuristic: both column-set AND consumer Jaccard ≥ 0.6.)"
+        )
+        rtbl = Table("old name", "new name")
+        for old, new in sorted(result.renamed_tables.items()):
+            rtbl.add_row(old, new)
+        console.print(rtbl)
+        console.print()
+
+    # --- Genuine lost producers ---
+    if result.lost_producer_tables:
+        console.print("[bold red]Lost producers (genuine data-loss risk):[/bold red]")
+        ltbl = Table("table", "dropped by files")
+        for t in result.lost_producer_tables:
+            files = result.attribution.get(t, [])
+            ltbl.add_row(t, ", ".join(files) if files else "(unknown)")
+        console.print(ltbl)
+        console.print()
+    else:
+        console.print("[green]No genuine lost producers detected.[/green]")
+        console.print()
+        return
+
+    # --- Blast radius (PR 1 two views) ---
+    blast = result.blast_radius
+
+    # N1 noise-filter already applied by the engine; --raw re-includes noise.
+    row_tables = blast.row_empty_tables
+    value_cols = blast.value_empty_columns
+    val_tables = blast.value_affected_tables
+    prop_order = blast.propagation_order
+    if raw:
+        row_tables = list(row_tables) + blast.noise_excluded
+        val_tables = list(val_tables) + blast.noise_excluded
+
+    console.print("[bold green]View 2 — Value derivation (PRIMARY)[/bold green]")
+    console.print(
+        "  Downstream columns/tables whose VALUES are transitively derived from the lost source."
+    )
+    console.print()
+    if val_tables:
+        fully_set = set(blast.value_fully_empty_tables)
+        partially_set = set(blast.value_partially_empty_tables)
+        vtbl = Table("table", "value-empty / total columns", "full|partial")
+        for t in val_tables:
+            ve_count = sum(1 for c in value_cols if c.rsplit(".", 1)[0] == t)
+            marker = "full" if t in fully_set else ("partial" if t in partially_set else "?")
+            vtbl.add_row(t, str(ve_count), marker)
+        console.print(vtbl)
+        n_vc = len(value_cols)
+        n_vt = len(val_tables)
+        console.print(f"  {n_vc} value-empty column(s) across {n_vt} table(s).")
+    else:
+        console.print("  [yellow]No value-derived downstream tables found.[/yellow]")
+    console.print()
+
+    console.print("[bold yellow]View 1 — Row reachability (SUPPLEMENT)[/bold yellow]")
+    console.print(f"  {_ROW_EMPTY_LABEL}")
+    console.print()
+    if row_tables:
+        rtbl2 = Table("table")
+        for t in row_tables:
+            rtbl2.add_row(t)
+        console.print(rtbl2)
+    else:
+        console.print("  [yellow]No row-reachable downstream tables found.[/yellow]")
+    console.print()
+
+    if prop_order:
+        console.print("[bold]Propagation order (closest-to-source first):[/bold]")
+        for i, t in enumerate(prop_order, 1):
+            console.print(f"  {i}. {t}")
+        console.print()
+
+    if blast.hint:
+        console.print(f"[yellow]Hint:[/yellow] {blast.hint}")
+    if blast.truncated:
+        console.print(
+            "[yellow]Warning:[/yellow] Traversal hit the 50k-node safety cap; "
+            "results may be incomplete."
+        )
+    if blast.noise_excluded and not raw:
+        console.print(
+            f"[dim]{len(blast.noise_excluded)} table(s) excluded as backup/noise/synthetic "
+            "(use --raw to include them).[/dim]"
+        )

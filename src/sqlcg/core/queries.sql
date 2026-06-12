@@ -326,3 +326,12 @@ SELECT DISTINCT ss.dst_key AS source_table, q.target_table AS dest_table
 FROM "SqlQuery" q
 JOIN "STAR_SOURCE" ss ON ss.src_key = q.id
 WHERE q.target_table <> '' AND q.target_table IS NOT NULL
+
+-- GET_PRODUCER_TABLES
+-- PR 2 (pr-impact detector): snapshot the set of tables that have a feeding query.
+-- Used to diff producers(base) vs producers(head) to detect lost producers.
+-- Empty-string sentinel excluded: target_table = '' marks bare-SELECT queries.
+-- params: []
+SELECT DISTINCT target_table AS producer_table
+FROM "SqlQuery"
+WHERE target_table <> '' AND target_table IS NOT NULL
