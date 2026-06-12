@@ -406,6 +406,16 @@ class SnowflakeParser(AnsiParser):
     def _has_scripting_block(self, sql: str) -> bool:
         """Token-aware BEGIN detection — avoids false-positives on string literals and comments.
 
+        The sqlglot Tokenizer is instantiated as ``Tokenizer(dialect="snowflake")``
+        (constructor-kwarg form) because ``Tokenizer.from_dialect(...)`` does not exist
+        in the version of sqlglot bundled with this project (30.x).  Using the wrong
+        factory call causes an AttributeError that is silently swallowed by the ``except``
+        clause, falling back to a plain ``re.search`` that matches ``BEGIN`` inside SQL
+        comments — producing false-positive scripting-block detection and routing the
+        file through ``_parse_scripting_file``, where ``CREATE TEMPORARY TABLE`` is not
+        extracted, so ``_current_file_temp_keys`` is never populated and downstream
+        INSERT edges use un-namespaced temp keys (the v1.21.1 dual-write bug class).
+
         Args:
             sql: SQL text to check
 
@@ -415,7 +425,7 @@ class SnowflakeParser(AnsiParser):
         try:
             from sqlglot.tokens import Tokenizer, TokenType  # type: ignore
 
-            toks = Tokenizer.from_dialect("snowflake").tokenize(sql)  # type: ignore
+            toks = Tokenizer(dialect="snowflake").tokenize(sql)  # type: ignore
             return any(t.token_type == TokenType.BEGIN for t in toks)  # type: ignore
         except Exception:
             # Fallback to regex if tokenization fails

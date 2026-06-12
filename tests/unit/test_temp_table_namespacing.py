@@ -660,3 +660,138 @@ class TestSchemaAliasAndTempLeafStamping:
             assert "::" in src.full_id, (
                 f"Source tmp_base must be namespaced, got full_id={src.full_id!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# v1.21.1 dst-side regression: BEGIN-in-comment false-positive scripting detection
+# ---------------------------------------------------------------------------
+
+
+class TestBeginInCommentScriptingFalsePositive:
+    """_has_scripting_block must not be fooled by BEGIN in a SQL comment.
+
+    The root cause of the remaining dst-side dual-write:
+      ``Tokenizer.from_dialect("snowflake")`` does not exist in sqlglot 30.x; it
+      raises AttributeError which is swallowed by the except-clause, falling back
+      to ``re.search(r'\\bBEGIN\\b', sql, re.IGNORECASE)`` which matches "begin"
+      inside a single-line comment.  Files that match falsely go through
+      ``_parse_scripting_file``, where ``CREATE TEMPORARY TABLE`` is NOT extracted
+      (``_EMBEDDED_DML`` only matches DML keywords), so ``_current_file_temp_keys``
+      is never populated.  Subsequent INSERT statements see bare ``tmp_base`` as an
+      ordinary table — emitting un-namespaced src/dst keys and creating a shared
+      ``ba.tmp_base`` kind='table' node that bridges separate ETL files (the exact
+      cross-file fusion the namespacing feature was designed to prevent).
+
+    Fix: change ``Tokenizer.from_dialect(...)`` → ``Tokenizer(dialect=...)`` so the
+    correct constructor is used and the except-clause is only a safety net.
+
+    Guards fix/temp-namespacing-dual-write (v1.21.1)
+    (plan/sprints/temp_table_namespacing.md §Deviations).
+    """
+
+    def test_begin_in_comment_is_not_scripting_block(self):
+        """A file with BEGIN inside a SQL comment must NOT be detected as a scripting block.
+
+        Pre-fix: ``Tokenizer.from_dialect(...)`` raises AttributeError → regex fallback
+        → ``re.search(r'\\bBEGIN\\b', ...)`` matches "begin" in the comment → True.
+        Post-fix: ``Tokenizer(dialect=...)`` works → token-aware scan → no BEGIN token
+        → False.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "-- de pvcode wordt aan het begin van een telcyclus vastgelegd\n"
+            "use schema BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS SELECT x FROM DA.src;\n"
+            "INSERT INTO real_target SELECT x FROM tmp_base;\n"
+        )
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser._has_scripting_block(sql)
+        assert result is False, (
+            "A file with 'begin' only inside a SQL comment must NOT be detected as a "
+            "scripting block.  Pre-fix: Tokenizer.from_dialect() raises → regex fallback "
+            "matched 'begin' in comment → True.  Post-fix: Tokenizer(dialect=...) works "
+            "→ token-aware scan → False.  "
+            "Guards fix/temp-namespacing-dual-write (v1.21.1)."
+        )
+
+    def test_begin_in_comment_file_parses_as_full_quality(self, tmp_path):
+        """A file with BEGIN in a comment parses at FULL quality (not SCRIPTING_FALLBACK).
+
+        Pre-fix: falsely routed through _parse_scripting_file → parse_quality=SCRIPTING_FALLBACK.
+        Post-fix: _has_scripting_block returns False → AnsiParser path → FULL.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "-- de pvcode wordt aan het begin van een telcyclus vastgelegd\n"
+            "use schema BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS SELECT x FROM DA.src;\n"
+            "INSERT INTO real_target SELECT x FROM tmp_base;\n"
+        )
+        rel = "etl/sql/fact/begin_comment.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+        assert result.parse_quality.value != "SCRIPTING_FALLBACK", (
+            f"File with BEGIN only in comment must NOT be SCRIPTING_FALLBACK, "
+            f"got {result.parse_quality!r}.  "
+            f"Guards fix/temp-namespacing-dual-write (v1.21.1)."
+        )
+
+    def test_begin_in_comment_temp_dst_is_namespaced_with_alias(self, tmp_path):
+        """With BEGIN in a comment and schema_aliases={'ba_tmp':'ba'}, the CREATE TEMPORARY
+        TABLE dst edges use the namespaced key — no bare 'ba.tmp_base' dst.
+
+        Pre-fix: file routed through _parse_scripting_file → _EMBEDDED_DML skips CREATE →
+        _current_file_temp_keys never populated → INSERT emits 'ba.tmp_base' as src
+        (role='table') — a shared node bridging unrelated files.
+        Post-fix: FULL parse path → _current_file_temp_keys={'ba.tmp_base'} →
+        INSERT src is namespaced.
+
+        The dst of the CREATE stmt edges is also checked: must be namespaced.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "-- de pvcode wordt aan het begin van een telcyclus vastgelegd\n"
+            "use schema BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS SELECT x FROM DA.src;\n"
+            "INSERT INTO real_target SELECT x FROM tmp_base;\n"
+        )
+        rel = "etl/sql/fact/begin_comment.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+
+        # All COLUMN_LINEAGE edges must use namespaced temp keys — never bare 'ba.tmp_base'
+        for stmt in result.statements:
+            for edge in stmt.column_lineage:
+                src_fid = edge.src.table.full_id
+                dst_fid = edge.dst.table.full_id
+                assert src_fid != "ba.tmp_base", (
+                    f"Bare 'ba.tmp_base' must not appear as edge src in a file where "
+                    f"BEGIN appears only in a comment and schema_aliases={'ba_tmp':'ba'} "
+                    f"is configured.  Pre-fix: _has_scripting_block false-positive → "
+                    f"_parse_scripting_file → _current_file_temp_keys never populated.  "
+                    f"Post-fix: Tokenizer(dialect=...) fix → FULL parse → namespaced src.  "
+                    f"Got src: {src_fid!r}  "
+                    f"Guards fix/temp-namespacing-dual-write (v1.21.1)."
+                )
+                assert dst_fid != "ba.tmp_base", (
+                    f"Bare 'ba.tmp_base' must not appear as edge dst in a file where "
+                    f"BEGIN appears only in a comment.  Got dst: {dst_fid!r}  "
+                    f"Guards fix/temp-namespacing-dual-write (v1.21.1)."
+                )
+                # If tmp_base appears at all, it must be namespaced
+                if "tmp_base" in src_fid:
+                    assert "::" in src_fid, f"tmp_base src ref must be namespaced; got {src_fid!r}"
+                if "tmp_base" in dst_fid:
+                    assert "::" in dst_fid, f"tmp_base dst ref must be namespaced; got {dst_fid!r}"

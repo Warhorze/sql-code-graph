@@ -682,3 +682,172 @@ class TestSchemaAliasDualWriteRegression:
             )
         finally:
             backend.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.21.1 regression guard: BEGIN-in-comment false-positive scripting detection
+# ---------------------------------------------------------------------------
+
+# Fixture modelled on the real wtfv_cyclische_telling.sql DWH pattern:
+#   - SQL comment contains the word "begin" (not a scripting keyword)
+#   - USE SCHEMA BA_TMP + schema alias ba_tmp → ba
+#   - CREATE TEMPORARY TABLE tmp_base AS SELECT ... UNION SELECT ...
+#   - INSERT INTO real_target SELECT ... FROM tmp_base
+#
+# Pre-fix: Tokenizer.from_dialect("snowflake") raises AttributeError (method does
+# not exist in sqlglot 30.x) → except-clause falls back to re.search(r'\bBEGIN\b')
+# → matches "begin" in the SQL comment → _has_scripting_block returns True →
+# _parse_scripting_file runs → _EMBEDDED_DML only matches DML keywords (not CREATE)
+# → _current_file_temp_keys never populated → INSERT emits un-namespaced
+# 'ba.tmp_base' as src_key, creating a shared kind='table' node that bridges ETL files.
+#
+# Post-fix: Tokenizer(dialect="snowflake") succeeds → token-aware scan → no BEGIN
+# token → _has_scripting_block returns False → AnsiParser path → full temp registration.
+
+_BEGIN_IN_COMMENT_SQL = """\
+-- de pvcode wordt aan het begin van een telcyclus vastgelegd
+use schema BA_TMP;
+
+create or replace temporary table tmp_base as
+select winkelnr, bontype
+from DA.real_src
+where status = 2
+union
+select winkelnr, bontype
+from DA.alt_src
+where status = 3;
+
+insert into real_target
+select base.winkelnr, base.bontype
+from tmp_base base;
+"""
+
+
+class TestBeginInCommentDualWriteRegression:
+    """A file with BEGIN only in a SQL comment must NOT be routed through the
+    scripting fallback path, and must produce a single namespaced temp identity.
+
+    Root cause of the dual-write observed on the live DWH after the v1.21.1
+    read-side fix: Tokenizer.from_dialect() does not exist → except-clause
+    → regex matches 'begin' in comments → false scripting detection.
+
+    Guards fix/temp-namespacing-dual-write (v1.21.1).
+    (plan/sprints/temp_table_namespacing.md §Deviations).
+    """
+
+    def test_no_bare_tmp_base_node_when_begin_in_comment(self, tmp_path):
+        """After indexing a file where BEGIN appears only in a SQL comment, the bare
+        'ba.tmp_base' kind='table' node must NOT exist.
+
+        Pre-fix: Tokenizer.from_dialect() → except → regex → 'begin' matched in comment
+        → scripting path → CREATE TEMPORARY skipped → INSERT emits bare src node.
+        Post-fix: correct Tokenizer API → no BEGIN token → FULL parse → namespaced temp.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/begin_comment.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_BEGIN_IN_COMMENT_SQL)
+
+        (tmp_path / ".sqlcg.toml").write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            # No bare 'ba.tmp_base' node must exist
+            bare_rows = backend.run_read(
+                "SELECT qualified, kind FROM \"SqlTable\" WHERE qualified = 'ba.tmp_base'",
+                {},
+            )
+            assert bare_rows == [], (
+                f"Un-namespaced 'ba.tmp_base' kind='table' node must not exist when BEGIN "
+                f"appears only in a SQL comment.  Pre-fix: Tokenizer.from_dialect() raises "
+                f"→ regex false-positive → scripting path → _current_file_temp_keys never "
+                f"populated → INSERT emits bare src, creating this node.  "
+                f"Post-fix: Tokenizer(dialect=...) fix → FULL parse → namespaced temp only.  "
+                f"Found: {bare_rows}"
+            )
+        finally:
+            backend.close()
+
+    def test_single_namespaced_tmp_base_when_begin_in_comment(self, tmp_path):
+        """After indexing with BEGIN in comment + schema_aliases, exactly ONE tmp_base
+        node exists — the namespaced kind='temp' node.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/begin_comment.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_BEGIN_IN_COMMENT_SQL)
+
+        (tmp_path / ".sqlcg.toml").write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            rows = backend.run_read(
+                "SELECT qualified, kind FROM \"SqlTable\" WHERE name = 'tmp_base'",
+                {},
+            )
+            assert len(rows) == 1, (
+                f"Expected exactly 1 tmp_base node (the namespaced kind='temp'), "
+                f"got {len(rows)}: {rows}"
+            )
+            assert rows[0]["kind"] == "temp", (
+                f"The single tmp_base node must have kind='temp', got {rows[0]['kind']!r}"
+            )
+            assert "::" in rows[0]["qualified"], (
+                f"The tmp_base node must be namespaced, got {rows[0]['qualified']!r}"
+            )
+        finally:
+            backend.close()
+
+    def test_no_bare_column_lineage_edges_when_begin_in_comment(self, tmp_path):
+        """After indexing with BEGIN in comment + schema_aliases, COLUMN_LINEAGE has
+        zero rows with bare 'ba.tmp_base' as either src_key or dst_key.
+
+        This is the core assertion for the shepherd-observed dual-write: both
+        INSERT src edges AND CREATE dst edges must be namespaced, not bare.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/begin_comment.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_BEGIN_IN_COMMENT_SQL)
+
+        (tmp_path / ".sqlcg.toml").write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            bare_dst = backend.run_read(
+                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE dst_key LIKE ?',
+                {"prefix": "ba.tmp_base.%"},
+            )
+            bare_src = backend.run_read(
+                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE src_key LIKE ?',
+                {"prefix": "ba.tmp_base.%"},
+            )
+
+            assert bare_dst == [], (
+                f"Zero COLUMN_LINEAGE rows with bare 'ba.tmp_base' dst_key expected.  "
+                f"Pre-fix: CREATE stmt from scripting path never emitted (so this was 0), "
+                f"but the INSERT stmt (correctly extracted) emitted bare src.  "
+                f"Post-fix: both CREATE and INSERT are on the FULL parse path → namespaced.  "
+                f"Found dst: {bare_dst}"
+            )
+            assert bare_src == [], (
+                f"Zero COLUMN_LINEAGE rows with bare 'ba.tmp_base' src_key expected.  "
+                f"Pre-fix: INSERT emitted bare 'ba.tmp_base' as src because "
+                f"_current_file_temp_keys was empty (CREATE was never extracted).  "
+                f"Post-fix: FULL parse → temp keys registered → namespaced src.  "
+                f"Found src: {bare_src}"
+            )
+        finally:
+            backend.close()
