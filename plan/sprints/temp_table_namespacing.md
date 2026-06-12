@@ -600,6 +600,38 @@ this plan in the docstring.
   was caused by the dual-write.
 - **Date**: 2026-06-12
 
+#### Deviation 2: BEGIN-in-comment false-positive scripting detection — second dual-write root cause
+- **Reason**: After the Deviation 1 fix (v1.21.1), the live DWH re-acceptance run still showed
+  a bare `ba.tmp_base` `kind='table'` node and COLUMN_LINEAGE edges with un-namespaced
+  `src_key LIKE 'ba.tmp_base.%'`.  Root cause: `_has_scripting_block` calls
+  `Tokenizer.from_dialect("snowflake")` which does not exist in sqlglot 30.x
+  (`Tokenizer` is instantiated as `Tokenizer(dialect=...)`).  The `AttributeError` is
+  silently swallowed by the `except`-clause, falling back to `re.search(r'\bBEGIN\b', sql)`
+  which matches the word "begin" inside a SQL comment (e.g. `-- aan het begin van een
+  telcyclus`).  Affected files are falsely routed through `_parse_scripting_file`,
+  where `_EMBEDDED_DML` only matches DML keywords (`SELECT`/`INSERT INTO`/`UPDATE`/
+  `DELETE`/`MERGE INTO`) — not `CREATE`.  So `CREATE TEMPORARY TABLE tmp_base AS
+  SELECT ... UNION SELECT ...` is never extracted, `_current_file_temp_keys` stays empty,
+  and subsequent `INSERT ... FROM tmp_base` emits bare `ba.tmp_base` (role='table')
+  as edge src, creating the shared node.  The root file identified: `wtfv_cyclische_telling.sql`
+  (comment "de pvcode wordt aan het **begin** van een telcyclus vastgelegd" — a false match).
+  The same class of bug as Deviation 1 (schema-alias-path-dependent, missing alias/context
+  at a key formation site) — different mechanism, same symptom.
+- **Change**: In [`snowflake_parser.py`](../../src/sqlcg/parsers/snowflake_parser.py)
+  `_has_scripting_block`, change `Tokenizer.from_dialect("snowflake")` →
+  `Tokenizer(dialect="snowflake")`.  One-line fix.  Expanded the existing
+  `TestSchemaAliasDualWriteRegression` with three new unit tests
+  (`TestBeginInCommentScriptingFalsePositive`) and three new integration tests
+  (`TestBeginInCommentDualWriteRegression`) that demonstrate BEGIN-in-comment with
+  schema_aliases — asserting zero bare `ba.tmp_base` dst/src edges.
+  All 6 FAIL on the pre-fix code, all PASS after.
+- **Impact**: Same patch scope (1.21.1).  No schema version change.  Wall-time expected
+  to drop further on re-index: falsely-scripted files were producing fewer edges (CREATE
+  not extracted → fewer defined_tables, fewer lineage edges), so the corrected FULL parse
+  adds edges, not removes.  Corrected count: 13 namespaced `ba.tmp_base` temp nodes (was 12
+  temp + 1 bare table after Deviation 1 fix with this file still scripted).
+- **Date**: 2026-06-12
+
 ## User verification queue
 
 Per house rule, the agent never tags releases. **On hold (pending user verification):**
