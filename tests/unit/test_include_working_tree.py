@@ -145,6 +145,7 @@ def _call_index_cmd(
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer
         mock_indexer.index_repo.return_value = {
+            "files_found": 1,  # required by atomic_full_index empty-root guard
             "files_parsed": 1,
             "tables_found": 1,
             "lineage_edges_created": 0,
@@ -158,6 +159,7 @@ def _call_index_cmd(
             # Simulate the real indexer calling set_indexed_sha(HEAD)
             backend1.set_indexed_sha(actual_head)
             return {
+                "files_found": 1,  # required by atomic_full_index empty-root guard
                 "files_parsed": 1,
                 "tables_found": 1,
                 "lineage_edges_created": 0,

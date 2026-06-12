@@ -53,6 +53,7 @@ def test_index_quiet_flag_suppresses_summary():
 
                 # Mock the summary result
                 mock_indexer.index_repo.return_value = {
+                    "files_found": 1,  # required by atomic_full_index empty-root guard
                     "files_parsed": 1,
                     "tables_found": 1,
                     "lineage_edges_created": 0,
@@ -113,6 +114,7 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer
         mock_indexer.index_repo.return_value = {
+            "files_found": 1,  # required by atomic_full_index empty-root guard
             "files_parsed": 1,
             "tables_found": 1,
             "lineage_edges_created": 0,

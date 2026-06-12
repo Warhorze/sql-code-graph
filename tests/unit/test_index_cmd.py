@@ -49,6 +49,7 @@ def test_zero_edges_warning_appears_in_output():
             mock_indexer = MagicMock()
             mock_indexer_class.return_value = mock_indexer
             mock_indexer.index_repo.return_value = {
+                "files_found": 1,  # required by atomic_full_index empty-root guard
                 "files_parsed": 1,
                 "tables_found": 1,
                 "lineage_edges_created": 0,  # Key: zero edges
@@ -111,6 +112,7 @@ def test_no_warning_when_edges_exist():
             mock_indexer = MagicMock()
             mock_indexer_class.return_value = mock_indexer
             mock_indexer.index_repo.return_value = {
+                "files_found": 1,  # required by atomic_full_index empty-root guard
                 "files_parsed": 1,
                 "tables_found": 1,
                 "lineage_edges_created": 5,  # Key: edges exist
