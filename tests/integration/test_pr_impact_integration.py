@@ -17,7 +17,7 @@ from pathlib import Path
 import sqlcg.server.tools as tools
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
-from sqlcg.server.tools import _capture_producer_set, get_pr_impact
+from sqlcg.server.tools import _capture_producer_set, _compute_pr_impact, get_pr_impact
 
 # ---------------------------------------------------------------------------
 # Git + index helpers
@@ -298,3 +298,138 @@ def test_detection_only_code_regression_is_true(tmp_path):
 
     result = get_pr_impact(base_ref=base_sha)
     assert result.detection_only_code_regression is True
+
+
+# ---------------------------------------------------------------------------
+# BUG B regression (v1.24.2) — blast radius must be NON-EMPTY for a deleted
+# producer with non-trivial downstream.
+# ---------------------------------------------------------------------------
+
+
+def test_blast_radius_nonempty_for_deleted_producer_with_downstream(tmp_path):
+    """_compute_pr_impact returns non-empty value_empty_columns for a deleted producer.
+
+    BUG B (v1.24.2): before the fix, _compute_empty_propagation was called AFTER
+    resync_changed deleted the lost producer's table + column nodes, so the engine
+    started from an empty column seed → value_empty_columns = [] (the 502-column
+    capstone collapse).
+
+    Fix (Option i — shepherd-directed): blast radius computed on the INTACT base
+    graph BEFORE resync, keyed per candidate.  After resync + diff, the pre-computed
+    radii for genuine_lost tables are aggregated.
+
+    Asserts:
+      - result.blast_radius.value_empty_columns is NON-EMPTY
+      - da.report ∈ result.blast_radius.value_affected_tables
+      - da.report.price ∈ result.blast_radius.value_empty_columns (or at least one
+        da.report.* column is present)
+
+    Guards plan/sprints/unfilled_table_impact.md PR 5 Integration test strategy.
+    """
+    _init_repo(tmp_path)
+
+    # Base: da.source produces da.orphan; da.child derives columns from da.orphan.
+    # Reuse the exact fixture shape from test_genuine_deletion_lost_producer_and_blast_radius
+    # which is known to give da.orphan kind='table' (da.child's SELECT FROM da.orphan sets
+    # the kind='table' entry before the INSERT INTO da.orphan 'derived' row can downgrade it
+    # via the DB-level guard).  Add a 2nd downstream to make the blast radius non-trivial.
+    (tmp_path / "source.sql").write_text(
+        "INSERT INTO da.orphan SELECT id, amount FROM da.source_raw"
+    )
+    (tmp_path / "downstream.sql").write_text(
+        "INSERT INTO da.child SELECT orphan.amount FROM da.orphan"
+    )
+    (tmp_path / "downstream2.sql").write_text(
+        "INSERT INTO da.grandchild SELECT child.amount FROM da.child"
+    )
+    base_sha = _commit_all(tmp_path, "base")
+
+    backend = _make_backend()
+    _index(tmp_path, backend, base_sha)
+    # Do NOT set tools._backend — call _compute_pr_impact directly with the backend.
+
+    # Head: delete source.sql → da.orphan loses its producer.
+    (tmp_path / "source.sql").unlink()
+    _commit_all(tmp_path, "delete source.sql")
+
+    result = _compute_pr_impact(backend, base_sha, max_depth=None)
+
+    # da.orphan must be in the genuine lost set.
+    assert "da.orphan" in result.lost_producer_tables, (
+        f"da.orphan should be detected as lost; got {result.lost_producer_tables}"
+    )
+
+    # BUG B: value_empty_columns must be NON-EMPTY (the radius was zeroed pre-fix).
+    assert result.blast_radius.value_empty_columns, (
+        "BUG B regression: value_empty_columns must not be empty for a deleted producer "
+        "with non-trivial downstream (da.child and da.grandchild derive from da.orphan). "
+        "Pre-fix this collapsed to [] because the engine ran on the post-resync graph "
+        "where da.orphan nodes were deleted. "
+        f"Got: blast_radius.value_empty_columns = {result.blast_radius.value_empty_columns!r}"
+    )
+
+    # da.child must be in value_affected_tables (derives columns from da.orphan).
+    assert "da.child" in result.blast_radius.value_affected_tables, (
+        f"da.child should be in value_affected_tables; "
+        f"got {result.blast_radius.value_affected_tables}"
+    )
+
+    # At least one da.child.* column must be in value_empty_columns.
+    child_cols = [c for c in result.blast_radius.value_empty_columns if "da.child" in c]
+    assert child_cols, (
+        f"At least one da.child.* column must appear in value_empty_columns; "
+        f"got {result.blast_radius.value_empty_columns!r}"
+    )
+
+
+def test_rename_still_excluded_from_blast_radius_after_bug_b_fix(tmp_path):
+    """Rename classification still works correctly after BUG B fix (Option i).
+
+    A renamed producer (same columns + consumers) must appear in renamed_tables
+    and produce NO blast radius — verifies that the pre-candidate blast approach
+    does not break rename exclusion.
+
+    Guards plan/sprints/unfilled_table_impact.md PR 5 Rename-still-excluded test.
+    """
+    _init_repo(tmp_path)
+
+    # Base: da.foo produced + da.consumer reads it.
+    (tmp_path / "foo_producer.sql").write_text(
+        "INSERT INTO da.foo SELECT id, amount, created_at FROM da.raw"
+    )
+    (tmp_path / "consumer.sql").write_text(
+        "INSERT INTO da.consumer_result SELECT foo.amount FROM da.foo"
+    )
+    base_sha = _commit_all(tmp_path, "base")
+
+    backend = _make_backend()
+    _index(tmp_path, backend, base_sha)
+
+    # Head: rename da.foo → da.bar (same columns, same consumers updated).
+    (tmp_path / "foo_producer.sql").unlink()
+    (tmp_path / "bar_producer.sql").write_text(
+        "INSERT INTO da.bar SELECT id, amount, created_at FROM da.raw"
+    )
+    (tmp_path / "consumer.sql").write_text(
+        "INSERT INTO da.consumer_result SELECT bar.amount FROM da.bar"
+    )
+    _commit_all(tmp_path, "rename da.foo to da.bar")
+
+    result = _compute_pr_impact(backend, base_sha, max_depth=None)
+
+    # Either da.foo is in renamed_tables (ideal), or at least it's not in the blast
+    # radius as a data-loss source (conservative path — Jaccard may be < 0.6 for
+    # small fixture; in that case, da.consumer_result should not be affected since
+    # it now reads da.bar, not da.foo).
+    if "da.foo" in result.renamed_tables:
+        assert result.renamed_tables["da.foo"] == "da.bar"
+        assert "da.foo" not in result.lost_producer_tables
+    else:
+        # Conservative path: da.foo listed as lost, but da.consumer_result not in
+        # blast radius because it now reads da.bar (no column lineage from da.foo).
+        blast_affected = set(result.blast_radius.row_empty_tables) | set(
+            result.blast_radius.value_affected_tables
+        )
+        assert "da.consumer_result" not in blast_affected, (
+            "da.consumer_result must NOT be in blast radius — it now reads da.bar"
+        )

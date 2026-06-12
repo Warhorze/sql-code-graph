@@ -2606,6 +2606,319 @@ def _diff_lost_producers(
     return genuine_lost, attribution, renamed
 
 
+def _aggregate_candidate_blast(
+    per_candidate: dict[str, "EmptyPropagationResult"],
+    genuine_lost: list[str],
+    max_depth: int | None,
+) -> "EmptyPropagationResult":
+    """Aggregate pre-computed per-candidate blast radii for the genuine-lost set.
+
+    After resync destroys the lost producers' nodes, we cannot re-run the engine.
+    Instead, union the blast results that were computed pre-resync for each table
+    in ``genuine_lost``.
+
+    ``genuine_lost ⊆ per_candidate.keys()`` by construction (a lost table's
+    producer file must be in ``deleted ∪ modified``).  For any table not in
+    ``per_candidate`` (rare edge case), we silently skip it — still better than
+    querying a post-resync graph where nodes are gone.
+
+    Args:
+        per_candidate: Map of table → blast result computed on the intact base graph.
+        genuine_lost: Genuinely-lost producer tables (renames excluded).
+        max_depth: Passed through to build a default empty result when needed.
+
+    Returns:
+        A merged ``EmptyPropagationResult`` for the union of all genuine-lost sources.
+    """
+    if not genuine_lost:
+        return _compute_empty_propagation_empty(genuine_lost)
+
+    relevant = [per_candidate[t] for t in genuine_lost if t in per_candidate]
+    if not relevant:
+        return _compute_empty_propagation_empty(genuine_lost)
+
+    # Union all per-source results.
+    sources: list[str] = []
+    row_empty: list[str] = []
+    value_cols: list[str] = []
+    value_affected: list[str] = []
+    value_fully: list[str] = []
+    value_partially: list[str] = []
+    prop_order: list[str] = []
+    noise_excluded: list[str] = []
+    truncated = False
+
+    seen_sources: set[str] = set()
+    seen_row: set[str] = set()
+    seen_vcols: set[str] = set()
+    seen_vaff: set[str] = set()
+    seen_vfull: set[str] = set()
+    seen_vpart: set[str] = set()
+    seen_order: set[str] = set()
+    seen_noise: set[str] = set()
+
+    for r in relevant:
+        for s in r.sources:
+            if s not in seen_sources:
+                sources.append(s)
+                seen_sources.add(s)
+        for t in r.row_empty_tables:
+            if t not in seen_row:
+                row_empty.append(t)
+                seen_row.add(t)
+        for c in r.value_empty_columns:
+            if c not in seen_vcols:
+                value_cols.append(c)
+                seen_vcols.add(c)
+        for t in r.value_affected_tables:
+            if t not in seen_vaff:
+                value_affected.append(t)
+                seen_vaff.add(t)
+        for t in r.value_fully_empty_tables:
+            if t not in seen_vfull:
+                value_fully.append(t)
+                seen_vfull.add(t)
+        for t in r.value_partially_empty_tables:
+            if t not in seen_vpart:
+                value_partially.append(t)
+                seen_vpart.add(t)
+        for t in r.propagation_order:
+            if t not in seen_order:
+                prop_order.append(t)
+                seen_order.add(t)
+        for t in r.noise_excluded:
+            if t not in seen_noise:
+                noise_excluded.append(t)
+                seen_noise.add(t)
+        truncated = truncated or r.truncated
+
+    # Recompute downstream_count as the union of both view table sets.
+    all_tables = seen_row | seen_vaff
+    downstream_count = len(all_tables)
+
+    # Build a composite hint.
+    hints = [r.hint for r in relevant if r.hint]
+    hint = " | ".join(hints) if hints else None
+
+    return EmptyPropagationResult(
+        sources=sources,
+        row_empty_tables=row_empty,
+        value_empty_columns=value_cols,
+        value_affected_tables=value_affected,
+        value_fully_empty_tables=value_fully,
+        value_partially_empty_tables=value_partially,
+        propagation_order=prop_order,
+        downstream_count=downstream_count,
+        noise_excluded=noise_excluded,
+        truncated=truncated,
+        hint=hint,
+    )
+
+
+def _compute_empty_propagation_empty(sources: list[str]) -> "EmptyPropagationResult":
+    """Return an empty EmptyPropagationResult for the given source list."""
+    return EmptyPropagationResult(
+        sources=sources,
+        downstream_count=0,
+        truncated=False,
+        hint="No producers lost — no data-loss blast radius.",
+    )
+
+
+def _compute_pr_impact(
+    db: GraphBackend,
+    base_ref: str,
+    max_depth: int | None,
+) -> PrImpactResult:
+    """Core pr-impact computation on an explicit backend handle.
+
+    Extracted from ``get_pr_impact`` so the CLI can supply its own backend (via
+    ``get_backend()``) and the MCP tool can supply its server-singleton backend
+    (via ``_open_backend()``).  The logic is identical in both cases.
+
+    **BUG-B FIX (Option i, v1.24.2 — shepherd-directed):** The blast radius is
+    computed on the INTACT base graph BEFORE ``resync_changed`` advances the
+    graph to HEAD.  The approach:
+
+    1.  Before resync, build the candidate set ``C`` = producer tables whose
+        generating file appears in ``deleted ∪ modified`` of the git delta.
+    2.  For each candidate ``c ∈ C``, run ``_compute_empty_propagation(db, [c],
+        max_depth)`` against the still-intact base graph and store the result.
+    3.  Resync to HEAD; capture ``producers_after``; diff and classify renames
+        (logic unchanged from PR 2).
+    4.  ``genuine_lost ⊆ C`` — assemble the final blast radius by unioning the
+        pre-computed per-candidate results for exactly the tables in
+        ``genuine_lost``.
+
+    **KNOWN LIMITATION:** the tool still resyncs the graph to HEAD as a side
+    effect — ``db.get_indexed_sha()`` will reflect HEAD after the call.  Making
+    detection non-destructive (Option ii — removing the internal resync) is a
+    follow-up tracked in plan/sprints/unfilled_table_impact.md §Deviations and
+    the O2 note.
+
+    **CODE REGRESSION DETECTION ONLY** — ``detection_only_code_regression`` is
+    always ``True``.  An edge disappears only when the SQL that produced it is
+    removed, renamed, or broken.  Runtime row-count monitoring is OUT OF SCOPE.
+
+    Args:
+        db: An open GraphBackend (R/W — resync requires write access).
+        base_ref: Git ref (branch, tag, or SHA) the current graph is indexed at.
+        max_depth: Optional BFS depth cap for the blast-radius traversal
+            (None = unbounded).
+
+    Returns:
+        PrImpactResult with lost producers, renames, attribution, and blast radius.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed (via ``_assert_indexed``).
+    """
+    _assert_indexed(db)
+
+    root = _indexed_root(db) or Path.cwd()
+
+    # 1. Resolve base_ref → base_sha.
+    base_sha = _resolve_git_ref(root, base_ref)
+    if base_sha is None:
+        return PrImpactResult(
+            base_ref=base_ref,
+            base_sha=None,
+            head_sha=None,
+            detection_only_code_regression=True,
+            hint=(
+                f"Could not resolve ref '{base_ref}' — ensure git is available and the ref exists."
+            ),
+        )
+
+    # 2. Assert graph is indexed at base_sha.
+    indexed_sha = db.get_indexed_sha()
+    if indexed_sha != base_sha:
+        return PrImpactResult(
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=None,
+            detection_only_code_regression=True,
+            hint=(
+                f"Graph is indexed at '{indexed_sha}' but base_ref resolves to '{base_sha}'. "
+                f"Run 'sqlcg index <path>' or 'sqlcg reindex' at '{base_ref}' first, "
+                "then call get_pr_impact."
+            ),
+        )
+
+    # 3. Capture producers_before.
+    producers_before = _capture_producer_set(db)
+
+    # 4. Resolve HEAD.
+    head_sha = _resolve_git_ref(root, "HEAD")
+    if head_sha is None:
+        return PrImpactResult(
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=None,
+            detection_only_code_regression=True,
+            hint="Could not resolve HEAD SHA — ensure git is available.",
+        )
+
+    if head_sha == base_sha:
+        # No change — nothing to detect.
+        return PrImpactResult(
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            detection_only_code_regression=True,
+            hint="HEAD is the same as base_ref — no changes to detect.",
+            blast_radius=_compute_empty_propagation(db, [], max_depth),
+        )
+
+    # Read dialect from the stored .sqlcg.toml for the repo root.
+    try:
+        from sqlcg.core.config import get_dialect
+
+        dialect: str | None = get_dialect(root)
+    except Exception:  # noqa: BLE001
+        dialect = None
+
+    # Pre-resync: capture file → target_table map for the changed-file set so
+    # attribution can find which file wrote each lost producer (even for deleted
+    # files whose graph entries will be removed by resync_changed).
+    from sqlcg.indexer.git_delta import git_name_status_delta as _gns_delta
+
+    pre_resync_file_targets: dict[str, list[str]] = {}
+    pre_delta = _gns_delta(root, base_sha, head_sha)
+    if pre_delta is not None:
+        changed_files_pre = [str(p) for p in pre_delta.deleted | pre_delta.modified]
+        for fp in changed_files_pre:
+            try:
+                rows = db.run_read(GET_TARGET_TABLES_FOR_FILE_QUERY, {"file_path": fp})
+                pre_resync_file_targets[fp] = [
+                    r["table_qualified"].lower() for r in rows if r.get("table_qualified")
+                ]
+            except Exception:  # noqa: BLE001
+                pre_resync_file_targets[fp] = []
+
+    # BUG-B FIX (Option i) — Step 2: compute blast radius per candidate on the
+    # still-intact base graph BEFORE resync destroys the lost producer's nodes.
+    # Candidate set C = union of pre_resync_file_targets values (producer tables
+    # whose generating file is in deleted ∪ modified).
+    candidate_set: set[str] = set()
+    for targets in pre_resync_file_targets.values():
+        candidate_set.update(targets)
+
+    # Per-candidate blast radius on the intact base graph.
+    per_candidate_blast: dict[str, EmptyPropagationResult] = {}
+    for candidate in sorted(candidate_set):
+        per_candidate_blast[candidate] = _compute_empty_propagation(db, [candidate], max_depth)
+
+    # 4b. Orchestrate resync to HEAD (graph-only; advances indexed_sha to HEAD).
+    indexer = Indexer()
+    indexer.resync_changed(root, base_sha, head_sha, db, dialect)
+
+    # 5. Capture producers_after.
+    producers_after = _capture_producer_set(db)
+
+    # 6. Diff. Pass pre_resync_file_targets for attribution (deleted files).
+    genuine_lost, attribution, renamed = _diff_lost_producers(
+        producers_before,
+        producers_after,
+        db,
+        base_sha,
+        head_sha,
+        pre_resync_file_targets=pre_resync_file_targets,
+    )
+
+    # 7. Assemble blast radius from pre-computed per-candidate results for exactly
+    # the tables in genuine_lost.  genuine_lost ⊆ candidate_set by construction
+    # (a lost table's base producer file must be in deleted ∪ modified).
+    # For tables not in candidate_set (edge case: modified file still had a query
+    # writing the table, but that query disappeared — rare), fall back to an empty
+    # radius so we never run the engine on the post-resync graph where nodes are gone.
+    blast = _aggregate_candidate_blast(per_candidate_blast, genuine_lost, max_depth)
+
+    # Build hint.
+    hints: list[str] = []
+    if not genuine_lost and not renamed:
+        hints.append("No producers lost — no data-loss blast radius.")
+    elif not genuine_lost and renamed:
+        hints.append(
+            f"{len(renamed)} table(s) renamed (see renamed_tables) — no genuine data loss detected."
+        )
+    hints.append(
+        "DETECTION ONLY: this tool detects code regressions (SQL removed/broken), "
+        "NOT runtime emptiness (a job that produces 0 rows while SQL is unchanged)."
+    )
+
+    return PrImpactResult(
+        base_ref=base_ref,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        lost_producer_tables=genuine_lost,
+        renamed_tables=renamed,
+        attribution=attribution,
+        blast_radius=blast,
+        detection_only_code_regression=True,
+        hint=" | ".join(hints),
+    )
+
+
 @mcp.tool()
 @_timed_tool("get_pr_impact")
 def get_pr_impact(base_ref: str, max_depth: int | None = None) -> PrImpactResult:
@@ -2623,17 +2936,10 @@ def get_pr_impact(base_ref: str, max_depth: int | None = None) -> PrImpactResult
     Jaccard ≥ 0.6 (AND-combined) and puts them in ``renamed_tables`` (excluded from
     the blast radius).  This is a heuristic — callers should verify ``renamed_tables``.
 
-    Sequence:
-    1. Resolve ``base_ref`` → ``base_sha``.
-    2. Assert ``get_indexed_sha() == base_sha`` — if not, return a hint (no crash,
-       no silent compare of mismatched states).
-    3. Capture ``producers_before`` from the base-indexed graph.
-    4. Orchestrate ``resync_changed(root, base_sha, head_sha, ...)`` to advance the
-       graph DB from ``base_sha`` to HEAD (graph-only update, not a filesystem change).
-    5. Capture ``producers_after`` from the advanced graph.
-    6. Diff: compute genuine lost producers (renames excluded via Jaccard heuristic).
-    7. Feed genuine lost producers only into ``_compute_empty_propagation`` (PR 1 engine).
-    8. Return ``PrImpactResult`` with blast radius + rename attribution.
+    **BUG-B KNOWN LIMITATION (v1.24.2):** the blast radius is computed on the intact
+    base graph (before resync) via the pre-candidate approach (Option i).  The tool
+    still resyncs the graph to HEAD as a side effect — making detection non-destructive
+    (Option ii, dropping the internal resync) is a follow-up.
 
     Args:
         base_ref: Git ref (branch, tag, or SHA) that the current graph is indexed at.
@@ -2646,131 +2952,4 @@ def get_pr_impact(base_ref: str, max_depth: int | None = None) -> PrImpactResult
         NotIndexedError: If no repos have been indexed.
     """
     with _open_backend() as db:
-        _assert_indexed(db)
-
-        root = _indexed_root(db) or Path.cwd()
-
-        # 1. Resolve base_ref → base_sha.
-        base_sha = _resolve_git_ref(root, base_ref)
-        if base_sha is None:
-            return PrImpactResult(
-                base_ref=base_ref,
-                base_sha=None,
-                head_sha=None,
-                detection_only_code_regression=True,
-                hint=(
-                    f"Could not resolve ref '{base_ref}' — "
-                    "ensure git is available and the ref exists."
-                ),
-            )
-
-        # 2. Assert graph is indexed at base_sha.
-        indexed_sha = db.get_indexed_sha()
-        if indexed_sha != base_sha:
-            return PrImpactResult(
-                base_ref=base_ref,
-                base_sha=base_sha,
-                head_sha=None,
-                detection_only_code_regression=True,
-                hint=(
-                    f"Graph is indexed at '{indexed_sha}' but base_ref resolves to '{base_sha}'. "
-                    f"Run 'sqlcg index <path>' or 'sqlcg reindex' at '{base_ref}' first, "
-                    "then call get_pr_impact."
-                ),
-            )
-
-        # 3. Capture producers_before.
-        producers_before = _capture_producer_set(db)
-
-        # 4. Resolve HEAD and orchestrate resync.
-        head_sha = _resolve_git_ref(root, "HEAD")
-        if head_sha is None:
-            return PrImpactResult(
-                base_ref=base_ref,
-                base_sha=base_sha,
-                head_sha=None,
-                detection_only_code_regression=True,
-                hint="Could not resolve HEAD SHA — ensure git is available.",
-            )
-
-        if head_sha == base_sha:
-            # No change — nothing to detect.
-            return PrImpactResult(
-                base_ref=base_ref,
-                base_sha=base_sha,
-                head_sha=head_sha,
-                detection_only_code_regression=True,
-                hint="HEAD is the same as base_ref — no changes to detect.",
-                blast_radius=_compute_empty_propagation(db, [], max_depth),
-            )
-
-        # Read dialect from the stored .sqlcg.toml for the repo root.
-        try:
-            from sqlcg.core.config import get_dialect
-
-            dialect: str | None = get_dialect(root)
-        except Exception:  # noqa: BLE001
-            dialect = None
-
-        # Pre-resync: capture file → target_table map for the changed-file set
-        # so attribution can find which file wrote each lost producer, even for
-        # deleted files whose graph entries will be removed by resync_changed.
-        from sqlcg.indexer.git_delta import git_name_status_delta as _gns_delta
-
-        pre_resync_file_targets: dict[str, list[str]] = {}
-        pre_delta = _gns_delta(root, base_sha, head_sha)
-        if pre_delta is not None:
-            changed_files_pre = [str(p) for p in pre_delta.deleted | pre_delta.modified]
-            for fp in changed_files_pre:
-                try:
-                    rows = db.run_read(GET_TARGET_TABLES_FOR_FILE_QUERY, {"file_path": fp})
-                    pre_resync_file_targets[fp] = [
-                        r["table_qualified"].lower() for r in rows if r.get("table_qualified")
-                    ]
-                except Exception:  # noqa: BLE001
-                    pre_resync_file_targets[fp] = []
-
-        indexer = Indexer()
-        indexer.resync_changed(root, base_sha, head_sha, db, dialect)
-
-        # 5. Capture producers_after.
-        producers_after = _capture_producer_set(db)
-
-        # 6. Diff. Pass pre_resync_file_targets for attribution (deleted files).
-        genuine_lost, attribution, renamed = _diff_lost_producers(
-            producers_before,
-            producers_after,
-            db,
-            base_sha,
-            head_sha,
-            pre_resync_file_targets=pre_resync_file_targets,
-        )
-
-        # 7. Feed genuine lost into PR 1 blast-radius engine.
-        blast = _compute_empty_propagation(db, genuine_lost, max_depth)
-
-        # Build hint.
-        hints: list[str] = []
-        if not genuine_lost and not renamed:
-            hints.append("No producers lost — no data-loss blast radius.")
-        elif not genuine_lost and renamed:
-            hints.append(
-                f"{len(renamed)} table(s) renamed (see renamed_tables) — "
-                "no genuine data loss detected."
-            )
-        hints.append(
-            "DETECTION ONLY: this tool detects code regressions (SQL removed/broken), "
-            "NOT runtime emptiness (a job that produces 0 rows while SQL is unchanged)."
-        )
-
-        return PrImpactResult(
-            base_ref=base_ref,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            lost_producer_tables=genuine_lost,
-            renamed_tables=renamed,
-            attribution=attribution,
-            blast_radius=blast,
-            detection_only_code_regression=True,
-            hint=" | ".join(hints),
-        )
+        return _compute_pr_impact(db, base_ref, max_depth)

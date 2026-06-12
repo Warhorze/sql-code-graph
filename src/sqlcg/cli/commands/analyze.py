@@ -543,11 +543,18 @@ def pr_impact(  # noqa: B008
         console.print("[red]Error: --max-depth must be between 1 and 100[/red]")
         raise typer.Exit(1)
 
-    # W2 / O1 — get_pr_impact manages the backend internally (it calls _open_backend).
-    # The resync step requires a writable backend, so we do not open read_only here.
-    from sqlcg.server.tools import get_pr_impact as _get_pr_impact
+    # W2 / O1 — mirror the PR 1 empty-impact seam: open a backend directly via
+    # get_backend() and pass it to _compute_pr_impact.  The resync step inside
+    # _compute_pr_impact requires write access; get_backend() returns a single
+    # R/W DuckDB handle (the read_only arg is ignored — see config.py L354-356).
+    # Do NOT call get_pr_impact() here — that goes through _open_backend() which
+    # yields the MCP-server-singleton _backend global (only set by init_backend()
+    # at MCP-server startup; never set in the CLI process → RuntimeError).
+    from sqlcg.core.config import get_backend
+    from sqlcg.server.tools import _compute_pr_impact
 
-    result = _get_pr_impact(base_ref=base, max_depth=max_depth)
+    with get_backend() as db:
+        result = _compute_pr_impact(db, base_ref=base, max_depth=max_depth)
 
     # --- Render ---
     console.print()
