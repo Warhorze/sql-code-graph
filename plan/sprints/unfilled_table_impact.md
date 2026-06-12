@@ -1,6 +1,6 @@
 # Feature Plan: Unfilled-Table Impact (empty-propagation report)
 
-> Status: DRAFT — pending plan-reviewer gate.
+> Status: REVISED — plan-reviewer REQUEST CHANGES (W1, W2, N1, N2, N3) folded in 2026-06-12.
 > Owner (compliance): architect-planner.
 > Version target: **1.22.0** (additive feature → minor; see §Version & Release).
 
@@ -127,9 +127,24 @@ sqlcg analyze empty-impact <table> [<table> ...] [--raw] [--max-depth N]
 > **Resolution:** the shared work (closure → rollup → exclude → order → filter) is
 > factored into a private helper `_compute_empty_propagation(db, tables, max_depth)`
 > in `tools.py` that takes an open backend. The MCP tool calls it under
-> `_open_backend()`. The CLI command obtains a backend the same way sibling
-> commands do — see §Open question O1; the developer MUST confirm the exact CLI
-> backend-acquisition pattern before implementing, not guess.
+> `_open_backend()`. The CLI command obtains a backend by opening one **directly**
+> — see §Open question O1 (resolved): this is a **NEW pattern for `analyze.py`**,
+> because **no existing `analyze` command holds a `GraphBackend` handle**. Every
+> sibling command (`upstream`, `downstream`, `impact`, `unused`) reads via
+> `run_read_routed(sql, params)` with **raw SQL strings** and never touches a backend
+> object. `_compute_empty_propagation` needs a real `db` handle (for
+> `_affected_columns_closure` / `_exclude_synthetic_tables` / `_kahn_topological_sort`),
+> so there is **no sibling backend pattern to copy**. The CLI command therefore
+> acquires the backend exactly as `run_read_routed`'s own read-only fallback does
+> ([`read_client.py`](../../src/sqlcg/server/read_client.py) ~L191):
+> ```python
+> with get_backend(read_only=True) as db:
+>     result = _compute_empty_propagation(db, tables, max_depth)
+> ```
+> `read_only=True` is mandatory — without it the open is read-write and any
+> concurrent writer raises "Database is locked" (the documented BLOCKER 1 at
+> read_client.py L187-188). The developer MUST NOT route this through
+> `run_read_routed` (it returns rows, not a backend) and MUST NOT invent a third seam.
 
 ## Decision 3 — Output shape (`EmptyPropagationResult`)
 
@@ -217,12 +232,32 @@ Notes:
 - Reuses `GET_COLUMNS_FOR_TABLE_QUERY`, `_affected_columns_closure`,
   `_rollup_to_tables`, noise filter, `_exclude_synthetic_tables`,
   `_kahn_topological_sort`. No new traversal/SQL.
+- **W1 (MANDATORY — silent wrong output if missed).** When calling
+  `_kahn_topological_sort` to produce `propagation_order`, the adjacency closure id
+  set MUST include the **start columns** (from the named source tables), not just
+  the affected columns. Pass the union, deduped order-preserving, exactly as
+  `get_backfill_order` does ([`tools.py`](../../src/sqlcg/server/tools.py) L1154):
+  ```python
+  closure_col_ids = _dedup_preserve_order([*start_cols, *affected_cols])
+  order, had_cycle = _kahn_topological_sort(affected_tables, db, closure_col_ids)
+  ```
+  Rationale: `GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY` needs both endpoints of the
+  direct producer edge — including the source's own columns — present in the id
+  set. If only `affected_cols` is passed, the direct producer→consumer edge from a
+  source's own columns is absent and propagation ordering degrades toward
+  alphabetical for multi-hop chains routed through CTE/derived bridges (whose
+  synthetic-node contraction in `_kahn_topological_sort` relies on those endpoints).
+  This is documented in `_kahn_topological_sort`'s docstring. Do NOT pass
+  `affected_cols` alone.
 - Computes `fully_empty_tables` / `partially_empty_tables` by comparing each
   affected table's empty-column subset against its full known column set.
 - Returns a plain dataclass/tuple the tool and CLI both consume.
 - Acceptance: pure function of `(db, tables, max_depth)`; given a fixture graph,
   returns the documented sets; `partially_empty_tables` is non-empty for the E3
-  fixture.
+  fixture; the `_kahn_topological_sort` call is verified to receive
+  `closure_col_ids = _dedup_preserve_order([*start_cols, *affected_cols])` — pinned
+  behaviourally by the **N3 multi-hop CTE/derived-bridge propagation-order test**
+  (§Test Strategy), which is constructed to fail if `affected_cols` alone is passed.
 
 ### Phase 2: MCP tool
 **Step 2.1 — `get_empty_propagation(tables)` MCP tool.**
@@ -239,13 +274,38 @@ Notes:
 ### Phase 3: CLI surface
 **Step 3.1 — `sqlcg analyze empty-impact` command.**
 - File: [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py).
-- Reads a backend via the **confirmed** CLI pattern (O1), calls
-  `_compute_empty_propagation`, renders a Rich table: propagation_order with a
+- **Backend acquisition (O1 resolved — NEW pattern for `analyze.py`).** Unlike the
+  sibling commands (which use `run_read_routed` with raw SQL and never hold a
+  backend), this command opens a backend directly because
+  `_compute_empty_propagation` needs a `db` handle:
+  ```python
+  from sqlcg.core.config import get_backend
+  with get_backend(read_only=True) as db:
+      result = _compute_empty_propagation(db, tables, max_depth)
+  ```
+  `read_only=True` is mandatory (lock semantics, read_client.py L187-188). Import
+  `get_backend` exactly as the `run_read_routed` fallback does.
+- **N1 — noise filter repo root.** When NOT in `--raw` mode, build the noise filter
+  with `NoiseFilter.from_config(repo_root=resolved_repo_root())`, importing
+  `resolved_repo_root` from [`read_client.py`](../../src/sqlcg/server/read_client.py)
+  exactly as `upstream`/`downstream`/`impact`/`unused` already do (analyze.py L163,
+  L204, L249, L298). Do NOT hardcode or guess the repo root.
+- **N2 — `--max-depth` validation (consistent with siblings).** `upstream` and
+  `downstream` validate `depth < 1 or depth > 100` and `raise typer.Exit(1)`
+  (analyze.py L138-140, L179-181). `empty-impact` MUST match that rule **with one
+  documented difference**: `--max-depth` defaults to `None` (= unbounded full
+  depth, mapping to the engine's `max_depth=None`), and `None` is **valid**. When a
+  value IS supplied, it must satisfy `1 <= max_depth <= 100`; an out-of-range value
+  (`< 1` or `> 100`) prints `[red]Error: --max-depth must be between 1 and 100[/red]`
+  and exits non-zero (`raise typer.Exit(1)`). State explicitly: omitted/`None` →
+  unbounded, valid; `0`, negative, or `> 100` → invalid, exit 1.
+- Calls `_compute_empty_propagation`, renders a Rich table: propagation_order with a
   per-table `empty / total columns` count and a `full|partial` marker; honours
   `--raw` and `--max-depth`.
 - Acceptance: `uv run sqlcg analyze empty-impact <fixture-table>` prints the
   affected tables in propagation order with the partial/full marker; `--raw` shows
-  noise rows; exit code 0 on success, non-zero on bad `--max-depth`.
+  noise rows; omitting `--max-depth` runs unbounded (exit 0); `--max-depth 0` and
+  `--max-depth 101` each exit non-zero with the documented message.
 
 ### Phase 4: Docs + version
 **Step 4.1 — Version bump + ARCHITECTURE_REVIEW tool-count + tool docstring.**
@@ -277,8 +337,18 @@ in the docstring (per developer.md test-naming).
     the unfilled source loses only the derived columns.
   - Fully-empty fixture: a downstream table all of whose columns derive from the
     unfilled source ⇒ it lands in `fully_empty_tables`.
-  - Propagation order: a 3-hop chain `s → m → d` returns `[m, d]` in
-    `propagation_order` (closest-to-source first).
+  - **Propagation order (N3 — must exercise the W1 path).** A multi-hop chain
+    `s → m → d` returns `[m, d]` in `propagation_order` (closest-to-source first).
+    The intermediate hop `s → m` MUST be routed **through a CTE / derived BRIDGE
+    node** (a synthetic `kind in {cte, derived, temp}` node between `s` and `m`),
+    NOT a direct real-table `COLUMN_LINEAGE` edge. Rationale: only the synthetic-node
+    **contraction path** inside `_kahn_topological_sort` depends on the start
+    columns being present in the adjacency id set (W1). A direct real-table edge
+    chain would order correctly even if `closure_col_ids` omitted `start_cols`, so a
+    direct-edge fixture would pass while W1 is violated — masking the regression this
+    test exists to catch. The fixture must build the bridge so that, were the
+    developer to pass `affected_cols` alone (not `[*start_cols, *affected_cols]`),
+    this test would observably fail (order degrades / `m` and `d` mis-ordered).
   - Synthetic exclusion: a CTE/derived bridge between `s` and `d` does NOT appear in
     any output table list; `d` still appears.
   - Star-source: a `SELECT *` from `s` feeding `d` reports `d`'s columns as empty.
@@ -336,17 +406,18 @@ in the docstring (per developer.md test-naming).
 - Per project rule: agent does NOT close issues and does NOT tag; user verifies
   live + tags `v1.22.0` after merge.
 
-## Open Questions (resolve before / during implementation; do not block planning)
-- **O1 — CLI backend acquisition.** Sibling `analyze` commands read via
-  `run_read_routed` (raw SQL strings), not via a `GraphBackend` handle, whereas
-  `_compute_empty_propagation` wants a backend (for `db.run_read(...)` and the
-  helper reuse). The developer MUST confirm the canonical pattern: either (a) run
-  the helper inside the MCP/server seam and have the CLI route to it, or (b) obtain
-  a read-only backend in the CLI the way the server fallback does
-  (`get_backend(read_only=True)`), respecting the lock semantics documented in
-  `read_client.py`. **Pick the pattern an existing command already uses; do not
-  invent a third seam.** This is a minor-uncertainty resolution by existing
-  pattern, not a new architecture decision.
+## Open Questions (resolved during plan revision — no longer open)
+- **O1 — CLI backend acquisition — RESOLVED.** Investigation (this revision)
+  confirmed **no existing `analyze` command holds a `GraphBackend` handle**; all
+  five read via `run_read_routed(sql, params)` with raw SQL strings. There is
+  therefore **no sibling pattern to copy** for a helper that needs a `db` handle.
+  Resolution: the CLI command opens a backend **directly** via
+  `with get_backend(read_only=True) as db:`, mirroring `run_read_routed`'s own
+  read-only fallback at [`read_client.py`](../../src/sqlcg/server/read_client.py)
+  L191 and respecting the documented lock semantics (L187-188). This is option (b)
+  and is a **NEW pattern for `analyze.py`** (acknowledged, not a copy). It is NOT a
+  third seam — it is the exact seam `read_client.py` already uses for its fallback.
+  See §Decision 2 and Step 3.1.
 
 > No blocking questions. Feature is well-defined and aligned with
 > ARCHITECTURE_REVIEW.md (read-side lineage tooling; no parser/schema-CSV path).
