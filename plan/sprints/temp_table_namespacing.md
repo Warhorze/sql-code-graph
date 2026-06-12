@@ -632,6 +632,34 @@ this plan in the docstring.
   temp + 1 bare table after Deviation 1 fix with this file still scripted).
 - **Date**: 2026-06-12
 
+#### Deviation 3: Fossil-key stale-graph artifact — "2,019 W1 artifacts" and residual-bare-twin reports were not parser bugs
+- **Reason**: Live-DWH acceptance reports after v1.21.0 and v1.21.1 showed
+  "2,019 bare edges across all files" and "bare-twin residuals" that were attributed
+  to parser behavior.  Investigation for v1.21.2 identified the root cause: the direct
+  CLI path (`index_cmd._run_index`) called `indexer.index_repo()` with **no prior
+  `clear_all_tables()`**, leaving rows from previous indexing runs permanently in the
+  graph.  The "2,019 W1 artifact" count and the residual bare-twin edge reports were
+  stale rows from pre-v1.21.x index runs co-existing with new namespaced rows — not
+  parser regressions.  A fresh DB produced zero bare rows for the same query, confirming
+  the stale-graph origin.  Only the MCP server drain path
+  (`writer._do_index`) called `clear_all_tables()` before `index_repo()`.
+- **Change**: Extracted `atomic_full_index()` (module-level function in
+  [`indexer.py`](../../src/sqlcg/indexer/indexer.py)) that wraps
+  `db.clear_all_tables()` + `indexer.index_repo()` + empty-root guard in one
+  `db.transaction()`.  Both `writer._do_index` (MCP drain) and
+  `index_cmd._run_index` (direct CLI) now call this single helper so the two paths
+  can never diverge.  The CLI Repo node upsert is moved to after the rebuild
+  (inside the transaction `clear_all_tables()` would wipe a pre-existing Repo row).
+  Three regression guards added in
+  [`test_cli_index_clear_before_rebuild.py`](../../tests/integration/test_cli_index_clear_before_rebuild.py):
+  (1) stale SqlTable rows absent after reindex, (2) empty-dir rollback preserves graph,
+  (3) normal index commits a non-empty graph.
+- **Impact**: Patch version 1.21.1 → 1.21.2.  The "2,019 W1 artifact" count should
+  drop to 0 after the first re-index with this fix on a clean DB (or after a re-index
+  on the existing DB, since `clear_all_tables()` now runs first).  No parser or schema
+  change; no scope or risk change.
+- **Date**: 2026-06-12
+
 ## User verification queue
 
 Per house rule, the agent never tags releases. **On hold (pending user verification):**

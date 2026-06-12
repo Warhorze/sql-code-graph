@@ -1796,3 +1796,67 @@ class Indexer:
         except Exception as exc:
             logger.warning("catalog re-apply failed: %s", exc)
             return empty
+
+
+# ---------------------------------------------------------------------------
+# Shared atomic rebuild helper — used by BOTH the MCP drain and the CLI path
+# ---------------------------------------------------------------------------
+
+_EMPTY_ROOT_ERROR = "refusing to index empty root — graph preserved"
+
+
+def atomic_full_index(
+    indexer: Indexer,
+    path: Path,
+    dialect: str | None,
+    db: GraphBackend,
+    *,
+    progress_callback=None,
+    **index_kwargs,
+) -> dict:
+    """Clear the graph and re-index *path* in a single atomic transaction.
+
+    Wraps ``db.clear_all_tables()`` + ``indexer.index_repo(...)`` in one
+    ``db.transaction()`` so DuckDB MVCC readers see the old graph until
+    COMMIT and a mid-rebuild failure rolls back to the old graph.
+
+    Empty-root guard (A1): if the walker found zero SQL files, raises
+    ``ValueError(_EMPTY_ROOT_ERROR)`` **inside** the transaction so the
+    ``clear_all_tables()`` is rolled back and the prior graph is preserved.
+
+    Both the MCP server drain path (``writer._do_index``) and the direct
+    CLI path (``index_cmd._run_index``) call this function so the two
+    paths can never diverge in their rebuild semantics.
+
+    Args:
+        indexer: Indexer instance (caller owns it; normally ``Indexer()``).
+        path: Root directory to index.
+        dialect: SQL dialect, or None for ANSI.
+        db: Live GraphBackend (must support ``transaction()`` and
+            ``clear_all_tables()``).
+        progress_callback: Optional ``(files_done: int, files_total: int) ->
+            None`` callback forwarded to ``index_repo``.
+        **index_kwargs: Additional keyword arguments forwarded verbatim to
+            ``indexer.index_repo()`` (e.g. ``batch_size``, ``no_ddl``,
+            ``timeout_per_file``, ``profile``).
+
+    Returns:
+        The summary dict returned by ``indexer.index_repo()``.
+
+    Raises:
+        ValueError: if the root contains zero SQL files (guard message:
+            ``_EMPTY_ROOT_ERROR``).  The transaction is rolled back before
+            the exception propagates.
+    """
+    with db.transaction():
+        db.clear_all_tables()
+        summary = indexer.index_repo(
+            path,
+            dialect,
+            db,
+            progress_callback=progress_callback,
+            **index_kwargs,
+        )
+        if summary.get("files_found", 0) == 0:
+            raise ValueError(_EMPTY_ROOT_ERROR)
+        return summary

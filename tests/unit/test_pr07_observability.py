@@ -141,6 +141,7 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
     indexer_mock = MagicMock()
     indexer_mock.index_repo = MagicMock(
         return_value={
+            "files_found": 1,  # required by atomic_full_index empty-root guard
             "files_parsed": 0,
             "tables_found": 0,
             "lineage_edges_created": 0,

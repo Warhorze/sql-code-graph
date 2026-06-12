@@ -1,8 +1,8 @@
 ## Current State [2026-06-12]
-ACTIVE AGENT: developer — HANDOFF (v1.21.1 final live re-acceptance COMPLETE)
-FEATURE: v1.21.1 — temp-namespacing dual-write bugfix — re-acceptance on merged master
-BRANCH: master (PR #92 merged: c718468)
-PR: #92 MERGED
+ACTIVE AGENT: developer — HANDOFF (PR opened, ready for review)
+FEATURE: v1.21.2 — CLI direct-index clear-before-rebuild (stale fossil key fix)
+BRANCH: fix/cli-index-clear-before-rebuild
+PR: (see handoff below)
 
 ## Handoff — operational: v1.21.1 final re-acceptance verification [2026-06-12]
 

@@ -54,6 +54,7 @@ from sqlcg.cli.commands.index import index_cmd  # noqa: E402  (already in codeba
 
 def _make_mock_indexer_summary() -> dict:
     return {
+        "files_found": 1,  # required by atomic_full_index empty-root guard
         "files_parsed": 0,
         "tables_found": 0,
         "lineage_edges_created": 1,
