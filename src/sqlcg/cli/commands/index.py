@@ -16,7 +16,7 @@ from rich.progress import (
 )
 
 from sqlcg.core.config import DbConfig, config_file_present, get_backend, get_db_path, get_dialect
-from sqlcg.indexer.indexer import Indexer
+from sqlcg.indexer.indexer import Indexer, atomic_full_index
 
 console = Console()
 
@@ -349,17 +349,10 @@ def _run_index(
             )
             raise typer.Exit(1)
 
-        abs_path = str(path.resolve())
-        backend.upsert_node(
-            NodeLabel.REPO,
-            abs_path,
-            {
-                "path": abs_path,
-                "name": path.name,
-            },
-        )
-
-        # Index the repository
+        # Atomic rebuild: clear the graph and re-index inside a single transaction
+        # so stale keys from prior indexing runs are never left behind.  The Repo
+        # node is upserted AFTER the rebuild because clear_all_tables() runs first
+        # inside atomic_full_index and would wipe a pre-existing Repo row.
         indexer = Indexer()
 
         with Progress(
@@ -376,17 +369,35 @@ def _run_index(
             def _progress_callback(n: int, total_n: int) -> None:
                 progress.update(task, completed=n, total=total_n)
 
-            summary = indexer.index_repo(
-                path,
-                dialect,
-                backend,
-                dbt_manifest,
-                timeout_per_file,
-                progress_callback=_progress_callback,
-                no_ddl=no_ddl,
-                batch_size=batch_size,
-                profile=profile,
-            )
+            try:
+                summary = atomic_full_index(
+                    indexer,
+                    path,
+                    dialect,
+                    backend,
+                    progress_callback=_progress_callback,
+                    dbt_manifest=dbt_manifest,
+                    timeout_per_file=timeout_per_file,
+                    no_ddl=no_ddl,
+                    batch_size=batch_size,
+                    profile=profile,
+                )
+            except ValueError as exc:
+                # Empty-root guard: the transaction was rolled back; prior graph intact.
+                console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(1) from exc
+
+        # Post-rebuild: upsert the Repo node (clear_all_tables wiped it) and
+        # wire BELONGS_TO edges from every indexed File.
+        abs_path = str(path.resolve())
+        backend.upsert_node(
+            NodeLabel.REPO,
+            abs_path,
+            {
+                "path": abs_path,
+                "name": path.name,
+            },
+        )
 
         # Connect files to repo
         from sqlcg.core.queries import INDEX_REPO_FILES_QUERY

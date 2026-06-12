@@ -354,31 +354,18 @@ async def drain_loop(
                     _idx = indexer
 
                     def _do_index(_r=_req, _b=_db, _q=queue, _P=_Path, _i=_idx) -> dict:
-                        # Phase 4 (C3/C6): full rebuild in ONE transaction —
-                        # clear all graph tables, then re-index. Readers on MVCC
-                        # snapshots see the old graph until COMMIT flips it
-                        # atomically; a mid-rebuild raise rolls back to the old
-                        # graph. transaction() is reentrant, so index_repo's
-                        # internal per-batch transactions join this outer one.
-                        with _b.transaction():
-                            _b.clear_all_tables()
-                            summary = _i.index_repo(
-                                _P(_r.root),
-                                _r.dialect,
-                                _b,
-                                progress_callback=_q.update_progress,
-                            )
-                            # Empty-root guard (PR-1, A1): if the walker found
-                            # zero SQL files, raise inside the transaction so
-                            # DuckDB rolls back the clear_all_tables() call and
-                            # the prior graph is preserved intact.  We key off
-                            # files_found (files walked), NOT files_parsed — a
-                            # file can legitimately parse to zero rows; the
-                            # signature of an accidental wipe is zero files
-                            # walked.
-                            if summary.get("files_found", 0) == 0:
-                                raise ValueError("refusing to index empty root — graph preserved")
-                            return summary
+                        # Phase 4 (C3/C6): delegate to the shared atomic rebuild
+                        # helper so the MCP drain and the direct CLI path use
+                        # exactly the same clear+index+empty-root-guard semantics.
+                        from sqlcg.indexer.indexer import atomic_full_index
+
+                        return atomic_full_index(
+                            _i,
+                            _P(_r.root),
+                            _r.dialect,
+                            _b,
+                            progress_callback=_q.update_progress,
+                        )
 
                     summary = await _to_thread.run_sync(_do_index)
                 elif req.op == "reindex":
