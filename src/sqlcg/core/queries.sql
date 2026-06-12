@@ -308,3 +308,21 @@ WHERE t.qualified = ANY(?)
 -- COUNT_EXTERNAL_CONSUMERS
 -- params: []
 SELECT count(*) AS n FROM "CONSUMED_BY"
+
+-- GET_TABLE_READS_ADJACENCY
+-- View 1 (row_empty_tables) adjacency: source_table -> dest_table derived from
+-- queries that read FROM a source (SELECTS_FROM or STAR_SOURCE) and write to a
+-- dest (SqlQuery.target_table). The query OUTPUT table is NOT an edge in the
+-- graph (INSERTS_INTO/DECLARES are never written by the indexer) — so the table
+-- adjacency must be derived by joining the read-edge to the query's target_table.
+-- Empty-string sentinel excluded: target_table = '' marks bare-SELECT queries.
+-- params: []
+SELECT DISTINCT sf.dst_key AS source_table, q.target_table AS dest_table
+FROM "SqlQuery" q
+JOIN "SELECTS_FROM" sf ON sf.src_key = q.id
+WHERE q.target_table <> '' AND q.target_table IS NOT NULL
+UNION
+SELECT DISTINCT ss.dst_key AS source_table, q.target_table AS dest_table
+FROM "SqlQuery" q
+JOIN "STAR_SOURCE" ss ON ss.src_key = q.id
+WHERE q.target_table <> '' AND q.target_table IS NOT NULL

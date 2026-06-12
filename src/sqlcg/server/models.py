@@ -495,3 +495,98 @@ class HubRankingResult(BaseModel):
         None,
         description="Diagnostic hint (e.g. when no tables have downstream dependents).",
     )
+
+
+class EmptyPropagationResult(BaseModel):
+    """Result of get_empty_propagation — downstream blast radius for one or more
+    unfilled (empty) tables. Returns TWO views:
+
+    - **View 2 (PRIMARY)** — column-lineage refinement: which downstream COLUMNS
+      lose their source VALUES because transitively derived from a source table's
+      columns. This is the reliable headline answer; it captures CTE-wrapped derived
+      reads (which dominate the corpus).
+    - **View 1 (SUPPLEMENT)** — row-level reachability: the UNION of (a) View 2's
+      affected tables and (b) tables with a DIRECT ``SELECTS_FROM``/``STAR_SOURCE``
+      read of a source (the gating-join case). ``row_empty_tables`` is therefore a
+      superset of ``value_affected_tables``. KNOWN GAP: CTE-wrapped pure-gating reads
+      are NOT detected. UPPER BOUND: depends on join type (not recorded on edges).
+
+    Present View 2 first as the primary answer; View 1 follows as a supplement.
+    """
+
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Named unfilled tables (echoed, lowercased, dedup-order-preserving).",
+    )
+
+    # --- View 1: table-level ROW reachability (SUPPLEMENT) ---
+    row_empty_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tables that may go fully empty — direct gating-join reads + value-derived tables; "
+            "CTE-wrapped pure-gating reads are NOT detected (known gap); depends on join type. "
+            "This is the UNION of (a) value_affected_tables [tables with ≥1 column derived from a "
+            "source] and (b) tables with a direct SELECTS_FROM/STAR_SOURCE read of a source. "
+            "row_empty_tables ⊇ value_affected_tables by construction."
+        ),
+    )
+
+    # --- View 2: COLUMN-lineage refinement (PRIMARY) ---
+    value_empty_columns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Downstream column ids transitively derived from a source's columns; "
+            "these lose their source VALUES when the source is empty."
+        ),
+    )
+    value_affected_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Table rollup of value_empty_columns (noise-filtered, synthetic-excluded). "
+            "Every table with ≥1 column in value_empty_columns."
+        ),
+    )
+    value_fully_empty_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "value_affected_tables where ALL graph-known columns are in value_empty_columns "
+            "(all value-paths from the source — the table goes fully value-empty)."
+        ),
+    )
+    value_partially_empty_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "value_affected_tables where only SOME columns are in value_empty_columns "
+            "(the table still receives value from non-affected sources)."
+        ),
+    )
+
+    # --- Shared ordering + diagnostics ---
+    propagation_order: list[str] = Field(
+        default_factory=list,
+        description=(
+            "UNION(row_empty_tables, value_affected_tables) ordered closest-to-source first "
+            "(reuses _kahn_topological_sort). Tables that appear ONLY in row_empty_tables "
+            "(branch-(b) gating-join readers with no column-lineage footprint) have no "
+            "closure_col_ids adjacency; their ordering falls back to alphabetical."
+        ),
+    )
+    downstream_count: int = Field(
+        0,
+        description="Count of the union of both views' table sets.",
+    )
+    noise_excluded: list[str] = Field(
+        default_factory=list,
+        description="Tables dropped as backup/noise or synthetic (cte/derived/temp).",
+    )
+    truncated: bool = Field(
+        False,
+        description="True if the 50k-node safety cap was hit in EITHER traversal.",
+    )
+    hint: str | None = Field(
+        None,
+        description=(
+            "Diagnostic hint — set when a table is not found, has no downstream consumers, "
+            "a cycle was detected, or the 50k cap was hit."
+        ),
+    )
