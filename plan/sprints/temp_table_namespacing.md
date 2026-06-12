@@ -161,6 +161,41 @@ within a file.
   TemporaryProperty)` call is **once per CREATE statement**, not per column. Zero per-column
   cost. (See perf section.)
 
+### Lineage-preservation invariant — temps must still collapse onto the correct tables
+
+**This is the load-bearing correctness requirement (user-flagged).** Re-keying the temp to a
+per-file `kind='temp'` node must NOT sever the lineage chain that flows *through* the temp.
+A typical chain is `real_src → ba.tmp_base → real_final` (the temp is a bridge). The fix must
+preserve `real_src → … → real_final` end-to-end. Two facts make this hold, and the plan
+guarantees both:
+
+1. **Single namespaced identity within a file.** The temp's CREATE-target dst key and every
+   later same-file read src key must be the **identical** `<rel>::ba.tmp_base` key. If the
+   CREATE side were namespaced but a read side were left as bare `ba.tmp_base` (or vice-versa),
+   the COLUMN_LINEAGE chain would break at the temp and lineage *would* be lost. Steps 2.1
+   (sources), 2.2 (lineage leaves), and 1.2 (target), plus the USE-SCHEMA parity test, exist
+   precisely to enforce one identity. **Acceptance**: an integration test traces a real source
+   through a temp to a real sink (`real_src → tmp → real_final`) and asserts the upstream/
+   downstream trace from `real_final` reaches `real_src` (the chain is intact), with the temp
+   merely re-keyed in the middle.
+
+2. **Read-path traversal is kind-agnostic; the kind-filter only hides, never severs.** The
+   recursive-CTE traversal in [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py)
+   (`_upstream_sql` / `_downstream_sql`) recurses over **every** COLUMN_LINEAGE edge with no
+   kind predicate inside the recursion; the `kind IN ('table','external')` filter is applied
+   **only to the final result rows**. So an intermediate `kind='temp'` node is traversed
+   *through* and simply not listed — exactly the "collapse onto the correct tables" behaviour.
+   Because `temp` (like `cte`/`derived`) is absent from the include-list, the default trace
+   hides the temp but still connects `real_src` to `real_final`. **No change to the recursion
+   is needed** — the temp inherits the same correct behaviour CTEs already have. The same is
+   true for `tools.py` impact analysis, which explicitly **contracts** synthetic bridges
+   (`producer -> cte -> consumer`); adding `'temp'` to `_SYNTHETIC_TABLE_KINDS` (Step 4.2) keeps
+   the temp contracted as a bridge rather than dropped as a dead end.
+
+The failure mode to guard against is therefore **not** the kind value itself (traversal is
+kind-agnostic) but a **key mismatch** at the temp endpoint within a file. The integration test
+in (1) and the USE-SCHEMA parity test below are the guards.
+
 ### USE-SCHEMA interaction (verified)
 
 `_qualify_bare_tables` qualifies bare names to `<schema>.<name>` before parse. Because both
@@ -295,6 +330,12 @@ this plan in the docstring.
   assert **two** `kind='temp'` `SqlTable` rows with distinct namespaced keys, **no** single
   fused `ba.tmp_base` `kind='table'` node, and that a separately-indexed genuinely-shared
   physical table (two writers, no TEMPORARY property) remains **one** `kind='table'` node.
+- **Integration (lineage collapse through temp — user-flagged correctness gate)** — index a
+  file with `real_src → ba.tmp_base → real_final` (temp written from a real source, then a real
+  sink reads the temp). Assert the upstream trace from `real_final` reaches `real_src` (chain
+  intact end-to-end), the temp endpoint is re-keyed `<rel>::ba.tmp_base` on **both** the
+  produce and consume edges (single identity), and the default (non-`--include-intermediate`)
+  trace hides the temp from the listed results while still connecting source to sink.
 - **Integration (consumer round-trips)** — namespaced temp keys are excluded from
   `_harvest_usage_catalog` HAS_COLUMN(source='usage'); a `kind='temp'` row is NOT upgraded by
   `upgrade_derived_to_table_for_keys` via **both** catalog seams (`catalog load` command +
@@ -320,6 +361,11 @@ this plan in the docstring.
 - [ ] The ~2,607 affected COLUMN_LINEAGE edges are **re-keyed, not dropped** — intra-file
       lineage through every temp survives (edge count for those endpoints preserved, only the
       temp endpoint key changes).
+- [ ] **Lineage collapses correctly through temps (user-flagged):** a `real_src → tmp →
+      real_final` chain is traversable end-to-end after re-keying — an upstream trace from
+      `real_final` reaches `real_src`, with the temp re-keyed (not severed) in the middle. The
+      temp's CREATE-target key and its same-file read key are byte-identical (single
+      namespaced identity per file).
 - [ ] Non-temporary multi-writer tables (the `368 − 85` set) are **byte-identical**
       before/after (same `qualified`, `kind='table'`, same node count).
 - [ ] Scoped-health denominator change documented; rendered line reads "excl. CTE/derived/temp".
