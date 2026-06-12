@@ -3546,3 +3546,16 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 - PR 5 #88 v1.19.1 (File.skip_counts JSON column, SCHEMA_VERSION 7->8)
 - Tags pending user verification: v1.15.0-v1.18.0 (prev sprint) + v1.18.1-v1.19.1 (this sprint). User actions: dwh/.sqlcg.toml [sqlcg.catalog] section.
 - NOW: DWH reindex + catalog load + gain health + table_graph.html regen via developer. THEN: issue #76 (stale MCP server) via architect-planner.
+
+[2026-06-11 shepherd close-out: issue #76 self-healing MCP server COMPLETE]
+- PR 1 #89 + PR 2 #90 merged, both under v1.20.0 (PR 1 carried the bump).
+- Detector (selfheal.py) + re-exec machinery (server.py): A2 handler wrap, A4 generation cap, A5 abs argv0, W2 recovery outside backend_lock, drain->close-DB->execv ordering.
+- e2e test_selfheal_e2e.py PASSES live on this machine (same PID, same pipe, version swap).
+- PR 2 developer died of context overflow AFTER committing+pushing+opening PR; shepherd ran the final gates itself (1276 passed/0 failed, ruff clean, pyright 0 errors) and merged.
+- Issue #76 stays OPEN until user live-verifies (house rule). Tag v1.20.0 user-gated.
+- Full tag queue: v1.15.0-v1.18.0, v1.18.1-v1.19.1, v1.20.0.
+
+## Current State [2026-06-12]
+ACTIVE AGENT: architect-planner
+FEATURE: temp_table_namespacing — per-file namespacing of session-scoped TEMPORARY tables (v1.21.0)
+PLAN: plan/sprints/temp_table_namespacing.md (DRAFT — plan-reviewer gates next)
