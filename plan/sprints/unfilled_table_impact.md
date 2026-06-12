@@ -1,5 +1,18 @@
-# Feature Plan: Data-Loss Impact Analysis (three sequenced PRs) + one standalone correctness bugfix
+# Feature Plan: Data-Loss Impact Analysis (three sequenced PRs) + two standalone correctness bugfixes
 
+> **Shepherd-directed addition (2026-06-13): PR 5 added** — a STANDALONE CORRECTNESS
+> bugfix for TWO real bugs found in the SHIPPED PR 2 `pr-impact` detector (v1.23.0)
+> during the live-DWH capstone demo (2026-06-13). **BUG A (HIGH):** `analyze pr-impact`
+> CLI raises `RuntimeError: Backend not initialized` — the CLI comment is wrong, the tool
+> does NOT initialize a backend. **BUG B (HIGH):** `get_pr_impact` zeroes its own View-2
+> blast radius because it computes the radius AFTER `resync_changed` deletes the lost
+> producer's nodes (the real 502-column / 22-table impact collapsed to 0). Version:
+> PATCH (target **`1.24.2`** — patch on the latest merged version `1.24.1`). Touches
+> `tools.py` (`get_pr_impact`) + `analyze.py` (CLI) + the e2e test; no new MCP tool, no
+> ARCHITECTURE tool-count change. NOT re-looped through the plan-reviewer per shepherd
+> instruction; shepherd verifies. **v1.23.0+ must NOT be tagged until PR 5 lands** (the
+> user tags). PR 1/2/3/4 sections are UNTOUCHED. See §PR 5 below.
+>
 > **Shepherd-directed addition (2026-06-12): PR 4 added** — a STANDALONE `SELECTS_FROM`-
 > completeness CORRECTNESS bugfix for the existing `analyze unused` (HIGH severity,
 > actively misleading) and `find_table_usages` (MEDIUM, under-counts) commands. Surfaced
@@ -1570,6 +1583,21 @@ Fixtures use aliased / schema-qualified statement shapes matching the live corpu
   feature PRs). Agent does NOT close issues or tag; user verifies live + tags the chosen
   patch version.
 
+### Deviations
+
+#### Deviation 1: T0d fixture requires DDL to register `da.x_gate` in `SqlTable`
+- **Reason**: Without a DDL `CREATE TABLE` statement, a table referenced only inside
+  a CTE body is never added to `SqlTable` (parser `_real_tables` excludes CTE-sourced
+  names, base.py L604 — out of scope per M1). `ANALYZE_UNUSED_TABLES` reads from
+  `SqlTable`, so a table not in that relation cannot appear in unused. The gap test
+  would be vacuously true without DDL.
+- **Change**: Added `_T0D_DDL = "CREATE TABLE da.x_gate (k INTEGER);"` and a separate
+  DDL file in the T0d fixture, so `da.x_gate` has a `SqlTable` node. This mirrors the
+  real-corpus scenario (DDL-defined tables whose only reads are pure-gating CTEs).
+- **Impact**: The test correctly asserts the documented gap — a defined table whose only
+  reads are pure-gating CTEs still appears as unused. No scope change; no new risk.
+- **Date**: 2026-06-13
+
 ---
 
 ## Cross-cutting build order + gating
@@ -1608,3 +1636,388 @@ Fixtures use aliased / schema-qualified statement shapes matching the live corpu
 > the reviewer gate and are NOT re-looped through the reviewer per the shepherd's
 > instruction; the shepherd verifies them directly. Ready for shepherd verification —
 > do NOT re-loop the reviewer.
+
+---
+
+# PR 5 — pr-impact correctness bugfix (STANDALONE; capstone-demo findings, 2026-06-13)
+
+> Shepherd-directed; NOT part of the feature. Fixes TWO HIGH bugs shipped in PR 2
+> (v1.23.0). Standalone PATCH (`1.24.2`). NOT re-looped through the plan-reviewer;
+> shepherd verifies. Both bugs were found by the live-DWH capstone demo (2026-06-13);
+> the demo only worked via a manual script that called `init_backend()` first AND that
+> happened to read a base graph that had not yet been resync-overwritten — i.e. both bugs
+> were masked by the manual harness exactly as the e2e test masked them in CI.
+
+## PR 5 Scope
+
+### In Scope
+- **BUG A** — the `sqlcg analyze pr-impact --base <ref>` CLI must acquire/initialize a
+  working backend before calling `get_pr_impact`, so the real CLI entrypoint runs end to
+  end (currently raises `RuntimeError: Backend not initialized`).
+- **BUG B** — `get_pr_impact` must compute the View-2 (and View-1) blast radius against
+  the **BASE** graph (where the lost producer + its columns + downstream still exist),
+  not the post-`resync_changed` HEAD graph (where they are deleted → radius collapses to 0).
+- Rewrite the e2e test `tests/e2e/test_pr_impact_cli_e2e.py` so it exercises the REAL
+  `sqlcg analyze pr-impact` CLI entrypoint end to end (no `tools._backend = backend`
+  injection), and add a regression test pinning a NON-EMPTY blast radius for a deleted
+  producer with non-trivial downstream.
+
+### Non-Goals
+- No new MCP tool; no ARCHITECTURE_REVIEW tool-count change (count stays at the PR-2 value).
+- No change to the detection semantics (`lost = producers(base) − producers(head)`),
+  the rename classifier, the runtime-blind contract, or the `PrImpactResult` shape.
+- No change to PR 1's engine (`_compute_empty_propagation`, `_table_row_reachability`,
+  `EmptyPropagationResult`) — only WHEN/against-which-graph-state the engine is invoked.
+- No parse-time / schema-CSV path; no hot-path edits (CLAUDE.md invariants untouched).
+
+---
+
+## BUG A — CLI raises "Backend not initialized"
+
+### Root cause (VERIFIED against the tree)
+The CLI `pr-impact` command ([`analyze.py` L546-550](../../src/sqlcg/cli/commands/analyze.py))
+calls `get_pr_impact(base_ref=base, ...)` directly and relies on the comment:
+
+> `# W2 / O1 — get_pr_impact manages the backend internally (it calls _open_backend).`
+
+This comment is **WRONG**. `get_pr_impact` opens its backend via
+`with _open_backend() as db:` ([`tools.py` L2648](../../src/sqlcg/server/tools.py)).
+`_open_backend` ([`tools.py` L242](../../src/sqlcg/server/tools.py)) is a context manager
+that just yields `_get_backend()` ([`tools.py` L205-213](../../src/sqlcg/server/tools.py)),
+which **raises `RuntimeError("Backend not initialized. Call init_backend() before using
+tools.")` when the `_backend` global is `None`**. `_open_backend` does NOT initialize a
+backend — it yields the pre-existing process singleton, which is only ever set by
+`init_backend()` ([`tools.py` L137-177](../../src/sqlcg/server/tools.py), assigns
+`_backend = rw_backend` at L176). The MCP-server path calls `init_backend()` at startup;
+the **CLI path never does**, so the global is `None` and the call raises.
+
+### Why the sibling PR 1 command works (the correct seam)
+The PR 1 `empty-impact` CLI ([`analyze.py` L428-433](../../src/sqlcg/cli/commands/analyze.py))
+does NOT touch the `tools._backend` global at all. It opens its OWN handle:
+```python
+from sqlcg.core.config import get_backend
+with get_backend(read_only=True) as db:
+    result = _compute_empty_propagation(db, list(tables), max_depth)
+```
+`get_backend` ([`config.py` L351-377](../../src/sqlcg/core/config.py)) returns a **fresh
+`DuckDBBackend` opened on the configured DB file**, independent of the `_backend` global —
+so it works with no prior `init_backend()`. **NOTE (VERIFIED):** `read_only=` is *ignored*
+by `get_backend` ([`config.py` L354-356](../../src/sqlcg/core/config.py)) — DuckDB uses a
+single R/W handle for the process lifetime. So a `get_backend()` handle is fully writable;
+the `read_only=True` in the PR 1 seam is documentation, not a write barrier.
+
+### The correctness wrinkle — `get_pr_impact` BOTH reads AND writes
+PR 1's `empty-impact` is pure-read, so it can pass its own `db` into a pure helper. But
+`get_pr_impact` runs `Indexer().resync_changed(root, base_sha, head_sha, db, dialect)`
+([`tools.py` L2733-2734](../../src/sqlcg/server/tools.py)) — a graph-mutating write. The
+CLI therefore needs a handle that is BOTH readable and writable. Because `get_backend()`
+returns a single R/W DuckDB handle (read_only ignored), **the same `get_backend()` seam
+PR 1 uses is sufficient for the write** — there is no separate "write seam" to find.
+
+### Fix — RECOMMENDED: refactor `get_pr_impact` to accept an injected backend
+The cleanest fix that lets the CLI control backend acquisition (mirroring PR 1) AND keeps
+the MCP tool working is to split the tool body from the backend acquisition, exactly as
+PR 1 split `get_empty_propagation` (the MCP tool) from `_compute_empty_propagation` (the
+db-taking engine):
+
+1. **Extract** the entire body of `get_pr_impact` (everything inside `with _open_backend()
+   as db:`, [`tools.py` L2648-2776](../../src/sqlcg/server/tools.py)) into a new
+   db-taking helper:
+   ```python
+   def _compute_pr_impact(db: GraphBackend, base_ref: str, max_depth: int | None) -> PrImpactResult:
+       _assert_indexed(db)
+       ...  # the existing steps 1–8, unchanged except BUG B (below)
+   ```
+2. The MCP tool becomes the thin wrapper (UNCHANGED backend source — the server singleton):
+   ```python
+   @mcp.tool()
+   @_timed_tool("get_pr_impact")
+   def get_pr_impact(base_ref: str, max_depth: int | None = None) -> PrImpactResult:
+       with _open_backend() as db:
+           return _compute_pr_impact(db, base_ref, max_depth)
+   ```
+3. The **CLI** acquires the backend itself, mirroring PR 1's seam, and calls the engine:
+   ```python
+   from sqlcg.core.config import get_backend
+   from sqlcg.server.tools import _compute_pr_impact
+   with get_backend() as db:                      # single R/W handle (read_only is ignored)
+       result = _compute_pr_impact(db, base_ref=base, max_depth=max_depth)
+   ```
+   Delete the wrong `# get_pr_impact manages the backend internally` comment; replace it
+   with a note that `get_backend()` returns a R/W handle (resync needs write; read_only is
+   ignored by DuckDB), citing [`config.py` L354-356](../../src/sqlcg/core/config.py).
+
+> **Alternative considered and REJECTED:** having the CLI call `init_backend()` then
+> `get_pr_impact()` then `shutdown_backend()`. Rejected because (a) it diverges from the
+> PR 1 sibling seam (two different patterns in the same `analyze.py` app is the kind of
+> inconsistency that hid this bug), (b) `init_backend` runs the schema-version gate and
+> metrics-store setup ([`tools.py` L159-185](../../src/sqlcg/server/tools.py)) that the
+> read-side CLI commands deliberately skip, and (c) mutating the process singleton from a
+> CLI command is a hidden global side effect. The inject-the-backend refactor is the
+> consistent, side-effect-free choice. The developer MAY instead choose the
+> `init_backend`/`shutdown_backend` bracket if injection proves infeasible, but MUST then
+> document why and ensure `shutdown_backend()` runs in a `finally`.
+
+### Root-cause of the TEST GAP (BUG A shipped CI-green while live-broken)
+The shipped e2e test `tests/e2e/test_pr_impact_cli_e2e.py` sets
+**`tools._backend = backend`** in its `genuine_loss_repo` fixture (VERIFIED — the fixture
+assigns `tools._backend = backend; tools._metrics = None` before invoking the CLI). So
+when the CLI called `get_pr_impact` → `_open_backend` → `_get_backend`, the global was
+ALREADY populated by the fixture, and the `Backend not initialized` raise never fired. The
+test invoked the real Typer app (`runner.invoke(app, ["analyze", "pr-impact", ...])`) but
+**pre-seeded the exact global the CLI was supposed to acquire itself** — so it validated
+everything EXCEPT the backend-acquisition seam that was broken. This is the
+CI-green-but-live-broken failure mode (project history: alias-config, `Tokenizer.from_dialect`).
+
+**Required fix to the test:** the e2e test MUST NOT touch `tools._backend` /
+`tools._metrics`. It must index the fixture repo to the **configured DB path** that
+`get_backend()` will open (point `DbConfig`/`SQLCG_DB`-equivalent env at a tmp DB via the
+existing config seam, then run the real `sqlcg index` + `reindex`/commit flow, or index
+directly into that same path), so the real CLI's `get_backend()` opens a populated graph
+with no global injection. After this change, reverting the BUG A fix MUST make the e2e
+test fail with the `Backend not initialized` error.
+
+---
+
+## BUG B — get_pr_impact zeroes its own View-2 blast radius
+
+### Root cause (VERIFIED against the tree)
+`get_pr_impact` runs, in order:
+- L2733-2734: `Indexer().resync_changed(root, base_sha, head_sha, db, dialect)` — advances
+  the graph to HEAD, **deleting the deleted-file's table + column nodes** (resync drops
+  nodes for deleted files; see [`indexer.py` L770-810](../../src/sqlcg/indexer/indexer.py)
+  resync algorithm steps 2–3).
+- L2737: `producers_after = _capture_producer_set(db)`.
+- L2740-2747: `_diff_lost_producers(...)` → `genuine_lost`.
+- **L2750: `blast = _compute_empty_propagation(db, genuine_lost, max_depth)`** — runs the
+  PR 1 engine against the **post-resync HEAD graph**. But View 2 seeds from
+  `GET_COLUMNS_FOR_TABLE_QUERY` for each lost source table, and at HEAD those tables and
+  their `HAS_COLUMN`/`COLUMN_LINEAGE` rows are **gone** → the closure starts from an empty
+  column set → `value_empty_columns = []`, `value_affected_tables = []`. View 1 partially
+  survives only because surviving consumer `SELECTS_FROM` edges may still point at the now
+  node-less table key. **This is the capstone collapse: 502 columns / 22 tables → 0.**
+
+### The catch-22
+Detection (`lost = before − after`) genuinely requires `after`, which requires the
+destructive `resync_changed`. But the blast radius needs the lost producer's downstream,
+which only exists in the BASE graph (before resync). The two needs are temporally opposed.
+
+### Options evaluated against the merged code
+
+**Option (i) — compute the radius on the INTACT base graph BEFORE resync, over the
+candidate-dropped-producer set; after resync, slice to the genuine-lost set.**
+- The candidate dropped-producer tables are **already in hand pre-resync**: the tool
+  already builds `pre_resync_file_targets: dict[file → list[target_table]]` for the
+  `deleted ∪ modified` files BEFORE resync ([`tools.py` L2715-2731](../../src/sqlcg/server/tools.py),
+  using `git_name_status_delta` + `GET_TARGET_TABLES_FOR_FILE_QUERY`). The union of all
+  those target tables is the candidate set `C` — a superset of `genuine_lost` (it includes
+  renames and tables still produced by a surviving query).
+- **Mechanism:** before the `resync_changed` call, compute the blast radius for `C`:
+  `blast_base = _compute_empty_propagation(db, sorted(C), max_depth)` on the intact base
+  graph. Do the resync + diff to get `genuine_lost` (⊆ `C`, renames removed). The final
+  blast radius must reflect ONLY `genuine_lost`, not all of `C`. Because
+  `_compute_empty_propagation` takes a source LIST and unions, the clean way to slice is
+  **not** to filter `blast_base`'s output (the union loses per-source provenance), but to
+  **recompute once on a base snapshot**. Since the base graph is destroyed by resync, the
+  precise bolt-on is: compute the radius pre-resync over `genuine_lost`-not-yet-known, so we
+  must compute it over `C` and accept that the final radius is for `C`-restricted-to-still-
+  detected sources. **Cleanest correct form of Option (i):** capture `genuine_lost`'s
+  membership without the destructive resync for the *purpose of choosing sources*, OR
+  compute one radius per the resolved `genuine_lost` set BEFORE the graph is mutated.
+  This forces the ordering: do the diff FIRST (needs `after`), which needs resync, which
+  destroys the base — so Option (i) as a pure bolt-on requires a base SNAPSHOT to recompute
+  against. DuckDB single-file handle makes a cheap second attached snapshot non-trivial.
+  Verdict: **feasible but awkward** — it either over-reports (radius for `C` ⊇ genuine) or
+  needs a base-graph snapshot to recompute for `genuine_lost` after the diff.
+
+**Option (ii) — make detection NON-destructive: derive `producers_after` by parsing only
+the changed files' HEAD versions, and DROP the in-place `resync_changed` from
+`get_pr_impact`, leaving the base graph intact for the blast radius.**
+- `producers_after = (producers_before − producers_dropped_by_change) ∪
+  producers_added_by_change`, where the dropped/added producer tables come from parsing
+  ONLY the `git_name_status_delta` `deleted ∪ modified ∪ added` files' HEAD versions
+  (deleted files contribute no HEAD producers; the parse is scoped to the diff, bounded —
+  same scoped-parse justification PR 2 already accepted for Option C attribution,
+  [plan §PR 2 step 7](#)). The base graph is never mutated, so
+  `_compute_empty_propagation(db, genuine_lost, max_depth)` runs against the intact base
+  graph and View 2 is correct.
+- **Feasibility against the tree:** `git_name_status_delta` already returns the changed-file
+  set; the parser can parse a single file's HEAD content (`git show head:path`) to recover
+  its `target_table`(s) — the SAME capability Option C attribution relies on. No
+  `resync_changed`, no whole-graph mutation. This DROPS the M6/O2 "orchestrate resync
+  internally" decision, which means **the tool no longer requires the graph to be advanced
+  to HEAD afterwards** — and it also removes the surprising side effect of a read-shaped
+  analysis tool mutating the graph DB. The `get_indexed_sha() == base_sha` assertion stays.
+- Verdict: **cleaner long-term, correct by construction, removes a side effect** — but a
+  bigger change (new scoped-parse-HEAD producer extraction; remove resync orchestration;
+  re-justify the M6 decision it overturns).
+
+### RECOMMENDATION — **Option (i) for PR 5** (smaller, safer bolt-on), with Option (ii) noted as the long-term direction.
+
+Rationale: PR 5 is a PATCH bugfix that must be low-risk and verifiable against the live
+capstone. Option (ii) is the better end state but overturns the M6/O2 orchestration
+decision and introduces a new scoped-parse-HEAD path — too large for a patch. Option (i)
+reuses code already present (`pre_resync_file_targets`, `_compute_empty_propagation`) and
+moves ONE call earlier. Resolve Option (i)'s slicing awkwardness as follows (the concrete,
+correct bolt-on):
+
+1. Build the candidate set `C` from the EXISTING `pre_resync_file_targets` map (union of all
+   its target-table lists), pre-resync, synthetic-excluded.
+2. **Compute `genuine_lost` WITHOUT mutating the base graph first.** `genuine_lost` ⊆ `C`.
+   The diff `before − after` is only needed to drop (a) tables still produced by a surviving
+   query and (b) renames. Both can be decided from `C` + the post-state producer set. To get
+   `producers_after` cheaply WITHOUT the destructive whole-graph resync is exactly Option
+   (ii)'s move — so the *minimal* Option (i) that stays purely a bolt-on keeps the resync but
+   **reorders**: compute `blast_base = _compute_empty_propagation(db, sorted(C), max_depth)`
+   on the intact base graph BEFORE resync; THEN resync + diff to get `genuine_lost`; THEN
+   return a blast radius **restricted to `genuine_lost`** by RE-RUNNING the engine — but the
+   base graph is now gone.
+3. **Therefore the chosen concrete form:** compute the blast radius pre-resync **once per
+   the candidate set `C`** and, because the final answer must be for `genuine_lost` ⊆ `C`,
+   restrict by recomputing the View-2 closure on the base graph for `genuine_lost`
+   **before** the resync. Since `genuine_lost` requires `after` (post-resync), the ordering
+   conflict is real and the ONLY way to keep Option (i) a pure bolt-on without a snapshot is
+   to compute the radius for the **conservative candidate set `C`** pre-resync and label the
+   blast radius as "candidate-scoped (≥ genuine)". **This over-reports renames.** That is
+   unacceptable given PR 2's whole point was excluding renames from the radius.
+
+> **Decision forced by the above:** a faithful Option (i) needs `genuine_lost` resolved
+> BEFORE the base graph is destroyed. The clean way to get `producers_after` without
+> destroying the base graph is precisely Option (ii)'s scoped-HEAD-parse. **So the
+> recommended PR 5 implementation is the minimal Option (ii): resolve `producers_after`
+> by scoped-parsing only the changed files' HEAD versions, drop the in-place
+> `resync_changed` from `get_pr_impact`, compute the blast radius on the intact base
+> graph for `genuine_lost`.** This is the smallest change that is also CORRECT (no
+> over-reporting of renames, no zeroed radius). Option (i) is documented above only to
+> show why the pure bolt-on cannot avoid the snapshot/over-report problem — it is NOT the
+> chosen path.
+
+**Net recommendation (single sentence the developer follows):** implement **Option (ii)**
+— make `get_pr_impact` non-destructive by deriving `producers_after` from a scoped parse of
+the changed files' HEAD versions, remove the internal `resync_changed`, and compute
+`_compute_empty_propagation(db, genuine_lost, max_depth)` against the still-intact base
+graph. If the scoped-HEAD parse proves infeasible in the time box, fall back to a base-graph
+SNAPSHOT (copy the DuckDB file before resync, run the engine against the copy for
+`genuine_lost`, discard the copy) — explicitly NOT the candidate-set over-report.
+
+> **M6/O2 consequence (must be recorded):** Option (ii) overturns the M6 decision that
+> `get_pr_impact` orchestrates `resync_changed` internally. PR 5 MUST update the O2 note
+> and the PR 2 §Detection-mechanism step 4 to state that, as of v1.24.2, detection is
+> non-destructive and the tool no longer advances the graph to HEAD. The
+> `get_indexed_sha() == base_sha` assertion REMAINS (the base graph must be at base_ref).
+> Document why: the destructive resync was the direct cause of the zeroed blast radius.
+
+---
+
+## PR 5 Implementation Steps
+
+### Step 5.1 — Fix BUG A: inject the backend into the tool body; CLI acquires it.
+- Files: [`tools.py`](../../src/sqlcg/server/tools.py) (extract `_compute_pr_impact`),
+  [`analyze.py`](../../src/sqlcg/cli/commands/analyze.py) (`pr-impact` command).
+- Extract the `with _open_backend()` body of `get_pr_impact` into
+  `_compute_pr_impact(db, base_ref, max_depth)`; MCP tool wraps it via `_open_backend`.
+- CLI: replace the wrong comment + direct `get_pr_impact()` call with
+  `with get_backend() as db: result = _compute_pr_impact(db, base_ref=base, max_depth=max_depth)`.
+- Acceptance: `_compute_pr_impact` has a grep-confirmed call site from BOTH the MCP tool
+  and the CLI; the MCP tool still registers (`@mcp.tool()`); the CLI no longer references
+  `tools._backend`.
+
+### Step 5.2 — Fix BUG B: non-destructive detection; radius on the intact base graph.
+- File: [`tools.py`](../../src/sqlcg/server/tools.py) (`_compute_pr_impact`).
+- Derive `producers_after` from a scoped parse of the changed files' HEAD versions
+  (Option ii); remove the internal `Indexer().resync_changed(...)` call; run
+  `_compute_empty_propagation(db, genuine_lost, max_depth)` against the un-mutated base
+  graph. Keep the `get_indexed_sha() == base_sha` assertion and all rename/attribution
+  logic. (Snapshot fallback only if scoped-HEAD parse is infeasible — never the
+  candidate-set over-report.)
+- Acceptance: for a deleted producer with non-trivial downstream, `blast_radius.
+  value_empty_columns` is NON-EMPTY and contains the expected downstream column ids; the
+  base graph's `get_indexed_sha()` is UNCHANGED after the call (non-destructive).
+
+### Step 5.3 — Rewrite the e2e test to exercise the REAL CLI; add the radius regression.
+- File: [`tests/e2e/test_pr_impact_cli_e2e.py`](../../tests/e2e/test_pr_impact_cli_e2e.py).
+- Remove all `tools._backend = ...` / `tools._metrics = ...` injection. Index the fixture
+  repo into the DB path that `get_backend()` opens (via the config seam), so the real CLI
+  acquires a populated graph itself.
+- Keep the existing assertions (caveat present, max-depth validation) but ensure they run
+  through the un-injected path. Add the BUG-B regression below.
+- Acceptance: reverting Step 5.1 makes this test fail with `Backend not initialized`;
+  reverting Step 5.2 makes the radius assertion fail with an empty `value_empty_columns`.
+
+### Step 5.4 — Version bump + O2 / PR-2-step-4 note update.
+- `pyproject.toml` + [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py) →
+  **`1.24.2`**; `uv lock`. (Patch on the latest merged version `1.24.1`.)
+- Update the O2 note (§Open Questions) and PR 2 §Detection-mechanism step 4 to record that
+  detection is non-destructive as of v1.24.2 (Option ii); resync orchestration removed.
+- No ARCHITECTURE_REVIEW tool-count change.
+
+## PR 5 Test Strategy
+Tests assert **observable output** AND exercise the **real CLI path**. Name
+`test_<unit>_<scenario>_<expected>`, link this plan in the docstring.
+
+- **E2E (`tests/e2e/test_pr_impact_cli_e2e.py`) — the real entrypoint:**
+  - **Real CLI runs (pins BUG A).** Index a fixture git repo to the configured DB path
+    (NO `tools._backend` injection), delete a producer file at HEAD, then
+    `runner.invoke(app, ["analyze", "pr-impact", "--base", <base_sha>])`. Assert
+    `exit_code == 0` AND the runtime-blind caveat AND the lost-producer row are printed.
+    This test MUST fail with `Backend not initialized` if Step 5.1 is reverted.
+  - **Non-zero blast radius (pins BUG B — the capstone finding).** Fixture where a deleted
+    producer's downstream is NON-trivial: `da.product` (producer, deleted at HEAD) feeds
+    `da.report.price` and `da.report.id` via `COLUMN_LINEAGE`, optionally a 2nd hop. Assert
+    the rendered View-2 table is NON-EMPTY (e.g. `da.report` appears with a non-zero
+    value-empty column count) — i.e. the radius is NOT zeroed. Pair with a direct-result
+    assertion (next bullet) so the pin is on the model, not only the rendering.
+
+- **Integration (real in-memory DuckDB, `tests/integration/`) — pins BUG B on the model:**
+  - **`_compute_pr_impact` returns a non-empty radius for a deleted producer.** Build a
+    base graph (producer `da.product` + downstream `da.report` deriving columns from it),
+    delete the producer file at HEAD, call `_compute_pr_impact(db, base_ref, None)`. Assert
+    `result.blast_radius.value_empty_columns` is NON-EMPTY and contains the expected
+    downstream column ids (e.g. `da.report.price`), and `da.report ∈
+    blast_radius.value_affected_tables`. Assert `db.get_indexed_sha()` is UNCHANGED by the
+    call (non-destructive). Fixtures use aliased / schema-qualified shapes matching the live
+    corpus (minimal idealized fixtures hide real failure modes — project history).
+  - **Rename still excluded.** A rename fixture still lands in `renamed_tables` and produces
+    NO blast radius (regression guard that Option ii kept rename classification intact).
+
+## PR 5 Acceptance Criteria
+- [ ] **BUG A fixed:** `uv run sqlcg analyze pr-impact --base <sha>` runs to completion
+      (exit 0) against a populated graph with NO `tools._backend` injection; reverting
+      Step 5.1 reproduces `RuntimeError: Backend not initialized` in the e2e test.
+- [ ] `_compute_pr_impact` has grep-confirmed call sites from BOTH the MCP `get_pr_impact`
+      tool AND the CLI `pr-impact` command; the CLI no longer references `tools._backend`.
+- [ ] **BUG B fixed:** for a deleted producer with non-trivial downstream,
+      `PrImpactResult.blast_radius.value_empty_columns` is NON-EMPTY and contains the
+      expected downstream column ids; `da.report ∈ value_affected_tables`.
+- [ ] `get_pr_impact` / `_compute_pr_impact` is **non-destructive** — `db.get_indexed_sha()`
+      is unchanged after the call (the internal `resync_changed` is removed).
+- [ ] Rename fixture still classified into `renamed_tables` with no blast radius.
+- [ ] e2e test exercises the REAL `sqlcg analyze pr-impact` entrypoint (no global
+      injection); the BUG-B regression asserts a non-empty rendered View-2 table.
+- [ ] Version `1.24.2` in `pyproject.toml`, `__init__.py`, `uv.lock`; O2 note + PR 2 step 4
+      updated to record non-destructive detection (Option ii); no tool-count change.
+- [ ] **Live-DWH re-acceptance** (MANDATORY — lineage-class; CI green is necessary but not
+      sufficient): on a fresh-indexed real DWH base graph, make a branch-change deletion of
+      a DA producer, run `sqlcg analyze pr-impact --base <base>` via the REAL CLI, and
+      confirm BOTH (a) the CLI runs end to end AND (b) the View-2 blast radius is non-zero
+      (re-run the capstone — the 502-column / 22-table case must report a non-empty radius,
+      not 0). Record in the postmortem. **v1.24.2 must NOT be tagged until this passes;
+      the user tags.**
+
+## PR 5 Risks and Mitigations
+- **R1 — scoped-HEAD parse mis-derives `producers_after`.** Mitigated by reusing the same
+  delta + target-table extraction PR 2 already uses for attribution; pinned by the
+  non-empty-radius and rename-excluded tests. If infeasible, fall back to a base-graph
+  file snapshot (never the candidate-set over-report).
+- **R2 — removing `resync_changed` changes the tool contract (M6/O2 reversal).** Mitigated
+  by updating the O2 note + PR 2 step 4 and keeping the `get_indexed_sha() == base_sha`
+  assertion; the base graph must be at base_ref, the tool simply no longer advances it.
+- **R3 — the e2e test masks the seam again.** Mitigated by the explicit revert-checks in
+  Step 5.3 acceptance (revert Step 5.1 ⇒ `Backend not initialized`; revert Step 5.2 ⇒ empty
+  radius) — the test is only valid if both reverts make it red.
+
+## PR 5 Version & Release
+- Bug fix → **PATCH**: latest merged `1.24.1` → **`1.24.2`**. Bump `pyproject.toml`,
+  `__init__.py`, `uv lock` in the feature branch.
+- Agent does NOT close issues, does NOT tag; **v1.23.0+ stays untagged until PR 5 lands**;
+  user verifies live + tags `v1.24.2`.
