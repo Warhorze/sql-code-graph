@@ -1,9 +1,9 @@
-## Current State [2026-06-11]
-ACTIVE AGENT: developer — HANDOFF (PR ready for review)
-FEATURE: mcp_server_self_healing PR 2 — self-heal re-exec machinery (v1.20.0)
-PLAN: plan/sprints/mcp_server_self_healing.md §Phase 2
-BRANCH: feat/mcp-self-heal-reexec
-PR: (opening)
+## Current State [2026-06-12]
+ACTIVE AGENT: developer — IN PROGRESS
+FEATURE: temp_table_namespacing — per-file TEMPORARY table namespacing (v1.21.0)
+PLAN: plan/sprints/temp_table_namespacing.md (APPROVED rev 3)
+BRANCH: feat/temp-table-namespacing
+PR: (not yet opened)
 
 ## Handoff — developer: mcp_server_self_healing PR 2 (v1.20.0) [2026-06-11]
 

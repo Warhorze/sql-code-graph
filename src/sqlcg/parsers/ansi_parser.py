@@ -1,5 +1,6 @@
 """ANSI SQL parser implementation."""
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,9 @@ class AnsiParser(SqlParser):
         # Falls back to str(path) for single-file / reindex_file callers that do not
         # supply rel_path; those callers should supply it for consistency.
         self._current_file_namespace = rel_path if rel_path is not None else str(path)
+        # temp_table_namespacing (Step 1.1 / W4): reset alongside _current_file_namespace
+        # so a re-used parser instance starts each file with a clean temp-key set.
+        self._current_file_temp_keys = set()
 
         # Parse all statements in the file using the hook (allows subclass overrides)
         statements, parse_errors = self._do_parse(sql)
@@ -244,6 +248,9 @@ class AnsiParser(SqlParser):
 
         # PR 3 — clear namespace after parsing to avoid stale state on reuse
         self._current_file_namespace = None
+        # temp_table_namespacing (Step 1.1 / W4): also clear the temp-key set at
+        # file-end so a pool-reused parser instance carries no stale temp identity.
+        self._current_file_temp_keys = set()
         return out
 
     def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:
@@ -322,6 +329,27 @@ class AnsiParser(SqlParser):
             target = self._apply_table_alias(self._extract_target_table(stmt))
         elif isinstance(stmt, exp.Insert):
             target = self._apply_table_alias(self._extract_insert_target(stmt))
+
+        # temp_table_namespacing Step 1.2 (Amendment 3): detect TEMPORARY property on a
+        # CREATE target and stamp it role="temp" + namespace=current file.  Detection is
+        # by AST property (exp.TemporaryProperty) — NEVER by name heuristic.  Runs once
+        # per CREATE statement; zero per-column cost.  _extract_target_table is kept as a
+        # pure static that returns the plain ref; role/namespace decoration happens here
+        # where self and the Create AST are both available.
+        # Guard: only when _current_file_namespace is set (i.e. parse_file is active) so
+        # a bare TEMPORARY CREATE without a namespace stays role="table" and emits no
+        # kind='temp' row — making the symmetric PK-collision scenario structurally
+        # impossible (Amendment 6).
+        if (
+            isinstance(stmt, exp.Create)
+            and stmt.find(exp.TemporaryProperty) is not None
+            and target is not None
+            and self._current_file_namespace is not None
+        ):
+            target = dataclasses.replace(
+                target, role="temp", namespace=self._current_file_namespace
+            )
+            self._current_file_temp_keys.add(self._temp_identity(target.db, target.name))
 
         # C1 — capture the CLONE/LIKE source TableRef for:
         #   CREATE TABLE t CLONE src     → args['clone'] is exp.Clone
@@ -407,6 +435,22 @@ class AnsiParser(SqlParser):
         # Remove target from sources if present (CREATE/INSERT shouldn't select from target)
         if target:
             sources = [src for src in sources if src.full_id != target.full_id]
+
+        # temp_table_namespacing Step 2.1 (Amendment 5 — exact placement): stamp any
+        # source whose schema-qualified identity is registered in _current_file_temp_keys.
+        # MUST be AFTER the target-exclusion filter (above) and BEFORE
+        # _extract_column_lineage (below) so that the namespaced temp source flows into
+        # the star-resolution path (query_sources=sources).  If stamping happens after
+        # _extract_column_lineage, SELECT * FROM temp produces an orphaned bare-key
+        # kind='table' star-source row.  O(1) set membership per source — zero extra
+        # qualify/scope/expand cost.
+        if self._current_file_temp_keys and self._current_file_namespace is not None:
+            sources = [
+                dataclasses.replace(s, role="temp", namespace=self._current_file_namespace)
+                if self._temp_identity(s.db, s.name) in self._current_file_temp_keys
+                else s
+                for s in sources
+            ]
 
         # Extract column lineage (skip for pure-DDL files)
         if skip_column_lineage:

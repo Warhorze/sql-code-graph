@@ -473,6 +473,16 @@ class DuckDBBackend(GraphBackend):
                         "WHEN \"SqlTable\".\"kind\" IN ('table', 'view') "
                         "AND EXCLUDED.\"kind\" = 'derived' "
                         'THEN "SqlTable"."kind" '
+                        # temp_table_namespacing Step 3.2 (Amendment 1 — BLOCKER):
+                        # a committed kind='temp' row must survive cross-batch reference
+                        # or star-source rows (which emit kind='table') arriving later.
+                        # The <> 'temp' form covers all non-temp incomers including
+                        # star_sources (hardcoded kind='table') and reference rows.
+                        # Without this arm, ELSE EXCLUDED."kind" would silently re-fuse
+                        # the per-file temp node back to a shared kind='table' node.
+                        'WHEN "SqlTable"."kind" = \'temp\' '
+                        "AND EXCLUDED.\"kind\" <> 'temp' "
+                        'THEN "SqlTable"."kind" '
                         'ELSE EXCLUDED."kind" END'
                     )
                 elif c == "defined_in_file":

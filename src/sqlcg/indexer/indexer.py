@@ -1290,7 +1290,10 @@ class Indexer:
                     "name": table.name,
                     "catalog": table.catalog or "",
                     "db": table.db or "",
-                    "kind": "table",
+                    # temp_table_namespacing Step 3.1: emit table.role so a TEMPORARY
+                    # CREATE target produces kind='temp'.  Non-temp defined tables have
+                    # role="table" (default), so existing kind='table' emission is unchanged.
+                    "kind": table.role,
                     "defined_in_file": parsed.path_str,
                 }
             )

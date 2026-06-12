@@ -459,6 +459,11 @@ class SnowflakeParser(AnsiParser):
         # available so CTE/derived keys are portable.  Falls back to str(path) for single-file
         # callers that do not supply rel_path.
         self._current_file_namespace = rel_path if rel_path is not None else str(path)
+        # temp_table_namespacing (Step 1.1 / W4): reset alongside _current_file_namespace
+        # at the _parse_scripting_file entry point (the SECOND reset site in the Snowflake
+        # parser).  Without this, a pool-reused parser would leak temp keys from the
+        # previous file into this scripting block's reads.
+        self._current_file_temp_keys = set()
 
         # --- Step 3.1: build position-aware USE schema context map ---
         # Scan the raw SQL for USE schema-setter statements and record (offset, schema).
@@ -559,4 +564,6 @@ class SnowflakeParser(AnsiParser):
 
         # PR 3 — clear namespace after parsing
         self._current_file_namespace = None
+        # temp_table_namespacing (Step 1.1 / W4): clear temp-key set at scripting file end.
+        self._current_file_temp_keys = set()
         return out

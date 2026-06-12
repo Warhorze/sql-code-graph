@@ -458,6 +458,12 @@ class SqlParser(ABC):
         # _extract_column_lineage when constructing CTE/derived TableRefs.
         # None outside of an active parse_file call.
         self._current_file_namespace: str | None = None
+        # temp_table_namespacing — per-file temp identity set; persists across
+        # statements within a file (unlike CTE aliases which are per-statement).
+        # Populated in _parse_statement when a TEMPORARY CREATE is seen; consumed
+        # by source-stamping (ansi_parser.py) and _lineage_node_to_edges (base.py).
+        # Reset at every namespace assignment site (file start + file end).
+        self._current_file_temp_keys: set[str] = set()
 
     @abstractmethod
     def parse_file(
@@ -480,6 +486,22 @@ class SqlParser(ABC):
             ParsedFile containing parsed statements and metadata
         """
         ...
+
+    @staticmethod
+    def _temp_identity(db: str | None, name: str) -> str:
+        """Lowercased schema-qualified temp identity; bare name when db is falsy.
+
+        The ANSI path may have ``db=None`` (no USE-SCHEMA qualification), so the
+        key is the bare ``tmp_x``.  The ``f"{db}.{name}"`` form WITHOUT this guard
+        would wrongly produce ``"none.tmp_x"``.
+
+        Used byte-identically at three sites (Amendment 3 — temp_table_namespacing.md):
+          Step 1.2 — target registration in _parse_statement
+          Step 2.1 — source stamping in _parse_statement
+          Step 2.2 — lineage-leaf stamping in _lineage_node_to_edges
+        """
+        name = name.lower()
+        return f"{db.lower()}.{name}" if db else name
 
     def _classify(self, stmt: Any) -> str:
         """Classify a SQL statement into a kind string.
@@ -838,6 +860,7 @@ class SqlParser(ABC):
             return None
         if isinstance(source, exp.Table):
             name = source.name if hasattr(source, "name") else str(source)
+            src_db = source.db if hasattr(source, "db") else None
             # PR 3: if this table name matches a CTE alias in the current statement
             # AND we have a namespace, produce a namespaced CTE TableRef so the
             # outer-SELECT edge key matches the CTE projection edge's dst key.
@@ -851,10 +874,27 @@ class SqlParser(ABC):
                     role="cte",
                     namespace=self._current_file_namespace,
                 )
+            # temp_table_namespacing (Step 2.2 / Amendment 2): if this leaf's
+            # schema-qualified identity is registered as a temp in the current file,
+            # stamp it as role="temp" with the current file namespace.  Uses the same
+            # _temp_identity helper as registration (Step 1.2) so the key is
+            # byte-identical — a mismatch here would break the lineage chain.
+            if (
+                self._current_file_temp_keys
+                and self._current_file_namespace is not None
+                and self._temp_identity(src_db, name) in self._current_file_temp_keys
+            ):
+                return TableRef(
+                    catalog=source.catalog if hasattr(source, "catalog") else None,
+                    db=src_db,
+                    name=name,
+                    role="temp",
+                    namespace=self._current_file_namespace,
+                )
             return self._apply_table_alias(
                 TableRef(
                     catalog=source.catalog if hasattr(source, "catalog") else None,
-                    db=source.db if hasattr(source, "db") else None,
+                    db=src_db,
                     name=name,
                 )
             )
