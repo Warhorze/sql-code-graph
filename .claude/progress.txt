@@ -3574,3 +3574,16 @@ plan/sprints/temp_table_namespacing.md (rev 2):
 - W3: star_sources hardcoded-kind documented as no-change-IF-A1.
 - W4: temp-set reset required at snowflake _parse_scripting_file site too.
 NEXT: re-submit to plan-reviewer for the gate.
+
+## Handoff — architect-planner: temp_table_namespacing APPROVED [2026-06-12]
+Plan-reviewer verdict APPROVE-WITH-AMENDMENTS (rev 2 cleared the 2 blockers).
+Two new warnings applied (rev 3):
+- A5: Step 2.1 source-stamping placement — MUST go between ansi_parser.py:409
+  (target-exclusion filter) and :422 (_extract_column_lineage call), NOT after
+  the dedup. Verified query_sources=sources feeds star resolution; late stamping
+  orphans a bare-key kind='table' star-source row. Added star-source AC test.
+- A6: documented symmetric-hazard impossibility (namespaced <rel>::ba.tmp_base PK
+  vs bare ba.tmp_base PK never collide; _current_file_namespace guard means no
+  bare kind='temp' row is ever emitted).
+STATUS: plan/sprints/temp_table_namespacing.md APPROVED (rev 3) — ready for developer.
+NEXT: developer implements; architect-planner idle for Q&A + compliance check on "finished".

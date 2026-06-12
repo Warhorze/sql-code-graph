@@ -1,9 +1,19 @@
 # Feature Plan: Per-file namespacing of session-scoped TEMPORARY tables
 
-**Status: DRAFT (rev 2)** — plan-reviewer returned REWORK (2026-06-12); amendments A1–A4 +
-warnings W1–W4 applied below. Re-submitting for the gate.
+**Status: APPROVED (rev 3)** — plan-reviewer verdict APPROVE-WITH-AMENDMENTS (2026-06-12,
+rev 2 cleared the rework blockers); amendments A5–A6 applied below. Ready for the developer.
 
-**Plan-review amendments applied (2026-06-12):**
+**Plan-review amendments applied (2026-06-12, rev 3):**
+- **A5 (warning)** — Step 2.1 source stamping must be placed **between the target-exclusion
+  filter (`ansi_parser.py:409`) and the `_extract_column_lineage` call (line 422)**, NOT after
+  the dedup; otherwise a `SELECT *` from a temp produces an orphaned bare-key `kind='table'`
+  star-source row (verified: `query_sources=sources` feeds star resolution). Added star-source
+  acceptance test.
+- **A6 (warning)** — documented why the symmetric `Stored='table', EXCLUDED='temp'` direction is
+  structurally impossible (namespaced vs bare PK never collide; the `_current_file_namespace
+  is not None` guard means no bare `kind='temp'` row is ever emitted).
+
+**Plan-review amendments applied (2026-06-12, rev 2):**
 - **A1 (blocker)** — `upsert_nodes_bulk` ON CONFLICT must protect `kind='temp'` from cross-batch
   overwrite (§Cross-batch kind protection, Step 3.2, consumer audit row, test + acceptance).
 - **A2 (blocker)** — `_lineage_node_to_edges` leaf key-formation spelled out exactly (Step 2.2).
@@ -176,9 +186,21 @@ within a file.
   ```
   Keep `_extract_target_table` unchanged (still a static helper that returns the plain ref);
   the role/namespace decoration is layered on in the instance method that owns `self`.
-- **Stamping site for the sources**: source `TableRef`s are produced by `_real_tables`
-  ([`base.py:582-613`](../../src/sqlcg/parsers/base.py)) and the fallback scan, then dedup'd.
-  After `sources` is finalized in `_parse_statement` (after line ~460), map each source `s`
+- **Stamping site for the sources (Amendment 5 — exact placement, load-bearing)**: source
+  `TableRef`s are produced by `_real_tables`
+  ([`base.py:582-613`](../../src/sqlcg/parsers/base.py)) and the fallback scan. The stamping
+  MUST be inserted **after the target-exclusion filter
+  ([`ansi_parser.py:409`](../../src/sqlcg/parsers/ansi_parser.py),
+  `sources = [src for src in sources if src.full_id != target.full_id]`) and BEFORE the
+  `_extract_column_lineage` call ([`ansi_parser.py:422`](../../src/sqlcg/parsers/ansi_parser.py))**
+  — NOT after the dedup at line ~460. Reason: `_extract_column_lineage` receives
+  `query_sources=sources` (line 429) and uses it for **star resolution** (`_resolve_star_source`
+  via `query_sources`). If the temp source is still un-stamped when the star path runs, the
+  resulting `StarSource.source.full_id` is the **bare** `ba.tmp_base` (not `<rel>::ba.tmp_base`),
+  and the indexer's hardcoded `star_sources` emit
+  ([`indexer.py:1459`](../../src/sqlcg/indexer/indexer.py)) writes an orphaned `kind='table'`
+  row under the wrong key. Amendment 1's ON CONFLICT guard prevents kind-corruption of the temp
+  node, but it cannot fix a wrong-key orphan — only correct ordering does. Map each source `s`
   whose `self._temp_identity(s.db, s.name)` is in `self._current_file_temp_keys` to a
   namespaced `role="temp"` ref via `dataclasses.replace(s, role="temp",
   namespace=self._current_file_namespace)`. This mirrors how the CTE fallback stamps a
@@ -309,6 +331,19 @@ sole cross-batch mechanism preserving `kind='temp'`** — analogous to how `WHER
 is the sole precedence mechanism in `upgrade_derived_to_table_for_keys`. Grep-confirm the
 edited CASE is the one reached for `label == NodeLabel.TABLE`.
 
+**Symmetric direction is structurally impossible (Amendment 6).** The new arm only guards the
+`Stored='temp'` direction. The reverse — `Stored='table', EXCLUDED='temp'` — would fall into the
+`ELSE EXCLUDED."kind"` branch and overwrite a real `kind='table'` row with `'temp'` **IF** the
+two rows ever shared a `qualified` PK. They never do: a `role="temp"` `TableRef` produces a
+namespaced key (`<rel>::ba.tmp_base`), while a physical table named `tmp_base` produces the bare
+key (`ba.tmp_base`). Because ON CONFLICT matches on `qualified` (the PK), a temp row and a
+physical-table row are **different PKs and can never conflict**. The one invariant that makes
+this hold is the `self._current_file_namespace is not None` guard in Step 1.2: a CREATE
+TEMPORARY parsed without a namespace is left as `role="table"` and emits **no `kind='temp'` row
+at all** (so a bare-key `EXCLUDED='temp'` row a buggy parser might produce simply never arises
+from the correct implementation). No additional CASE arm is needed for the symmetric direction;
+this paragraph documents *why*.
+
 > **Note on `_upgrade_kinds`** ([`indexer.py:201-203`](../../src/sqlcg/indexer/indexer.py)):
 > `temp` is intentionally NOT added to `_upgrade_kinds = {"cte","external"}`. The in-batch
 > defined-target row always carries `defined_in_file`, so Rule 1 already wins in-batch; the
@@ -367,14 +402,21 @@ f-string) in `self._current_file_temp_keys`.
 
 ### Phase 2: Parser — stamp same-file reads + lineage leaves
 
-**Step 2.1**: After `sources` is finalized in `_parse_statement`, replace any source `s` whose
-`self._temp_identity(s.db, s.name)` is in `self._current_file_temp_keys` with a namespaced
-`role="temp"` ref via `dataclasses.replace(s, role="temp",
-namespace=self._current_file_namespace)` (Amendment 3 — same helper).
+**Step 2.1 (Amendment 5 — exact placement)**: Insert the source stamping **after the
+target-exclusion filter at [`ansi_parser.py:409`](../../src/sqlcg/parsers/ansi_parser.py) and
+BEFORE the `_extract_column_lineage` call at line 422** (NOT after the dedup at ~460). Replace
+any source `s` whose `self._temp_identity(s.db, s.name)` is in `self._current_file_temp_keys`
+with a namespaced `role="temp"` ref via `dataclasses.replace(s, role="temp",
+namespace=self._current_file_namespace)` (Amendment 3 — same helper). This guarantees the
+stamped sources flow into `_extract_column_lineage`'s star-resolution path.
 - Files: [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py).
 - Acceptance: in a file that creates `ba.tmp_base` then `insert into ba.final select … from
   ba.tmp_base`, the second statement's source ref for the temp has
   `full_id == "<rel>::ba.tmp_base"` and `role == "temp"`; the `ba.final` target is unchanged.
+- Acceptance (star-source, Amendment 5): a file with `CREATE TEMPORARY TABLE ba.tmp AS SELECT *
+  FROM real_src` produces a `star_sources` entry whose `source.full_id` is the **namespaced**
+  temp key (`<rel>::ba.tmp`), never the bare `ba.tmp` — i.e. no orphaned bare-key `kind='table'`
+  row appears for the temp.
 
 **Step 2.2**: Extend the namespace-stamping branch in `_lineage_node_to_edges`
 ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)) to also stamp leaf sources whose
