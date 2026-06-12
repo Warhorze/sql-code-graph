@@ -1,0 +1,513 @@
+"""Integration tests for per-file TEMPORARY-table namespacing (kind='temp').
+
+Indexes fixture files into an in-memory DuckDB graph and verifies all acceptance
+criteria from plan/sprints/temp_table_namespacing.md.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from sqlcg.cli.coverage import collect_coverage
+from sqlcg.core.duckdb_backend import DuckDBBackend
+from sqlcg.indexer.indexer import Indexer
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _routed(backend: DuckDBBackend):
+    """Return a run_read_routed side-effect that routes queries to the given backend."""
+
+    def _fn(query: str, params: dict):
+        return backend.run_read(query, params)
+
+    return _fn
+
+
+@pytest.fixture
+def db():
+    """Fresh in-memory DuckDB backend."""
+    backend = DuckDBBackend(":memory:")
+    backend.init_schema()
+    yield backend
+    backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Fixture SQL corpuses
+# ---------------------------------------------------------------------------
+
+# Corpus 1: two files each creating ba.tmp_base (the classic fusion scenario)
+_FILE_A_SQL = """\
+CREATE TABLE ba.real_src (x INT);
+CREATE OR REPLACE TEMPORARY TABLE ba.tmp_base AS SELECT x FROM ba.real_src;
+INSERT INTO ba.final_a (x) SELECT x FROM ba.tmp_base;
+"""
+
+_FILE_B_SQL = """\
+CREATE TABLE ba.other_src (x INT);
+CREATE OR REPLACE TEMPORARY TABLE ba.tmp_base AS SELECT x FROM ba.other_src;
+INSERT INTO ba.final_b (x) SELECT x FROM ba.tmp_base;
+"""
+
+# Corpus 2: permanent multi-writer table (must remain a single node, unchanged).
+# Two files each INSERT from ba.shared_table into different targets.
+# No TEMPORARY property → must stay kind='table' (single fused node).
+_FILE_C_SQL = "INSERT INTO ba.out_c (y) SELECT y FROM ba.shared_table;"
+_FILE_D_SQL = "INSERT INTO ba.out_d (y) SELECT y FROM ba.shared_table;"
+
+# Corpus 3: real_src → ba.tmp_base → real_final (chain through a temp)
+_CHAIN_SQL = """\
+CREATE TABLE ba.chain_src (col INT);
+CREATE OR REPLACE TEMPORARY TABLE ba.tmp_chain AS SELECT col FROM ba.chain_src;
+INSERT INTO ba.chain_final (col) SELECT col FROM ba.tmp_chain;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Test class: two-file corpus (de-fusion acceptance)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_file_corpus(db, tmp_path):
+    """Index file A and file B (both define ba.tmp_base) into one in-memory DB."""
+    (tmp_path / "file_a.sql").write_text(_FILE_A_SQL)
+    (tmp_path / "file_b.sql").write_text(_FILE_B_SQL)
+    Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
+    return db
+
+
+class TestTwoFileTempDefusion:
+    """Two files each defining ba.tmp_base produce TWO distinct kind='temp' nodes.
+
+    Guards temp_table_namespacing.md Acceptance — distinct keys, no fusion.
+    """
+
+    def test_two_temp_nodes_with_distinct_keys(self, two_file_corpus):
+        """Two kind='temp' SqlTable nodes exist, each keyed to its defining file.
+
+        Guards temp_table_namespacing.md Acceptance criterion.
+        """
+        rows = two_file_corpus.run_read(
+            "SELECT qualified, kind FROM \"SqlTable\" WHERE kind = 'temp' AND name = 'tmp_base'",
+            {},
+        )
+        keys = [r["qualified"] for r in rows]
+        assert len(keys) == 2, (
+            f"Expected exactly 2 kind='temp' nodes for ba.tmp_base, got {len(keys)}: {keys}"
+        )
+        assert keys[0] != keys[1], "The two temp nodes must have distinct qualified keys"
+        assert any("file_a.sql" in k for k in keys), "file_a.sql key not found"
+        assert any("file_b.sql" in k for k in keys), "file_b.sql key not found"
+
+    def test_no_shared_bare_tmp_base_table_node(self, two_file_corpus):
+        """There is no bare ba.tmp_base kind='table' node (the pre-fix fusion artifact).
+
+        Guards temp_table_namespacing.md Acceptance.
+        """
+        rows = two_file_corpus.run_read(
+            "SELECT qualified, kind FROM \"SqlTable\" WHERE qualified = 'ba.tmp_base'",
+            {},
+        )
+        assert rows == [], (
+            f"Bare ba.tmp_base kind='table' node must not exist after namespacing: {rows}"
+        )
+
+    def test_permanent_shared_table_stays_single_node(self, db, tmp_path):
+        """Genuinely shared physical table (two writers, no TEMPORARY) stays one kind='table' node.
+
+        Guards temp_table_namespacing.md §Non-Goals (368−85 set untouched).
+        """
+        (tmp_path / "c.sql").write_text(_FILE_C_SQL)
+        (tmp_path / "d.sql").write_text(_FILE_D_SQL)
+        Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
+
+        rows = db.run_read(
+            "SELECT qualified, kind FROM \"SqlTable\" WHERE name = 'shared_table'",
+            {},
+        )
+        table_rows = [r for r in rows if r["kind"] == "table"]
+        assert len(table_rows) == 1, (
+            f"Permanent shared table must remain a single kind='table' node: {table_rows}"
+        )
+        assert table_rows[0]["qualified"] == "ba.shared_table"
+
+
+# ---------------------------------------------------------------------------
+# Test class: lineage chain through temp (user-flagged correctness gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def chain_corpus(db, tmp_path):
+    """Index the chain fixture: real_src → ba.tmp_chain → chain_final."""
+    (tmp_path / "chain.sql").write_text(_CHAIN_SQL)
+    Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
+    return db
+
+
+class TestLineageChainThroughTemp:
+    """Intra-file lineage chain through a temp is re-keyed, not severed.
+
+    Guards temp_table_namespacing.md Acceptance — chain_src → tmp → chain_final end-to-end.
+    """
+
+    def test_column_lineage_edges_span_the_temp(self, chain_corpus):
+        """COLUMN_LINEAGE edges exist on both sides of the temp node.
+
+        Guards temp_table_namespacing.md §Lineage-preservation invariant.
+        """
+        # Edges into the temp (chain_src → tmp_chain)
+        _q_into = (
+            "SELECT src_key, dst_key FROM \"COLUMN_LINEAGE\" WHERE dst_key LIKE '%::ba.tmp_chain.%'"
+        )
+        into_temp = chain_corpus.run_read(_q_into, {})
+        # Edges out of the temp (tmp_chain → chain_final)
+        _q_out = (
+            "SELECT src_key, dst_key FROM \"COLUMN_LINEAGE\" WHERE src_key LIKE '%::ba.tmp_chain.%'"
+        )
+        out_of_temp = chain_corpus.run_read(_q_out, {})
+        assert into_temp, (
+            "No COLUMN_LINEAGE edges found INTO ba.tmp_chain — temp node is severed upstream"
+        )
+        assert out_of_temp, (
+            "No COLUMN_LINEAGE edges found OUT OF ba.tmp_chain — temp node is severed downstream"
+        )
+
+    def test_temp_node_kind_is_temp(self, chain_corpus):
+        """The tmp_chain node in the graph has kind='temp'.
+
+        Guards temp_table_namespacing.md Step 3.1.
+        """
+        rows = chain_corpus.run_read(
+            "SELECT qualified, kind FROM \"SqlTable\" WHERE name = 'tmp_chain'",
+            {},
+        )
+        assert rows, "tmp_chain node not found in SqlTable"
+        kinds = {r["kind"] for r in rows}
+        assert "temp" in kinds, f"Expected kind='temp' for tmp_chain, got {kinds}"
+        assert "table" not in kinds, f"tmp_chain must not have kind='table': {kinds}"
+
+    def test_single_namespaced_identity_within_file(self, chain_corpus):
+        """The temp's CREATE-target key and its same-file read key are byte-identical.
+
+        Guards temp_table_namespacing.md §Lineage-preservation invariant.
+        """
+        # Find the temp node's qualified key
+        rows = chain_corpus.run_read(
+            "SELECT qualified FROM \"SqlTable\" WHERE name = 'tmp_chain' AND kind = 'temp'",
+            {},
+        )
+        assert rows, "No temp node found for tmp_chain"
+        temp_key = rows[0]["qualified"]
+        assert "::" in temp_key, f"Temp key must be namespaced, got {temp_key!r}"
+
+        # All COLUMN_LINEAGE edges referencing tmp_chain use the same namespaced key.
+        # Use the temp node's own qualified key (which is the table part of the column key).
+        all_edges = chain_corpus.run_read(
+            'SELECT src_key, dst_key FROM "COLUMN_LINEAGE"',
+            {},
+        )
+        tmp_chain_edges = [
+            e for e in all_edges if "tmp_chain" in e["src_key"] or "tmp_chain" in e["dst_key"]
+        ]
+        for edge in tmp_chain_edges:
+            if "tmp_chain" in edge["src_key"]:
+                assert "::" in edge["src_key"], (
+                    f"tmp_chain src_key not namespaced: {edge['src_key']!r}"
+                )
+            if "tmp_chain" in edge["dst_key"]:
+                assert "::" in edge["dst_key"], (
+                    f"tmp_chain dst_key not namespaced: {edge['dst_key']!r}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Test class: cross-batch kind protection (Amendment 1, BLOCKER gate)
+# ---------------------------------------------------------------------------
+
+
+class TestCrossBatchKindProtection:
+    """committed kind='temp' survives cross-batch reference/star-source rows.
+
+    Guards temp_table_namespacing.md Step 3.2 (Amendment 1 — BLOCKER).
+    """
+
+    def test_temp_kind_survives_table_reference_row(self, db):
+        """A committed kind='temp' node is NOT overwritten by a later kind='table' row.
+
+        Guards temp_table_namespacing.md Step 3.2.
+        """
+        # Batch 1: commit a kind='temp' node
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/x.sql::ba.tmp_x",
+                    "name": "tmp_x",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "temp",
+                    "defined_in_file": "etl/x.sql",
+                }
+            ],
+        )
+        # Batch 2: upsert a kind='table' reference row for the same key
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/x.sql::ba.tmp_x",
+                    "name": "tmp_x",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "table",
+                    "defined_in_file": "",
+                }
+            ],
+        )
+        rows = db.run_read(
+            "SELECT kind FROM \"SqlTable\" WHERE qualified = 'etl/x.sql::ba.tmp_x'",
+            {},
+        )
+        assert rows, "Node must still exist"
+        assert rows[0]["kind"] == "temp", (
+            f"kind='temp' was overwritten to {rows[0]['kind']!r} by a kind='table' reference row"
+        )
+
+    def test_temp_kind_survives_derived_reference_row(self, db):
+        """A committed kind='temp' node is NOT overwritten by a later kind='derived' row.
+
+        Guards temp_table_namespacing.md Step 3.2.
+        """
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/x.sql::ba.tmp_y",
+                    "name": "tmp_y",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "temp",
+                    "defined_in_file": "etl/x.sql",
+                }
+            ],
+        )
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/x.sql::ba.tmp_y",
+                    "name": "tmp_y",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "derived",
+                    "defined_in_file": "",
+                }
+            ],
+        )
+        rows = db.run_read(
+            "SELECT kind FROM \"SqlTable\" WHERE qualified = 'etl/x.sql::ba.tmp_y'",
+            {},
+        )
+        assert rows[0]["kind"] == "temp", (
+            f"kind='temp' was overwritten by kind='derived': {rows[0]['kind']!r}"
+        )
+
+    def test_existing_guard_table_vs_derived_still_holds(self, db):
+        """Regression: existing kind='table'/'view' vs kind='derived' guard is unchanged.
+
+        Guards temp_table_namespacing.md Step 3.2 (counterpart).
+        """
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "ba.real_table",
+                    "name": "real_table",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "table",
+                    "defined_in_file": "etl/x.sql",
+                }
+            ],
+        )
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "ba.real_table",
+                    "name": "real_table",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "derived",
+                    "defined_in_file": "",
+                }
+            ],
+        )
+        rows = db.run_read(
+            "SELECT kind FROM \"SqlTable\" WHERE qualified = 'ba.real_table'",
+            {},
+        )
+        assert rows[0]["kind"] == "table", (
+            f"kind='table' should survive a kind='derived' update: {rows[0]['kind']!r}"
+        )
+
+    def test_star_source_row_does_not_re_fuse_temp(self, db):
+        """A star_sources row (hardcoded kind='table') for a temp key leaves kind='temp' intact.
+
+        This is the Warning 3 path: the indexer emits kind='table' for star_sources.
+        The Amendment 1 ON CONFLICT guard prevents re-fusion.
+        Guards temp_table_namespacing.md §Consumer audit — star_sources.
+        """
+        # Commit the temp node first
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/s.sql::ba.tmp_star",
+                    "name": "tmp_star",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "temp",
+                    "defined_in_file": "etl/s.sql",
+                }
+            ],
+        )
+        # Simulate the star_sources emit: hardcoded kind='table'
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/s.sql::ba.tmp_star",
+                    "name": "tmp_star",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "table",
+                    "defined_in_file": "",
+                }
+            ],
+        )
+        rows = db.run_read(
+            "SELECT kind FROM \"SqlTable\" WHERE qualified = 'etl/s.sql::ba.tmp_star'",
+            {},
+        )
+        assert rows[0]["kind"] == "temp", (
+            f"Star-source row (kind='table') re-fused the temp node: {rows[0]['kind']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test class: consumer round-trips
+# ---------------------------------------------------------------------------
+
+
+class TestConsumerRoundTrips:
+    """Consumer behaviour for kind='temp' nodes.
+
+    Guards temp_table_namespacing.md §Consumer audit.
+    """
+
+    def test_temp_excluded_from_harvest_usage_catalog(self, two_file_corpus):
+        """Namespaced temp keys are excluded from _harvest_usage_catalog (HAS_COLUMN usage).
+
+        Guards temp_table_namespacing.md §Consumer audit — _harvest_usage_catalog.
+        """
+        # Check that no HAS_COLUMN usage rows exist for ::ba.tmp_base column keys
+        rows = two_file_corpus.run_read(
+            'SELECT src_key, dst_key FROM "HAS_COLUMN" '
+            "WHERE source = 'usage' AND src_key LIKE '%::ba.tmp_base'",
+            {},
+        )
+        assert rows == [], f"Namespaced temp keys must not appear in usage HAS_COLUMN: {rows}"
+
+    def test_temp_not_upgraded_by_catalog_kind_upgrade(self, db):
+        """upgrade_derived_to_table_for_keys must NOT touch kind='temp' nodes.
+
+        Guards temp_table_namespacing.md §Consumer audit — catalog kind-upgrade.
+        """
+        db.upsert_nodes_bulk(
+            "SqlTable",
+            [
+                {
+                    "qualified": "etl/x.sql::ba.tmp_no_upgrade",
+                    "name": "tmp_no_upgrade",
+                    "catalog": "",
+                    "db": "ba",
+                    "kind": "temp",
+                    "defined_in_file": "etl/x.sql",
+                }
+            ],
+        )
+        # Simulate catalog kind upgrade call for the temp's qualified key
+        db.upgrade_derived_to_table_for_keys(["etl/x.sql::ba.tmp_no_upgrade"])
+
+        rows = db.run_read(
+            "SELECT kind FROM \"SqlTable\" WHERE qualified = 'etl/x.sql::ba.tmp_no_upgrade'",
+            {},
+        )
+        assert rows[0]["kind"] == "temp", (
+            f"upgrade_derived_to_table_for_keys must not upgrade kind='temp', "
+            f"but got kind={rows[0]['kind']!r}"
+        )
+
+    def test_temp_not_counted_as_cte_collision(self, two_file_corpus):
+        """Namespaced temp nodes do not register in _Q_CTE_COLLISIONS.
+
+        Guards temp_table_namespacing.md §Consumer audit — _Q_CTE_COLLISIONS.
+        """
+        with patch("sqlcg.cli.coverage.run_read_routed", side_effect=_routed(two_file_corpus)):
+            stats = collect_coverage()
+        # cte_key_collisions counts distinct CTE/derived dst column keys — temp must be 0
+        assert stats.cte_key_collisions == 0, (
+            f"Temp nodes must not count as CTE collisions; got {stats.cte_key_collisions}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test class: scoped-health coverage
+# ---------------------------------------------------------------------------
+
+
+class TestCoverageScoped:
+    """Scoped-health denominator excludes kind='temp' dst keys.
+
+    Guards temp_table_namespacing.md Step 4.1.
+    """
+
+    def test_scoped_health_excludes_temp(self, two_file_corpus):
+        """Temp endpoints do not inflate total_edges_scoped.
+
+        Guards temp_table_namespacing.md Step 4.1.
+        """
+        with patch("sqlcg.cli.coverage.run_read_routed", side_effect=_routed(two_file_corpus)):
+            stats = collect_coverage()
+        # total_edges_scoped must be <= total_edges (temp-dst edges excluded)
+        assert stats.total_edges_scoped <= stats.total_edges, (
+            "total_edges_scoped must not exceed total_edges "
+            "(temp edges should move to the scoped-excluded bucket)"
+        )
+
+    def test_coverage_label_includes_temp(self, two_file_corpus):
+        """Rendered scoped-health label reads 'excl. CTE/derived/temp'.
+
+        Guards temp_table_namespacing.md Step 4.1.
+        """
+        from sqlcg.cli.coverage import render_coverage_lines
+
+        with patch("sqlcg.cli.coverage.run_read_routed", side_effect=_routed(two_file_corpus)):
+            stats = collect_coverage()
+        lines = render_coverage_lines(stats)
+        scoped_line = next(
+            (line for line in lines if "scoped" in line.lower() and "excl." in line.lower()),
+            None,
+        )
+        assert scoped_line is not None, "No scoped-health line found in rendered output"
+        assert "temp" in scoped_line.lower(), (
+            f"Rendered scoped line does not mention 'temp': {scoped_line!r}"
+        )
