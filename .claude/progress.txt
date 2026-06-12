@@ -1,8 +1,8 @@
 ## Current State [2026-06-12]
-ACTIVE AGENT: developer — IN PROGRESS
+ACTIVE AGENT: developer — HANDOFF (PR opened, ready for review)
 FEATURE: v1.21.2 — CLI direct-index clear-before-rebuild (stale fossil key fix)
 BRANCH: fix/cli-index-clear-before-rebuild
-PR: (not yet opened)
+PR: (see handoff below)
 
 ## Handoff — operational: v1.21.1 final re-acceptance verification [2026-06-12]
 
