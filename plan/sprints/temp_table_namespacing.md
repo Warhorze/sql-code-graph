@@ -573,11 +573,39 @@ this plan in the docstring.
 | Perf regression from per-CREATE property read | `find(exp.TemporaryProperty)` is once-per-CREATE; source/leaf stamping is O(1) set membership; no per-column qualify/scope/expand. Perf guards pass unmodified. |
 | Temp-key set leaks across files | Reset at the namespace-assignment sites + cleared at end-of-file; isolation unit test. |
 
+### Deviations
+
+#### Deviation 1: Schema-alias interaction bug in Step 2.2 (_lineage_node_to_edges) — v1.21.1 patch
+- **Reason**: Live-DWH acceptance run (v1.21.0) showed 483 residual un-namespaced
+  `tmp_*` `kind='table'` nodes alongside 739 `kind='temp'` nodes.  The namespaced temp
+  nodes had zero outgoing edges (orphaned sinks); consuming statements wrote to the
+  un-namespaced node instead.  Root cause identified in Step 2.2:
+  `_lineage_node_to_edges` read `src_db` directly from the raw `exp.Table` node
+  (pre-alias, e.g. `'ba_tmp'`), but the registered key used the post-alias db
+  (e.g. `'ba'`, via `_apply_table_alias` on the CREATE target in Step 1.2).
+  `_temp_identity('ba_tmp','tmp_base') = 'ba_tmp.tmp_base'` missed the set
+  `{'ba.tmp_base'}` → the ref fell through to `_apply_table_alias` → emitted
+  `TableRef(db='ba', role='table')` — the second (kind='table') write.
+  The CI fixtures used pre-qualified `ba.tmp_base` directly (no `USE SCHEMA` +
+  schema alias), so the alias mismatch was invisible.
+- **Change**: In [`base.py`](../../src/sqlcg/parsers/base.py)
+  `_lineage_node_to_edges`, normalise `src_db` through `_schema_aliases` before
+  calling `_temp_identity` and before constructing the `role='temp'` `TableRef`.
+  The aliased db is used in the returned `TableRef` so the key is byte-identical
+  to the Step 1.2 registration.  One-line alias lookup; zero per-column cost.
+  Six new tests added (3 unit, 3 integration) in the existing test files.
+- **Impact**: Patch version 1.21.0 → 1.21.1.  No scope, risk, or acceptance-criterion
+  change — this closes the gap that the live DWH exposed.  Wall-time regression
+  (2m43s → 3m54s) is expected to recover on re-index since the +11k edge inflation
+  was caused by the dual-write.
+- **Date**: 2026-06-12
+
 ## User verification queue
 
 Per house rule, the agent never tags releases. **On hold (pending user verification):**
 v1.15.0–v1.20.0 (prior sprints). **This sprint adds:**
 - **v1.21.0** — per-file TEMPORARY-table namespacing (`kind='temp'`).
+- **v1.21.1** — schema-alias dual-write bugfix (patch).
 
 After this merges and the DWH is re-indexed, **regenerate `table_graph.html`** to see the
 de-fused graph (the single `ba.tmp_base` hub split into 13 per-file nodes). Version bumped in
