@@ -15,6 +15,7 @@ from sqlcg.server.models import (
     DependencyResult,
     DialectRepoResult,
     DiffImpactResult,
+    EmptyPropagationResult,
     HubRankingResult,
     Judgement,
     LineageResult,
@@ -74,7 +75,7 @@ _WORKFLOWS = """\
 
 # ---------------------------------------------------------------------------
 # Explicit tool → return-model map (single source for fact/heuristic label)
-# The map covers all 16 @mcp.tool()-decorated functions.
+# The map covers all 17 @mcp.tool()-decorated functions.
 # For tools returning plain dict/list[dict] (no Pydantic model), we use
 # BaseModel directly — it has no Judgement field → tagged as fact.
 # ---------------------------------------------------------------------------
@@ -100,6 +101,8 @@ TOOL_RETURN_MODELS: dict[str, type[BaseModel]] = {
     "scope_change": ScopeChangeResult,
     # Heuristic-bearing (dead_code: Judgement)
     "analyze_unused": UnusedTablesResult,
+    # Empty-impact blast radius (two-view, fact-only)
+    "get_empty_propagation": EmptyPropagationResult,
 }
 
 
@@ -124,6 +127,7 @@ _TOOL_PURPOSE: dict[str, str] = {
     "get_change_scope": "Minimal reading set + heuristic risk for a table change",
     "scope_change": "Single-call synthesis: files, upstreams, blast radius, risk",
     "analyze_unused": "Find tables with no within-corpus consumers (dead-code candidates)",
+    "get_empty_propagation": "Downstream blast radius (two views) when named table(s) are empty",
 }
 
 

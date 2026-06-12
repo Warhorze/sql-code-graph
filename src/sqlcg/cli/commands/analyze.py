@@ -372,3 +372,113 @@ def _print_table(rows: list[dict], columns: list[str]) -> None:
     for row in rows:
         t.add_row(*[str(row.get(c, "")) for c in columns])
     console.print(t)
+
+
+# ---------------------------------------------------------------------------
+# empty-impact command (PR 1 — v1.22.0)
+# ---------------------------------------------------------------------------
+
+_ROW_EMPTY_LABEL = (
+    "tables that may go fully empty — direct gating-join reads + value-derived tables; "
+    "CTE-wrapped pure-gating reads are NOT detected (known gap); depends on join type."
+)
+
+
+@app.command("empty-impact")
+def empty_impact(  # noqa: B008
+    tables: list[str] = typer.Argument(..., help="Qualified table name(s) to analyze"),  # noqa: B008
+    raw: bool = typer.Option(False, "--raw", help="Disable noise filtering"),  # noqa: B008
+    max_depth: int | None = typer.Option(  # noqa: B008
+        None,
+        "--max-depth",
+        help="Maximum traversal depth (1-100). Default: unbounded.",
+    ),
+) -> None:
+    """Show downstream blast radius when named table(s) are empty.
+
+    Returns TWO views: View 2 (PRIMARY — column-lineage refinement) lists
+    downstream columns/tables that lose their source values. View 1 (SUPPLEMENT)
+    adds tables that row-empty via a direct gating join. See result for caveats.
+    """
+    # N2 — validate max_depth.
+    if max_depth is not None and (max_depth < 1 or max_depth > 100):
+        console.print("[red]Error: --max-depth must be between 1 and 100[/red]")
+        raise typer.Exit(1)
+
+    from sqlcg.core.config import get_backend
+    from sqlcg.server.tools import _compute_empty_propagation
+
+    # W2 / O1 — open backend directly; no existing analyze command holds a handle.
+    with get_backend(read_only=True) as db:
+        result = _compute_empty_propagation(db, list(tables), max_depth)
+
+    # --raw: when raw, append noise-excluded tables to the display lists.
+    # The engine always returns noise_excluded separately; --raw re-includes them.
+    row_tables = result.row_empty_tables
+    value_cols = result.value_empty_columns
+    val_tables = result.value_affected_tables
+    prop_order = result.propagation_order
+    if raw:
+        row_tables = list(row_tables) + result.noise_excluded
+        val_tables = list(val_tables) + result.noise_excluded
+
+    # Render View 2 (PRIMARY) first.
+    console.print()
+    console.print("[bold green]View 2 — Value derivation (PRIMARY)[/bold green]")
+    console.print(
+        "  Downstream columns/tables whose VALUES are transitively derived from the source."
+    )
+    console.print()
+
+    if val_tables:
+        fully_set = set(result.value_fully_empty_tables)
+        partially_set = set(result.value_partially_empty_tables)
+        tbl = Table("table", "value-empty / total columns", "full|partial")
+        for t in val_tables:
+            ve_count = sum(1 for c in value_cols if c.rsplit(".", 1)[0] == t)
+            marker = "full" if t in fully_set else ("partial" if t in partially_set else "?")
+            tbl.add_row(t, str(ve_count), marker)
+        console.print(tbl)
+        n_col = len(value_cols)
+        n_tbl = len(val_tables)
+        console.print(f"  {n_col} value-empty column(s) across {n_tbl} table(s).")
+    else:
+        console.print("  [yellow]No value-derived downstream tables found.[/yellow]")
+
+    console.print()
+
+    # Render View 1 (SUPPLEMENT) second.
+    console.print("[bold yellow]View 1 — Row reachability (SUPPLEMENT)[/bold yellow]")
+    console.print(f"  {_ROW_EMPTY_LABEL}")
+    console.print()
+
+    if row_tables:
+        tbl2 = Table("table")
+        for t in row_tables:
+            tbl2.add_row(t)
+        console.print(tbl2)
+    else:
+        console.print("  [yellow]No row-reachable downstream tables found.[/yellow]")
+
+    console.print()
+
+    # Propagation order.
+    if prop_order:
+        console.print("[bold]Propagation order (closest-to-source first):[/bold]")
+        for i, t in enumerate(prop_order, 1):
+            console.print(f"  {i}. {t}")
+        console.print()
+
+    # Diagnostics.
+    if result.hint:
+        console.print(f"[yellow]Hint:[/yellow] {result.hint}")
+    if result.truncated:
+        console.print(
+            "[yellow]Warning:[/yellow] Traversal hit the 50k-node safety cap; "
+            "results may be incomplete."
+        )
+    if result.noise_excluded and not raw:
+        console.print(
+            f"[dim]{len(result.noise_excluded)} table(s) excluded as backup/noise/synthetic "
+            "(use --raw to include them).[/dim]"
+        )

@@ -84,7 +84,7 @@ writer per database.
 |---|---|
 | [`cli/main.py`](src/sqlcg/cli/main.py) + [`cli/commands/`](src/sqlcg/cli/commands) | Typer CLI. Commands: `index`, `reindex`, `watch`, `report`, `gain`, `install`, `uninstall`; groups `db` (`init`/`reset`/`info`/`list-repos`), `find` (`table`/`column`/`pattern`), `analyze` (`upstream`/`downstream`/`impact`/`failures`/`unused`), `mcp`, `git` (`install-hooks`). |
 | [`server/server.py`](src/sqlcg/server/server.py) | FastMCP instance + stdio entry. Constructs `mcp` at module scope (after the stdout→stderr guard) so [`tools.py`](src/sqlcg/server/tools.py) can register tools onto it. |
-| [`server/tools.py`](src/sqlcg/server/tools.py) | The 16 MCP tools — `trace_column_lineage`, `get_upstream_dependencies`, `get_downstream_dependencies`, `diff_impact`, `find_table_usages`, `find_definition`, `search_sql_pattern`, `analyze_unused`, `get_hub_ranking`, `index_repo`, `execute_sql`, etc. |
+| [`server/tools.py`](src/sqlcg/server/tools.py) | The 17 MCP tools — `trace_column_lineage`, `get_upstream_dependencies`, `get_downstream_dependencies`, `diff_impact`, `find_table_usages`, `find_definition`, `search_sql_pattern`, `analyze_unused`, `get_hub_ranking`, `index_repo`, `execute_sql`, `get_empty_propagation`, etc. |
 | [`server/writer.py`](src/sqlcg/server/writer.py) | Single-writer queue + drain task. The drain holds `backend_lock` and runs the indexer op directly — the sole backend writer. |
 | [`server/read_client.py`](src/sqlcg/server/read_client.py) | Routes CLI read commands through the live server socket when one is running. |
 | [`server/control.py`](src/sqlcg/server/control.py) | `.pid` / `.sock` control files for server discovery, status, and stop — keyed off the db path. |

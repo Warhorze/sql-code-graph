@@ -26,6 +26,7 @@ from sqlcg.core.queries import (
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
     GET_TABLE_KINDS_BATCH_QUERY,
+    GET_TABLE_READS_ADJACENCY_QUERY,
     GET_TABLES_DEFINED_IN_FILE_QUERY,
     GET_TABLES_EXTERNAL_CONSUMERS_BATCH_QUERY,
     GET_TARGET_TABLES_FOR_FILE_QUERY,
@@ -51,6 +52,7 @@ from sqlcg.server.models import (
     DialectRepo,
     DialectRepoResult,
     DiffImpactResult,
+    EmptyPropagationResult,
     HubEntry,
     HubRankingResult,
     Judgement,
@@ -2064,3 +2066,280 @@ def get_hub_ranking(k: int = 10) -> HubRankingResult:
             )
 
         return HubRankingResult(top=top, k=k, hint=hint)
+
+
+# ---------------------------------------------------------------------------
+# empty-impact blast-radius engine (PR 1 — v1.22.0)
+# ---------------------------------------------------------------------------
+
+
+def _table_row_reachability(
+    db: GraphBackend,
+    start_tables: list[str],
+    max_depth: int | None = None,
+) -> tuple[list[str], bool]:
+    """BFS over the table-reads adjacency for View 1 (row_empty_tables branch (b)).
+
+    Loads the full ``SELECTS_FROM ∪ STAR_SOURCE`` adjacency once (source_table →
+    dest_table via ``SqlQuery.target_table``), then contracts synthetic nodes (kind
+    in {cte, derived, temp}) OUT OF the adjacency itself — bridging real→synthetic→real
+    paths into direct real→real successor edges — so synthetic bridges never gate or
+    pollute the traversal.
+
+    M4 (plan §Step 1.2): the contraction happens IN the adjacency map before the BFS,
+    not only as a post-filter.  ``_exclude_synthetic_tables`` is applied to the output
+    as a belt-and-braces second pass.
+
+    Args:
+        db: Graph backend.
+        start_tables: Named source tables (lowercased).
+        max_depth: Optional depth cap (None = unbounded).
+
+    Returns:
+        (reachable_tables, truncated): order-preserving list of reachable tables
+        excluding the named sources and synthetic nodes, plus a bool cap flag.
+    """
+    # 1. Load the full source → dest adjacency in one query.
+    rows = db.run_read(GET_TABLE_READS_ADJACENCY_QUERY, {})
+    raw_successors: dict[str, set[str]] = {}
+    all_endpoints: set[str] = set()
+    for row in rows:
+        src, dst = row["source_table"], row["dest_table"]
+        raw_successors.setdefault(src, set()).add(dst)
+        all_endpoints.add(src)
+        all_endpoints.add(dst)
+
+    # 2. Identify synthetic nodes among the endpoints.
+    synthetic_ids: set[str] = set()
+    if all_endpoints:
+        kind_rows = db.run_read(
+            GET_TABLE_KINDS_BATCH_QUERY, {"table_qualifieds": list(all_endpoints)}
+        )
+        synthetic_ids = {
+            r["table_qualified"] for r in kind_rows if r["kind"] in _SYNTHETIC_TABLE_KINDS
+        }
+
+    # 3. Build contracted adjacency: for each real source, BFS through any chain
+    #    of synthetic nodes to find the real consumers — real→synthetic→...→real
+    #    becomes a direct real→real successor edge.
+    def _real_successors(node: str, visited_chain: set[str] | None = None) -> set[str]:
+        """Return the set of real table successors reachable from node via synthetic bridges."""
+        if visited_chain is None:
+            visited_chain = set()
+        result: set[str] = set()
+        for nxt in raw_successors.get(node, ()):
+            if nxt in visited_chain:
+                continue
+            visited_chain.add(nxt)
+            if nxt not in synthetic_ids:
+                result.add(nxt)
+            else:
+                result.update(_real_successors(nxt, visited_chain))
+        return result
+
+    contracted: dict[str, set[str]] = {}
+    for src in all_endpoints:
+        if src not in synthetic_ids:
+            contracted[src] = _real_successors(src)
+
+    # 4. Cycle-safe BFS from start_tables over the contracted adjacency.
+    source_set = set(start_tables)
+    visited: set[str] = set(start_tables)  # seed with sources so they aren't re-queued
+    reachable: list[str] = []
+    emitted: set[str] = set()
+    queue: deque[tuple[str, int]] = deque((t, 0) for t in start_tables)
+    truncated = False
+
+    while queue:
+        current, depth = queue.popleft()
+
+        if max_depth is not None and depth >= max_depth:
+            # Enqueue nothing; flag truncated if there would be successors.
+            if contracted.get(current):
+                truncated = True
+            continue
+
+        for nxt in contracted.get(current, ()):
+            if nxt in visited:
+                continue
+            if len(visited) >= _MAX_CLOSURE_NODES:
+                truncated = True
+                break
+            visited.add(nxt)
+            if nxt not in source_set and nxt not in emitted:
+                emitted.add(nxt)
+                reachable.append(nxt)
+            queue.append((nxt, depth + 1))
+
+    # 5. Belt-and-braces: exclude any synthetic node that slipped through.
+    real_reachable, synthetic_excluded = _exclude_synthetic_tables(db, reachable)
+    return real_reachable, truncated
+
+
+def _compute_empty_propagation(
+    db: GraphBackend,
+    tables: list[str],
+    max_depth: int | None,
+) -> EmptyPropagationResult:
+    """Compute the two-view empty-propagation blast radius for named source tables.
+
+    View 2 (PRIMARY — column-lineage refinement) is built first; it is the reliable
+    headline answer. View 1 (SUPPLEMENT — row_empty_tables) is the UNION of
+    View 2's affected-table rollup (branch a) and the direct ``SELECTS_FROM``/
+    ``STAR_SOURCE`` reachability result (branch b).
+
+    W1 (plan §Step 1.3): ``_kahn_topological_sort`` receives
+    ``_dedup_preserve_order([*start_cols, *affected_cols])`` — both endpoints of
+    every producer→consumer hop — so the synthetic-node contraction inside Kahn
+    can find the adjacency edges.  Passing ``affected_cols`` alone degrades
+    ordering for multi-hop chains routed through CTE/derived bridges (N3).
+
+    Args:
+        db: Graph backend (already open).
+        tables: One or more lowercased qualified table names.
+        max_depth: Maximum BFS depth (None = unbounded).
+
+    Returns:
+        EmptyPropagationResult with both views populated.
+    """
+    # Normalise: lowercase, dedup, preserve order.
+    sources = _dedup_preserve_order([t.lower() for t in tables])
+    source_set = set(sources)
+
+    # Collect start columns (union of all source tables' known columns).
+    start_cols: list[str] = []
+    start_seen: set[str] = set()
+    not_found: list[str] = []
+    for source in sources:
+        col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": source})
+        if not col_rows:
+            not_found.append(source)
+        for r in col_rows:
+            cid = r["col_id"]
+            if cid not in start_seen:
+                start_seen.add(cid)
+                start_cols.append(cid)
+
+    # --- View 2: column-lineage closure (PRIMARY) ---
+    root = _indexed_root(db) or Path.cwd()
+    noise_filter = NoiseFilter.from_config(repo_root=root)
+
+    affected_cols, _depth, truncated_v2 = _affected_columns_closure(db, start_cols, max_depth)
+
+    # Roll up to tables, exclude sources, noise-filter, exclude synthetic.
+    affected_tables_raw = [t for t in _rollup_to_tables(affected_cols) if t not in source_set]
+    affected_tables_nf, noise_excluded_v2 = noise_filter.filter_nodes(affected_tables_raw)
+    value_affected_tables, synthetic_excluded_v2 = _exclude_synthetic_tables(db, affected_tables_nf)
+    noise_excluded = _dedup_preserve_order([*noise_excluded_v2, *synthetic_excluded_v2])
+
+    # Filter value_empty_columns to only kept tables.
+    kept_set = set(value_affected_tables)
+    value_empty_columns = [c for c in affected_cols if c.rsplit(".", 1)[0] in kept_set]
+
+    # Fully vs. partially empty tables: compare per-table value-empty columns against
+    # the full set of known columns for that table.
+    value_fully_empty_tables: list[str] = []
+    value_partially_empty_tables: list[str] = []
+    affected_col_set = set(value_empty_columns)
+    for tbl in value_affected_tables:
+        all_col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": tbl})
+        all_col_ids = {r["col_id"] for r in all_col_rows}
+        if not all_col_ids:
+            # No known columns in graph — cannot classify; treat as partial.
+            value_partially_empty_tables.append(tbl)
+            continue
+        affected_here = all_col_ids & affected_col_set
+        if affected_here >= all_col_ids:
+            value_fully_empty_tables.append(tbl)
+        else:
+            value_partially_empty_tables.append(tbl)
+
+    # --- View 1: row_empty_tables (SUPPLEMENT) ---
+    # branch (a) = value_affected_tables (already computed above)
+    # branch (b) = _table_row_reachability BFS result
+    branch_b_reachable, truncated_v1 = _table_row_reachability(db, sources, max_depth)
+
+    truncated = truncated_v1 or truncated_v2
+
+    # Union of branch (a) and branch (b), then noise-filter and exclude synthetic.
+    row_union_raw = _dedup_preserve_order([*value_affected_tables, *branch_b_reachable])
+    # branch_b may include noise that didn't go through value filter.
+    row_union_nf, noise_excl_b = noise_filter.filter_nodes(row_union_raw)
+    row_empty_tables, synthetic_excl_b = _exclude_synthetic_tables(db, row_union_nf)
+    # Merge any additional exclusions from branch (b) into noise_excluded.
+    noise_excluded = _dedup_preserve_order([*noise_excluded, *noise_excl_b, *synthetic_excl_b])
+    # Ensure sources are excluded from both views.
+    row_empty_tables = [t for t in row_empty_tables if t not in source_set]
+
+    # --- Propagation order (W1) ---
+    # order_tables = union of both views, sources excluded.
+    order_tables_raw = _dedup_preserve_order([*row_empty_tables, *value_affected_tables])
+    order_tables = [t for t in order_tables_raw if t not in source_set]
+
+    # W1: pass _dedup_preserve_order([*start_cols, *affected_cols]) to Kahn.
+    closure_col_ids = _dedup_preserve_order([*start_cols, *affected_cols])
+    propagation_order, had_cycle = _kahn_topological_sort(order_tables, db, closure_col_ids)
+
+    # Build hint.
+    hints: list[str] = []
+    if not_found:
+        hints.append(f"Table(s) not found in graph: {', '.join(not_found)}.")
+    if not order_tables and not not_found:
+        hints.append("No downstream consumers — nothing propagates.")
+    elif had_cycle:
+        hints.append(
+            "Dependency cycle detected; propagation_order is approximate (cyclic tables appended)."
+        )
+    if truncated:
+        hints.append("Traversal stopped at 50k-node safety cap.")
+
+    downstream_count = len(set(row_empty_tables) | set(value_affected_tables))
+
+    return EmptyPropagationResult(
+        sources=sources,
+        row_empty_tables=row_empty_tables,
+        value_empty_columns=value_empty_columns,
+        value_affected_tables=value_affected_tables,
+        value_fully_empty_tables=value_fully_empty_tables,
+        value_partially_empty_tables=value_partially_empty_tables,
+        propagation_order=propagation_order,
+        downstream_count=downstream_count,
+        noise_excluded=noise_excluded,
+        truncated=truncated,
+        hint=" | ".join(hints) if hints else None,
+    )
+
+
+@mcp.tool()
+@_timed_tool("get_empty_propagation")
+def get_empty_propagation(tables: list[str]) -> EmptyPropagationResult:
+    """Return the downstream blast radius when one or more tables are empty.
+
+    Answers the operational question "a job failed and left table(s) empty —
+    what downstream is at risk?" using TWO complementary views:
+
+    **View 2 (PRIMARY — column-lineage refinement)**: which downstream COLUMNS lose
+    their source VALUES because they are transitively derived from the named table's
+    columns (``value_empty_columns``, rolled up to ``value_affected_tables``).  This
+    is the reliable headline answer — it captures CTE-wrapped derived reads.
+
+    **View 1 (SUPPLEMENT — row reachability)**: ``row_empty_tables`` is the UNION
+    of (a) View 2's affected tables and (b) tables with a DIRECT
+    ``SELECTS_FROM``/``STAR_SOURCE`` read of a source (the inner-join gating case).
+    KNOWN GAP: CTE-wrapped pure-gating reads are NOT detected (the parser's
+    ``_real_tables`` excludes CTE-sourced names; this is a documented, accepted gap).
+    UPPER BOUND: depends on join type (not recorded on edges).
+
+    Args:
+        tables: One or more qualified table names (e.g., ["ba.fact_sales"]).
+                Graph keys are lowercased at index time; inputs are folded.
+
+    Returns:
+        EmptyPropagationResult with both views, propagation order, and diagnostics.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed.
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+        return _compute_empty_propagation(db, tables, max_depth=None)
