@@ -351,6 +351,24 @@ class AnsiParser(SqlParser):
             )
             self._current_file_temp_keys.add(self._temp_identity(target.db, target.name))
 
+        # View classification: a CREATE VIEW target is stamped role="view" so it lands
+        # in the graph as SqlTable.kind='view' (indexer.py emits "kind": table.role).
+        # Without this, views were indistinguishable from tables — the parser knew the
+        # statement was a view (QueryKind.CREATE_VIEW on the SqlQuery node) but never
+        # propagated it to the SqlTable node.  Downstream already expects 'view' as a
+        # valid kind: indexer._USAGE_ELIGIBLE_KINDS = {'table','view'}, schema_resolver,
+        # and the duckdb_backend kind-upgrade guard (kind IN ('table','view') is never
+        # downgraded to 'derived').  Guarded on role == "table" so a TEMPORARY VIEW keeps
+        # role="temp" (the temp block above runs first and wins).  Metadata-only: one
+        # equality check per CREATE statement; zero per-column hot-path cost.
+        if (
+            isinstance(stmt, exp.Create)
+            and stmt.kind == "VIEW"
+            and target is not None
+            and target.role == "table"
+        ):
+            target = dataclasses.replace(target, role="view")
+
         # C1 — capture the CLONE/LIKE source TableRef for:
         #   CREATE TABLE t CLONE src     → args['clone'] is exp.Clone
         #   CREATE TABLE t LIKE src      → args['properties'] contains exp.LikeProperty
