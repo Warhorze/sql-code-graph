@@ -1,14 +1,25 @@
-# Feature Plan: Data-Loss Impact Analysis (two sequenced PRs)
+# Feature Plan: Data-Loss Impact Analysis (three sequenced PRs)
 
 > Status: REVIEWED (shepherd-verified 2026-06-12 — M1/M6 blockers confirmed
 > resolved by reading the revised §"two views" and §"PR 2 Detection mechanism"
-> against the tree; gate passed). Ready for implementation, PR 1 first. Preserves the
+> against the tree; gate passed). **PR 1 is in development.** Ready for implementation,
+> PR 1 first. Preserves the
 > plan-reviewer-revised W1/W2/N1/N2/N3 PASS content (commit dcda023), scoped into
 > **PR 1**. View 1 is reframed (M1) as a documented SUPPLEMENT to View 2 (the
 > primary, reliable answer) after the corpus measurement below; O2 is resolved
 > (M6) — `get_pr_impact` requires a base-indexed graph and orchestrates the resync
 > internally. Owner (compliance): architect-planner.
-> Version targets: **PR 1 → 1.22.0**, **PR 2 → 1.23.0** (both additive → minor).
+> Version targets: **PR 1 → 1.22.0**, **PR 2 → 1.23.0**, **PR 3 → 1.24.0** (all
+> additive → minor).
+>
+> **Shepherd-directed amendment (2026-06-12):** (A) **PR 3 added** — retrofit PR 1's
+> gating-join supplement (branch (b)) into the existing impact tools
+> (`get_change_scope`/`diff_impact`) via a SEPARATE `gating_join_tables` field, reusing
+> PR 1's `_table_row_reachability` (no reimplementation); depends on PR 1. (B) **PR 2
+> rename-handling folded in** as a CORRECTNESS requirement — `producers(base) −
+> producers(head)` mis-reports renames as total data loss; PR 2 now classifies renames
+> (file + in-file structural) into a distinct `renamed_tables` category and excludes
+> them from the blast radius. PR 1 sections are UNTOUCHED.
 >
 > **M1 corpus measurement (the reframe basis).** On the DWH corpus
 > `SELECTS_FROM = 4,944` edges vs `COLUMN_LINEAGE = 53,285` — ~90% of cross-table
@@ -22,10 +33,12 @@
 > and rebuilds View 1 as a supplement whose genuine value-add is the direct
 > gating-join reader tables, with a documented residual gap.
 
-## Feature Summary (both PRs)
+## Feature Summary (three PRs)
 
 Answer the operational question "a job failed and left table(s) empty — what
-downstream is at risk?" in two stages:
+downstream is at risk?" in three stages (PR 1 the engine; PR 2 the change-detection
+front-end; PR 3 retrofits PR 1's gating-join supplement into the existing impact tools
+so they answer consistently):
 
 - **PR 1 — Blast-radius core (the engine).** Given user-NAMED empty table(s),
   report the downstream blast radius. **View 2 (column-lineage closure) is the
@@ -42,22 +55,33 @@ downstream is at risk?" in two stages:
   edges disappear) — then auto-feed those tables into PR 1's engine, returning the
   same two-view blast radius without hand-naming tables. Ships after PR 1, depends
   on its engine. Entry point: MCP `get_pr_impact(base_ref)` + CLI
-  `sqlcg analyze pr-impact --base <ref>`.
+  `sqlcg analyze pr-impact --base <ref>`. **Classifies renames into a distinct
+  `renamed_tables` category and excludes them from the blast radius** (correctness —
+  raw `producers(base) − producers(head)` would cry wolf on every rename).
+- **PR 3 — gating-join supplement retrofit (consistency).** Extend the existing impact
+  tools `get_change_scope` and `diff_impact` with a SEPARATE `gating_join_tables` field,
+  reusing PR 1's `_table_row_reachability` so the existing tools and the new one give
+  consistent answers about direct gating-join readers. Ships after PR 1, independent of
+  PR 2. No new MCP tool, no new traversal code.
 
-## Shared design (built by PR 1, reused by PR 2 — no duplication)
+## Shared design (built by PR 1, reused by PR 2 + PR 3 — no duplication)
 
-PR 2 MUST NOT reimplement any blast-radius logic. PR 1 builds, and PR 2 reuses:
+PR 2 and PR 3 MUST NOT reimplement any blast-radius / reachability logic. PR 1 builds,
+and PR 2 / PR 3 reuse:
 
-| Shared artifact | Built in | Reused by PR 2 |
+| Shared artifact | Built in | Reused by PR 2 / PR 3 |
 |---|---|---|
-| `EmptyPropagationResult` (two-view model) | PR 1 Step 1.1 | returned verbatim, wrapped with attribution |
-| `_compute_empty_propagation(db, tables, max_depth)` engine | PR 1 Step 1.3 | called directly with the detected lost-producer table set |
-| `_table_row_reachability(db, tables, max_depth)` (view 1 traversal) | PR 1 Step 1.2 | invoked transitively via the engine |
+| `EmptyPropagationResult` (two-view model) | PR 1 Step 1.1 | PR 2: returned verbatim, wrapped with attribution |
+| `_compute_empty_propagation(db, tables, max_depth)` engine | PR 1 Step 1.3 | PR 2: called directly with the detected lost-producer table set |
+| `_table_row_reachability(db, tables, max_depth)` (view 1 traversal) | PR 1 Step 1.2 | PR 2: invoked transitively via the engine. **PR 3: called DIRECTLY in `get_change_scope`/`diff_impact` to populate `gating_join_tables`** |
+| `GET_TABLE_READS_ADJACENCY` query | PR 1 Step 1.2 | PR 3: reused transitively via `_table_row_reachability` (no new query) |
 | `_affected_columns_closure` / `_rollup_to_tables` / `_exclude_synthetic_tables` / `_kahn_topological_sort` (existing helpers) | already in tree | unchanged |
 | `get_backend(read_only=True)` CLI seam (W2/O1) | PR 1 Step 3.1 | same seam reused by PR 2's CLI |
 
 > **Dependency gate:** PR 2 cannot start until PR 1's engine
 > (`_compute_empty_propagation`, both views, `EmptyPropagationResult`) is merged.
+> PR 3 cannot start until PR 1's `_table_row_reachability` + `GET_TABLE_READS_ADJACENCY`
+> are merged. PR 2 and PR 3 are mutually independent.
 
 ---
 
@@ -610,6 +634,14 @@ tables into PR 1's blast-radius engine and return the same two-view result,
 attributed to the detected change. This turns the blast radius into a CI gate
 without hand-naming tables.
 
+> **Rename handling is a CORRECTNESS requirement, not optional (shepherd-directed,
+> 2026-06-12).** Raw `producers(base) − producers(head)` reports a RENAME as a lost
+> producer: renaming `da.foo` → `da.bar` drops `da.foo` from the producer set, and the
+> detector cries "total data loss + full downstream blast radius" when nothing was lost.
+> Unhandled, the detector cries wolf on every rename and is untrustworthy. PR 2 MUST
+> classify renames into a distinct `renamed_tables` category and EXCLUDE them from the
+> data-loss blast radius. See §PR 2 Rename handling below.
+
 ## PR 2 Scope
 
 ### In Scope
@@ -629,6 +661,15 @@ without hand-naming tables.
 - No row-count export, no `last_loaded`/`filled`/`row_count` signal (consistent with
   PR 1 and the standing non-detection decision for runtime signals).
 - No new blast-radius logic — PR 2 reuses PR 1's engine verbatim.
+- **Rename classification is a HEURISTIC, not an exact rename oracle.** It pairs a lost
+  producer with a new producer by BOTH column-set and downstream-consumer Jaccard
+  (≥ 0.6 each, §PR 2 Rename handling). A rename that simultaneously rewrites the schema
+  AND re-points the consumers below threshold will be (correctly, conservatively)
+  treated as deletion+addition rather than a silent rename — the safe failure direction
+  (report a blast radius rather than hide a real loss). A genuine deletion that happens
+  to coincide with an unrelated new table sharing ≥ 0.6 on BOTH axes could be
+  mis-classified as a rename; the AND-of-both-axes threshold makes this rare. The
+  `renamed_tables` docstring/CLI MUST label it a heuristic so callers verify.
 
 ## PR 2 Detection mechanism — investigation + RECOMMENDATION
 
@@ -710,6 +751,93 @@ snapshot-capture with diff-computation).** Split into three pieces:
   before, run `resync_changed`, capture after (steps 2–5 above).
 - `_diff_lost_producers(before, after, db) -> tuple[list[str], dict[str, list[str]]]`
   — computes `before − after`, excludes synthetic, builds Option C attribution.
+  **Now also returns the rename classification (see §PR 2 Rename handling) — its
+  signature and return shape are extended there.**
+
+## PR 2 Rename handling (CORRECTNESS — shepherd-directed, 2026-06-12)
+
+**Problem.** Detection is `lost = producers(base) − producers(head)`. A RENAME is a
+**false positive**: if `da.foo` is renamed to `da.bar`, `da.foo` drops out of
+`producers(head)` and lands in `lost`, so the detector reports `da.foo` as a "lost
+producer" = total data loss + full downstream blast radius — when in fact the table was
+renamed and nothing was lost. The detector MUST distinguish a rename from a genuine
+deletion, classify renames into a distinct visible category, and keep them OUT of the
+blast radius. Genuine deletions (no matching new producer) still flow to the engine.
+
+**The mirror set — "new producers".** Compute, symmetrically to the lost set:
+```
+new_producers = producers(head) − producers(base)     # tables that GAINED a producer
+lost_producers = producers(base) − producers(head)     # the raw candidate lost set
+```
+A rename of `da.foo` → `da.bar` shows up as `da.foo ∈ lost_producers` AND
+`da.bar ∈ new_producers` simultaneously. Rename detection pairs members of `lost` with
+members of `new` that are "the same table under a new name".
+
+**Two rename shapes — both MUST be handled:**
+
+1. **FILE rename.** `git_name_status_delta` already splits a git rename into a
+   `deleted` of the old `.sql` path + an `added` of the new `.sql` path
+   ([`git_delta.py`](../../src/sqlcg/indexer/git_delta.py), "renames split into
+   delete+add"). The rename is reconstructable from the delta: a `deleted` old-path
+   whose producer table is in `lost`, paired with an `added` new-path whose producer
+   table is in `new`. (A file rename may or may not also rename the table it writes —
+   the structural overlap check below is the actual classifier; the file-delta pairing
+   is supporting attribution evidence.)
+2. **IN-FILE table rename.** `CREATE TABLE da.bar` replacing `CREATE TABLE da.foo` in
+   the **same modified file** — the file path is unchanged, so git reports it as a plain
+   `modified` with **NO rename signal**. This MUST be detected **STRUCTURALLY** from the
+   graph, not from git. `da.foo ∈ lost`, `da.bar ∈ new`, and the overlap check (below)
+   classifies the pair as a rename.
+
+**Structural rename heuristic (the classifier).** A lost producer `L` that coincides,
+in the same change set, with a new producer `N ∈ new_producers` whose **column set AND
+downstream-consumer set substantially overlap** `L`'s is almost certainly a rename.
+
+- **Overlap signal — use BOTH, AND-combined, and justify the threshold.** A pure
+  column-name overlap is too weak (two unrelated tables can share `id`/`created_at`); a
+  pure downstream-consumer overlap is too weak (a brand-new table can be wired into the
+  same consumers a deleted one fed). Requiring BOTH cuts the false-rename rate sharply:
+  - **column overlap** = Jaccard of `L`'s graph-known column-name set vs `N`'s
+    (`GET_COLUMNS_FOR_TABLE_QUERY` for each, captured at the *base* graph for `L` and the
+    *head* graph for `N`) `≥ 0.6`.
+  - **downstream-consumer overlap** = Jaccard of the table sets that read `L` (at base)
+    vs read `N` (at head), via `GET_TABLE_READS_ADJACENCY` reverse lookup, `≥ 0.6`.
+  - **Classify the `(L, N)` pair as a rename iff BOTH Jaccard scores ≥ 0.6.** Rationale
+    for 0.6: a true rename keeps the same schema and the same consumers, so both scores
+    are typically ~1.0; an unrelated coincidence rarely clears 0.6 on BOTH axes at once.
+    The threshold is a named constant `_RENAME_OVERLAP_THRESHOLD = 0.6` (single source of
+    truth, tunable), pinned by the in-file-rename test. The FILE-rename git pairing, when
+    present, is recorded as corroborating attribution but the BOTH-Jaccard structural
+    check is the authoritative classifier (so a file rename that also genuinely changes
+    the schema/consumers is correctly treated as deletion+addition, not a silent rename).
+
+**Classification outcome:**
+- `(L, N)` pair clears BOTH thresholds → `L` is classified **"possible rename"**, placed
+  in a distinct `renamed_tables` entry (`old → new`), and **EXCLUDED from
+  `lost_producer_tables` and from the blast-radius input set**. (Recommended: distinct
+  category so the rename is VISIBLE — "verify consumers updated" — not silently dropped.)
+- `L` with **no** matching `N` clearing the thresholds → **genuine lost producer**;
+  stays in `lost_producer_tables` and **flows to `_compute_empty_propagation`**.
+
+**Helper extension.** `_diff_lost_producers` is extended to take both snapshots and the
+delta, and to return the rename classification:
+```python
+def _diff_lost_producers(
+    before: set[str], after: set[str], db, base_sha, head_sha
+) -> tuple[
+    list[str],            # genuine lost_producer_tables (renames removed)
+    dict[str, list[str]], # attribution: lost_table -> [files that dropped its producer]
+    dict[str, str],       # renamed_tables: old_name -> new_name (excluded from blast radius)
+]:
+    ...
+```
+- Computes `lost = before − after`, `new = after − before`, both synthetic-excluded.
+- For each `L ∈ lost`, search `new` for an `N` clearing BOTH Jaccard thresholds
+  (`_RENAME_OVERLAP_THRESHOLD`); first match wins, classify as rename. File-delta pairing
+  from `git_name_status_delta(base_sha, head_sha)` corroborates attribution.
+- `lost_producer_tables` = `lost` minus all classified-rename `L`s.
+- Only `lost_producer_tables` (genuine losses) is fed to the blast-radius engine in
+  `get_pr_impact`; `renamed_tables` is reported but produces NO blast radius.
 
 ## PR 2 Decision — Entry-point signatures
 
@@ -739,9 +867,15 @@ class PrImpactResult(BaseModel):
     base_ref: str                       # echoed
     base_sha: str | None                # resolved base SHA (None if unresolvable → hint)
     head_sha: str | None
-    lost_producer_tables: list[str]     # tables whose producer disappeared (detection output)
+    lost_producer_tables: list[str]     # GENUINE lost producers (renames removed) — detection output
+    renamed_tables: dict[str, str]      # old_name -> new_name; classified renames (file + in-file
+                                        # structural), EXCLUDED from lost_producer_tables and from
+                                        # blast_radius. "verify consumers updated" category — a rename
+                                        # is NOT data loss. Docstring MUST state this is a heuristic
+                                        # (both column-set AND downstream-consumer Jaccard ≥ 0.6).
     attribution: dict[str, list[str]]   # lost_table -> [files that dropped its producer] (Option C)
-    blast_radius: EmptyPropagationResult  # PR 1 engine output for lost_producer_tables
+    blast_radius: EmptyPropagationResult  # PR 1 engine output for lost_producer_tables ONLY
+                                          # (renamed_tables contribute NO blast radius)
     detection_only_code_regression: bool = True  # constant True — documents the runtime-blind contract
     hint: str | None                    # base not resolved / graph not at base_ref / no producers lost
 ```
@@ -759,15 +893,25 @@ typed, docstrings carry the code-regression-only caveat.
   `GET_PRODUCER_TABLES` (`SELECT DISTINCT target_table FROM "SqlQuery" WHERE
   target_table <> ''`), returns the producer-table set. Pure read; no SHA logic.
 - `_diff_lost_producers(before, after, db, base_sha, head_sha) -> tuple[list[str],
-  dict[str, list[str]]]` — computes `before − after`, excludes synthetic via
-  `_exclude_synthetic_tables`, and builds Option C attribution from
-  `git_name_status_delta(base_sha, head_sha)` `deleted ∪ modified`.
-- These two helpers do NOT capture SHAs, do NOT assert base state, and do NOT
-  resync — that orchestration lives in `get_pr_impact` (Step 2.3).
+  dict[str, list[str]], dict[str, str]]` — computes `before − after` AND `after − before`
+  (the new-producer mirror set), excludes synthetic via `_exclude_synthetic_tables`,
+  **classifies renames** (§PR 2 Rename handling: pair each lost `L` with a new `N`
+  clearing BOTH column-set and downstream-consumer Jaccard ≥ `_RENAME_OVERLAP_THRESHOLD`),
+  removes classified renames from the lost set, and builds Option C attribution from
+  `git_name_status_delta(base_sha, head_sha)` `deleted ∪ modified`. Returns
+  `(genuine_lost_producer_tables, attribution, renamed_tables)`.
+- These two helpers do NOT capture SHAs (the SHA *args* to `_diff_lost_producers` are
+  only for the git-delta attribution lookup, not for snapshotting), do NOT assert base
+  state, and do NOT resync — that orchestration lives in `get_pr_impact` (Step 2.3).
+- Add a named constant `_RENAME_OVERLAP_THRESHOLD = 0.6` (single source of truth).
 - Acceptance: `_capture_producer_set` returns the producer set on a hand-built
   fixture; `_diff_lost_producers` on a `before`/`after` pair where a producer was
   dropped returns the orphaned table in the lost set, excludes a still-produced
-  table, and maps the orphaned table to the deleted file.
+  table, and maps the orphaned table to the deleted file; on a `before`/`after` pair
+  where a producer was RENAMED (old in `before` only, new in `after` only, both column
+  and consumer Jaccard ≥ 0.6) returns the old name in `renamed_tables[old]==new` and
+  NOT in the genuine lost set; a genuine deletion with NO matching new producer stays in
+  the lost set.
 
 ### Phase 2: Orchestration + MCP tool
 **Step 2.3 — `get_pr_impact(base_ref, max_depth)` MCP tool (owns orchestration).**
@@ -777,13 +921,14 @@ typed, docstrings carry the code-regression-only caveat.
   `resync_changed(root, base_sha, head_sha, backend, dialect, ...)` to advance the
   graph DB to HEAD (graph-only, NOT a working-tree mutation — same as `sqlcg
   reindex`); (5) `producers_after = _capture_producer_set(db)`; (6)
-  `lost, attribution = _diff_lost_producers(producers_before, producers_after, db,
-  base_sha, head_sha)`; (7) feed `lost` into `_compute_empty_propagation`; (8) build
-  `PrImpactResult`.
+  `lost, attribution, renamed = _diff_lost_producers(producers_before, producers_after,
+  db, base_sha, head_sha)`; (7) feed **`lost` only** (renames excluded) into
+  `_compute_empty_propagation`; (8) build `PrImpactResult` with `renamed_tables=renamed`.
 - Acceptance: registered (`@mcp.tool()`); fixture with a dropped producer returns the
-  lost table + its PR-1 two-view blast radius; `NotIndexedError` when empty; graph
-  not at `base_ref` returns the documented hint with NO resync run, no crash;
-  unresolvable `base_ref` returns a hint.
+  lost table + its PR-1 two-view blast radius; a fixture with a RENAMED producer puts
+  the table in `renamed_tables` (not `lost_producer_tables`) and produces NO blast
+  radius for it; `NotIndexedError` when empty; graph not at `base_ref` returns the
+  documented hint with NO resync run, no crash; unresolvable `base_ref` returns a hint.
 - **Call site:** `@mcp.tool()` registration. Bump the MCP-tool count in
   `ARCHITECTURE_REVIEW.md` **L87: 17 → 18 after PR 2**.
 
@@ -807,19 +952,49 @@ typed, docstrings carry the code-regression-only caveat.
   returns `before − after` with synthetic excluded and attribution mapping lost
   table → file; `get_pr_impact` mismatch path (graph not at base) returns hint with NO
   resync run and no detection (assert `resync_changed` not invoked).
-- **Integration (real DuckDB + a tmp git repo):** index a base state with a producer
-  file writing `d`; delete/break that file; reindex to head; assert `d` ∈
-  `lost_producer_tables`, a still-produced `e` ∉, attribution maps `d`→the deleted file,
-  and `blast_radius.row_empty_tables` contains `d`'s downstream. A `modified`-but-still-
-  produces fixture asserts the table is NOT reported (no over-report).
+- **Unit — rename classification (the correctness requirement):**
+  - **In-file table rename.** Hand-built `before`/`after`: `da.foo ∈ before` only,
+    `da.bar ∈ after` only, both sharing the SAME column-name set AND the SAME downstream
+    consumers (Jaccard 1.0 ≥ 0.6 on both axes). Assert `_diff_lost_producers` returns
+    `renamed_tables["da.foo"] == "da.bar"` and `da.foo ∉` the genuine lost set.
+  - **Below-threshold rename → treated as deletion+addition (conservative).** A lost
+    `L` whose only candidate `N` clears column-Jaccard but NOT consumer-Jaccard (or vice
+    versa) is NOT classified as a rename: `L` stays in the genuine lost set,
+    `renamed_tables` does not contain it (pins the AND-of-both-axes rule and the 0.6
+    threshold via `_RENAME_OVERLAP_THRESHOLD`).
+- **Integration (real DuckDB + a tmp git repo):**
+  - **Genuine deletion → blast radius.** Index a base state with a producer file writing
+    `d`; delete/break that file; reindex to head; assert `d ∈ lost_producer_tables`, a
+    still-produced `e ∉`, `renamed_tables` empty, attribution maps `d`→the deleted file,
+    and `blast_radius.row_empty_tables` contains `d`'s downstream. A
+    `modified`-but-still-produces fixture asserts the table is NOT reported (no over-report).
+  - **FILE rename (no false data loss).** Rename the `.sql` file that writes `da.foo` to
+    a new path that writes `da.bar` (same columns + consumers); reindex. `git_name_status_delta`
+    splits this into delete(old)+add(new). Assert `da.foo ∈ renamed_tables` with value
+    `da.bar`, `da.foo ∉ lost_producer_tables`, and the rename produces NO data-loss blast
+    radius (`blast_radius` does NOT include `da.foo`'s old downstream as lost).
+  - **IN-FILE table rename (no git rename signal, no false data loss).** In a single
+    file, change `CREATE TABLE da.foo ...` to `CREATE TABLE da.bar ...` (same columns +
+    consumers); reindex (git reports a plain `modified`, NO rename). Assert it is
+    detected STRUCTURALLY: `da.foo ∈ renamed_tables` (= `da.bar`), `da.foo ∉
+    lost_producer_tables`, NO blast radius for `da.foo`.
 - **E2E:** `sqlcg analyze pr-impact --base <ref>` end-to-end on a fixture repo prints
-  the lost producer + blast radius + the runtime-blind caveat.
+  the lost producer + blast radius + the runtime-blind caveat; a rename fixture prints
+  the renamed table under the "verify consumers updated" category with no blast radius.
 - Tests assert **observable output**, not "no exception". Aliased/schema-qualified
   fixtures matching the live corpus.
 
 ## PR 2 Acceptance Criteria
-- [ ] A deleted/renamed/broken producer file makes its orphaned table appear in
+- [ ] A deleted/broken producer file (NOT a rename) makes its orphaned table appear in
       `lost_producer_tables`; a table still produced by a surviving query does NOT.
+- [ ] **FILE rename** of a producer (old `.sql` → new `.sql`, same columns + consumers)
+      puts the table in `renamed_tables` (`old → new`), NOT in `lost_producer_tables`,
+      and produces NO data-loss blast radius for it.
+- [ ] **IN-FILE table rename** (`CREATE TABLE da.bar` replacing `CREATE TABLE da.foo` in
+      the same modified file — no git rename signal) is detected STRUCTURALLY: the table
+      is in `renamed_tables`, NOT in `lost_producer_tables`, with NO blast radius.
+- [ ] A genuine deletion with NO matching new producer clearing BOTH Jaccard thresholds
+      DOES flow to the blast-radius engine (stays in `lost_producer_tables`).
 - [ ] `attribution[lost_table]` lists the file(s) that dropped the producer.
 - [ ] `blast_radius` is PR 1's two-view `EmptyPropagationResult` for the lost set
       (row + value views both populated as in PR 1).
@@ -834,7 +1009,8 @@ typed, docstrings carry the code-regression-only caveat.
       `get_pr_impact`; `_diff_lost_producers` ← `get_pr_impact`; `get_pr_impact` ←
       `@mcp.tool()`; CLI command ← Typer app).
 - [ ] **Live-DWH re-acceptance** before tag (delete a real producer file, run the gate,
-      confirm the orphaned table + blast radius are sane).
+      confirm the orphaned table + blast radius are sane; AND rename a real producer
+      table, confirm it lands in `renamed_tables` with NO false data-loss blast radius).
 
 ## PR 2 Risks and Mitigations
 - **R6 — mis-sold as runtime data monitoring.** Mitigated by the prominent non-goal,
@@ -846,6 +1022,13 @@ typed, docstrings carry the code-regression-only caveat.
 - **R9 — perf.** Producer-set query is `DISTINCT target_table` over `SqlQuery`
   (table-sized); attribution parses only the small changed-file set (`git_name_status_delta`),
   never the corpus. No hot-path / CLAUDE.md invariant impact.
+- **R10 — rename cries wolf (the correctness bug).** Raw `producers(base) −
+  producers(head)` reports every rename as total data loss. Mitigated by the structural
+  rename classifier (§PR 2 Rename handling): BOTH column-set AND downstream-consumer
+  Jaccard ≥ `_RENAME_OVERLAP_THRESHOLD` (0.6) → `renamed_tables`, excluded from blast
+  radius. Pinned by the file-rename, in-file-rename, below-threshold, and genuine-deletion
+  tests. Failure direction is conservative: an ambiguous case is treated as deletion
+  (reports a blast radius) rather than silently hiding a real loss.
 
 ## PR 2 Version & Release
 - Additive → **minor**: `1.22.0` → **`1.23.0`**. Agent does NOT close issues or tag;
@@ -853,11 +1036,230 @@ typed, docstrings carry the code-regression-only caveat.
 
 ---
 
+# PR 3 — Retrofit the gating-join supplement into the existing impact tools (ships after PR 1; depends on its engine)
+
+## PR 3 Goal
+
+The three existing impact tools — [`get_change_scope`](../../src/sqlcg/server/tools.py)
+(L1028), [`diff_impact`](../../src/sqlcg/server/tools.py) (L1180), and
+[`get_backfill_order`](../../src/sqlcg/server/tools.py) (L1115) — all build their
+affected-table set by the SAME path: `_affected_columns_closure` over `COLUMN_LINEAGE`
+→ `_rollup_to_tables` → noise-filter → `_exclude_synthetic_tables`
+([`tools.py` L1067-1078, L1138-1149, L1226-1248](../../src/sqlcg/server/tools.py)).
+This is the CTE-robust #38 traversal — it correctly captures CTE-wrapped *derived*
+reads. **But it shares ONE blind spot with PR 1's View 2: a downstream table that
+READS a source via a gating inner join yet derives NO column from it** is invisible to
+the column-lineage closure (the exact case PR 1's View-1 branch (b) catches —
+`INSERT INTO d SELECT other.x FROM other JOIN x v ON other.k = v.k`, where `d` row-empties
+when `x` empties but no `d` column is COLUMN_LINEAGE-derived from `x`).
+
+PR 3 closes that gap consistently across the existing tools by **reusing PR 1's
+`_table_row_reachability` + `GET_TABLE_READS_ADJACENCY`** (no reimplementation), so the
+existing impact tools and the new `get_empty_propagation` give consistent answers about
+gating-join readers.
+
+> **Dependency gate:** PR 3 cannot start until PR 1's `_table_row_reachability`
+> helper + `GET_TABLE_READS_ADJACENCY` query merge. PR 3 is independent of PR 2.
+
+## PR 3 Decision — SEPARATE field, NOT broadened `affected_tables` (RECOMMENDED — chosen)
+
+| Option | Verdict |
+|--------|---------|
+| **(A) ADD branch (b) into the existing `affected_tables`** | **Rejected.** `get_change_scope` and `diff_impact` are SHIPPED public MCP tools. `affected_tables` is documented as "column-precise, rolled up to tables" ([`tools.py` L1033, L1192](../../src/sqlcg/server/tools.py)) and `downstream_count` is a fact pinned to `len(affected_tables)` ([`models.py` L284](../../src/sqlcg/server/models.py)) and feeds the `risk` heuristic thresholds ([`tools.py` L1083-1090](../../src/sqlcg/server/tools.py)). Silently folding gating-join readers in would (i) change the meaning of an existing field for every caller, (ii) inflate `downstream_count` and therefore the risk label, and (iii) mix two semantically different signals (value-derivation vs row-gating, the very distinction PR 1 went to two views to keep separate). Worse, branch (b) is an UPPER BOUND (join-type not recorded) carrying a known gap — folding an upper-bound set into a field documented as precise is dishonest. |
+| **(B) Surface branch (b) as a SEPARATE `gating_join_tables` field** | **CHOSEN.** Adds a new, clearly-labelled field alongside the existing `affected_tables`; existing callers see no change to `affected_tables`/`downstream_count`/`risk`; the new signal is opt-in and carries its own honest caveats. Mirrors PR 1's deliberate two-view separation rather than collapsing it. Additive → no contract break. |
+
+**Justification (required):** the separate-field approach is mandated because
+`affected_tables` is an existing public contract whose consumers (CI gates, risk
+scoring) rely on its current "value-derived, column-precise" meaning. Branch (b) is a
+different KIND of answer (row-gating, upper-bound, with a documented CTE-pure-gating
+gap). Keeping it in its own field preserves backward behaviour AND keeps the two
+signals legible — exactly the reasoning that produced PR 1's `row_empty_tables` vs
+`value_affected_tables` split. There is no strong reason to override the recommendation.
+
+## PR 3 Scope
+
+### In Scope
+- Add a `gating_join_tables: list[str]` field to `ChangeScopeResult` and (if it shares
+  the affected-table rollup — it does) `DiffImpactResult`, populated by reusing PR 1's
+  `_table_row_reachability` seeded from the tool's source/changed table set.
+- Carry the SAME honest caveats as PR 1 View-1 branch (b) into the new field's
+  docstring and CLI labels: the CTE-wrapped pure-gating residual gap AND the join-type
+  upper bound.
+- `gating_join_tables` excludes the tool's own target/changed tables and any table
+  already covered conceptually — but per the decision it is reported as its OWN set
+  (NOT subtracted from / merged into `affected_tables`); the relationship
+  `gating_join_tables` may overlap `affected_tables` (a table can be both value-derived
+  AND a gating-join reader) is documented, not deduplicated away.
+
+### Non-Goals
+- **`get_backfill_order` is NOT amended.** Its single job is a topological *rebuild
+  order* over the value-derived blast radius; adding row-gating readers to a rebuild
+  order conflates two concerns and there is no rebuild-order meaning for a gating-join
+  reader that derives no column. State this explicitly so the developer does not
+  "consistency-add" the field everywhere. (If a future need arises, file it separately.)
+- **No change to `affected_tables`, `downstream_count`, `risk`, `presentation_facing`,
+  or `order`** in either tool — those keep their exact current semantics (decision B).
+- **No new traversal code.** PR 3 calls PR 1's `_table_row_reachability` verbatim; it
+  MUST NOT reimplement the adjacency/BFS. If PR 1 has not merged, PR 3 does not start.
+- **No parse-time/schema-CSV path, no join-type modelling** (inherited from PR 1).
+
+## PR 3 Decision — which tools get the field
+
+| Tool | Shares the closure→rollup affected-table path? | Gets `gating_join_tables`? |
+|---|---|---|
+| `get_change_scope` (single table) | YES ([`tools.py` L1069-1077](../../src/sqlcg/server/tools.py)) | **YES** — seed `_table_row_reachability` from `[target]`. |
+| `diff_impact` (changed-file set) | YES ([`tools.py` L1232-1247](../../src/sqlcg/server/tools.py)) | **YES** — seed from the resolved `changed_tables` set (the same seed its column closure uses). |
+| `get_backfill_order` | YES, but produces a rebuild *order*, not an impact set | **NO** (Non-Goal above). |
+
+## PR 3 Decision — Output shape (additive fields)
+
+In [`models.py`](../../src/sqlcg/server/models.py), add to BOTH `ChangeScopeResult`
+and `DiffImpactResult`:
+```python
+    gating_join_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Downstream tables that READ a changed/source table via a DIRECT "
+            "(non-CTE) gating join (SELECTS_FROM/STAR_SOURCE) but derive NO column "
+            "from it — they may go fully empty if the source empties, even though "
+            "they are NOT in affected_tables (no value-derivation). Reused from the "
+            "PR 1 row-reachability supplement. KNOWN GAP: CTE-wrapped pure-gating "
+            "reads are NOT detected. UPPER BOUND: depends on join type (not recorded "
+            "on SELECTS_FROM) — may be fully empty only for inner joins."
+        ),
+    )
+```
+- `default_factory=list` so the field is backward-additive (older serialised payloads
+  and any caller not setting it get `[]`).
+- `downstream_count` is NOT changed and remains `len(affected_tables)` — the docstring
+  for `gating_join_tables` notes it is reported separately and not counted there.
+
+## PR 3 Implementation Steps (ranked — build first → last)
+
+### Phase 1: Model fields
+**Step 3.1 — Add `gating_join_tables` to `ChangeScopeResult` and `DiffImpactResult`.**
+- File: [`models.py`](../../src/sqlcg/server/models.py).
+- Acceptance: both models importable; field typed `list[str]`, `default_factory=list`;
+  docstring carries BOTH caveats (known gap + join-type upper bound) as string content.
+
+### Phase 2: Tool wiring
+**Step 3.2 — Populate `gating_join_tables` in `get_change_scope`.**
+- File: [`tools.py`](../../src/sqlcg/server/tools.py), inside `get_change_scope` after
+  the existing `affected_tables` is built, before constructing `ChangeScopeResult`.
+- Call `gating_join_tables, gj_truncated = _table_row_reachability(db, [target], max_depth=None)`
+  (PR 1's helper — it already excludes the seed sources and synthetic nodes). OR the
+  reachable set minus `affected_tables` is NOT computed — report the full reachable set
+  per the decision (overlap with `affected_tables` is allowed and documented).
+- Fold `gj_truncated` into the existing `truncated` flag (`truncated = truncated or gj_truncated`).
+- Pass `gating_join_tables=gating_join_tables` to `ChangeScopeResult`.
+- Acceptance: on the PR-1 gating-join fixture, `get_change_scope("x")`-style call
+  returns `d` in `gating_join_tables`, `affected_tables` is UNCHANGED from pre-PR-3
+  behaviour (no `d` added there because `d` derives no column from the source), and
+  `downstream_count == len(affected_tables)` (unchanged).
+
+**Step 3.3 — Populate `gating_join_tables` in `diff_impact`.**
+- File: [`tools.py`](../../src/sqlcg/server/tools.py), inside `diff_impact` after
+  `affected_tables`/`order` are built.
+- Seed `_table_row_reachability(db, changed_tables, max_depth=None)` from the resolved
+  `changed_tables` set (same seed the column closure uses); fold `truncated`.
+- Pass `gating_join_tables=` to `DiffImpactResult`. `order`/`presentation_facing`/
+  `external_consumers`/`downstream_count` are UNCHANGED.
+- Acceptance: on a multi-file fixture where one changed file's table is read by a
+  downstream table via a gating join with no column derived, that downstream appears in
+  `gating_join_tables` but not in `affected_tables`.
+
+### Phase 3: CLI labels (if these tools have a CLI surface)
+**Step 3.4 — Surface `gating_join_tables` honestly wherever these results render.**
+- Verify the CLI/render path for `get_change_scope`/`diff_impact` (the `analyze` Typer
+  app and/or MCP-only). For each render site, add a labelled section for
+  `gating_join_tables` carrying BOTH caveats: **"direct gating-join reads only;
+  CTE-wrapped pure-gating reads NOT detected (known gap); may be fully empty depends on
+  join type."** If a tool is MCP-only (no CLI), the caveats live in the field docstring
+  (Step 3.1) and that is sufficient — record which tools have a CLI surface.
+- Acceptance: any CLI that prints these results shows the new section with both caveat
+  strings; the existing affected-tables section is unchanged.
+
+### Phase 4: Docs + version
+**Step 3.5 — Version `1.24.0` + ARCHITECTURE_REVIEW + docstrings.**
+- `pyproject.toml` + [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py) → `1.24.0`;
+  `uv lock`. (Additive fields on existing tools.)
+- **Tool-count:** PR 3 adds NO new MCP tool (it extends two existing tools), so the
+  `ARCHITECTURE_REVIEW.md` **L87** MCP-tool count is NOT incremented by PR 3 (PR 1 → 17,
+  PR 2 → 18; PR 3 stays at 18). If a field-count or capability table is tracked
+  elsewhere, note the two new fields there instead — developer verifies whether such a
+  count exists; if it does, update it, otherwise no count change.
+- Update the `get_change_scope` and `diff_impact` tool docstrings to mention
+  `gating_join_tables` and its caveats.
+
+## PR 3 Test Strategy
+Tests assert **observable output** (specific table ids + caveat strings), never just
+"no exception". Name `test_<unit>_<scenario>_<expected>`, link this plan in the docstring.
+
+- **Integration (real in-memory DuckDB, aliased/schema-qualified fixtures):**
+  - **Gating-join reader appears in the new field, NOT in the column closure.** Reuse
+    PR 1's branch-(b) fixture shape
+    (`INSERT INTO d SELECT other.x FROM other JOIN x v ON other.k = v.k`). For
+    `get_change_scope("x")`: assert `d ∈ gating_join_tables`, `d ∉ affected_tables`,
+    and `affected_tables`/`downstream_count` equal the pre-PR-3 values for the same
+    fixture (regression-pin that `affected_tables` did NOT broaden). This is the
+    headline criterion the shepherd named.
+  - **`diff_impact` equivalent.** A changed file writes the joined-into source; a
+    downstream gating-join reader is in `gating_join_tables`, not `affected_tables`.
+  - **Documented gap carried over.** The CTE-wrapped pure-gating fixture (PR 1 Test
+    T0b shape) yields the reader in NEITHER `gating_join_tables` NOR `affected_tables`;
+    test docstring states the accepted gap.
+  - **No regression on a value-derived case.** A purely value-derived downstream (no
+    gating join) appears in `affected_tables` exactly as before; `gating_join_tables`
+    may be empty.
+- **Unit:** the `gating_join_tables` field docstring string-asserts contain both the
+  "CTE-wrapped pure-gating reads are NOT detected" and "depends on join type" caveats.
+- **E2E (only if these tools have a CLI surface):** the render shows the new labelled
+  section with both caveats.
+
+## PR 3 Acceptance Criteria
+- [ ] `get_change_scope` returns the direct gating-join reader in `gating_join_tables`
+      for a fixture where that reader derives NO column from the target (table-id
+      equality), AND `affected_tables` + `downstream_count` are UNCHANGED from pre-PR-3
+      behaviour on that fixture (regression-pin).
+- [ ] `diff_impact` returns the gating-join reader in `gating_join_tables`, not in
+      `affected_tables`, for a changed-file fixture.
+- [ ] The CTE-wrapped pure-gating reader appears in NEITHER field (documented gap pinned).
+- [ ] `gating_join_tables` docstring carries BOTH caveats (known gap + join-type upper
+      bound) — string assertions.
+- [ ] `get_backfill_order` is UNCHANGED (no `gating_join_tables` field, Non-Goal).
+- [ ] PR 3 reuses PR 1's `_table_row_reachability` (grep-confirms the call sites in
+      `get_change_scope` and `diff_impact`; NO new adjacency/BFS function added).
+- [ ] Version `1.24.0` in `pyproject.toml`, `__init__.py`, `uv.lock`; MCP-tool count in
+      `ARCHITECTURE_REVIEW.md` UNCHANGED at 18 (no new tool).
+- [ ] **Live-DWH re-acceptance** before tag: run `get_change_scope` on a real DWH table
+      with a known gating-join downstream; confirm it surfaces in `gating_join_tables`
+      and that `affected_tables` matches the prior shipped value for that table.
+
+## PR 3 Risks and Mitigations
+- **R10 — silently broadening a shipped contract.** Mitigated by decision B (separate
+  field) + the regression-pin asserting `affected_tables`/`downstream_count` unchanged.
+- **R11 — reimplementing PR 1's traversal.** Mitigated by the grep-confirmed reuse
+  criterion + the dependency gate (PR 3 cannot start before PR 1 merges).
+- **R12 — over-promising the new field.** The upper-bound + CTE-pure-gating-gap caveats
+  ride in the docstring and any CLI label, identical to PR 1 View 1.
+- **R13 — perf.** PR 3 adds one `_table_row_reachability` call (one table-sized
+  adjacency query + BFS) per tool invocation — the same cost class PR 1 already
+  measured as a pure read path; no parser/indexer/CLAUDE.md invariant impact.
+
+## PR 3 Version & Release
+- Additive → **minor**: `1.23.0` → **`1.24.0`**. Agent does NOT close issues or tag;
+  user verifies live + tags `v1.24.0`.
+
+---
+
 ## Cross-cutting build order + gating
 
 - **Within each PR:** model → helper/engine → MCP tool → CLI → docs/version.
 - **Across PRs:** PR 2 cannot start until PR 1's engine (`_compute_empty_propagation`,
-  both views, `EmptyPropagationResult`) merges.
+  both views, `EmptyPropagationResult`) merges. **PR 3 cannot start until PR 1's
+  `_table_row_reachability` + `GET_TABLE_READS_ADJACENCY` merge** (PR 3 reuses them
+  verbatim). PR 2 and PR 3 are independent of each other and may proceed in either
+  order once PR 1 lands.
 - Both PRs: grep-confirmed call sites; observable-output tests (not "no exception");
   ARCHITECTURE_REVIEW.md tool-count updates; live-DWH re-acceptance before tag.
 
@@ -874,7 +1276,10 @@ typed, docstrings carry the code-regression-only caveat.
   (`_diff_lost_producers`) are separate from the orchestration in the tool. See §PR 2
   Detection mechanism steps 1–8 and Step 2.3.
 
-> **This spec has been through the plan-reviewer gate; the two BLOCKERS (M1 view-1
-> reframe, M6 / O2 orchestration) and the M4/Kahn/tool-count warnings are resolved
-> per the shepherd's decisions (2026-06-12).** Ready for shepherd verification — do
-> NOT re-loop the reviewer.
+> **The PR 1 + PR 2 core spec has been through the plan-reviewer gate; the two BLOCKERS
+> (M1 view-1 reframe, M6 / O2 orchestration) and the M4/Kahn/tool-count warnings are
+> resolved per the shepherd's decisions (2026-06-12).** The PR 3 section and the PR 2
+> rename-handling requirement were FOLDED IN by shepherd direction (2026-06-12) AFTER
+> the reviewer gate and are NOT re-looped through the reviewer per the shepherd's
+> instruction; the shepherd verifies them directly. Ready for shepherd verification —
+> do NOT re-loop the reviewer.
