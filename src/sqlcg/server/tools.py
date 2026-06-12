@@ -22,6 +22,7 @@ from sqlcg.core.queries import (
     GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
     GET_PRODUCER_FILES_FOR_TABLE_QUERY,
+    GET_PRODUCER_TABLES_QUERY,
     GET_TABLE_ADJACENCY_FOR_COLUMNS_QUERY,
     GET_TABLE_DEFINING_FILES_QUERY,
     GET_TABLE_DIRECT_UPSTREAMS_QUERY,
@@ -59,6 +60,7 @@ from sqlcg.server.models import (
     LineageNode,
     LineageResult,
     PresentationCandidate,
+    PrImpactResult,
     ScopeChangeResult,
     SqlPatternMatch,
     SqlPatternResult,
@@ -2343,3 +2345,367 @@ def get_empty_propagation(tables: list[str]) -> EmptyPropagationResult:
     with _open_backend() as db:
         _assert_indexed(db)
         return _compute_empty_propagation(db, tables, max_depth=None)
+
+
+# ---------------------------------------------------------------------------
+# PR 2 — PR-impact detector (v1.23.0)
+# ---------------------------------------------------------------------------
+
+# Threshold for Jaccard similarity on BOTH column-set and downstream-consumer axes.
+# A lost producer L and a new producer N are classified as a RENAME iff BOTH
+# column-set Jaccard AND downstream-consumer Jaccard ≥ this value.
+# AND-of-both-axes minimises false-rename rate: a true rename keeps same schema AND
+# same consumers (~1.0 each); unrelated coincidences rarely clear 0.6 on both axes.
+_RENAME_OVERLAP_THRESHOLD = 0.6
+
+
+def _resolve_git_ref(root: Path, ref: str) -> str | None:
+    """Resolve a git ref (branch, tag, SHA, HEAD) to a 40-char SHA.
+
+    Returns None if git is unavailable or the ref cannot be resolved.
+    Unlike the reindex CLI helper, this does NOT raise typer.Exit — callers
+    convert None to a hint message.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", ref],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return sha if sha else None
+    except FileNotFoundError:
+        return None
+
+
+def _capture_producer_set(db: GraphBackend) -> set[str]:
+    """Return the set of tables that have a feeding query in the current graph state.
+
+    Runs ``GET_PRODUCER_TABLES`` (``SELECT DISTINCT target_table FROM "SqlQuery"
+    WHERE target_table <> ''``).  Pure read; no SHA logic.
+
+    Args:
+        db: Graph backend (already open).
+
+    Returns:
+        Set of lowercased qualified table names that currently have at least one
+        writing query in the graph.
+    """
+    rows = db.run_read(GET_PRODUCER_TABLES_QUERY, {})
+    return {r["producer_table"].lower() for r in rows if r["producer_table"]}
+
+
+def _get_table_consumers(db: GraphBackend, table: str) -> set[str]:
+    """Return the set of tables that directly read ``table`` via SELECTS_FROM or STAR_SOURCE.
+
+    Used for rename classification: the downstream-consumer overlap axis.
+    """
+    rows = db.run_read(GET_TABLE_READS_ADJACENCY_QUERY, {})
+    return {r["dest_table"].lower() for r in rows if r["source_table"].lower() == table.lower()}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Jaccard similarity of two sets. Returns 0.0 when both are empty."""
+    if not a and not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+def _diff_lost_producers(
+    before: set[str],
+    after: set[str],
+    db: GraphBackend,
+    base_sha: str | None,
+    head_sha: str | None,
+    *,
+    pre_resync_file_targets: dict[str, list[str]] | None = None,
+) -> tuple[list[str], dict[str, list[str]], dict[str, str]]:
+    """Compute lost producers, attribution, and rename classification.
+
+    Computes ``before − after`` (lost) and ``after − before`` (new), excludes
+    synthetic via ``_exclude_synthetic_tables``, then classifies each lost
+    producer against new producers using BOTH column-set AND downstream-consumer
+    Jaccard ≥ ``_RENAME_OVERLAP_THRESHOLD`` (AND-combined — both axes must clear
+    the threshold). Classified renames are removed from the genuine-lost set.
+
+    Option C attribution: for each genuine lost producer, attributes which files
+    dropped the producer via ``git_name_status_delta`` ``deleted ∪ modified`` paths.
+    The git-delta lookup is scoped to the changed-file set only (bounded by the diff,
+    not the corpus — no hot-path violation).
+
+    Args:
+        before: Producer-table set at base state.
+        after:  Producer-table set at head state.
+        db:     Graph backend (open at head state, for column/consumer lookups).
+        base_sha: Base SHA for git-delta attribution (None → skip attribution).
+        head_sha: Head SHA for git-delta attribution (None → skip attribution).
+
+    Returns:
+        (genuine_lost_producer_tables, attribution, renamed_tables) where:
+        - genuine_lost_producer_tables: tables confirmed lost (renames removed), sorted.
+        - attribution: dict[lost_table, list[files that dropped its producer]].
+        - renamed_tables: dict[old_name, new_name] for classified renames.
+    """
+    from sqlcg.indexer.git_delta import git_name_status_delta
+
+    lost_raw = before - after
+    new_raw = after - before
+
+    # Exclude synthetic from both sides.
+    if lost_raw:
+        lost_cleaned, _ = _exclude_synthetic_tables(db, sorted(lost_raw))
+        lost_set = set(lost_cleaned)
+    else:
+        lost_set = set()
+
+    if new_raw:
+        new_cleaned, _ = _exclude_synthetic_tables(db, sorted(new_raw))
+        new_set = set(new_cleaned)
+    else:
+        new_set = set()
+
+    # --- Rename classification ---
+    # For each L in lost_set, try to find a matching N in new_set with
+    # BOTH column-set AND consumer Jaccard ≥ _RENAME_OVERLAP_THRESHOLD.
+    renamed: dict[str, str] = {}
+    matched_new: set[str] = set()  # prevent one N from matching multiple Ls
+
+    for lost_table in sorted(lost_set):
+        # Fetch L's columns from the current (head) graph.  Since L was removed
+        # at head, its columns may no longer be present — use what's available.
+        l_col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": lost_table})
+        l_cols = {r["col_id"].rsplit(".", 1)[-1].lower() for r in l_col_rows}
+        l_consumers = _get_table_consumers(db, lost_table)
+
+        best_match: str | None = None
+        for new_table in sorted(new_set - matched_new):
+            n_col_rows = db.run_read(GET_COLUMNS_FOR_TABLE_QUERY, {"table_qualified": new_table})
+            n_cols = {r["col_id"].rsplit(".", 1)[-1].lower() for r in n_col_rows}
+            n_consumers = _get_table_consumers(db, new_table)
+
+            col_j = _jaccard(l_cols, n_cols)
+            cons_j = _jaccard(l_consumers, n_consumers)
+
+            if col_j >= _RENAME_OVERLAP_THRESHOLD and cons_j >= _RENAME_OVERLAP_THRESHOLD:
+                best_match = new_table
+                break  # first match wins
+
+        if best_match is not None:
+            renamed[lost_table] = best_match
+            matched_new.add(best_match)
+
+    genuine_lost = sorted(lost_set - set(renamed.keys()))
+
+    # --- Option C attribution ---
+    # For each genuine lost producer, identify which changed files dropped it.
+    # Parse the git delta: deleted ∪ modified files could have been the producer.
+    # Pre-resync file targets (passed from get_pr_impact) are used first so that
+    # deleted-file target tables are attributable even after resync removes them.
+    attribution: dict[str, list[str]] = {t: [] for t in genuine_lost}
+    if base_sha and head_sha and genuine_lost:
+        root = _indexed_root(db) or Path.cwd()
+        delta = git_name_status_delta(root, base_sha, head_sha)
+        if delta is not None:
+            changed_files = [str(p) for p in delta.deleted | delta.modified]
+            genuine_lost_set = set(genuine_lost)
+
+            # Build file → target-table map: prefer pre-resync snapshot for deleted
+            # files; fall back to live graph query for modified (still-present) files.
+            pre = pre_resync_file_targets or {}
+            for file_path in changed_files:
+                if file_path in pre:
+                    file_targets = set(pre[file_path])
+                else:
+                    try:
+                        tgt_rows = db.run_read(
+                            GET_TARGET_TABLES_FOR_FILE_QUERY, {"file_path": file_path}
+                        )
+                        file_targets = {
+                            r["table_qualified"].lower()
+                            for r in tgt_rows
+                            if r.get("table_qualified")
+                        }
+                    except Exception:  # noqa: BLE001
+                        file_targets = set()
+                for tbl in genuine_lost_set & file_targets:
+                    attribution[tbl].append(file_path)
+
+    return genuine_lost, attribution, renamed
+
+
+@mcp.tool()
+@_timed_tool("get_pr_impact")
+def get_pr_impact(base_ref: str, max_depth: int | None = None) -> PrImpactResult:
+    """Detect tables that lose their producer between ``base_ref`` and HEAD, then
+    return the blast-radius (PR 1 engine) for those genuinely lost producers.
+
+    **CODE REGRESSION DETECTION ONLY** — ``detection_only_code_regression`` is always
+    ``True``.  An edge disappears only when the SQL that produced it is removed,
+    renamed, or broken.  If a job runs and produces 0 rows while the SQL is unchanged,
+    NO edge disappears and this tool detects nothing.  Runtime row-count monitoring is
+    OUT OF SCOPE.
+
+    Rename handling: raw ``producers(base) − producers(head)`` would cry wolf on every
+    rename.  This tool classifies renames using BOTH column-set AND downstream-consumer
+    Jaccard ≥ 0.6 (AND-combined) and puts them in ``renamed_tables`` (excluded from
+    the blast radius).  This is a heuristic — callers should verify ``renamed_tables``.
+
+    Sequence:
+    1. Resolve ``base_ref`` → ``base_sha``.
+    2. Assert ``get_indexed_sha() == base_sha`` — if not, return a hint (no crash,
+       no silent compare of mismatched states).
+    3. Capture ``producers_before`` from the base-indexed graph.
+    4. Orchestrate ``resync_changed(root, base_sha, head_sha, ...)`` to advance the
+       graph DB from ``base_sha`` to HEAD (graph-only update, not a filesystem change).
+    5. Capture ``producers_after`` from the advanced graph.
+    6. Diff: compute genuine lost producers (renames excluded via Jaccard heuristic).
+    7. Feed genuine lost producers only into ``_compute_empty_propagation`` (PR 1 engine).
+    8. Return ``PrImpactResult`` with blast radius + rename attribution.
+
+    Args:
+        base_ref: Git ref (branch, tag, or SHA) that the current graph is indexed at.
+        max_depth: Optional BFS depth cap for the blast-radius traversal (None = unbounded).
+
+    Returns:
+        PrImpactResult with lost producers, renames, attribution, and blast radius.
+
+    Raises:
+        NotIndexedError: If no repos have been indexed.
+    """
+    with _open_backend() as db:
+        _assert_indexed(db)
+
+        root = _indexed_root(db) or Path.cwd()
+
+        # 1. Resolve base_ref → base_sha.
+        base_sha = _resolve_git_ref(root, base_ref)
+        if base_sha is None:
+            return PrImpactResult(
+                base_ref=base_ref,
+                base_sha=None,
+                head_sha=None,
+                detection_only_code_regression=True,
+                hint=(
+                    f"Could not resolve ref '{base_ref}' — "
+                    "ensure git is available and the ref exists."
+                ),
+            )
+
+        # 2. Assert graph is indexed at base_sha.
+        indexed_sha = db.get_indexed_sha()
+        if indexed_sha != base_sha:
+            return PrImpactResult(
+                base_ref=base_ref,
+                base_sha=base_sha,
+                head_sha=None,
+                detection_only_code_regression=True,
+                hint=(
+                    f"Graph is indexed at '{indexed_sha}' but base_ref resolves to '{base_sha}'. "
+                    f"Run 'sqlcg index <path>' or 'sqlcg reindex' at '{base_ref}' first, "
+                    "then call get_pr_impact."
+                ),
+            )
+
+        # 3. Capture producers_before.
+        producers_before = _capture_producer_set(db)
+
+        # 4. Resolve HEAD and orchestrate resync.
+        head_sha = _resolve_git_ref(root, "HEAD")
+        if head_sha is None:
+            return PrImpactResult(
+                base_ref=base_ref,
+                base_sha=base_sha,
+                head_sha=None,
+                detection_only_code_regression=True,
+                hint="Could not resolve HEAD SHA — ensure git is available.",
+            )
+
+        if head_sha == base_sha:
+            # No change — nothing to detect.
+            return PrImpactResult(
+                base_ref=base_ref,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                detection_only_code_regression=True,
+                hint="HEAD is the same as base_ref — no changes to detect.",
+                blast_radius=_compute_empty_propagation(db, [], max_depth),
+            )
+
+        # Read dialect from the stored .sqlcg.toml for the repo root.
+        try:
+            from sqlcg.core.config import get_dialect
+
+            dialect: str | None = get_dialect(root)
+        except Exception:  # noqa: BLE001
+            dialect = None
+
+        # Pre-resync: capture file → target_table map for the changed-file set
+        # so attribution can find which file wrote each lost producer, even for
+        # deleted files whose graph entries will be removed by resync_changed.
+        from sqlcg.indexer.git_delta import git_name_status_delta as _gns_delta
+
+        pre_resync_file_targets: dict[str, list[str]] = {}
+        pre_delta = _gns_delta(root, base_sha, head_sha)
+        if pre_delta is not None:
+            changed_files_pre = [str(p) for p in pre_delta.deleted | pre_delta.modified]
+            for fp in changed_files_pre:
+                try:
+                    rows = db.run_read(GET_TARGET_TABLES_FOR_FILE_QUERY, {"file_path": fp})
+                    pre_resync_file_targets[fp] = [
+                        r["table_qualified"].lower() for r in rows if r.get("table_qualified")
+                    ]
+                except Exception:  # noqa: BLE001
+                    pre_resync_file_targets[fp] = []
+
+        indexer = Indexer()
+        indexer.resync_changed(root, base_sha, head_sha, db, dialect)
+
+        # 5. Capture producers_after.
+        producers_after = _capture_producer_set(db)
+
+        # 6. Diff. Pass pre_resync_file_targets for attribution (deleted files).
+        genuine_lost, attribution, renamed = _diff_lost_producers(
+            producers_before,
+            producers_after,
+            db,
+            base_sha,
+            head_sha,
+            pre_resync_file_targets=pre_resync_file_targets,
+        )
+
+        # 7. Feed genuine lost into PR 1 blast-radius engine.
+        blast = _compute_empty_propagation(db, genuine_lost, max_depth)
+
+        # Build hint.
+        hints: list[str] = []
+        if not genuine_lost and not renamed:
+            hints.append("No producers lost — no data-loss blast radius.")
+        elif not genuine_lost and renamed:
+            hints.append(
+                f"{len(renamed)} table(s) renamed (see renamed_tables) — "
+                "no genuine data loss detected."
+            )
+        hints.append(
+            "DETECTION ONLY: this tool detects code regressions (SQL removed/broken), "
+            "NOT runtime emptiness (a job that produces 0 rows while SQL is unchanged)."
+        )
+
+        return PrImpactResult(
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            lost_producer_tables=genuine_lost,
+            renamed_tables=renamed,
+            attribution=attribution,
+            blast_radius=blast,
+            detection_only_code_regression=True,
+            hint=" | ".join(hints),
+        )

@@ -19,6 +19,7 @@ from sqlcg.server.models import (
     HubRankingResult,
     Judgement,
     LineageResult,
+    PrImpactResult,
     ScopeChangeResult,
     SqlPatternResult,
     TableUsageResult,
@@ -103,6 +104,8 @@ TOOL_RETURN_MODELS: dict[str, type[BaseModel]] = {
     "analyze_unused": UnusedTablesResult,
     # Empty-impact blast radius (two-view, fact-only)
     "get_empty_propagation": EmptyPropagationResult,
+    # PR-impact detector (code-regression detection, two-view blast radius)
+    "get_pr_impact": PrImpactResult,
 }
 
 
@@ -128,6 +131,7 @@ _TOOL_PURPOSE: dict[str, str] = {
     "scope_change": "Single-call synthesis: files, upstreams, blast radius, risk",
     "analyze_unused": "Find tables with no within-corpus consumers (dead-code candidates)",
     "get_empty_propagation": "Downstream blast radius (two views) when named table(s) are empty",
+    "get_pr_impact": "Detect tables that lose their producer between a base ref and HEAD; returns blast radius",
 }
 
 

@@ -91,13 +91,13 @@ def test_F2_skill_module_exists():
 def test_F2_drift_guard_all_registered_tools_in_skill():
     """Step 2.1 AC (drift guard part a): every registered @mcp.tool() name appears in the skill.
 
-    v1.22.0: 17 tools (16 original + get_empty_propagation).
-    Guards plan/sprints/unfilled_table_impact.md PR 1 Step 2.1 tool-count.
+    v1.23.0: 18 tools (17 from v1.22.0 + get_pr_impact).
+    Guards plan/sprints/unfilled_table_impact.md PR 2 Step 2.3 tool-count.
     """
     registered = list_registered_tools()
     assert len(registered) > 0, "list_registered_tools() must return a non-empty list"
-    assert len(registered) == 17, (
-        f"Expected 17 registered tools (v1.22.0 adds get_empty_propagation), "
+    assert len(registered) == 18, (
+        f"Expected 18 registered tools (v1.23.0 adds get_pr_impact), "
         f"got {len(registered)}: {registered}"
     )
     skill_text = render_skill("0.3.1")
@@ -161,19 +161,19 @@ def test_F2_drift_guard_fact_tools_tagged_correctly():
 
 
 @pytest.mark.skipif(not _SKILL_MODULE_AVAILABLE, reason="F2 Phase 2 not yet implemented")
-def test_F2_tool_return_models_covers_all_17_tools():
-    """Step 2.1 AC: TOOL_RETURN_MODELS has exactly 17 entries matching the live registry.
+def test_F2_tool_return_models_covers_all_18_tools():
+    """Step 2.1 AC: TOOL_RETURN_MODELS has exactly 18 entries matching the live registry.
 
-    v1.22.0: 17 tools (16 original + get_empty_propagation).
-    Guards plan/sprints/unfilled_table_impact.md PR 1 Step 2.1 tool-count.
+    v1.23.0: 18 tools (17 from v1.22.0 + get_pr_impact).
+    Guards plan/sprints/unfilled_table_impact.md PR 2 Step 2.3 tool-count.
     """
     registered = list_registered_tools()
-    assert len(TOOL_RETURN_MODELS) == 17, (
-        f"TOOL_RETURN_MODELS must map exactly 17 tools, got {len(TOOL_RETURN_MODELS)}: "
+    assert len(TOOL_RETURN_MODELS) == 18, (
+        f"TOOL_RETURN_MODELS must map exactly 18 tools, got {len(TOOL_RETURN_MODELS)}: "
         f"{list(TOOL_RETURN_MODELS.keys())}"
     )
-    assert len(registered) == 17, (
-        f"list_registered_tools() must return 17 tools, got {len(registered)}"
+    assert len(registered) == 18, (
+        f"list_registered_tools() must return 18 tools, got {len(registered)}"
     )
 
 
