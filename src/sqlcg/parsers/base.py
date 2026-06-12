@@ -879,14 +879,32 @@ class SqlParser(ABC):
             # stamp it as role="temp" with the current file namespace.  Uses the same
             # _temp_identity helper as registration (Step 1.2) so the key is
             # byte-identical — a mismatch here would break the lineage chain.
+            #
+            # BUGFIX (v1.21.1): registration (Step 1.2) uses the POST-ALIAS db
+            # (via _apply_table_alias on the parsed target), but raw exp.Table nodes
+            # from sg_lineage carry the PRE-ALIAS db (e.g. 'ba_tmp' before the
+            # 'ba_tmp' → 'ba' schema alias).  Without normalising src_db through the
+            # alias map first, _temp_identity("ba_tmp","tmp_base") = "ba_tmp.tmp_base"
+            # which is NOT in _current_file_temp_keys {"ba.tmp_base"} → the check
+            # misses → the un-aliased non-namespaced TableRef falls through to
+            # _apply_table_alias → emits a second kind='table' row for the same
+            # temp under the aliased key, producing the dual-write observed on the
+            # live DWH (483 residual un-namespaced tmp_* kind='table' nodes).
+            # Fix: apply the schema alias to src_db before _temp_identity, and use
+            # the aliased db in the returned TableRef (same as Step 1.2 does).
+            aliased_db: str | None
+            if src_db and self._schema_aliases:
+                aliased_db = self._schema_aliases.get(src_db.lower(), src_db)
+            else:
+                aliased_db = src_db
             if (
                 self._current_file_temp_keys
                 and self._current_file_namespace is not None
-                and self._temp_identity(src_db, name) in self._current_file_temp_keys
+                and self._temp_identity(aliased_db, name) in self._current_file_temp_keys
             ):
                 return TableRef(
                     catalog=source.catalog if hasattr(source, "catalog") else None,
-                    db=src_db,
+                    db=aliased_db,
                     name=name,
                     role="temp",
                     namespace=self._current_file_namespace,

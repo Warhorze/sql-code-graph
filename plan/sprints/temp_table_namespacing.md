@@ -573,11 +573,71 @@ this plan in the docstring.
 | Perf regression from per-CREATE property read | `find(exp.TemporaryProperty)` is once-per-CREATE; source/leaf stamping is O(1) set membership; no per-column qualify/scope/expand. Perf guards pass unmodified. |
 | Temp-key set leaks across files | Reset at the namespace-assignment sites + cleared at end-of-file; isolation unit test. |
 
+### Deviations
+
+#### Deviation 1: Schema-alias interaction bug in Step 2.2 (_lineage_node_to_edges) — v1.21.1 patch
+- **Reason**: Live-DWH acceptance run (v1.21.0) showed 483 residual un-namespaced
+  `tmp_*` `kind='table'` nodes alongside 739 `kind='temp'` nodes.  The namespaced temp
+  nodes had zero outgoing edges (orphaned sinks); consuming statements wrote to the
+  un-namespaced node instead.  Root cause identified in Step 2.2:
+  `_lineage_node_to_edges` read `src_db` directly from the raw `exp.Table` node
+  (pre-alias, e.g. `'ba_tmp'`), but the registered key used the post-alias db
+  (e.g. `'ba'`, via `_apply_table_alias` on the CREATE target in Step 1.2).
+  `_temp_identity('ba_tmp','tmp_base') = 'ba_tmp.tmp_base'` missed the set
+  `{'ba.tmp_base'}` → the ref fell through to `_apply_table_alias` → emitted
+  `TableRef(db='ba', role='table')` — the second (kind='table') write.
+  The CI fixtures used pre-qualified `ba.tmp_base` directly (no `USE SCHEMA` +
+  schema alias), so the alias mismatch was invisible.
+- **Change**: In [`base.py`](../../src/sqlcg/parsers/base.py)
+  `_lineage_node_to_edges`, normalise `src_db` through `_schema_aliases` before
+  calling `_temp_identity` and before constructing the `role='temp'` `TableRef`.
+  The aliased db is used in the returned `TableRef` so the key is byte-identical
+  to the Step 1.2 registration.  One-line alias lookup; zero per-column cost.
+  Six new tests added (3 unit, 3 integration) in the existing test files.
+- **Impact**: Patch version 1.21.0 → 1.21.1.  No scope, risk, or acceptance-criterion
+  change — this closes the gap that the live DWH exposed.  Wall-time regression
+  (2m43s → 3m54s) is expected to recover on re-index since the +11k edge inflation
+  was caused by the dual-write.
+- **Date**: 2026-06-12
+
+#### Deviation 2: BEGIN-in-comment false-positive scripting detection — second dual-write root cause
+- **Reason**: After the Deviation 1 fix (v1.21.1), the live DWH re-acceptance run still showed
+  a bare `ba.tmp_base` `kind='table'` node and COLUMN_LINEAGE edges with un-namespaced
+  `src_key LIKE 'ba.tmp_base.%'`.  Root cause: `_has_scripting_block` calls
+  `Tokenizer.from_dialect("snowflake")` which does not exist in sqlglot 30.x
+  (`Tokenizer` is instantiated as `Tokenizer(dialect=...)`).  The `AttributeError` is
+  silently swallowed by the `except`-clause, falling back to `re.search(r'\bBEGIN\b', sql)`
+  which matches the word "begin" inside a SQL comment (e.g. `-- aan het begin van een
+  telcyclus`).  Affected files are falsely routed through `_parse_scripting_file`,
+  where `_EMBEDDED_DML` only matches DML keywords (`SELECT`/`INSERT INTO`/`UPDATE`/
+  `DELETE`/`MERGE INTO`) — not `CREATE`.  So `CREATE TEMPORARY TABLE tmp_base AS
+  SELECT ... UNION SELECT ...` is never extracted, `_current_file_temp_keys` stays empty,
+  and subsequent `INSERT ... FROM tmp_base` emits bare `ba.tmp_base` (role='table')
+  as edge src, creating the shared node.  The root file identified: `wtfv_cyclische_telling.sql`
+  (comment "de pvcode wordt aan het **begin** van een telcyclus vastgelegd" — a false match).
+  The same class of bug as Deviation 1 (schema-alias-path-dependent, missing alias/context
+  at a key formation site) — different mechanism, same symptom.
+- **Change**: In [`snowflake_parser.py`](../../src/sqlcg/parsers/snowflake_parser.py)
+  `_has_scripting_block`, change `Tokenizer.from_dialect("snowflake")` →
+  `Tokenizer(dialect="snowflake")`.  One-line fix.  Expanded the existing
+  `TestSchemaAliasDualWriteRegression` with three new unit tests
+  (`TestBeginInCommentScriptingFalsePositive`) and three new integration tests
+  (`TestBeginInCommentDualWriteRegression`) that demonstrate BEGIN-in-comment with
+  schema_aliases — asserting zero bare `ba.tmp_base` dst/src edges.
+  All 6 FAIL on the pre-fix code, all PASS after.
+- **Impact**: Same patch scope (1.21.1).  No schema version change.  Wall-time expected
+  to drop further on re-index: falsely-scripted files were producing fewer edges (CREATE
+  not extracted → fewer defined_tables, fewer lineage edges), so the corrected FULL parse
+  adds edges, not removes.  Corrected count: 13 namespaced `ba.tmp_base` temp nodes (was 12
+  temp + 1 bare table after Deviation 1 fix with this file still scripted).
+- **Date**: 2026-06-12
+
 ## User verification queue
 
 Per house rule, the agent never tags releases. **On hold (pending user verification):**
 v1.15.0–v1.20.0 (prior sprints). **This sprint adds:**
 - **v1.21.0** — per-file TEMPORARY-table namespacing (`kind='temp'`).
+- **v1.21.1** — schema-alias dual-write bugfix (patch).
 
 After this merges and the DWH is re-indexed, **regenerate `table_graph.html`** to see the
 de-fused graph (the single `ba.tmp_base` hub split into 13 per-file nodes). Version bumped in
