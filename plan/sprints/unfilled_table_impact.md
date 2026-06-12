@@ -1,7 +1,8 @@
 # Feature Plan: Data-Loss Impact Analysis (two sequenced PRs)
 
-> Status: REVISED per gate blockers M1/M6 (shepherd decision: no parser change) —
-> ready for shepherd verification. 2026-06-12. Preserves the
+> Status: REVIEWED (shepherd-verified 2026-06-12 — M1/M6 blockers confirmed
+> resolved by reading the revised §"two views" and §"PR 2 Detection mechanism"
+> against the tree; gate passed). Ready for implementation, PR 1 first. Preserves the
 > plan-reviewer-revised W1/W2/N1/N2/N3 PASS content (commit dcda023), scoped into
 > **PR 1**. View 1 is reframed (M1) as a documented SUPPLEMENT to View 2 (the
 > primary, reliable answer) after the corpus measurement below; O2 is resolved
