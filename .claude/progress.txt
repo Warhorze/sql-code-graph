@@ -1,8 +1,152 @@
 ## Current State [2026-06-12]
-ACTIVE AGENT: developer
+ACTIVE AGENT: developer — HANDOFF (PR #92 updated, ready for compliance check + re-acceptance)
 FEATURE: v1.21.1 — temp-namespacing dual-write bugfix (fix/temp-namespacing-dual-write)
-BRANCH: fix/temp-namespacing-dual-write (off master @ 759e65e)
-PR: (in progress)
+BRANCH: fix/temp-namespacing-dual-write
+PR: #92 (https://github.com/Warhorze/sql-code-graph/pull/92)
+
+## Handoff — developer: temp-namespacing-dual-write v1.21.1 Root cause 2 fix [2026-06-12]
+
+SECOND ROOT CAUSE FOUND AND FIXED:
+  File/line: src/sqlcg/parsers/snowflake_parser.py _has_scripting_block (~line 418)
+  Tokenizer.from_dialect("snowflake") raises AttributeError (method does not exist
+  in sqlglot 30.x). The except-clause swallows it silently, falling back to
+  re.search(r'\bBEGIN\b') which matched "begin" inside a SQL comment
+  ("-- de pvcode wordt aan het begin van een telcyclus"). Files with this pattern
+  (e.g. wtfv_cyclische_telling.sql) were falsely routed through _parse_scripting_file,
+  where _EMBEDDED_DML only matches DML keywords (SELECT/INSERT INTO/etc.) — not CREATE.
+  CREATE TEMPORARY TABLE was never extracted → _current_file_temp_keys stayed empty →
+  INSERT emitted bare 'ba.tmp_base' src_key (role='table') → shared kind='table' node.
+
+FIX:
+  Tokenizer.from_dialect("snowflake") → Tokenizer(dialect="snowflake")
+  One-line change in _has_scripting_block.
+
+PRE/POST EVIDENCE (via Python script on DWH fact/*.sql with alias):
+  Pre-fix:  bare src_key edges: 3, ba.tmp_base kind='table' node EXISTS
+  Post-fix: bare src_key edges: 0, bare dst edges: 0, 13 namespaced kind='temp' nodes
+
+TESTS: +6 new (3 unit + 3 integration):
+  Unit: TestBeginInCommentScriptingFalsePositive (3 tests)
+    - _has_scripting_block returns False for BEGIN-in-comment SQL
+    - File parses at FULL quality (not SCRIPTING_FALLBACK)
+    - dst/src edges namespaced (no bare 'ba.tmp_base')
+  Integration: TestBeginInCommentDualWriteRegression (3 tests)
+    - No bare 'ba.tmp_base' kind='table' node after indexing
+    - Single namespaced kind='temp' node
+    - Zero COLUMN_LINEAGE rows with bare ba.tmp_base src or dst key
+  All 6 FAIL on pre-fix code, all PASS after fix.
+
+TOTAL TEST COUNTS (final):
+  1329 passed, 4 skipped, 1 xfailed (unit+integration; was 1323 after Root cause 1)
+  13/13 perf-guard suites pass unmodified. ruff: clean. pyright: 0 errors.
+
+COMMITS:
+  b08e238 fix(T-01): correct Tokenizer API in _has_scripting_block (dst-side dual-write)
+  ba747a3 docs(T-01): add Deviation 2 — BEGIN-in-comment scripting false-positive (v1.21.1)
+
+PR #92 BODY UPDATED: root-cause now covers BOTH sides:
+  - Root cause 1: schema-alias interaction in _lineage_node_to_edges (abd2980)
+  - Root cause 2: BEGIN-in-comment scripting false-positive via wrong Tokenizer API (b08e238)
+  "residual second-order" framing removed — it was the same bug class, now fixed.
+
+PLAN DEVIATIONS: Deviation 2 added to plan/sprints/temp_table_namespacing.md.
+
+DWH RE-ACCEPTANCE REQUIRED (user-gated):
+  Must re-index DWH and verify: zero un-namespaced tmp_* nodes, edge count ~52k,
+  wall-time ≤3m. wtfv_cyclische_telling.sql should now parse at FULL quality
+  (was SCRIPTING_FALLBACK) with proper temp chain.
+
+## Handoff — operational: v1.21.1 DWH re-acceptance verification [2026-06-12]
+
+TASK: Re-index DWH on PR #92 branch (schema-alias fix) and verify acceptance numbers.
+
+MCP SERVER: Not running.
+
+INDEX RUN (post-fix):
+  Wall time: 2m44s — WITHIN BUDGET (budget: 3m00s, prior v1.21.0 run: 3m54s — fixed)
+  Files: 1372, tables: 2065 (+12 vs v1.21.0), edges: 41033 (+1081 vs 39952 — recovered edges)
+  Timeouts: 1 (wtdh_artikel only; the prior 2 loonkosten timeouts resolved)
+  Catalog auto-applied: 122,815 columns (no catalog-missing warning)
+
+COVERAGE (§G post-fix):
+  Tables with catalog:                      6293 / 7215  (87%)
+  Edge health strict (column-level):       60250 / 69774 (86%)
+  Edge health table-level (legacy):        60886 / 69774 (87%)
+  Edge health scoped (excl CTE/derived/temp): 46798 / 47659 (98%)
+  Phantom edges: 13723 (20%); confirmed 13081; contradicted 509 (0.7%); unverified 133
+  Scoped denominator: 47,659 (was 44,781 in v1.21.0 — +2,878 edges now correctly counted)
+  Write queries with zero outgoing lineage: 1091 / 2314
+
+HAS_COLUMN by source (post-fix):
+  information_schema: 109,572
+  ddl:                 26,082
+  usage:                7,420
+  star_expansion:       5,808
+  clone_inherited:        290
+
+TEMP NAMESPACING ACCEPTANCE (4a-4e, post-fix):
+  (a) ba.tmp_base: 1 shared kind='table' + 13 per-file kind='temp' = 14 total — PASS
+  (b) kind='temp' nodes: 753 total, all 753 namespaced with '::'; non-namespaced: 0 — PASS
+      Non-namespaced tmp_* kind='table' nodes: 483 (unchanged — these are tables referenced
+      without in-file CREATE TEMP TABLE; they are expected residuals, not regressions)
+  (c) COLUMN_LINEAGE edges touching kind='temp' endpoints: 17,095 (was 10,944 pre-fix — +6,151
+      additional edges now correctly routed through namespaced temp nodes)
+  (d) wtfv_bon.sql chain — PASS:
+      - da.htaxi_axmibon -> wtfv_bon.sql::ba.tmp_base (query :1) EXISTS
+      - wtfv_bon.sql::ba.tmp_base -> ba.wtfv_bon (query :2 AND :3) EXISTS — downstream wired
+      - Full intra-file chain traversable through namespaced temp: CONFIRMED
+      - Non-namespaced ba.tmp_base still receives 2 edges from wtfv_bon (parallel path)
+        — this is the residual dual-write; 11 files write to both paths for ba.tmp_base
+  (e) ba.wtfv_bon: single kind='table' node, 1 variant — PASS (no over-namespacing)
+
+RESIDUAL NOTE:
+  483 non-namespaced tmp_* kind='table' nodes remain; 11 files still write to non-namespaced
+  ba.tmp_base in addition to the namespaced path. The primary lineage chain IS traversable
+  through the namespaced node (fix achieved), but the shared node still exists as a parallel
+  bridge. This is a second-order issue for a follow-up sprint.
+
+TABLE_GRAPH.HTML (post-fix):
+  Backup: /tmp/table_graph.html.bak.v121_fix (pre-fix v1.21.0 version)
+  Original backup: /tmp/table_graph.html.bak (v1.20.0 version)
+  New nodes: 5869 (was 6565 at v1.20.0; +1 vs v1.21.0 run due to 1 new table node)
+  New links: 2619 (unchanged vs v1.21.0 run)
+  Temp nodes excluded: 0 — PASS
+  Script 1 (force-graph library): node --check PASS
+  Script 2 (DATA + app logic):    node --check PASS
+
+## Handoff — developer: temp-namespacing-dual-write (v1.21.1) [2026-06-12]
+
+ROOT CAUSE:
+  File/line: src/sqlcg/parsers/base.py _lineage_node_to_edges (~line 885)
+  Step 2.2 read src_db from the raw exp.Table node (pre-alias, e.g. 'ba_tmp')
+  while registration (Step 1.2) used the post-alias db ('ba', via _apply_table_alias
+  on the CREATE target). _temp_identity('ba_tmp','tmp_base') = 'ba_tmp.tmp_base'
+  missed _current_file_temp_keys {'ba.tmp_base'} → fell through → emitted
+  un-namespaced TableRef(db='ba', role='table') — the dual write.
+  CI fixtures used pre-qualified ba.tmp_base, hiding the schema-alias mismatch.
+
+FIX (minimal, 1-line logic):
+  Normalise src_db through _schema_aliases before _temp_identity + use aliased
+  db in the returned role='temp' TableRef. Zero per-column cost.
+
+TESTS: 1323 passed (was 1317, +6), 4 skipped, 1 xfailed.
+  +6 regression guards: 3 unit (TestSchemaAliasAndTempLeafStamping) +
+  3 integration (TestSchemaAliasDualWriteRegression).
+  All 6 FAIL on master (v1.21.0), all PASS with fix.
+  13/13 perf-guard suites pass unmodified. ruff: clean. pyright: 0 errors.
+
+COMMITS:
+  abd2980 fix(T-01): apply schema alias to leaf db
+  7accd22 test(T-01): add schema-alias regression guards
+  76a5f76 chore(T-01): bump 1.21.0 → 1.21.1
+  9dd033b docs(T-01): plan deviations section
+
+VERSION: 1.21.0 → 1.21.1 (patch).
+
+POST-MERGE (user-gated):
+  1. Fresh DWH re-index — verify: zero un-namespaced tmp_* nodes,
+     edges ~52k (from 63k), wall-time ≤3m.
+  2. Tag v1.21.0 then v1.21.1 on master merge commits.
 
 ## Handoff — operational: v1.21.0 DWH acceptance verification [2026-06-12]
 
