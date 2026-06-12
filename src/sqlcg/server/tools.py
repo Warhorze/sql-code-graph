@@ -19,6 +19,7 @@ from sqlcg.core.queries import (
     ANALYZE_UNUSED_TABLES_QUERY,
     FIND_DEFINITION_QUERY,
     FIND_TABLE_USAGES_QUERY,
+    FIND_TABLE_USAGES_VIA_LINEAGE_QUERY,
     GET_COLUMNS_FOR_TABLE_QUERY,
     GET_DOWNSTREAM_DEPENDENCIES_QUERY,
     GET_PRODUCER_FILES_FOR_TABLE_QUERY,
@@ -934,27 +935,61 @@ def find_table_usages(table_name: str) -> TableUsageResult:
         _assert_indexed(db)
 
         # Step 1.4: Lowercase the input to match lowercased SqlTable.name (C2)
-        rows = db.run_read(
+        name_lower = table_name.lower()
+
+        # Direct reads: SELECTS_FROM and STAR_SOURCE (D1 + D2).
+        direct_rows = db.run_read(
             FIND_TABLE_USAGES_QUERY,
-            {"name": table_name.lower()},
+            {"name": name_lower},
         )
 
         usages: list[TableUsage] = []
-        for row in rows:
+        # Track (query_file, sql) pairs already added so we can dedup below.
+        # When the same query appears in both direct and via-lineage, prefer "direct".
+        seen: set[tuple[str, str | None]] = set()
+        for row in direct_rows:
+            usage = TableUsage(
+                query_file=row["file"],
+                sql=row.get("sql"),
+                kind=row.get("kind"),
+                usage_kind="direct",
+            )
+            usages.append(usage)
+            seen.add((row["file"], row.get("sql")))
+
+        # Via-lineage reads: COLUMN_LINEAGE source-table rollup (D3).
+        # Captures CTE-wrapped derived reads that emit no top-level SELECTS_FROM edge.
+        lineage_rows = db.run_read(
+            FIND_TABLE_USAGES_VIA_LINEAGE_QUERY,
+            {"name": name_lower},
+        )
+        for row in lineage_rows:
+            key = (row["file"], row.get("sql"))
+            if key in seen:
+                # Already reported as a direct usage — skip to preserve "direct" label.
+                continue
             usages.append(
                 TableUsage(
                     query_file=row["file"],
                     sql=row.get("sql"),
                     kind=row.get("kind"),
+                    usage_kind="via_lineage",
                 )
             )
+            seen.add(key)
 
-        # Populate hint if result is empty
+        # Populate hint if result is empty.
         hint = None
         if not usages:
             hint = (
-                "No usages found for this table. The table may not be referenced by any "
-                "indexed SQL file, or it may be consumed externally (BI tools, APIs). "
+                "No usages found for this table. Possible causes (in order): "
+                "(1) No direct SELECTS_FROM or STAR_SOURCE read found in any indexed SQL file. "
+                "(2) No column-lineage value flows out of this table "
+                "(CTE-wrapped derived reads are captured via COLUMN_LINEAGE). "
+                "(3) The table may be read ONLY inside a CTE without deriving any column "
+                "(a pure-gating read) — this is NOT detected by any signal (known gap). "
+                "(4) The table may be consumed externally (BI tools, APIs) without any "
+                "indexed SQL referencing it. "
                 "Run 'analyze impact <table>' from the CLI to cross-check."
             )
 

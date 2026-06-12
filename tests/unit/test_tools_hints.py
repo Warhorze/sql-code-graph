@@ -58,15 +58,22 @@ class TestFindTableUsagesHint:
     """Test hint field in find_table_usages empty results."""
 
     def test_empty_result_has_hint(self):
-        """Test that empty usages result has a hint."""
+        """Test that empty usages result has a hint.
+
+        PR 4 (SELECTS_FROM-completeness): find_table_usages now makes three run_read
+        calls: (1) _assert_indexed, (2) FIND_TABLE_USAGES (direct), (3)
+        FIND_TABLE_USAGES_VIA_LINEAGE (via_lineage). All three must be mocked.
+        ([plan](plan/sprints/unfilled_table_impact.md))
+        """
         with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
             mock_get_backend.return_value.__enter__.return_value = mock_db
 
-            # Mock empty usages results
+            # Mock empty usages results — three calls: indexed check, direct, via-lineage.
             mock_db.run_read.side_effect = [
                 [{"n": 1}],  # _assert_indexed
-                [],  # find usages query returns empty
+                [],  # FIND_TABLE_USAGES (direct) returns empty
+                [],  # FIND_TABLE_USAGES_VIA_LINEAGE (via_lineage) returns empty
             ]
 
             result = find_table_usages("orders")
@@ -76,15 +83,21 @@ class TestFindTableUsagesHint:
             assert result.usages == []
 
     def test_non_empty_result_no_hint(self):
-        """Test that non-empty usages result has no hint."""
+        """Test that non-empty usages result has no hint.
+
+        PR 4 (SELECTS_FROM-completeness): find_table_usages now makes three run_read
+        calls; mock all three. The via-lineage call returns empty here.
+        ([plan](plan/sprints/unfilled_table_impact.md))
+        """
         with patch("sqlcg.server.tools._open_backend") as mock_get_backend:
             mock_db = MagicMock()
             mock_get_backend.return_value.__enter__.return_value = mock_db
 
-            # Mock non-empty usages
+            # Mock: indexed check, one direct usage, empty via-lineage.
             mock_db.run_read.side_effect = [
                 [{"n": 1}],  # _assert_indexed
-                [{"file": "etl.sql", "sql": "SELECT * FROM orders", "kind": "SELECT"}],
+                [{"file": "etl.sql", "sql": "SELECT * FROM orders", "kind": "SELECT"}],  # direct
+                [],  # via-lineage returns empty
             ]
 
             result = find_table_usages("orders")

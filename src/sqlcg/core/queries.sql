@@ -261,9 +261,23 @@ WHERE t.qualified = ANY(?)
 
 -- ANALYZE_UNUSED_TABLES
 -- params: []
+-- A table is USED if ANY of the three signals fires:
+-- (D1) direct SELECTS_FROM read, (D2) STAR_SOURCE read, or (D3) a value flows
+-- OUT of one of its columns via COLUMN_LINEAGE (captures CTE-wrapped derived reads).
+-- KNOWN GAP: a table read ONLY inside a CTE without deriving any column
+-- (a pure-gating read) is NOT detected by any signal — see PR 4 plan note.
 SELECT t.qualified AS table_qualified
 FROM "SqlTable" t
-WHERE t.qualified NOT IN (SELECT DISTINCT dst_key FROM "SELECTS_FROM")
+WHERE t.qualified NOT IN (
+    SELECT DISTINCT dst_key AS table_qualified FROM "SELECTS_FROM"
+    UNION
+    SELECT DISTINCT dst_key AS table_qualified FROM "STAR_SOURCE"
+    UNION
+    SELECT DISTINCT src.table_qualified AS table_qualified
+    FROM "COLUMN_LINEAGE" cl
+    JOIN "SqlColumn" src ON src.id = cl.src_key
+    WHERE src.table_qualified IS NOT NULL AND src.table_qualified <> ''
+)
 ORDER BY t.qualified
 
 -- HUB_RANKING
@@ -326,6 +340,23 @@ SELECT DISTINCT ss.dst_key AS source_table, q.target_table AS dest_table
 FROM "SqlQuery" q
 JOIN "STAR_SOURCE" ss ON ss.src_key = q.id
 WHERE q.target_table <> '' AND q.target_table IS NOT NULL
+
+-- FIND_TABLE_USAGES_VIA_LINEAGE
+-- PR 4 (SELECTS_FROM-completeness fix): find queries whose output column derives
+-- its value from a column of the target table (CTE-wrapped derived reads).
+-- Joins SqlTable t (name = ?) → SqlColumn src (src.table_qualified = t.qualified) →
+-- COLUMN_LINEAGE cl (cl.src_key = src.id) → SqlQuery q → QUERY_DEFINED_IN → File.
+-- Returns the same file/sql/kind shape as FIND_TABLE_USAGES.
+-- Rows where cl.query_id is NULL are excluded by the INNER JOIN on SqlQuery.
+-- params: [name]
+SELECT DISTINCT f.path AS file, q.sql AS sql, q.kind AS kind
+FROM "SqlTable" t
+JOIN "SqlColumn" src ON src.table_qualified = t.qualified
+JOIN "COLUMN_LINEAGE" cl ON cl.src_key = src.id
+JOIN "SqlQuery" q ON q.id = cl.query_id
+JOIN "QUERY_DEFINED_IN" qdi ON qdi.src_key = q.id
+JOIN "File" f ON f.path = qdi.dst_key
+WHERE t.name = ?
 
 -- GET_PRODUCER_TABLES
 -- PR 2 (pr-impact detector): snapshot the set of tables that have a feeding query.
