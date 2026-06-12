@@ -1035,6 +1035,12 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
     and a coarse risk label. Backup/noise tables are excluded from the blast
     radius and reported in ``noise_excluded``.
 
+    The ``gating_join_tables`` field supplements the column-lineage blast radius
+    with tables that read the target via a DIRECT (non-CTE) gating join
+    (SELECTS_FROM/STAR_SOURCE) but derive NO column from it.
+    KNOWN GAP: CTE-wrapped pure-gating reads are NOT detected.
+    UPPER BOUND: depends on join type (not recorded on SELECTS_FROM).
+
     Args:
         table_qualified: Qualified table name (e.g. "ba.wtfe_verkoopinfo")
 
@@ -1091,6 +1097,12 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
             ),
         )
 
+        # PR 3 (v1.24.0) — gating-join supplement: tables that read the target
+        # via a DIRECT (non-CTE) gating join but derive NO column from it.
+        # Does NOT change affected_tables or downstream_count (decision B).
+        gating_join_tables, gj_truncated = _table_row_reachability(db, [target], max_depth=None)
+        truncated = truncated or gj_truncated
+
         hint = None
         if not defining_files and not affected_tables and not upstream_tables:
             hint = (
@@ -1107,6 +1119,7 @@ def get_change_scope(table_qualified: str) -> ChangeScopeResult:
             downstream_count=n,
             risk=risk,
             noise_excluded=noise_excluded,
+            gating_join_tables=gating_join_tables,
             truncated=truncated,
             hint=hint,
         )
@@ -1187,12 +1200,18 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
     radius, union and noise-filter the result, flag presentation-facing tables
     (config-driven prefixes), and return a topological rebuild order.
 
+    The ``gating_join_tables`` field supplements the column-lineage blast radius
+    with tables that read any of the changed tables via a DIRECT (non-CTE) gating
+    join (SELECTS_FROM/STAR_SOURCE) but derive NO column from them.
+    KNOWN GAP: CTE-wrapped pure-gating reads are NOT detected.
+    UPPER BOUND: depends on join type (not recorded on SELECTS_FROM).
+
     Args:
         changed_files: SQL file paths that changed (must match indexed File.path)
 
     Returns:
         DiffImpactResult with changed tables, union blast radius, presentation
-        subset, and rebuild order.
+        subset, rebuild order, and gating_join_tables supplement.
 
     Raises:
         NotIndexedError: If no repos have been indexed
@@ -1269,6 +1288,16 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
                     seen_consumers.add(cname)
                     external_consumers.append(cname)
 
+        # PR 3 (v1.24.0) — gating-join supplement: tables that read any changed
+        # table via a DIRECT (non-CTE) gating join but derive NO column from them.
+        # Does NOT change affected_tables, order, downstream_count, presentation_facing,
+        # or external_consumers (decision B).
+        gating_join_tables: list[str] = []
+        if changed_tables:
+            gj_tables, gj_truncated = _table_row_reachability(db, changed_tables, max_depth=None)
+            gating_join_tables = gj_tables
+            truncated = truncated or gj_truncated
+
         hint = None
         if not changed_tables:
             hint = (
@@ -1289,6 +1318,7 @@ def diff_impact(changed_files: list[str]) -> DiffImpactResult:
             backfill_order=order,
             external_consumers=external_consumers,
             noise_excluded=noise_excluded,
+            gating_join_tables=gating_join_tables,
             truncated=truncated,
             hint=hint,
         )
