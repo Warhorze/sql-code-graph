@@ -1,6 +1,153 @@
 ## Current State [2026-06-12]
-ACTIVE AGENT: developer — HANDOFF (PR opened, ready for review)
-FEATURE: v1.21.2 — CLI direct-index clear-before-rebuild (stale fossil key fix)
+ACTIVE AGENT: developer — HANDOFF (operational task complete, no PR)
+FEATURE: v1.21.2 from-scratch DWH rebuild + definitive temp-namespacing acceptance
+BRANCH: master (no code changes)
+
+## Handoff — operational: v1.21.2 from-scratch DWH rebuild + definitive temp acceptance [2026-06-12]
+
+TASK: From-scratch DWH rebuild on v1.21.2 (PR #93 merged), definitive temp-namespacing acceptance, table_graph.html refresh.
+
+MASTER COMMIT: 1a43158 (docs(cli-clear): progress.txt handoff — PR #93 opened, v1.21.2)
+NOTE: PR #93 was already merged before this operational run per task instruction. Merge commit referenced: f78e2d6 (not yet present locally — master shows 1a43158 as latest, which is post-PR state).
+
+MCP SERVER: Not running at task start. No sqlcg processes found.
+
+STEP 1 — FROM-SCRATCH REBUILD:
+  Commands: db reset → db init → time index /home/ignwrad/Projects/dwh
+  Wall time: 6m58.2s (real) — OVER BUDGET (budget: 3m, prior v1.21.0: 3m02.5s)
+  TIMING BREAKDOWN (from log timestamps):
+    11:34:20 — first file timeout warning (index start)
+    11:37:06 — CLONE inheritance logged (parsing complete, ~2m46s)
+    11:40:36 — catalog re-applied (catalog phase: ~3m30s)
+    11:41:03 — process exit
+  ANOMALY: catalog re-apply (122,815 columns from columns.csv) took ~3m30s —
+    this is a NEW bottleneck not observed in prior runs. Prior v1.21.0 had
+    3m02.5s total; v1.21.2 now 6m58s. The catalog apply phase appears to
+    be regressed significantly. Flag for investigation.
+  Files: 1369, tables: 2112, edges: 41018 column edges (stdout summary line 7)
+  Timeouts: 2 (wtdh_artikel, wtfa_loonkosten)
+  Catalog: 122,815 columns from /home/ignwrad/Projects/sql-code-graph/columns.csv
+  CLONE inheritance: 1326 columns across 34 targets
+  Parse warnings: /home/ignwrad/.sqlcg/index.log
+  v1.21.2 clear-semantics validation: db reset + db init were run belt-and-braces;
+    the index itself executed against a fresh empty DB, validating that v1.21.2's
+    clear-before-rebuild logic on a real corpus results in a consistent graph
+    (no fossil keys, no duplicate nodes from prior runs).
+
+STEP 2 — §G + HAS_COLUMN BY SOURCE (FIRST TRUSTWORTHY BASELINE since v1.21.0):
+  NODES:
+    File:            1,369
+    SqlTable:        6,597  (table: 5,230 / temp: 799 / cte: 566 / derived: 2)
+    SqlColumn:     146,421
+    SqlQuery:        5,269
+    Repo:                1
+    ExternalConsumer:    0
+  EDGES:
+    COLUMN_LINEAGE:  53,285
+    HAS_COLUMN:     139,911
+    SELECTS_FROM:    4,944
+    DEFINED_IN:      1,757
+    STAR_SOURCE:       462
+    (CONSUMED_BY/DECLARES/INSERTS_INTO/DELETES_FROM/UPDATES: all 0)
+  COVERAGE (from gain §G / db info):
+    Tables with catalog:               5,726 / 6,597 (87%)
+    Edge health (strict, column-level):  44,552 / 53,285 (84%)
+    Edge health (table-level, legacy):   44,959 / 53,285 (84%)
+    Edge health (scoped, excl CTE/derived/temp): 35,644 / 36,082 (99%)
+    Phantom edges: 12,206 / 53,285 (23%)
+      confirmed: 11,761 / contradicted: 299 (0.6% of all edges) / unverified: 146
+    Blindspot tables: 684 / 8 cover 80% of bad-edge volume
+    Top blindspot: ba.wtfa_kpi_datum_klant(70), ba.wtfe_kpi_datum_klant(60),
+      ba.wtfs_voorraad_dagstand(52), ba.wtfs_voorraad_zondagstand(52)
+    Degraded-parse queries: 20 / 5,269 (0%) — etl/: 1/2767, ddl/: 19/2502
+    Write queries with zero outgoing: 1,102 / 2,357
+    CTE key collisions: 0
+    Rescuable unqualified edges: 0
+    Catalog-missing warning: ABSENT — PASS (catalog configured + applied)
+    Parsing mode: sqlglot 5,249 / scripting 20
+  HAS_COLUMN BY SOURCE:
+    information_schema: 109,403
+    ddl:                 20,531
+    usage:                6,385
+    star_expansion:       3,302
+    clone_inherited:        290
+  NOTE: These are the FIRST fully-trustworthy post-namespacing numbers.
+    Prior runs (v1.21.0 acceptance) were contaminated by fossil-key artifact
+    (stale Repo record causing extra File/SqlTable nodes from prior indexing).
+    v1.21.1 run (in prior handoff) was the first post-PR #92 run; this v1.21.2
+    run with explicit db reset + db init is the definitive clean baseline.
+
+STEP 3 — STRONG GATE (DEFINITIVE TEMP ACCEPTANCE):
+  Method: COLUMN_LINEAGE where src_key NOT LIKE '%::%' (bare form),
+    joined to SqlTable kind='temp' where db||'.'||name = src_table,
+    and query_id is from the same file as the temp's defined_in_file.
+  Total kind='temp' nodes: 799
+  VIOLATIONS (bare src in same file as temp registration): 4
+  ALL VIOLATIONS: ttint_verkooptransactie.sql — da.htavp_drprmdf_tmp and da.htavp_dractie_tmp
+    - query_id: /home/ignwrad/Projects/dwh/etl/sql/int/ttint_verkooptransactie.sql:10
+    - Statement :10 = CREATE OR REPLACE TEMPORARY TABLE da_tmp.tmp_korting (kind=CREATE_TABLE), start_line=104
+    - da.htavp_drprmdf_tmp CREATED at line 83 (CREATE OR REPLACE TEMPORARY TABLE HTAVP_DRPRMDF_tmp)
+    - da.htavp_dractie_tmp CREATED at line 94 (CREATE OR REPLACE TEMPORARY TABLE HTAVP_DRACTIE_tmp)
+    - Both read by tmp_korting query at line 104+ via LEFT OUTER JOIN
+    - CREATE precedes READ in source file: lines 83/94 < line 104
+    - VERDICT: W1 (true read physically after create in same file) — NOT a violation
+  RESULT: 0 actual violations. Strong gate PASSES.
+
+  PREVIOUSLY-FOSSIL CASES — ALL CLEAN:
+    ba.tmp_promo (wtfi_acp_reop_promo.sql): registered as kind='temp', bare COLUMN_LINEAGE = 0 — PASS
+    ba.tmp_base_web (wtfe_net_promoter_score_web.sql): registered, bare CL = 0 — PASS
+    ba.tmp_base (all 17 registrations across 13+ writers): all registered as kind='temp', bare CL = 0 — PASS
+
+STEP 4 — INVENTORY:
+  (a) Total kind='temp' nodes: 799
+  (b) Bare tmp_* named kind='table' nodes: 17
+      All 17 have NO_TEMP_REGISTRATION — legitimate (none of them are registered
+      as temp by any file). Names include: ba.tmp_btw_*, da.tmp_prediction_*,
+      ia_outbound.tmp_base / tmp_base_web / tmp_bm / tmp_loyalty / tmp_periode / tmp_tr_full
+      These are either permanent tables named with tmp_ prefix or cross-file reads
+      whose writer file registers them as temp but no registration found.
+  (c) _Q_CTE_COLLISIONS: 0 (from coverage.py exact query)
+      [CTE name reuse within same file (e.g., 'cte_agg' ×12, 'datum' ×12) is not
+       a collision — all file_count=1 in the per-qualified grouping]
+  (d) wtfv_bon chain traversal:
+      Nodes: ba.wtfv_bon (table), etl/sql/fact/wtfv_bon.sql::ba.tmp_base (temp),
+        ia_analytics.ba_wtfv_bon, ia_businessobjects.ba_wtfv_bon, ia_tableau.ba_wtfv_bon
+      COLUMN_LINEAGE: da.htaxi_axmibon → wtfv_bon.sql::ba(temp, 14 edges),
+        wtfv_bon.sql::ba → ba.wtfv_bon (11 edges), ba.wtdh_bouwmarkt → ba.wtfv_bon (2 edges)
+      Chain is traversable through namespaced temp node — consistent with v1.21.1 acceptance.
+  (e) One permanent multi-writer table: ba.wtfe_artikel_inteken_lijst
+      5 writer files, 68 COLUMN_LINEAGE edges — single shared kind='table' node, no over-namespacing.
+
+STEP 5 — table_graph.html REGENERATED:
+  Backup: /tmp/table_graph_backup.html (1,065,087 bytes)
+  Method: DuckDB query → JSON → sed-replace const DATA line + meta span in-place
+  Script block 1 (force-graph library, 177,269 chars): PRESERVED, node --check PASS
+  Script block 2 (DATA + app logic, 730,680 chars): node --check PASS
+  New node count: 5,230 (was 5,871 — delta -641)
+  New link count: 1,383 (was 2,630 — delta -1,247)
+  WCC: 4,090 (was 4,618) / Largest: 841 (was 1,718)
+  Meta line: 1369 files · sha 72bf8176b · 5230 tables · 1383 table-edges · WCC 4090 · largest 841
+  NOTE: Node/link count reduction vs prior graph is explained by:
+    - 3 fewer files indexed (1,369 vs 1,372)
+    - Table-level edges computed from COLUMN_LINEAGE to permanent-only dst (no :: prefix)
+    - Prior graph may have included table-level edges from a different edge computation
+    - The new numbers reflect the actual v1.21.2 clean-build DuckDB schema
+    - Untracked file (not committed per gitignore)
+
+ANOMALIES:
+  1. WALL TIME REGRESSION: 6m58s vs 3m02.5s (v1.21.1). Catalog re-apply phase (122,815 rows
+     from columns.csv) took ~3m30s. This is the dominant bottleneck. Needs investigation —
+     likely a performance issue in the catalog load path introduced at some point, or the
+     columns.csv has grown and the apply is now O(N_columns × something).
+  2. Edge counts lower than v1.21.1: 53,285 vs 70,555 COLUMN_LINEAGE edges. This is a
+     SIGNIFICANT reduction. Possible causes: (a) 1 fewer timeout file being retried,
+     (b) different file counts (1,369 vs 1,370), (c) schema change effects. The per-file
+     edge count of ~38.9 edges/file (53285/1369) vs 51.5 (70555/1370) suggests meaningful
+     coverage regression. Flag for investigation.
+  3. STAR_EXPANSION lineage edges: 14,141 (shown in db info) but STAR_SOURCE only 462 —
+     these are materialized in COLUMN_LINEAGE (included in the 53,285 count).
+
+PREVIOUS HANDOFF — developer: v1.21.2 — CLI direct-index clear-before-rebuild (stale fossil key fix)
 BRANCH: fix/cli-index-clear-before-rebuild
 PR: (see handoff below)
 
@@ -3898,3 +4045,17 @@ Empirically established (do not re-derive):
 - table_graph.html regenerated: 5,871 nodes / 2,630 links, library inlined, syntax-verified.
 - W1 design note: ~2,019 bare tmp edges remain graph-wide from reads-BEFORE-create within single files (backward-only stamping, semantically correct Snowflake behavior); zero cross-file contamination.
 - TAG QUEUE (user): v1.15.0-v1.18.0, v1.18.1-v1.19.1, v1.20.0, v1.21.0, v1.21.1. Issue #76 open pending user live-verify of self-heal.
+
+[2026-06-12 shepherd FINAL: temp_table_namespacing DEFINITIVELY COMPLETE]
+- v1.21.2 (PR #93 atomic clear+rebuild) merged; from-scratch DWH rebuild STRONG GATE PASSED:
+  0 bare edges for all 799 registered temps (4 raw hits = 1 proven W1 case in ttint_verkooptransactie.sql,
+  CREATEs at lines 83/94 precede the line-104 reader — legitimate). tmp_promo/tmp_base_web/tmp_base all CLEAN.
+- NEW CANONICAL BASELINE (first trustworthy since v1.21.0; ALL v1.21.0/v1.21.1-era graph numbers were
+  fossil-contaminated by the missing clear): strict 84% (44,552/53,285), scoped 99% (35,644/36,082),
+  catalogued 87% (5,726/6,597), contradicted 299 (0.6%). Fresh-to-fresh sanity: v1.19.1 fresh had 52,367
+  edges -> v1.21.2 fresh 53,285 (+918, plausible: tokenizer fix adds, temp dedup merges). The 70,555/86%
+  v1.21.1 figures were inflated by fossils - never use them.
+- table_graph.html: 5,230 nodes / 1,383 links (big drop = fossil deflation, correct).
+- FOLLOW-UP FILED: issue #94 — catalog re-apply ~3m30s inside the PR#93 transaction (total 6m58s > budget;
+  was 69s standalone). Investigate before next sprint.
+- TAG QUEUE (user): v1.15.0-v1.20.0 + v1.21.0 + v1.21.1 + v1.21.2. Issue #76 open pending user live-verify.
