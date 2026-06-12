@@ -3559,3 +3559,18 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 ACTIVE AGENT: architect-planner
 FEATURE: temp_table_namespacing — per-file namespacing of session-scoped TEMPORARY tables (v1.21.0)
 PLAN: plan/sprints/temp_table_namespacing.md (DRAFT — plan-reviewer gates next)
+
+## Handoff — architect-planner: temp_table_namespacing REWORK applied [2026-06-12]
+Plan-reviewer returned REWORK (2 blockers + 4 warnings). All applied to
+plan/sprints/temp_table_namespacing.md (rev 2):
+- A1 (blocker): upsert_nodes_bulk ON CONFLICT must protect kind='temp' from
+  cross-batch overwrite (new Step 3.2 + consumer-audit row + risk + test + AC).
+  Verified the gap live: duckdb_backend.py:470-477 guards only ('table','view')
+  vs 'derived'; a committed 'temp' falls in ELSE EXCLUDED.kind and re-fuses.
+- A2 (blocker): _lineage_node_to_edges leaf key-formation spelled out (Step 2.2).
+- A3: shared _temp_identity(db,name) helper (db=None -> bare name) used at
+  Steps 1.2/2.1/2.2; replaces inconsistent inline f-string.
+- W1: backward-only stamping made explicit (no forward-ref pre-scan).
+- W3: star_sources hardcoded-kind documented as no-change-IF-A1.
+- W4: temp-set reset required at snowflake _parse_scripting_file site too.
+NEXT: re-submit to plan-reviewer for the gate.

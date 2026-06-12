@@ -1,6 +1,18 @@
 # Feature Plan: Per-file namespacing of session-scoped TEMPORARY tables
 
-**Status: DRAFT** — plan-reviewer gates before implementation.
+**Status: DRAFT (rev 2)** — plan-reviewer returned REWORK (2026-06-12); amendments A1–A4 +
+warnings W1–W4 applied below. Re-submitting for the gate.
+
+**Plan-review amendments applied (2026-06-12):**
+- **A1 (blocker)** — `upsert_nodes_bulk` ON CONFLICT must protect `kind='temp'` from cross-batch
+  overwrite (§Cross-batch kind protection, Step 3.2, consumer audit row, test + acceptance).
+- **A2 (blocker)** — `_lineage_node_to_edges` leaf key-formation spelled out exactly (Step 2.2).
+- **A3 (warning)** — single shared `_temp_identity(db, name)` helper handling `db=None`, used
+  byte-identically at Steps 1.2 / 2.1 / 2.2 (replaces the inconsistent inline `f"{db}.{name}"`).
+- **A4 / W3 (warning)** — `star_sources` hardcoded-kind emit documented as no-change-IF-A1 in
+  the consumer audit.
+- **W1** — backward-only temp stamping made explicit (no forward-reference pre-scan).
+- **W4** — temp-set reset required at the Snowflake `_parse_scripting_file` site too (Step 1.1).
 
 Source of evidence: shepherd measurement on the live DWH graph (v1.19.1, 2026-06-12).
 Reuses the per-file namespace machinery introduced for CTE/derived collisions in
@@ -117,41 +129,75 @@ within a file.
   at the same two assignment sites in each parser
   ([`snowflake_parser.py:445,545`](../../src/sqlcg/parsers/snowflake_parser.py);
   [`ansi_parser.py:118,244`](../../src/sqlcg/parsers/ansi_parser.py)) and cleared in the
-  `finally`/end-of-file path (snowflake clears `_current_file_namespace = None` at line 561 —
-  clear the temp set there too).
-- **Pass-1 ordering**: files are parsed statement-by-statement in order. When a CREATE carries
-  the TEMPORARY property, register its `db.name` lowercase identity in
-  `self._current_file_temp_keys` **before** processing subsequent statements. A later
-  statement's source `TableRef` whose `db.name` is in that set is stamped with
-  `role="temp"` + `namespace=self._current_file_namespace`.
+  end-of-file path. **Warning 4 — there are TWO reset sites in the Snowflake parser**, and the
+  temp set must be cleared at BOTH alongside `_current_file_namespace = None`: the normal
+  `parse_file` path AND the `_parse_scripting_file` path (which clears
+  `_current_file_namespace = None` at [`snowflake_parser.py:561`](../../src/sqlcg/parsers/snowflake_parser.py),
+  a bare end-of-method assignment, not a `finally`). The ANSI parser resets at
+  [`ansi_parser.py:118,244`](../../src/sqlcg/parsers/ansi_parser.py). Add
+  `self._current_file_temp_keys = set()` (or `.clear()`) at every site that sets the namespace,
+  including the two assignment sites that set it at the START of a file (so a re-used parser
+  instance starts each file clean) and the end-of-file clears.
+- **Identity-key formula (Amendment 3 — single shared formula, used at ALL THREE sites).**
+  The string registered in `self._current_file_temp_keys` and the string looked up at every
+  read/leaf site MUST be byte-identical, or the chain breaks at the temp. Define one helper and
+  use it everywhere (target registration, source stamping, lineage-leaf stamping):
+  ```python
+  @staticmethod
+  def _temp_identity(db: str | None, name: str) -> str:
+      """Lowercased schema-qualified temp identity; bare name when db is falsy (ANSI path)."""
+      name = name.lower()
+      return f"{db.lower()}.{name}" if db else name
+  ```
+  Snowflake's `_qualify_bare_tables` always sets `db`, so the key is `ba.tmp_base`. The ANSI
+  path may have `db=None` (no USE-SCHEMA qualification), so the key is the bare `tmp_x` — the
+  `f"{target.db}.{target.name}"` form WITHOUT this guard would wrongly produce `"none.tmp_x"`.
+  Use `_temp_identity` literally at Step 1.2, Step 2.1, and Step 2.2; never inline the f-string.
+- **Pass-1 ordering (Warning 1 — backward-only stamping is intentional).** Files are parsed
+  statement-by-statement in order; `self._current_file_temp_keys` is built **incrementally** as
+  CREATEs are seen. A later statement's source/leaf whose `_temp_identity` is in the set is
+  stamped `role="temp"` + `namespace=self._current_file_namespace`. A reference to a temp that
+  appears **before** its CREATE in the same file is deliberately treated as an ordinary physical
+  table reference (it is not yet in the set). This is correct for valid SQL — you cannot read a
+  session temp before it is created in the same flow. **Do NOT add a per-file pre-scan / two-pass
+  temp discovery** to handle the non-existent forward-reference case; backward-only is by design.
 - **Stamping site for the target**: `_extract_target_table`
   ([`ansi_parser.py:480-496`](../../src/sqlcg/parsers/ansi_parser.py)) is a `@staticmethod`
   with no `self` — it cannot read the namespace or set role. **Refactor decision**: do the
   temp detection + role/namespace stamping in the instance method `_parse_statement`
   (around [`ansi_parser.py:320-322`](../../src/sqlcg/parsers/ansi_parser.py)) **after**
   `_extract_target_table` returns, where `self` and the `exp.Create` are both available:
-  ```
-  if isinstance(stmt, exp.Create) and stmt.find(exp.TemporaryProperty) is not None
-     and target is not None and self._current_file_namespace is not None:
+  ```python
+  if (isinstance(stmt, exp.Create) and stmt.find(exp.TemporaryProperty) is not None
+          and target is not None and self._current_file_namespace is not None):
       target = dataclasses.replace(target, role="temp",
                                    namespace=self._current_file_namespace)
-      self._current_file_temp_keys.add(target_bare_identity)   # db.name, lowercased
+      self._current_file_temp_keys.add(self._temp_identity(target.db, target.name))
   ```
   Keep `_extract_target_table` unchanged (still a static helper that returns the plain ref);
   the role/namespace decoration is layered on in the instance method that owns `self`.
 - **Stamping site for the sources**: source `TableRef`s are produced by `_real_tables`
   ([`base.py:582-613`](../../src/sqlcg/parsers/base.py)) and the fallback scan, then dedup'd.
-  After `sources` is finalized in `_parse_statement` (after line ~460), map each source whose
-  `db.name` identity is in `self._current_file_temp_keys` to a namespaced `role="temp"` ref
-  via `dataclasses.replace`. This mirrors how the CTE fallback stamps a namespaced ref in
-  `_lineage_node_to_edges` ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)) but operates
-  on the resolved source list rather than the lineage-node fallback.
-- **Pass-2 / column lineage**: the COLUMN_LINEAGE edges resolve through `sg_lineage` and
-  `_lineage_node_to_edges`. The temp will appear as a leaf source `exp.Table` named
-  `ba.tmp_base`. Extend the namespace-stamping branch in `_lineage_node_to_edges`
-  ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)): in addition to the CTE-alias check,
-  if the leaf source's `db.name` identity is in `self._current_file_temp_keys` and a namespace
-  is set, return a `role="temp"`, namespaced `TableRef`. This keeps the COLUMN_LINEAGE
+  After `sources` is finalized in `_parse_statement` (after line ~460), map each source `s`
+  whose `self._temp_identity(s.db, s.name)` is in `self._current_file_temp_keys` to a
+  namespaced `role="temp"` ref via `dataclasses.replace(s, role="temp",
+  namespace=self._current_file_namespace)`. This mirrors how the CTE fallback stamps a
+  namespaced ref in `_lineage_node_to_edges`
+  ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)) but operates on the resolved source
+  list rather than the lineage-node fallback.
+- **Pass-2 / column lineage (Amendment 2 — exact leaf key-formation)**: the COLUMN_LINEAGE
+  edges resolve through `sg_lineage` and `_lineage_node_to_edges`. The temp appears as a leaf
+  source `exp.Table` whose `.db` is `ba` and `.name` is `tmp_base` (post-qualification on the
+  Snowflake path; `.db` may be `None` on the ANSI path). Extend the namespace-stamping branch
+  in `_lineage_node_to_edges` ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)): in
+  addition to the CTE-alias check, compute the leaf identity with the SAME helper —
+  `self._temp_identity(source.db, source.name)` (read `source.db`/`source.name` off the
+  `exp.Table`) — and if that string is in `self._current_file_temp_keys` and a namespace is
+  set, return `TableRef(catalog=source.catalog, db=source.db, name=source.name, role="temp",
+  namespace=self._current_file_namespace)`. The formula MUST be byte-identical to Step 1.2's
+  registration (Amendment 3) so the leaf key matches the registered identity; a mismatch here
+  (e.g. inlining `f"{db}.{name}"` without the `db=None` guard) would break the chain at the
+  temp. This keeps the COLUMN_LINEAGE
   src/dst keys for the temp consistent with the target node — the ~2,607 edges are **re-keyed,
   not dropped**. The dst side (when a temp is the CREATE target) is keyed off `dst_table`,
   which is the already-stamped `target` — so dst is consistent by construction.
@@ -221,12 +267,63 @@ off `table.full_id`. Once temps are namespaced per file, each temp's `full_id` i
 the spurious `duplicate_ddl:ba.tmp_base:already_in:<other file>` warnings for temps disappear
 as a side effect (note this in the PR; no separate change).
 
+### Cross-batch kind protection (Amendment 1 — BLOCKER fix, load-bearing)
+
+**The single most important amendment.** `kind='table'` propagation to the target node (above)
+is NOT sufficient on its own, because the persisted `kind='temp'` can be silently overwritten
+across batch boundaries. The `upsert_nodes_bulk` ON CONFLICT guard
+([`duckdb_backend.py:470-477`](../../src/sqlcg/core/duckdb_backend.py)) currently is:
+
+```sql
+"kind" = CASE
+  WHEN "SqlTable"."kind" IN ('table', 'view') AND EXCLUDED."kind" = 'derived'
+  THEN "SqlTable"."kind"
+  ELSE EXCLUDED."kind" END
+```
+
+This protects only `('table','view')` from a `'derived'` downgrade. A committed `kind='temp'`
+row is in the unguarded `ELSE EXCLUDED."kind"` path: if a **later batch** processes a file that
+references `ba.tmp_base` as a source (emitting `kind='temp'` — fine) OR as a `star_source`
+(emitting hardcoded `kind='table'` — see Warning 3 below) OR if a `kind='table'` reference row
+for the same key arrives for any reason, `ELSE EXCLUDED."kind"` fires and **overwrites `'temp'`
+with `'table'`, silently re-fusing the node** — defeating the entire feature. The in-batch
+`_flush_row_batch` dedup (Rule 1 prefers `defined_in_file`) protects WITHIN a batch, but the
+cross-batch ON CONFLICT is the gap.
+
+**Required change**: extend the ON CONFLICT kind guard so `'temp'` is a protected stored kind
+that only another `'temp'` may overwrite:
+
+```sql
+"kind" = CASE
+  WHEN "SqlTable"."kind" IN ('table', 'view') AND EXCLUDED."kind" = 'derived'
+  THEN "SqlTable"."kind"
+  WHEN "SqlTable"."kind" = 'temp' AND EXCLUDED."kind" <> 'temp'
+  THEN "SqlTable"."kind"
+  ELSE EXCLUDED."kind" END
+```
+
+Rationale for the `<> 'temp'` form (not an inclusion list): a temp's identity is per-file and
+its only legitimate writer is its own defining file; nothing else should ever re-kind it. This
+also covers the star-source path (Warning 3) without a separate parser change. **This is the
+sole cross-batch mechanism preserving `kind='temp'`** — analogous to how `WHERE kind='derived'`
+is the sole precedence mechanism in `upgrade_derived_to_table_for_keys`. Grep-confirm the
+edited CASE is the one reached for `label == NodeLabel.TABLE`.
+
+> **Note on `_upgrade_kinds`** ([`indexer.py:201-203`](../../src/sqlcg/indexer/indexer.py)):
+> `temp` is intentionally NOT added to `_upgrade_kinds = {"cte","external"}`. The in-batch
+> defined-target row always carries `defined_in_file`, so Rule 1 already wins in-batch; the
+> cross-batch ON CONFLICT change above is what closes the real gap. Do not add `temp` to
+> `_upgrade_kinds` (it would let a temp source-ref upgrade an unrelated real `kind='table'`).
+
 ### Consumer audit (A3 — change/no-change + justification)
 
 | Consumer | Location | Decision | Justification |
 |----------|----------|----------|---------------|
 | Indexer target-node kind | [`indexer.py:1293`](../../src/sqlcg/indexer/indexer.py) | **CHANGE** → `table.role` | Sole place that hardcodes `"table"` for defined targets; must propagate `role="temp"`. |
+| **`upsert_nodes_bulk` ON CONFLICT kind guard** | [`duckdb_backend.py:470-477`](../../src/sqlcg/core/duckdb_backend.py) | **CHANGE (Amendment 1, BLOCKER)** | Current guard protects only `('table','view')` from `'derived'`; a committed `kind='temp'` row falls in the unguarded `ELSE EXCLUDED."kind"` path and is silently re-fused to `'table'` by a later-batch reference/star-source row. Add a `WHEN "SqlTable"."kind"='temp' AND EXCLUDED."kind"<>'temp' THEN "SqlTable"."kind"` arm (see §Cross-batch kind protection). Sole cross-batch mechanism preserving `temp`. |
 | Source-node kind | [`indexer.py:1364`](../../src/sqlcg/indexer/indexer.py) | no change | Already `src_table.role`; temp sources flow through. |
+| **`star_sources` emit (hardcoded kind)** | [`indexer.py:1459`](../../src/sqlcg/indexer/indexer.py) | **no change IF Amendment 1 applied (Warning 3)** | Emits hardcoded `"kind":"table"` for star sources. If a temp is ever `SELECT *`'d, this would emit a `kind='table'` row for the temp's key. The Amendment-1 ON CONFLICT guard (`temp` only overwritten by `temp`) prevents this row from re-fusing a committed `kind='temp'` node, so **no parser/indexer change here is needed** — but ONLY because Amendment 1 covers it. Do NOT add star-source kind logic; rely on the guard. Add a test: a star-source row for a temp key does not flip the stored `kind='temp'`. |
+| **`_upgrade_kinds` in-batch dedup** | [`indexer.py:201-203`](../../src/sqlcg/indexer/indexer.py) | no change (do NOT add `temp`) | In-batch, Rule 1 (`defined_in_file` wins) already keeps the temp target row; adding `temp` to `_upgrade_kinds` would wrongly let a temp source-ref upgrade an unrelated real `kind='table'`. The cross-batch gap is closed by Amendment 1, not here. |
 | `_harvest_usage_catalog` kind-guard + `::` skip | [`indexer.py:128-143`](../../src/sqlcg/indexer/indexer.py) | no change | Guards on `kind in _USAGE_ELIGIBLE_KINDS = {"table","view"}` — `temp` is excluded; the `::` skip also catches namespaced temp keys. Both guards already exclude temps. Add a round-trip test. |
 | `_Q_CTE_COLLISIONS` | [`coverage.py:244-257`](../../src/sqlcg/cli/coverage.py) | no change (verify) | Counts dst keys whose table `kind IN ('cte','derived')`. `temp` is **not** in that set, so temps never count as collisions. **This is the desired outcome**: zero multi-writer `kind='temp'` keys, and they do not pollute the CTE-collision counter. Confirm the query is unchanged and add a test asserting a namespaced temp does not register as a CTE collision. |
 | Scoped-health exclusion | [`coverage.py:84,156,328`](../../src/sqlcg/cli/coverage.py) | **DECISION: add `'temp'`** to the `kind IN ('cte','derived')` exclusion sets | Scoped health excludes synthetic intermediates from the strict denominator. A session temp is a non-shared intermediate, same conceptual class. Adding `'temp'` keeps scoped health honest (the temp endpoints are intra-file plumbing, not durable lineage targets). **Document the denominator change** (the ~2,607 temp edges move from strict-eligible to scoped-excluded). Update the label text to "excl. CTE/derived/temp". |
@@ -242,20 +339,26 @@ as a side effect (note this in the PR; no separate change).
 ### Phase 1: Parser — detect + stamp the temp target
 
 **Step 1.1**: Add `self._current_file_temp_keys: set[str]` init + reset alongside
-`self._current_file_namespace` in both parsers (init at construction; reset at the two
-namespace-assignment sites and cleared with `_current_file_namespace = None` at end-of-file).
+`self._current_file_namespace` in both parsers (init at construction). Also add the shared
+`_temp_identity(db, name)` helper (Amendment 3). Reset/clear `self._current_file_temp_keys` at
+**every** namespace assignment site — the file-start assignments AND the end-of-file clears —
+in BOTH parsers, including the Snowflake `_parse_scripting_file` reset at
+[`snowflake_parser.py:561`](../../src/sqlcg/parsers/snowflake_parser.py) (Warning 4).
 - Files: [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py),
-  [`snowflake_parser.py`](../../src/sqlcg/parsers/snowflake_parser.py).
+  [`snowflake_parser.py`](../../src/sqlcg/parsers/snowflake_parser.py),
+  [`base.py`](../../src/sqlcg/parsers/base.py) (the `_temp_identity` helper, on the shared base).
 - Acceptance: a fresh file parse starts with an empty temp-key set; parsing two files in
-  sequence does not leak temp keys from file A into file B (unit test: parse file A with a
-  temp, then file B without; assert B's refs carry no namespace).
+  sequence (including via the scripting path) does not leak temp keys from file A into file B
+  (unit test: parse file A with a temp, then file B without; assert B's refs carry no
+  namespace). `_temp_identity("ba","TMP_X") == "ba.tmp_x"` and `_temp_identity(None,"tmp_x")
+  == "tmp_x"` (the `db=None` ANSI path, Amendment 3).
 
 **Step 1.2**: In `_parse_statement`, after `target = self._apply_table_alias(
 _extract_target_table(stmt))`, when `stmt` is an `exp.Create` with
 `stmt.find(exp.TemporaryProperty) is not None` and `target` and `self._current_file_namespace`
 are set: `dataclasses.replace(target, role="temp", namespace=self._current_file_namespace)`
-and register `f"{target.db}.{target.name}"` (lowercased, omitting empty db) in
-`self._current_file_temp_keys`.
+and register `self._temp_identity(target.db, target.name)` (Amendment 3 — NOT an inline
+f-string) in `self._current_file_temp_keys`.
 - Files: [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py).
 - Acceptance: parsing `create or replace temporary table ba.tmp_base as select …` from path
   `etl/x.sql` under a known root yields a `target.full_id` of `etl/x.sql::ba.tmp_base` and
@@ -264,9 +367,10 @@ and register `f"{target.db}.{target.name}"` (lowercased, omitting empty db) in
 
 ### Phase 2: Parser — stamp same-file reads + lineage leaves
 
-**Step 2.1**: After `sources` is finalized in `_parse_statement`, replace any source whose
-`f"{db}.{name}"` identity is in `self._current_file_temp_keys` with a namespaced `role="temp"`
-ref (`dataclasses.replace`).
+**Step 2.1**: After `sources` is finalized in `_parse_statement`, replace any source `s` whose
+`self._temp_identity(s.db, s.name)` is in `self._current_file_temp_keys` with a namespaced
+`role="temp"` ref via `dataclasses.replace(s, role="temp",
+namespace=self._current_file_namespace)` (Amendment 3 — same helper).
 - Files: [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py).
 - Acceptance: in a file that creates `ba.tmp_base` then `insert into ba.final select … from
   ba.tmp_base`, the second statement's source ref for the temp has
@@ -274,18 +378,38 @@ ref (`dataclasses.replace`).
 
 **Step 2.2**: Extend the namespace-stamping branch in `_lineage_node_to_edges`
 ([`base.py:844-853`](../../src/sqlcg/parsers/base.py)) to also stamp leaf sources whose
-`db.name` identity is in `self._current_file_temp_keys`.
+`self._temp_identity(source.db, source.name)` is in `self._current_file_temp_keys` (Amendment 2
+— exact same helper as Step 1.2/2.1; read `source.db`/`source.name` off the `exp.Table`).
+Return `TableRef(catalog=source.catalog, db=source.db, name=source.name, role="temp",
+namespace=self._current_file_namespace)`.
 - Files: [`base.py`](../../src/sqlcg/parsers/base.py).
 - Acceptance: COLUMN_LINEAGE edges whose source or dst is the temp carry the namespaced
-  `<rel>::ba.tmp_base.<col>` key on the temp endpoint; the non-temp endpoint is unchanged.
+  `<rel>::ba.tmp_base.<col>` key on the temp endpoint; the non-temp endpoint is unchanged. A
+  dedicated unit test parses an **ANSI** `CREATE TEMPORARY TABLE tmp_x AS …` (no schema
+  qualification, `db=None`) and asserts the leaf source in `_lineage_node_to_edges` is stamped
+  `role="temp"` with the bare `tmp_x` identity matching the registration (Amendment 2).
 
-### Phase 3: Indexer — propagate role to the target node kind
+### Phase 3: Indexer + backend — propagate and protect the temp kind
 
 **Step 3.1**: Change [`indexer.py:1293`](../../src/sqlcg/indexer/indexer.py) `"kind": "table"`
 → `"kind": table.role`.
 - Files: [`indexer.py`](../../src/sqlcg/indexer/indexer.py).
 - Acceptance: a defined temp produces a `SqlTable` row with `kind='temp'`; a defined non-temp
   table still produces `kind='table'`.
+
+**Step 3.2 (Amendment 1, BLOCKER)**: Extend the `upsert_nodes_bulk` ON CONFLICT kind guard
+([`duckdb_backend.py:470-477`](../../src/sqlcg/core/duckdb_backend.py)) so a committed
+`kind='temp'` row is overwritten only by another `'temp'` row — add the
+`WHEN "SqlTable"."kind"='temp' AND EXCLUDED."kind"<>'temp' THEN "SqlTable"."kind"` arm before
+the `ELSE` (see §Cross-batch kind protection). Do NOT add `temp` to `_upgrade_kinds` in
+[`indexer.py:202`](../../src/sqlcg/indexer/indexer.py).
+- Files: [`duckdb_backend.py`](../../src/sqlcg/core/duckdb_backend.py).
+- Acceptance (cross-batch, observable): commit a `kind='temp'` node in batch 1; in batch 2
+  upsert a `kind='table'` (and separately a `kind='derived'`) reference row for the SAME
+  qualified key; assert the stored `kind` remains `'temp'` after both. Counterpart: a real
+  `kind='table'` node is NOT protected from a legitimate `kind='temp'`-free flow (a `kind='view'`
+  DDL row still wins where it should) — assert the existing `('table','view')` vs `'derived'`
+  guard is unchanged.
 
 ### Phase 4: Consumers — scoped-health + impact-analysis
 
@@ -336,6 +460,19 @@ this plan in the docstring.
   intact end-to-end), the temp endpoint is re-keyed `<rel>::ba.tmp_base` on **both** the
   produce and consume edges (single identity), and the default (non-`--include-intermediate`)
   trace hides the temp from the listed results while still connecting source to sink.
+- **Unit (parser, ANSI bare temp — Amendment 2/3)** — an ANSI `CREATE TEMPORARY TABLE tmp_x AS
+  SELECT …` (no USE-SCHEMA, `db=None`) registers the bare `tmp_x` identity; the target full_id
+  is `<rel>::tmp_x` and `role="temp"`; a later read of `tmp_x` in the same file is stamped to
+  the same key (no `none.tmp_x` mis-key).
+- **Integration (cross-batch kind protection — Amendment 1, BLOCKER gate)** — commit a
+  `kind='temp'` `SqlTable` node in batch 1, then in batch 2 upsert a `kind='table'` reference
+  row (and separately a `kind='derived'` row) for the SAME qualified key via
+  `upsert_nodes_bulk`; assert the stored `kind` is still `'temp'` after each. Regression
+  counterpart: the existing `('table','view')` vs `'derived'` guard still holds (a `derived`
+  row does not downgrade a committed `table` row).
+- **Integration (star-source does not re-fuse — Warning 3)** — a `star_sources` row
+  (hardcoded `kind='table'`) for a temp key, processed after the temp's defined-target row,
+  leaves the stored `kind='temp'` intact (relies on Amendment 1; no parser change).
 - **Integration (consumer round-trips)** — namespaced temp keys are excluded from
   `_harvest_usage_catalog` HAS_COLUMN(source='usage'); a `kind='temp'` row is NOT upgraded by
   `upgrade_derived_to_table_for_keys` via **both** catalog seams (`catalog load` command +
@@ -366,6 +503,10 @@ this plan in the docstring.
       `real_final` reaches `real_src`, with the temp re-keyed (not severed) in the middle. The
       temp's CREATE-target key and its same-file read key are byte-identical (single
       namespaced identity per file).
+- [ ] **Cross-batch protection (Amendment 1):** a committed `kind='temp'` node is NOT
+      overwritten to `kind='table'`/`'derived'` by a later-batch reference or star-source row
+      for the same key (the `upsert_nodes_bulk` ON CONFLICT `temp`-arm holds); the existing
+      `('table','view')` vs `'derived'` guard is unchanged.
 - [ ] Non-temporary multi-writer tables (the `368 − 85` set) are **byte-identical**
       before/after (same `qualified`, `kind='table'`, same node count).
 - [ ] Scoped-health denominator change documented; rendered line reads "excl. CTE/derived/temp".
@@ -384,6 +525,8 @@ this plan in the docstring.
 | Temp read in a later statement not stamped (key mismatch) | `_current_file_temp_keys` persists across statements within a file; Step 2.1/2.2 stamp sources and lineage leaves; USE-SCHEMA test proves target/read parity. |
 | USE-SCHEMA qualification breaks the identity match | Identity is captured AFTER `_qualify_bare_tables` (post-qualification `db.name`); both target and reads are qualified identically. Explicit test. |
 | Re-fusing via catalog kind-upgrade | `upgrade_derived_to_table_for_keys` only touches `kind='derived'`; `temp` is untouched. Test on both catalog seams. |
+| **Cross-batch re-fusion (A1)**: a later-batch `kind='table'`/`'derived'`/star-source row silently overwrites a committed `kind='temp'` via the unguarded `ELSE EXCLUDED."kind"` ON CONFLICT path | Step 3.2 adds a `temp`-protection arm (`temp` only overwritten by `temp`); cross-batch integration test asserts the stored kind survives both a `table` and a `derived` reference row. **Without this, the whole feature is defeated by batch ordering.** |
+| ANSI bare temp mis-keyed as `none.tmp_x` (A3) | Shared `_temp_identity` helper drops the db segment when `db` is falsy; ANSI bare-temp unit test asserts the `<rel>::tmp_x` key (no `none.` prefix). |
 | Scoped-health denominator shift looks like a regression | Documented as an intentional honesty change (temp endpoints are intra-file plumbing); the `~2,607` edges move from strict-eligible to scoped-excluded; label updated. |
 | Perf regression from per-CREATE property read | `find(exp.TemporaryProperty)` is once-per-CREATE; source/leaf stamping is O(1) set membership; no per-column qualify/scope/expand. Perf guards pass unmodified. |
 | Temp-key set leaks across files | Reset at the namespace-assignment sites + cleared at end-of-file; isolation unit test. |
