@@ -103,6 +103,14 @@ class TableUsage(BaseModel):
     query_file: str = Field(..., description="File path where query is defined")
     sql: str | None = Field(None, description="SQL of the query")
     kind: str | None = Field(None, description="Kind of query (SELECT, INSERT, etc.)")
+    usage_kind: Literal["direct", "via_lineage"] = Field(
+        "direct",
+        description=(
+            "How the table is used: 'direct' = top-level SELECTS_FROM or STAR_SOURCE "
+            "read; 'via_lineage' = CTE-wrapped derived read (a column-lineage value "
+            "flows out of this table, captured via COLUMN_LINEAGE)."
+        ),
+    )
 
 
 class TableUsageResult(BaseModel):

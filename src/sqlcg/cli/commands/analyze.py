@@ -285,10 +285,30 @@ def unused(
     threshold: int = typer.Option(0, "--threshold", help="Minimum reference count threshold"),
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
-    """Find tables with no query references."""
+    """Find tables with no detected read of any kind.
+
+    A table is considered USED if any of the following signals fires:
+    (D1) a direct SELECTS_FROM read, (D2) a STAR_SOURCE (SELECT *) read, or
+    (D3) a value flows out of one of its columns via COLUMN_LINEAGE (captures
+    CTE-wrapped derived reads, the dominant corpus pattern).
+
+    KNOWN GAP: a table read ONLY inside a CTE without deriving any column
+    (a pure-gating read — e.g. used only as a join filter, no value selected
+    from it) is NOT detected by any of the three signals. Such a table will
+    still appear as "unused" even if it is genuinely needed.
+    """
     results = run_read_routed(
         'SELECT DISTINCT qualified FROM "SqlTable"'
-        ' WHERE qualified NOT IN (SELECT DISTINCT dst_key FROM "SELECTS_FROM")'
+        " WHERE qualified NOT IN ("
+        '    SELECT DISTINCT dst_key AS table_qualified FROM "SELECTS_FROM"'
+        "    UNION"
+        '    SELECT DISTINCT dst_key AS table_qualified FROM "STAR_SOURCE"'
+        "    UNION"
+        "    SELECT DISTINCT src.table_qualified AS table_qualified"
+        '    FROM "COLUMN_LINEAGE" cl'
+        '    JOIN "SqlColumn" src ON src.id = cl.src_key'
+        "    WHERE src.table_qualified IS NOT NULL AND src.table_qualified <> ''"
+        ")"
         " LIMIT 100",
         {},
     )
