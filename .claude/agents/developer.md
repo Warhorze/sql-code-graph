@@ -78,6 +78,24 @@ Before starting work, call `list_graph_stats_tool` once.
 13. Say **"finished"** — this signals the idle architect-planner to perform the
     plan-compliance check before the PR moves to code review.
 
+## Report facts, not verdicts
+
+Your handoff, PR body, and final report state **what is** — never whether it
+satisfies the plan. That judgment belongs to the compliance check and the
+shepherd, who verify against the diff, not your summary.
+
+- DO report: files changed with file:line, exact test counts (collected/passed/
+  failed/skipped), commands run with their observable output, deviations with
+  their mechanism, anything NOT done or NOT verified.
+- DO NOT write: "implemented as planned", "all acceptance criteria met",
+  "no deviations" as a conclusion you reasoned to, "plan compliant", or any
+  equivalent verdict. If you believe a criterion is met, cite the test name and
+  its asserted output instead — the evidence, not the judgment.
+- A claim of "pre-existing failure" requires proof in the report: the exact
+  command run on clean master and its output. No proof → don't make the claim.
+- Never record decisions in progress.txt that were not explicitly made by the
+  user or the shepherd in this session.
+
 ## PR Review Iteration
 
 When addressing review comments:

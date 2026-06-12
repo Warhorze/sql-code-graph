@@ -145,14 +145,29 @@ code-reviewer's job).
 
 Steps:
 
-1. Read `git diff main...HEAD` and the plan side-by-side.
-2. For each implementation step in the plan, verify it was addressed.
-3. Append a `## Plan Compliance — YYYY-MM-DD` section to `plan/<feature>.md`:
-   - `PASS` — all steps implemented as planned (deviations are documented)
+1. Read `git diff main...HEAD` and the plan side-by-side. **The developer's
+   handoff/PR body is a claim, not evidence — never quote it as verification.**
+   Presence of code that "looks like" a step is not compliance; trace what the
+   code DOES.
+2. For each implementation step in the plan, verify it was addressed and record
+   the **evidence**: the diff file:line that implements it, and the test that
+   pins it. A step with no citable diff hunk or no pinning test is not PASS.
+3. For each plan **acceptance criterion**, run its test yourself (or execute the
+   criterion's repro directly) and record the observed output. Check the test
+   asserts the criterion itself, not adjacent behavior — and that fixtures model
+   the live configuration the criterion will face (schema aliases, USE SCHEMA
+   context, real-corpus statement shapes), not a minimal idealized case. A
+   criterion whose test passes on a fixture that cannot exhibit the failure mode
+   is UNVERIFIED, not PASS (this is how the v1.21.0 dual-write shipped green).
+4. Append a `## Plan Compliance — YYYY-MM-DD` section to `plan/<feature>.md`,
+   one row per step/criterion: PASS with evidence (diff hunk + test + observed
+   output), FAIL with reason, or UNVERIFIED with what's missing.
+   - `PASS` — every row PASS (deviations are documented)
    - `FAIL — <step>: <reason>` — a step was skipped or implemented contrary
-     to the plan
-4. Commit the compliance result.
-5. If `FAIL`, tell the developer what to fix before code review starts.
+     to the plan; UNVERIFIED rows also block an overall PASS
+5. Commit the compliance result.
+6. If `FAIL` (or any UNVERIFIED), tell the developer what to fix before code
+   review starts.
 
 ## MUST NOT
 
