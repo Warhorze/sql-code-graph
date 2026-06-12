@@ -1,9 +1,9 @@
-## Current State [2026-06-11]
-ACTIVE AGENT: developer — HANDOFF (PR ready for review)
-FEATURE: mcp_server_self_healing PR 2 — self-heal re-exec machinery (v1.20.0)
-PLAN: plan/sprints/mcp_server_self_healing.md §Phase 2
-BRANCH: feat/mcp-self-heal-reexec
-PR: (opening)
+## Current State [2026-06-12]
+ACTIVE AGENT: developer — IN PROGRESS
+FEATURE: temp_table_namespacing — per-file TEMPORARY table namespacing (v1.21.0)
+PLAN: plan/sprints/temp_table_namespacing.md (APPROVED rev 3)
+BRANCH: feat/temp-table-namespacing
+PR: (not yet opened)
 
 ## Handoff — developer: mcp_server_self_healing PR 2 (v1.20.0) [2026-06-11]
 
@@ -3546,3 +3546,44 @@ NEXT: open PR against master; architect-planner compliance check on "finished".
 - PR 5 #88 v1.19.1 (File.skip_counts JSON column, SCHEMA_VERSION 7->8)
 - Tags pending user verification: v1.15.0-v1.18.0 (prev sprint) + v1.18.1-v1.19.1 (this sprint). User actions: dwh/.sqlcg.toml [sqlcg.catalog] section.
 - NOW: DWH reindex + catalog load + gain health + table_graph.html regen via developer. THEN: issue #76 (stale MCP server) via architect-planner.
+
+[2026-06-11 shepherd close-out: issue #76 self-healing MCP server COMPLETE]
+- PR 1 #89 + PR 2 #90 merged, both under v1.20.0 (PR 1 carried the bump).
+- Detector (selfheal.py) + re-exec machinery (server.py): A2 handler wrap, A4 generation cap, A5 abs argv0, W2 recovery outside backend_lock, drain->close-DB->execv ordering.
+- e2e test_selfheal_e2e.py PASSES live on this machine (same PID, same pipe, version swap).
+- PR 2 developer died of context overflow AFTER committing+pushing+opening PR; shepherd ran the final gates itself (1276 passed/0 failed, ruff clean, pyright 0 errors) and merged.
+- Issue #76 stays OPEN until user live-verifies (house rule). Tag v1.20.0 user-gated.
+- Full tag queue: v1.15.0-v1.18.0, v1.18.1-v1.19.1, v1.20.0.
+
+## Current State [2026-06-12]
+ACTIVE AGENT: architect-planner
+FEATURE: temp_table_namespacing — per-file namespacing of session-scoped TEMPORARY tables (v1.21.0)
+PLAN: plan/sprints/temp_table_namespacing.md (DRAFT — plan-reviewer gates next)
+
+## Handoff — architect-planner: temp_table_namespacing REWORK applied [2026-06-12]
+Plan-reviewer returned REWORK (2 blockers + 4 warnings). All applied to
+plan/sprints/temp_table_namespacing.md (rev 2):
+- A1 (blocker): upsert_nodes_bulk ON CONFLICT must protect kind='temp' from
+  cross-batch overwrite (new Step 3.2 + consumer-audit row + risk + test + AC).
+  Verified the gap live: duckdb_backend.py:470-477 guards only ('table','view')
+  vs 'derived'; a committed 'temp' falls in ELSE EXCLUDED.kind and re-fuses.
+- A2 (blocker): _lineage_node_to_edges leaf key-formation spelled out (Step 2.2).
+- A3: shared _temp_identity(db,name) helper (db=None -> bare name) used at
+  Steps 1.2/2.1/2.2; replaces inconsistent inline f-string.
+- W1: backward-only stamping made explicit (no forward-ref pre-scan).
+- W3: star_sources hardcoded-kind documented as no-change-IF-A1.
+- W4: temp-set reset required at snowflake _parse_scripting_file site too.
+NEXT: re-submit to plan-reviewer for the gate.
+
+## Handoff — architect-planner: temp_table_namespacing APPROVED [2026-06-12]
+Plan-reviewer verdict APPROVE-WITH-AMENDMENTS (rev 2 cleared the 2 blockers).
+Two new warnings applied (rev 3):
+- A5: Step 2.1 source-stamping placement — MUST go between ansi_parser.py:409
+  (target-exclusion filter) and :422 (_extract_column_lineage call), NOT after
+  the dedup. Verified query_sources=sources feeds star resolution; late stamping
+  orphans a bare-key kind='table' star-source row. Added star-source AC test.
+- A6: documented symmetric-hazard impossibility (namespaced <rel>::ba.tmp_base PK
+  vs bare ba.tmp_base PK never collide; _current_file_namespace guard means no
+  bare kind='temp' row is ever emitted).
+STATUS: plan/sprints/temp_table_namespacing.md APPROVED (rev 3) — ready for developer.
+NEXT: developer implements; architect-planner idle for Q&A + compliance check on "finished".

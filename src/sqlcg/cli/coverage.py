@@ -69,7 +69,7 @@ FROM "COLUMN_LINEAGE" cl
 
 # ---------------------------------------------------------------------------
 # Query 2-scoped: same strict check, but excludes edges whose stripped dst
-# table is a CTE/derived intermediate (correct-by-design, not a coverage gap).
+# table is a CTE/derived/temp intermediate (correct-by-design, not a coverage gap).
 # ---------------------------------------------------------------------------
 _Q_EDGE_HEALTH_SCOPED = f"""
 SELECT
@@ -81,7 +81,7 @@ FROM "COLUMN_LINEAGE" cl
 WHERE NOT EXISTS (
     SELECT 1 FROM "SqlTable" t
     WHERE t.qualified = {_DST_TABLE.replace("dst_key", "cl.dst_key")}
-      AND t.kind IN ('cte', 'derived')
+      AND t.kind IN ('cte', 'derived', 'temp')
 )
 """
 
@@ -153,7 +153,7 @@ WITH bad_edges AS (
     AND NOT EXISTS (
         SELECT 1 FROM "SqlTable" t
         WHERE t.qualified = {_DST_TABLE.replace("dst_key", "cl.dst_key")}
-          AND t.kind IN ('cte', 'derived')
+          AND t.kind IN ('cte', 'derived', 'temp')
     )
 ),
 per_table AS (
@@ -325,7 +325,7 @@ class CoverageStats:
     # --- strict column-level health (new primary) ---
     good_edges_strict: int = 0
 
-    # --- scoped (excludes CTE/derived dst) ---
+    # --- scoped (excludes CTE/derived/temp dst) ---
     good_edges_scoped: int = 0
     total_edges_scoped: int = 0
 
@@ -388,7 +388,7 @@ class CoverageStats:
 
     @property
     def edge_health_scoped_pct(self) -> float:
-        """Strict edge health excluding CTE/derived dst intermediates."""
+        """Strict edge health excluding CTE/derived/temp dst intermediates."""
         if self.total_edges_scoped == 0:
             return 0.0
         return self.good_edges_scoped / self.total_edges_scoped * 100
@@ -618,10 +618,10 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f" ({coverage.edge_health_pct:.0f}%)[/{legacy_colour}]"
     )
 
-    # Scoped (excludes CTE/derived dst intermediates).
+    # Scoped (excludes CTE/derived/temp dst intermediates).
     scoped_colour = edge_health_colour(coverage.edge_health_scoped_pct)
     lines.append(
-        f"{indent}[{scoped_colour}]Edge health (scoped, excl. CTE/derived):"
+        f"{indent}[{scoped_colour}]Edge health (scoped, excl. CTE/derived/temp):"
         f" {coverage.good_edges_scoped} / {coverage.total_edges_scoped}"
         f" ({coverage.edge_health_scoped_pct:.0f}%)[/{scoped_colour}]"
     )
@@ -727,7 +727,7 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         # strict column-level health (new primary)
         "good_edges_strict": coverage.good_edges_strict,
         "edge_health_strict_pct": round(coverage.edge_health_strict_pct, 2),
-        # scoped (excludes CTE/derived dst)
+        # scoped (excludes CTE/derived/temp dst)
         "good_edges_scoped": coverage.good_edges_scoped,
         "total_edges_scoped": coverage.total_edges_scoped,
         "edge_health_scoped_pct": round(coverage.edge_health_scoped_pct, 2),

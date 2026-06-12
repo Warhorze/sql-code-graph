@@ -392,7 +392,11 @@ def _rollup_to_tables(col_ids: list[str]) -> list[str]:
 # the authoritative marker per indexer.py (kind="cte" / kind="derived"); see
 # _exclude_synthetic_tables. Keying on kind (not the alias string) avoids dropping
 # a real table that happens to share a name with a CTE alias.
-_SYNTHETIC_TABLE_KINDS = frozenset({"cte", "derived"})
+# temp_table_namespacing Step 4.2: 'temp' added — per-file session temps are
+# synthetic intermediates (bridges), not durable affected tables.  Impact analysis
+# already contracts cte/derived bridges; temp inherits the same behaviour so
+# per-file session temps are contracted rather than reported as distinct affected tables.
+_SYNTHETIC_TABLE_KINDS = frozenset({"cte", "derived", "temp"})
 
 
 def _exclude_synthetic_tables(db: GraphBackend, tables: list[str]) -> tuple[list[str], list[str]]:
