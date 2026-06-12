@@ -290,6 +290,18 @@ class ChangeScopeResult(BaseModel):
         default_factory=list,
         description="Affected tables excluded as backup/noise.",
     )
+    gating_join_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Downstream tables that READ the target table via a DIRECT "
+            "(non-CTE) gating join (SELECTS_FROM/STAR_SOURCE) but derive NO column "
+            "from it — they may go fully empty if the source empties, even though "
+            "they are NOT in affected_tables (no value-derivation). Reused from the "
+            "PR 1 row-reachability supplement. KNOWN GAP: CTE-wrapped pure-gating "
+            "reads are NOT detected. UPPER BOUND: depends on join type (not recorded "
+            "on SELECTS_FROM) — may be fully empty only for inner joins."
+        ),
+    )
     truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
     hint: str | None = Field(None, description="Diagnostic hint when scope is empty.")
 
@@ -348,6 +360,18 @@ class DiffImpactResult(BaseModel):
     )
     noise_excluded: list[str] = Field(
         default_factory=list, description="Affected tables excluded as backup/noise."
+    )
+    gating_join_tables: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Downstream tables that READ any of the changed tables via a DIRECT "
+            "(non-CTE) gating join (SELECTS_FROM/STAR_SOURCE) but derive NO column "
+            "from them — they may go fully empty if a changed source empties, even "
+            "though they are NOT in affected_tables (no value-derivation). Reused "
+            "from the PR 1 row-reachability supplement. KNOWN GAP: CTE-wrapped "
+            "pure-gating reads are NOT detected. UPPER BOUND: depends on join type "
+            "(not recorded on SELECTS_FROM) — may be fully empty only for inner joins."
+        ),
     )
     truncated: bool = Field(False, description="True if the 50k-node closure safety cap was hit.")
     hint: str | None = Field(
