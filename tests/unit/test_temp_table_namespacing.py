@@ -1,6 +1,8 @@
 """Unit tests for per-file TEMPORARY-table namespacing (kind='temp').
 
 Guards plan/sprints/temp_table_namespacing.md (Steps 1.1–2.2, Amendments A2/A3/A5/W1/W4).
+Also guards fix/temp-namespacing-dual-write (v1.21.1) — schema-alias interaction
+with _lineage_node_to_edges Step 2.2.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 from sqlcg.lineage.schema_resolver import SchemaResolver
 from sqlcg.parsers.ansi_parser import AnsiParser
 from sqlcg.parsers.base import SqlParser, TableRef
+from sqlcg.parsers.snowflake_parser import SnowflakeParser
 
 # ---------------------------------------------------------------------------
 # _temp_identity helper (Amendment 3)
@@ -524,3 +527,136 @@ class TestPortability:
         assert result_a.defined_tables[0].full_id == result_b.defined_tables[0].full_id, (
             "Same rel_path under two absolute roots must produce the same temp key"
         )
+
+
+# ---------------------------------------------------------------------------
+# v1.21.1 regression guard: schema-alias interaction with Step 2.2
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaAliasAndTempLeafStamping:
+    """_lineage_node_to_edges Step 2.2 must apply schema aliases before the
+    temp-identity check, or the check misses when the raw exp.Table carries
+    the pre-alias db (e.g. 'ba_tmp') while the registered key uses the
+    post-alias db (e.g. 'ba').
+
+    Reproduces the live-DWH dual-write observed in v1.21.0:
+      - CREATE stmt (:1) produced etl/.../wtfv_bon.sql::ba.tmp_base (kind='temp')
+      - INSERT stmts (:2/:3) also produced ba.tmp_base (kind='table') because
+        the leaf exp.Table had db='ba_tmp' (pre-alias) and _temp_identity
+        returned 'ba_tmp.tmp_base' which was NOT in _current_file_temp_keys
+        {'ba.tmp_base'} — the check missed and the aliased un-namespaced ref
+        fell through to _apply_table_alias, producing a second kind='table' row.
+
+    Guards fix plan/sprints/temp_table_namespacing.md §Deviations (v1.21.1).
+    """
+
+    def test_use_schema_alias_temp_leaf_edges_are_namespaced(self, tmp_path):
+        """With schema_aliases={'ba_tmp': 'ba'} and USE SCHEMA BA_TMP, the COLUMN_LINEAGE
+        edges through the temp carry the NAMESPACED key — no un-namespaced ba.tmp_base src.
+
+        Pre-fix: _lineage_node_to_edges read src_db='ba_tmp' from the raw exp.Table,
+        computed _temp_identity('ba_tmp','tmp_base')='ba_tmp.tmp_base' which missed
+        the registered key 'ba.tmp_base' → edge used un-namespaced ba.tmp_base (role='table').
+        Post-fix: alias is applied before the check, 'ba.tmp_base' matches, edge uses
+        the namespaced temp key.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "USE SCHEMA BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS"
+            " SELECT winkelnr FROM DA.source_table;\n"
+            "INSERT INTO real_target SELECT winkelnr FROM tmp_base;\n"
+        )
+        rel = "etl/sql/fact/wtfv_bon.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+
+        # The INSERT statement is index 1 (USE is suppressed, CREATE=0, INSERT=1).
+        insert_stmts = [s for s in result.statements if s.kind == "INSERT"]
+        assert insert_stmts, f"No INSERT found in {[s.kind for s in result.statements]}"
+        insert_stmt = insert_stmts[0]
+
+        # Collect COLUMN_LINEAGE edges from the INSERT.
+        # Pre-fix: edges have src.table.full_id = 'ba.tmp_base' (un-namespaced, role='table').
+        # Post-fix: edges have src.table.full_id = 'etl/.../wtfv_bon.sql::ba.tmp_base' (namespaced)
+        #           OR resolve straight through to 'da.source_table' (if expansion succeeded).
+        for edge in insert_stmt.column_lineage:
+            src_fid = edge.src.table.full_id
+            assert src_fid != "ba.tmp_base", (
+                f"Un-namespaced 'ba.tmp_base' (role='table') must not appear as edge src "
+                f"when a schema alias maps ba_tmp→ba and the temp was created in this file. "
+                f"This is the v1.21.0 dual-write bug (fix/temp-namespacing-dual-write). "
+                f"Got: {src_fid!r}"
+            )
+            # If the src IS the temp, it must be namespaced.
+            if "tmp_base" in src_fid:
+                assert "::" in src_fid, f"A tmp_base src edge must be namespaced, got: {src_fid!r}"
+
+    def test_use_schema_alias_temp_target_is_correct_key(self, tmp_path):
+        """The CREATE TEMPORARY TABLE target uses the post-alias db in the namespaced key.
+
+        Guards that Step 1.2 target registration is consistent with Step 2.2's new
+        alias-aware lookup (post-fix both use 'ba.tmp_base' as the registered identity).
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "USE SCHEMA BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS SELECT x FROM DA.src;\n"
+        )
+        rel = "etl/sql/fact/f.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+
+        assert result.defined_tables, "Expected at least one defined table"
+        tgt = result.defined_tables[0]
+        assert tgt.role == "temp", f"Expected role='temp', got {tgt.role!r}"
+        # Post-alias: db='ba', so full_id must be '<rel>::ba.tmp_base'
+        assert tgt.full_id == f"{rel}::ba.tmp_base", (
+            f"Expected '{rel}::ba.tmp_base', got {tgt.full_id!r}"
+        )
+        assert tgt.db == "ba", f"Expected db='ba' (post-alias), got db={tgt.db!r}"
+
+    def test_use_schema_alias_no_dual_write_in_sources(self, tmp_path):
+        """Sources list for the INSERT must contain a NAMESPACED temp ref — not bare.
+
+        Step 2.1 (source stamping) works correctly because _real_tables() goes through
+        _apply_table_alias before stamping.  This test confirms that Step 2.1 and
+        Step 2.2 (after the fix) both produce the same namespaced key.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        sql = (
+            "USE SCHEMA BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_base AS SELECT winkelnr FROM DA.src;\n"
+            "INSERT INTO real_target SELECT winkelnr FROM tmp_base;\n"
+        )
+        rel = "etl/sql/fact/check.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+
+        insert_stmts = [s for s in result.statements if s.kind == "INSERT"]
+        assert insert_stmts, "No INSERT statement found"
+        insert_stmt = insert_stmts[0]
+
+        # Step 2.1: the source for tmp_base should be stamped role='temp' and namespaced.
+        tmp_sources = [s for s in insert_stmt.sources if "tmp_base" in s.name]
+        assert tmp_sources, f"No tmp_base source found in INSERT; sources: {insert_stmt.sources}"
+        for src in tmp_sources:
+            assert src.role == "temp", (
+                f"Source tmp_base must have role='temp', got role={src.role!r}"
+            )
+            assert "::" in src.full_id, (
+                f"Source tmp_base must be namespaced, got full_id={src.full_id!r}"
+            )

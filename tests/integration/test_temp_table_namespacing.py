@@ -1,7 +1,8 @@
 """Integration tests for per-file TEMPORARY-table namespacing (kind='temp').
 
 Indexes fixture files into an in-memory DuckDB graph and verifies all acceptance
-criteria from plan/sprints/temp_table_namespacing.md.
+criteria from plan/sprints/temp_table_namespacing.md.  Also contains regression
+guards for fix/temp-namespacing-dual-write (v1.21.1) — schema-alias interaction.
 """
 
 from __future__ import annotations
@@ -511,3 +512,173 @@ class TestCoverageScoped:
         assert "temp" in scoped_line.lower(), (
             f"Rendered scoped line does not mention 'temp': {scoped_line!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# v1.21.1 regression guard: schema-alias + USE SCHEMA dual-write
+# ---------------------------------------------------------------------------
+
+# Fixture modelled on the real wtfv_bon.sql DWH pattern:
+#   USE SCHEMA BA_TMP (schema alias ba_tmp → ba)
+#   CREATE TEMPORARY TABLE tmp_base AS SELECT ... FROM da.real_src
+#   INSERT INTO real_target SELECT ... FROM tmp_base
+#
+# Pre-fix (v1.21.0): _lineage_node_to_edges saw src_db='ba_tmp' (pre-alias) from
+# the raw exp.Table, computed _temp_identity('ba_tmp','tmp_base')='ba_tmp.tmp_base',
+# which missed _current_file_temp_keys {'ba.tmp_base'} → fell through →
+# _apply_table_alias produced TableRef(db='ba', role='table') →
+# dual write: BOTH '<rel>::ba.tmp_base' (kind='temp') AND 'ba.tmp_base' (kind='table').
+#
+# Post-fix (v1.21.1): alias is applied to src_db before _temp_identity → match →
+# returns namespaced role='temp' TableRef → single identity, no duplicate.
+
+_WTFV_BON_STYLE_SQL = """\
+USE SCHEMA BA_TMP;
+
+CREATE OR REPLACE TEMPORARY TABLE tmp_base AS
+SELECT winkelnr, bontype
+FROM DA.real_src
+WHERE status = 2;
+
+INSERT INTO real_target
+SELECT base.winkelnr, base.bontype
+FROM tmp_base base
+INNER JOIN BA.ref_table r ON base.winkelnr = r.nr;
+"""
+
+
+class TestSchemaAliasDualWriteRegression:
+    """The USE SCHEMA + schema-alias + bare-temp pattern must produce a single
+    namespaced identity with no residual un-namespaced kind='table' node.
+
+    Reproduces the live-DWH dual-write from v1.21.0.
+    Guards fix/temp-namespacing-dual-write (v1.21.1).
+    """
+
+    def test_no_unnamespaced_tmp_base_table_node_with_alias(self, tmp_path):
+        """After indexing a file with USE SCHEMA BA_TMP (alias ba_tmp→ba) and a bare
+        CREATE TEMPORARY TABLE tmp_base, the un-namespaced 'ba.tmp_base' kind='table'
+        node must NOT exist.
+
+        Pre-fix: both 'ba.tmp_base' (kind='table') AND '<rel>::ba.tmp_base' (kind='temp')
+        existed — the dual-write.  Post-fix: only the namespaced kind='temp' node.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/wtfv_bon_style.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_WTFV_BON_STYLE_SQL)
+
+        # Create a .sqlcg.toml with the schema alias so index_repo picks it up
+        sqlcg_toml = tmp_path / ".sqlcg.toml"
+        sqlcg_toml.write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            # The un-namespaced 'ba.tmp_base' kind='table' node must NOT exist
+            rows = backend.run_read(
+                "SELECT qualified, kind FROM \"SqlTable\" WHERE qualified = 'ba.tmp_base'",
+                {},
+            )
+            assert rows == [], (
+                f"Un-namespaced 'ba.tmp_base' kind='table' node must not exist after "
+                f"indexing with schema alias ba_tmp→ba.  This is the v1.21.0 dual-write "
+                f"(fix/temp-namespacing-dual-write). Found: {rows}"
+            )
+        finally:
+            backend.close()
+
+    def test_namespaced_temp_node_exists_with_alias(self, tmp_path):
+        """After indexing with USE SCHEMA BA_TMP (alias ba_tmp→ba), the namespaced
+        kind='temp' node '<rel>::ba.tmp_base' must exist and be the ONLY tmp_base node.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/wtfv_bon_style.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_WTFV_BON_STYLE_SQL)
+
+        sqlcg_toml = tmp_path / ".sqlcg.toml"
+        sqlcg_toml.write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            # Exactly one tmp_base node — the namespaced kind='temp'
+            rows = backend.run_read(
+                "SELECT qualified, kind FROM \"SqlTable\" WHERE name = 'tmp_base'",
+                {},
+            )
+            assert len(rows) == 1, (
+                f"Expected exactly 1 tmp_base node (the namespaced kind='temp'), "
+                f"got {len(rows)}: {rows}"
+            )
+            assert rows[0]["kind"] == "temp", (
+                f"The single tmp_base node must have kind='temp', got {rows[0]['kind']!r}"
+            )
+            assert "::" in rows[0]["qualified"], (
+                f"The tmp_base node must be namespaced, got {rows[0]['qualified']!r}"
+            )
+        finally:
+            backend.close()
+
+    def test_lineage_chain_through_temp_with_alias(self, tmp_path):
+        """With schema alias ba_tmp→ba, COLUMN_LINEAGE edges flow through the namespaced
+        temp from da.real_src into real_target — the chain is intact end-to-end.
+
+        Pre-fix: edges from INSERT used 'ba.tmp_base' (un-namespaced) as src, so the
+        namespaced node had zero outgoing edges (orphaned sink).
+        Post-fix: edges use '<rel>::ba.tmp_base' → both sides of the temp are wired.
+
+        Guards fix/temp-namespacing-dual-write (v1.21.1).
+        """
+        rel = "etl/sql/fact/wtfv_bon_style.sql"
+        (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
+        (tmp_path / rel).write_text(_WTFV_BON_STYLE_SQL)
+
+        sqlcg_toml = tmp_path / ".sqlcg.toml"
+        sqlcg_toml.write_text('[sqlcg.schema_aliases]\nba_tmp = "ba"\n')
+
+        backend = DuckDBBackend(":memory:")
+        backend.init_schema()
+        try:
+            Indexer().index_repo(tmp_path, dialect="snowflake", db=backend, use_git=False)
+
+            # Find the namespaced temp node's qualified key
+            temp_rows = backend.run_read(
+                "SELECT qualified FROM \"SqlTable\" WHERE name = 'tmp_base' AND kind = 'temp'",
+                {},
+            )
+            assert temp_rows, "No namespaced kind='temp' node found for tmp_base"
+            temp_key = temp_rows[0]["qualified"]
+
+            # Edges INTO the temp (from da.real_src → tmp_base)
+            # Edge key format: "<table_qualified>.<col_name>"
+            into_temp = backend.run_read(
+                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE dst_key LIKE ?',
+                {"prefix": f"{temp_key}.%"},
+            )
+            # Edges OUT OF the temp (from tmp_base → real_target)
+            out_of_temp = backend.run_read(
+                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE src_key LIKE ?',
+                {"prefix": f"{temp_key}.%"},
+            )
+
+            assert into_temp, (
+                f"No COLUMN_LINEAGE edges INTO namespaced temp '{temp_key}' — "
+                f"pre-fix: CREATE stmt edges were correct; post-fix they still are. "
+                f"Check that the chain_src→tmp edge was not broken."
+            )
+            assert out_of_temp, (
+                f"No COLUMN_LINEAGE edges OUT OF namespaced temp '{temp_key}' — "
+                f"pre-fix: INSERT stmt edges pointed at un-namespaced 'ba.tmp_base' "
+                f"(orphaned sink); post-fix they must use the namespaced key. "
+                f"This is the core correctness check for fix/temp-namespacing-dual-write."
+            )
+        finally:
+            backend.close()
