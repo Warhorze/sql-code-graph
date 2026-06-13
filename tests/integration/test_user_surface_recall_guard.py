@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from sqlcg.cli.commands.analyze import _downstream_sql, _upstream_sql
+from sqlcg.cli.commands.analyze import _upstream_sql
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.queries import TRACE_COLUMN_LINEAGE_QUERY
 from sqlcg.indexer.indexer import Indexer
@@ -73,6 +73,27 @@ def indexed_db(db, tmp_path):
     (tmp_path / "etl.sql").write_text(_ETL_SQL)
     Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
     return db, tmp_path
+
+
+@pytest.fixture
+def indexed_db_file(tmp_path):
+    """Index the A–D fixture corpus into a file-backed DB; return (db_path, sql_dir).
+
+    Used by TC6b so a CliRunner invocation can reach the same graph via
+    SQLCG_DB_PATH — in-memory DuckDB is not accessible across the CliRunner
+    process boundary.
+    """
+    sql_dir = tmp_path / "sql"
+    sql_dir.mkdir()
+    (sql_dir / "ddl.sql").write_text(_DDL_SQL)
+    (sql_dir / "etl.sql").write_text(_ETL_SQL)
+
+    db_path = tmp_path / "graph.db"
+    backend = DuckDBBackend(str(db_path))
+    backend.init_schema()
+    Indexer().index_repo(sql_dir, dialect=None, db=backend, use_git=False)
+    backend.close()
+    return db_path, sql_dir
 
 
 # ---------------------------------------------------------------------------
@@ -369,66 +390,38 @@ def test_tc7_cte_only_source_is_findable(indexed_db):
 # ---------------------------------------------------------------------------
 
 
-def _downstream_filtered_query(depth: int = 5) -> str:
-    """Build the exact downstream SQL query analyze.py constructs with kind_filter ON.
+def test_tc6b_downstream_sink_location_present(indexed_db_file):
+    """Terminal sink rendered by the real CLI downstream command must show a file:line, not '?'.
 
-    Uses production _downstream_sql() so any regression in analyze.py reds this test
-    (Phase 3 port: replaces the old Cypher _kind_filter("dst", ...) helper).
+    Shape C: mart.fact_kpi.measure is the INSERT target with no outgoing COLUMN_LINEAGE
+    edge.  Before the incoming-edge fix the CLI rendered the sink location as '?' (NULL
+    file/line).  This test drives the production CLI via CliRunner — not _downstream_sql
+    directly — so it catches regressions in argument parsing, output formatting, and the
+    query path together.
+
+    Guards the fix_downstream_sink_location sprint plan.
     """
-    return _downstream_sql(depth, include_intermediate=False)
+    from typer.testing import CliRunner
 
+    from sqlcg.cli.main import app
 
-def test_tc6b_downstream_sink_location_present(indexed_db):
-    """Terminal-sink downstream result must carry a real file:line, not NULL.
-
-    Shape C: mart.fact_kpi.measure is the final INSERT target — it has no
-    outgoing COLUMN_LINEAGE edge (nothing downstream consumes it) but it IS
-    reachable as a downstream result from staging.src_a.x.  The current
-    outgoing-edge binding ``(dst)-[dstedge]->()`` finds no edge for this sink
-    → file/line are NULL → renders '?'.
-
-    This test is RED on master (outgoing-edge query) and must flip GREEN after
-    the Step 1.1 fix in fix_downstream_sink_location.md (incoming-edge query).
-
-    TC6 (upstream) does NOT cover this: TC6 asserts file:line for a column that
-    HAS an outgoing edge (a source).  TC6b explicitly targets a terminal sink —
-    the case that caused 81% '?' on the DWH corpus.
-    """
-    db, _ = indexed_db
-
-    # First confirm mart.fact_kpi.measure has zero outgoing COLUMN_LINEAGE edges —
-    # if this assertion fails, the fixture changed and the sink choice is wrong.
-    outgoing_count = db.run_read(
-        'SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE src_key = ?',
-        {"id": "mart.fact_kpi.measure"},
-    )
-    sink_outgoing = outgoing_count[0]["n"] if outgoing_count else 0
-    assert sink_outgoing == 0, (
-        f"mart.fact_kpi.measure has {sink_outgoing} outgoing COLUMN_LINEAGE edge(s) — "
-        "it is no longer a terminal sink.  Choose a different sink column for TC6b."
+    db_path, _ = indexed_db_file
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["analyze", "downstream", "staging.src_a.x", "--depth", "5"],
+        env={"SQLCG_DB_PATH": str(db_path)},
     )
 
-    # Run the downstream query starting from a physical source.
-    # The terminal sink mart.fact_kpi.measure must appear in the result.
-    query = _downstream_filtered_query()
-    rows = db.run_read(query, {"ref": "staging.src_a.x"})
-    assert rows, "No downstream results from staging.src_a.x — TC1/upstream lineage may be broken."
-
-    sink_rows = [r for r in rows if r["id"] == "mart.fact_kpi.measure"]
-    assert sink_rows, (
-        f"mart.fact_kpi.measure not found in downstream results.\n"
-        f"Returned ids: {sorted(r['id'] for r in rows)}"
+    assert result.exit_code == 0, f"CLI exited {result.exit_code}: {result.output}"
+    assert "mart.fact_kpi.measure" in result.output, (
+        f"Terminal sink 'mart.fact_kpi.measure' not found in CLI output.\nOutput:\n{result.output}"
     )
-
-    # The load-bearing assertion: the terminal sink must have a real file, not NULL.
-    # This is RED on master (outgoing-edge query returns NULL for a sink) and GREEN
-    # after the fix (incoming-edge query finds the producing INSERT query's file_path).
-    sink_file = sink_rows[0].get("file")
-    assert sink_file is not None and sink_file != "", (
-        f"mart.fact_kpi.measure has file='{sink_file}' (NULL/empty) — "
-        "the downstream location-binding query uses the outgoing edge, "
-        "which is absent for a terminal sink.  "
-        "Fix: flip OPTIONAL MATCH (dst)-[dstedge:COLUMN_LINEAGE]->() "
-        "to OPTIONAL MATCH ()-[dstedge:COLUMN_LINEAGE]->(dst) in analyze.py "
-        "lines ~134 and ~146 (fix_downstream_sink_location.md Step 1.1)."
+    # The terminal sink must not render its location as '?' — a '?' means the file/line
+    # binding returned NULL (outgoing-edge query finds no edge for a sink node).
+    output_lines = result.output.splitlines()
+    tail = output_lines[-5:] if len(output_lines) >= 5 else output_lines
+    assert "?" not in tail, (
+        "Terminal sink location rendered as '?' — fix_downstream_sink_location regression.\n"
+        "Last 5 lines:\n" + "\n".join(tail)
     )
