@@ -68,6 +68,9 @@ def test_transaction_default_warning(caplog):
         def set_indexed_sha(self, sha):
             pass
 
+        def clear_all_tables(self) -> None:
+            pass
+
         def close(self):
             pass
 
