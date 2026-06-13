@@ -547,7 +547,8 @@ spot-check:
 ### PR-1 Baseline (measured)
 
 Measured 2026-06-13, DWH graph sha `fdf1b551a34601a6cf3ce1c8b9f76e27ce2753e6`,
-1335 files indexed, v1.26.0.
+1335 files indexed, v1.26.0, **master without E8** (E8 / PR #111 was closed,
+never merged — these measurements reflect the canonical master state).
 
 Two independent from-scratch re-indexes at the same sha produced slightly
 different counts:
@@ -557,11 +558,14 @@ different counts:
 | Agent A (earlier) | **168** | reported to architect-planner; used for §Baseline reconciliation |
 | Agent B (fresh from-scratch, `/tmp/pr1_baseline.duckdb`) | **164** | catalog-apply timing drift; ~443s wall-time incl. 122 815-column catalog re-apply |
 
-**Working baseline: ≈164–168 graph-wide across two from-scratch re-indexes at sha
-`fdf1b551` (catalog-apply timing drift accounts for the ~4-row variance). Treat
-~166 as the working mid-point.** The §Baseline reconciliation and all acceptance
-criteria are keyed to **168** (the number the architect-planner used). Either
-observation is consistent with the reconciled §Baseline.
+**Authoritative without-E8 master baseline: 168.** (The ≈164–168 spread across the
+two runs reflects catalog-apply timing drift only; Agent A's 168 was used by the
+architect-planner for the §Baseline reconciliation and all acceptance criteria.)
+The §Baseline reconciliation and all acceptance criteria are keyed to **168** (the
+number the architect-planner used). Either observation is consistent with the
+reconciled §Baseline. E8 was measured to move this count by only **1** (168→167);
+since E8 is not on master (PR #111 closed), this baseline is the correct without-E8
+starting point PR-2 must move.
 
 This diverges from the plan's documented baseline of 46. The plan says to STOP
 and reconcile when the metric diverges materially (the "projection assumes this
