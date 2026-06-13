@@ -242,23 +242,27 @@ def cte_gap_db(tmp_path, monkeypatch):
     return _index(tmp_path, {"ddl.sql": _CTE_DDL, "etl.sql": _CTE_ETL})
 
 
-def test_change_scope_cte_gating_not_in_either_field(cte_gap_db, tmp_path):
-    """CTE-wrapped pure-gating read: da.d is in NEITHER gating_join_tables NOR affected_tables.
+def test_change_scope_cte_gating_in_gating_join_after_pr2(cte_gap_db, tmp_path):
+    """CTE-wrapped pure-gating read: da.d IS now in gating_join_tables after PR-2.
 
-    This is the documented residual gap (plan/sprints/unfilled_table_impact.md §View 1
-    honest semantics, M1): da.x is read only inside the CTE; the parser's _real_tables
-    excludes CTE-sourced names, so no SELECTS_FROM edge is emitted for da.x.
-    No column of da.d derives from da.x either. Both views miss this case.
+    Originally documented as a gap (plan/sprints/unfilled_table_impact.md §View 1
+    M1): the parser's _real_tables excluded CTE-sourced names, so no SELECTS_FROM
+    edge was emitted for da.x.  PR-2 fixes this by descending CTE child scopes.
 
-    Guards plan/sprints/unfilled_table_impact.md PR 3 Test Strategy (documented gap).
+    After PR-2: da.x IS a SELECTS_FROM source of the INSERT into da.d (via the CTE
+    body), so get_change_scope("da.x") correctly reports da.d as a gating-join
+    downstream.  da.d remains NOT in affected_tables (no column derives from da.x).
+
+    Guards plan/sprints/issue-38-selects-from-island-lever.md §Acceptance PR-2.
     """
     result = get_change_scope("da.x")
-    assert "da.d" not in result.gating_join_tables, (
-        f"da.d must NOT appear in gating_join_tables for CTE-wrapped pure-gating read. "
-        f"Got: {result.gating_join_tables}"
+    assert "da.d" in result.gating_join_tables, (
+        f"da.d must appear in gating_join_tables after PR-2 CTE-body fix. "
+        f"Got: {result.gating_join_tables}. "
+        "The CTE body reads da.x; _real_tables now emits SELECTS_FROM for it."
     )
     assert "da.d" not in result.affected_tables, (
-        f"da.d must NOT appear in affected_tables for CTE-wrapped pure-gating read. "
+        f"da.d must NOT appear in affected_tables (no column derives from da.x). "
         f"Got: {result.affected_tables}"
     )
 

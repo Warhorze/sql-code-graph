@@ -164,18 +164,28 @@ def t0b_db(tmp_path, monkeypatch):
     return _index(tmp_path, {"ddl.sql": _T0B_DDL, "etl.sql": _T0B_ETL})
 
 
-def test_cte_wrapped_pure_gating_not_caught_in_row_empty_tables(t0b_db):
-    """CTE-wrapped pure-gating read of da.x does NOT appear in row_empty_tables.
+def test_cte_wrapped_pure_gating_caught_in_row_empty_tables_after_pr2(t0b_db):
+    """CTE-wrapped pure-gating read of da.x IS now detected in row_empty_tables.
 
-    T0b: documents the accepted known gap. The parser's _real_tables excludes
-    CTE-sourced names (base.py L604, performance-invariant hot path, out of scope).
-    Neither view detects this case — it is a documented, accepted limitation.
-    Guards plan/sprints/unfilled_table_impact.md PR 1 T0b.
+    T0b originally documented an accepted gap: the parser's _real_tables excluded
+    CTE-sourced names and never descended into CTE body scopes, so a CTE-body read
+    of da.x was invisible to the SELECTS_FROM emission.
+
+    PR-2 (#38 island-lever fix, plan/sprints/issue-38-selects-from-island-lever.md):
+    _real_tables() now descends CTE child scopes and emits SELECTS_FROM rows for
+    tables found there.  The CTE body ``SELECT 1 AS k FROM da.x`` makes da.x a
+    real source of the INSERT into da.d, so the row-empty propagation now correctly
+    detects da.d as affected when da.x is empty.
+
+    This flip (not-caught → caught) is the intended consequence of the PR-2 fix:
+    the T0b gap is resolved.
+    Guards plan/sprints/unfilled_table_impact.md PR 1 T0b (gap now closed by PR-2).
     """
     result = _compute_empty_propagation(t0b_db, ["da.x"], None)
-    assert "da.d" not in result.row_empty_tables, (
-        f"da.d should NOT be in row_empty_tables for CTE-wrapped pure-gating read of da.x. "
-        f"Got: {result.row_empty_tables}. This is the documented accepted gap (T0b)."
+    assert "da.d" in result.row_empty_tables, (
+        f"da.d should be in row_empty_tables after PR-2 CTE-body descent fix. "
+        f"Got: {result.row_empty_tables}. "
+        "The CTE body reads da.x, so da.d is affected when da.x is empty."
     )
 
 

@@ -604,33 +604,72 @@ class SqlParser(ABC):
     def _real_tables(self, scope: Any) -> list[TableRef]:
         """Return real (non-CTE) tables referenced in a scope.
 
+        Collects tables from two places:
+        1. The top-level scope (``scope.tables``), filtering out CTE aliases.
+        2. Each CTE child scope (``scope.cte_sources.values()``), filtering the
+           child's table list against the **root** scope's flat CTE alias set.
+           This is a single-level pass — ``root.cte_sources`` is already flat in
+           sqlglot (all CTEs appear at the root level, even if they reference each
+           other).  Probed on sqlglot 30.6.0: a query ``WITH cte1 AS (SELECT x FROM
+           s.a), cte2 AS (SELECT x FROM cte1) SELECT x FROM cte2`` yields
+           ``root.cte_sources.keys() == ['cte1', 'cte2']``, so filtering each child's
+           tables against root's flat key set correctly drops inner CTE-alias references
+           (e.g. cte2 references cte1 → cte1 is in root.cte_sources → dropped).
+
+        Known gap — recursive CTEs (``WITH RECURSIVE r AS (… UNION ALL … FROM r)``):
+        the flat ``cte_sources`` walk yields zero real tables for recursive CTEs because
+        sqlglot puts their base/recursive halves in ``scope.union_scopes[i].tables``,
+        not in ``cte_sources.values()[i].tables``.  Recursive CTEs do not appear in the
+        DWH gap population (research §4, plan/sprints/issue-38-selects-from-island-lever.md),
+        so this is documented as a known gap for a future ticket rather than implemented here.
+
+        Schema-alias remap (e.g. ``ba_tmp → ba``) is applied via ``_apply_table_alias``
+        to CTE-body tables exactly as it is applied to top-level tables, so new edges land
+        on the correct giant-component table ids.
+
+        The returned list is de-duplicated: a real table reachable both top-level and via
+        a CTE body appears only once.
+
         Args:
             scope: sqlglot scope object
 
         Returns:
-            List of TableRef objects for non-CTE tables
+            De-duplicated list of TableRef objects for real (non-CTE) tables.
         """
         if not scope:
             return []
 
+        # Flat set of ALL CTE alias names at the root scope.  Used to filter both the
+        # top-level tables and each CTE child's tables.
         cte_sources = set(scope.cte_sources.keys()) if hasattr(scope, "cte_sources") else set()
-        tables = []
+        # Track seen full_ids to de-duplicate across top-level + CTE-body contributions.
+        seen: set[str] = set()
+        tables: list[TableRef] = []
 
-        if hasattr(scope, "tables"):
-            # scope.tables is a list of Table expressions
-            table_list = scope.tables
-            if isinstance(table_list, list):
-                for table_expr in table_list:
-                    # Extract the table name to check if it's a CTE
-                    table_name = None
-                    if hasattr(table_expr, "name"):
-                        table_name = table_expr.name
+        def _collect_from_table_list(table_list: list[Any]) -> None:
+            """Append resolved, alias-remapped TableRefs; filter CTE aliases by cte_sources."""
+            for table_expr in table_list:
+                table_name = table_expr.name if hasattr(table_expr, "name") else None
+                if table_name in cte_sources:
+                    continue
+                ref = self._apply_table_alias(self._convert_table_expr_to_ref(table_expr))
+                if ref and ref.full_id not in seen:
+                    seen.add(ref.full_id)
+                    tables.append(ref)
 
-                    if table_name not in cte_sources:
-                        # Convert table expression to TableRef
-                        ref = self._apply_table_alias(self._convert_table_expr_to_ref(table_expr))
-                        if ref:
-                            tables.append(ref)
+        # Step 1: top-level tables (existing behaviour, unchanged).
+        if hasattr(scope, "tables") and isinstance(scope.tables, list):
+            _collect_from_table_list(scope.tables)
+
+        # Step 2: single-level pass over CTE child scopes (#38 PR-2 fix).
+        # Each value in scope.cte_sources is the child Scope for that CTE.  We collect
+        # real tables from the child's .tables list, filtering against the ROOT's flat
+        # cte_sources key set (not the child's own cte_sources).
+        if cte_sources and hasattr(scope, "cte_sources"):
+            for child_scope in scope.cte_sources.values():
+                if not hasattr(child_scope, "tables") or not isinstance(child_scope.tables, list):
+                    continue
+                _collect_from_table_list(child_scope.tables)
 
         return tables
 
