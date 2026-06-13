@@ -57,8 +57,12 @@ def test_F2_install_global_scope_skill_has_frontmatter(fake_home: Path) -> None:
     )
 
 
-def test_F2_install_global_scope_skill_contains_all_16_tools(fake_home: Path) -> None:
-    """Step 3.1 AC: skill body lists all 16 MCP tool names."""
+def test_F2_install_global_scope_skill_contains_all_18_tools(fake_home: Path) -> None:
+    """Step 3.1 AC: skill body lists all 18 MCP tool names (v1.23.0 adds get_pr_impact).
+
+    v1.22.0 added get_empty_propagation (17); v1.23.0 added get_pr_impact (18).
+    Guards that the installed SKILL.md stays in sync with the live registry count.
+    """
     with patch("shutil.which", side_effect=_which_sqlcg):
         runner.invoke(app, ["install", "--scope", "global"])
     skill_path = fake_home / ".claude" / "skills" / "sqlcg" / "SKILL.md"
@@ -82,8 +86,10 @@ def test_F2_install_global_scope_skill_contains_all_16_tools(fake_home: Path) ->
         "index_repo",
         "execute_sql",
         "submit_feedback",
+        "get_empty_propagation",
+        "get_pr_impact",
     ]
-    assert len(expected_tools) == 16, "Test fixture must list exactly 16 tools"
+    assert len(expected_tools) == 18, "Test fixture must list exactly 18 tools"
     missing = [t for t in expected_tools if t not in content]
     assert not missing, f"Skill file is missing these tool names: {missing}"
 

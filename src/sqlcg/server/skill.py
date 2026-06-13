@@ -72,11 +72,14 @@ _WORKFLOWS = """\
 - **CI impact**: `diff_impact(changed_files)` (fact); `presentation_facing` flags user-visible tables; `external_consumers` lists any declared external egress consumers (e.g. Tableau, BI tools) attached to tables in the blast radius via `CONSUMED_BY` edges — injected at index time from `[[sqlcg.external_consumers]]` in `.sqlcg.toml`.
 - **Downstream egress**: `get_downstream_dependencies(col)` appends `DependencyNode(kind="external_consumer")` entries for any declared external consumers attached to terminal tables — these represent data leaving the modeled SQL corpus.
 - **Hub topology**: `get_hub_ranking(k)` (fact); high hub = high-risk change target, quantify via `scope_change`.
+- **Empty-table blast radius**: `get_empty_propagation(tables)` (fact); answers "a job failed and left table(s) empty — what downstream is at risk?". Returns two views: View 2 (primary, column-lineage) = downstream columns that lose source values; View 1 (supplement, row-reachability) = tables that row-empty via direct gating join. Always lead with View 2 (`value_affected_tables`).
+- **PR regression detection**: `get_pr_impact(base_ref)` (fact); detects tables that LOSE their SQL producer between `base_ref` and HEAD — code regression only, not runtime row-count monitoring. Lost producers appear in `lost_producers` with blast radius; renames (column-set AND consumer Jaccard ≥ 0.6) appear in `renamed_tables` for human verification. NOTE: this tool resyncs the graph to HEAD as a side effect.
+- **Graph health metrics** (CLI-only surface, not MCP): `uv run sqlcg gain` (human-readable) or `uv run sqlcg gain --json` (machine-readable JSON) reports coverage, edge-health, parse quality, and CTE-source gaps. An MCP agent that needs to know graph health should ask the user to run this command and share the output.
 """
 
 # ---------------------------------------------------------------------------
 # Explicit tool → return-model map (single source for fact/heuristic label)
-# The map covers all 17 @mcp.tool()-decorated functions.
+# The map covers all 18 @mcp.tool()-decorated functions.
 # For tools returning plain dict/list[dict] (no Pydantic model), we use
 # BaseModel directly — it has no Judgement field → tagged as fact.
 # ---------------------------------------------------------------------------
