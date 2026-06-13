@@ -87,6 +87,9 @@ Do **all** of this — the tag is the step most easily forgotten.
    ```
    All existing tags are annotated and look like `v1.1.3` (never bare `1.1.3`). Confirm with
    `git tag -l --format='%(contents)' vX.Y.Z` and verify it points at the master merge commit.
+   **Push tags ONE AT A TIME** (`git push origin vX.Y.Z`) — pushing multiple tags in a single
+   push causes GitHub Actions to silently skip runs beyond the first ~3. See
+   [`docs/releasing-pypi.md`](docs/releasing-pypi.md) for the full runbook and backfill guidance.
 
 ## Target scale — serve both ends of the spectrum
 
