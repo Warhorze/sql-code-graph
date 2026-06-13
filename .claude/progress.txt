@@ -1,9 +1,9 @@
 ## Current State [2026-06-13]
-ACTIVE AGENT: architect-planner — IN PROGRESS
-FEATURE: coverage_parse_failures — recover lineage lost to E5/E8 degradation on DWH (3-PR plan)
-BRANCH: plan/coverage-parse-failures
-PLAN: plan/sprints/coverage_parse_failures.md
-INPUT: plan/research/coverage_parse_failure_diagnosis.md (root causes pre-derived, do not re-investigate)
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: sprint-backlog-q2-bugfix PR-A (#116 + #124)
+BRANCH: fix/coverage-metric-baselining
+PLAN: plan/sprints/sprint_backlog_q2_bugfix.md §PR-A
+STATUS: PR opened, awaiting compliance check + review
 
 ## Previous State [2026-06-13]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
