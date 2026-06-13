@@ -468,14 +468,14 @@ class TestMcpStopNoServer:
 
 
 class TestMcpRestart:
-    def test_restart_prints_reconnect_guidance(
+    def test_restart_when_no_server_prints_no_server_message(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ):
-        """mcp_restart prints /mcp reconnect guidance (v1.20.0 self-heal docstring).
+        """mcp_restart with no server running prints 'no server found' message.
 
-        The old 'deferred to v1.2' message is gone; the new message instructs the
-        user to run /mcp → reconnect in Claude Code.
-        Guards plan/sprints/mcp_server_self_healing.md Step 1.2.
+        Guards the honest stop-only behavior: when there is nothing to stop the
+        command reports it clearly rather than pretending a restart occurred.
+        ([plan doc](plan/reports/feature_acceptance_dwh.md) §D MCP-RESTART VERDICT)
         """
         db = tmp_path / "noserver.db"
         monkeypatch.setenv("SQLCG_DB_PATH", str(db))
@@ -484,11 +484,79 @@ class TestMcpRestart:
 
         mcp_restart()
         captured = capsys.readouterr()
-        # Must contain /mcp reconnect guidance
-        assert "/mcp" in captured.out or "reconnect" in captured.out.lower(), (
-            f"Expected /mcp reconnect guidance; got:\n{captured.out}"
+        # Must report no server was found — not silently pretend to have restarted
+        assert "No running server found" in captured.out, (
+            f"Expected 'No running server found' message; got:\n{captured.out}"
         )
-        # Must NOT contain the old 'deferred to v1.2' promise
-        assert "deferred to v1.2" not in captured.out, (
-            f"Output must not contain 'deferred to v1.2'; got:\n{captured.out}"
+        # Must NOT say "Server stopped" when nothing was stopped
+        assert "Server stopped" not in captured.out, (
+            f"Output must not claim stop when nothing ran; got:\n{captured.out}"
         )
+
+    def test_restart_when_server_running_stops_and_prints_reconnect_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """mcp_restart with a live server calls stop_server and prints stop-only guidance.
+
+        The command stops the server but does NOT spawn a new one. Output must
+        explicitly say stop-only and give reconnect instructions, never implying
+        a new process was started.
+        ([plan doc](plan/reports/feature_acceptance_dwh.md) §D MCP-RESTART VERDICT)
+        """
+        db = tmp_path / "server.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db))
+
+        from unittest.mock import patch
+
+        from sqlcg.cli.commands.mcp import mcp_restart
+
+        # Simulate a running server that stop_server() stops successfully
+        with patch("sqlcg.cli.commands.mcp.stop_server", return_value=True) as mock_stop:
+            with patch("sqlcg.cli.commands.mcp.console") as mock_console:
+                mcp_restart()
+
+        # stop_server must have been called exactly once
+        mock_stop.assert_called_once()
+
+        # The printed output must contain stop-only signal and reconnect guidance
+        printed_args = " ".join(str(call) for call in mock_console.print.call_args_list)
+        assert "stop" in printed_args.lower(), (
+            f"Expected stop signal in output; got:\n{printed_args}"
+        )
+        assert "reconnect" in printed_args.lower(), (
+            f"Expected reconnect guidance in output; got:\n{printed_args}"
+        )
+        # Must NOT contain the stale 'deferred to v1.2' promise
+        assert "deferred to v1.2" not in printed_args, (
+            f"Output must not contain 'deferred to v1.2'; got:\n{printed_args}"
+        )
+
+    def test_restart_output_never_implies_new_process_spawned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """mcp_restart output must not use language implying a new server started.
+
+        The DWH acceptance test confirmed that after 'mcp restart' the server is NOT
+        running. This test guards that the output wording does not mislead the user
+        into thinking otherwise.
+        ([plan doc](plan/reports/feature_acceptance_dwh.md) §D MCP-RESTART VERDICT)
+        """
+        db = tmp_path / "server.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db))
+
+        from unittest.mock import patch
+
+        from sqlcg.cli.commands.mcp import mcp_restart
+
+        with patch("sqlcg.cli.commands.mcp.stop_server", return_value=True):
+            with patch("sqlcg.cli.commands.mcp.console") as mock_console:
+                mcp_restart()
+
+        printed_args = " ".join(str(call) for call in mock_console.print.call_args_list)
+        # These phrases would imply a server is now running — they must not appear
+        misleading_phrases = ["server started", "new server", "server is up", "server running"]
+        for phrase in misleading_phrases:
+            assert phrase not in printed_args.lower(), (
+                f"Output must not imply a new server started (found '{phrase}'); "
+                f"got:\n{printed_args}"
+            )

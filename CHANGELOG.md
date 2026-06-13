@@ -71,7 +71,7 @@
 > `SCHEMA_VERSION` 4 to 6 (added `start_line` on `SqlQuery`, repurposed
 > `SqlTable.kind`, added the `ExternalConsumer` node + `CONSUMED_BY` edge). There
 > is no in-place migration — re-run `sqlcg index <path>` to rebuild the graph. If
-> you run the MCP server, restart it (`sqlcg mcp restart`) after re-indexing.
+> you run the MCP server, stop it (`sqlcg mcp stop`) and reconnect via your editor after re-indexing. (Note: as of v1.20.0 the server self-heals on the next tool call — no manual stop needed.)
 
 ### Feat
 
