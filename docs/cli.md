@@ -670,13 +670,23 @@ a final message based on whether a server was found.
 sqlcg mcp restart [OPTIONS]
 ```
 
-Stop the server. The client (editor) must respawn.
+Stop the server (stop-only — the client must reconnect).
 
-v1.1 cannot re-parent an editor-spawned stdio process.  This command
-stops the current server and prints guidance for the user to restart
-the MCP server via their editor's MCP configuration.
+This command STOPS the server and instructs you to reconnect via your
+editor. It does NOT spawn a new server process.
 
-True auto-restart (re-parenting stdio) is deferred to v1.2.
+**Why no auto-respawn**: sqlcg runs as a stdio JSON-RPC server. The MCP
+client (e.g. Claude Code) launches it and holds the stdin/stdout pipe.
+A separate CLI invocation cannot re-attach to that pipe — only the client
+can respawn the server on reconnect.
+
+After running this command, reconnect from your editor (Claude Code: run
+`/mcp` → reconnect `sql-code-graph`, or restart the session).
+
+The normal upgrade path does **not** require this command: since v1.20.0 the
+server self-heals — on the next tool call after a reinstall it re-execs
+itself in place. Use `mcp restart` only when the process is unresponsive
+and you need an immediate stop before reconnecting manually.
 
 ### Options
 

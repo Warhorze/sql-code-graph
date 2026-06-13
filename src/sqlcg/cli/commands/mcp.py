@@ -291,19 +291,37 @@ def mcp_stop() -> None:
 
 @app.command("restart")
 def mcp_restart() -> None:
-    """Stop the server. Use only when the process is wedged.
+    """Stop the server (stop-only — the client must reconnect).
 
-    As of v1.20.0 the server self-heals automatically: on the next MCP tool
-    call after a reinstall it detects the version skew and re-execs itself
-    in place (same PID, same stdio pipe) — no editor reconnect needed.
+    This command STOPS the server and instructs you to reconnect via your
+    editor. It does NOT spawn a new server process.
 
-    Manual restart is only needed when the process is unresponsive or you
-    want to force an immediate pick-up of the new build without waiting for
-    the next tool call.  In Claude Code run /mcp → reconnect sql-code-graph
-    (or restart the session) after stopping.
+    Why no auto-respawn: sqlcg runs as a stdio JSON-RPC server. The MCP
+    client (e.g. Claude Code) launches it and holds the stdin/stdout pipe.
+    A separate CLI invocation cannot re-attach to that pipe — only the client
+    can respawn the server on reconnect.
+
+    After running this command, reconnect from your editor:
+      - Claude Code: run /mcp → reconnect sql-code-graph (or restart the
+        session).
+
+    The normal upgrade path does NOT require this command: as of v1.20.0 the
+    server self-heals — on the next tool call after a reinstall it detects the
+    version skew and re-execs itself in place (same PID, same stdio pipe).
+    Use this command only when the process is unresponsive and you need an
+    immediate stop before reconnecting manually.
     """
-    mcp_stop()
-    console.print(
-        "[yellow]Server stopped.[/yellow] In Claude Code run [bold]/mcp[/bold] → reconnect "
-        "[italic]sql-code-graph[/italic] (or restart the session) to pick up the new build."
-    )
+    stopped = stop_server()
+    if stopped:
+        console.print(
+            "[yellow]Server stopped (stop-only).[/yellow] "
+            "No new process was spawned — the server does not auto-restart.\n"
+            "To reconnect: in Claude Code run [bold]/mcp[/bold] → reconnect "
+            "[italic]sql-code-graph[/italic] (or restart the session)."
+        )
+    else:
+        console.print(
+            "[yellow]No running server found.[/yellow] "
+            "Nothing was stopped. If you expected a server to be running, "
+            "check `sqlcg mcp status`."
+        )
