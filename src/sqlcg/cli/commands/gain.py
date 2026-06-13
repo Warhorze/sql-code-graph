@@ -26,7 +26,12 @@ def gain_cmd(
         "--json",
         help="Output metrics as JSON",
     ),
-    _metrics_path: Path | None = None,  # For testing only
+    _metrics_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--metrics-path",
+        hidden=True,
+        help="Override metrics DB path (for testing only).",
+    ),
 ) -> None:
     """Show metrics and feedback analytics.
 
