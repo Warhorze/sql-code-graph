@@ -44,7 +44,8 @@ def _build_synthetic_db() -> duckdb.DuckDBPyConnection:
         CREATE TABLE "COLUMN_LINEAGE" (
             src_key VARCHAR,
             dst_key VARCHAR,
-            query_id VARCHAR
+            query_id VARCHAR,
+            inferred_from_source_name BOOLEAN
         )
     """)
     con.execute("""
@@ -54,14 +55,14 @@ def _build_synthetic_db() -> duckdb.DuckDBPyConnection:
         )
     """)
 
-    # Row 1: CTE-wrapped INSERT — COLUMN_LINEAGE present, SELECTS_FROM absent
+    # Row 1: CTE-wrapped INSERT — COLUMN_LINEAGE present (real edge), SELECTS_FROM absent
     con.execute(
         'INSERT INTO "SqlQuery" VALUES (?, ?, ?, ?, ?)',
         ("q1", "INSERT", "ba.target_a", "etl/file_a.sql", False),
     )
     con.execute(
-        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?)',
-        ("ba.target_a.col1", "ba.source_a.col1", "q1"),
+        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+        ("ba.target_a.col1", "ba.source_a.col1", "q1", False),
     )
     # No SELECTS_FROM row for q1 — this is the gap the metric targets
 
@@ -71,8 +72,8 @@ def _build_synthetic_db() -> duckdb.DuckDBPyConnection:
         ("q2", "INSERT", "ba.target_b", "etl/file_b.sql", False),
     )
     con.execute(
-        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?)',
-        ("ba.target_b.col1", "ba.source_b.col1", "q2"),
+        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+        ("ba.target_b.col1", "ba.source_b.col1", "q2", False),
     )
     con.execute(
         'INSERT INTO "SELECTS_FROM" VALUES (?, ?)',
@@ -86,8 +87,8 @@ def _build_synthetic_db() -> duckdb.DuckDBPyConnection:
         ("q3", "SELECT", "da.ctas_target", "etl/file_c.sql", False),
     )
     con.execute(
-        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?)',
-        ("da.ctas_target.col1", "da.source_c.col1", "q3"),
+        'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+        ("da.ctas_target.col1", "da.source_c.col1", "q3", False),
     )
     # No SELECTS_FROM row for q3 either
 
@@ -143,7 +144,8 @@ class TestCteSourceGapWritesMetric:
             CREATE TABLE "COLUMN_LINEAGE" (
                 src_key VARCHAR,
                 dst_key VARCHAR,
-                query_id VARCHAR
+                query_id VARCHAR,
+                inferred_from_source_name BOOLEAN
             )
         """)
         con.execute("""
@@ -158,8 +160,8 @@ class TestCteSourceGapWritesMetric:
             ("q1", "INSERT", "ba.target", "etl/f.sql", False),
         )
         con.execute(
-            'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?)',
-            ("ba.target.col1", "ba.src.col1", "q1"),
+            'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+            ("ba.target.col1", "ba.src.col1", "q1", False),
         )
         con.execute('INSERT INTO "SELECTS_FROM" VALUES (?, ?)', ("q1", "ba.src"))
 
@@ -191,7 +193,8 @@ class TestCteSourceGapWritesMetric:
             CREATE TABLE "COLUMN_LINEAGE" (
                 src_key VARCHAR,
                 dst_key VARCHAR,
-                query_id VARCHAR
+                query_id VARCHAR,
+                inferred_from_source_name BOOLEAN
             )
         """)
         con.execute('CREATE TABLE "SELECTS_FROM" (src_key VARCHAR, dst_key VARCHAR)')
@@ -202,8 +205,8 @@ class TestCteSourceGapWritesMetric:
             ("q_select", "SELECT", "da.inferred_target", "etl/ctas.sql", False),
         )
         con.execute(
-            'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?)',
-            ("da.inferred_target.col1", "da.src.col1", "q_select"),
+            'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+            ("da.inferred_target.col1", "da.src.col1", "q_select", False),
         )
 
         try:
@@ -215,4 +218,56 @@ class TestCteSourceGapWritesMetric:
         count = result[0]
         assert count == 0, (
             f"SELECT-kind row must be excluded by kind discriminator, got count={count}"
+        )
+
+    def test_cte_source_gap_excludes_writes_with_only_inferred_edges(self):
+        """Writes whose COLUMN_LINEAGE edges are all inferred_from_source_name=TRUE are excluded.
+
+        No-FROM literal inserts (INSERT … SELECT NULL AS x) produce only phantom
+        (inferred=TRUE) edges.  They are not addressable CTE gaps and must not be
+        counted even though they have COLUMN_LINEAGE but no SELECTS_FROM.
+
+        Guards #116 floor-filter
+        ([plan doc](plan/sprints/sprint_backlog_q2_bugfix.md)).
+        """
+        con = duckdb.connect(":memory:")
+        con.execute("""
+            CREATE TABLE "SqlQuery" (
+                id VARCHAR PRIMARY KEY,
+                kind VARCHAR,
+                target_table VARCHAR,
+                file_path VARCHAR,
+                parse_failed BOOLEAN
+            )
+        """)
+        con.execute("""
+            CREATE TABLE "COLUMN_LINEAGE" (
+                src_key VARCHAR,
+                dst_key VARCHAR,
+                query_id VARCHAR,
+                inferred_from_source_name BOOLEAN
+            )
+        """)
+        con.execute('CREATE TABLE "SELECTS_FROM" (src_key VARCHAR, dst_key VARCHAR)')
+
+        # INSERT with only inferred edges (no-FROM literal insert floor)
+        con.execute(
+            'INSERT INTO "SqlQuery" VALUES (?, ?, ?, ?, ?)',
+            ("q_literal", "INSERT", "t", "etl/literal.sql", False),
+        )
+        con.execute(
+            'INSERT INTO "COLUMN_LINEAGE" VALUES (?, ?, ?, ?)',
+            ("t.x", "t.x", "q_literal", True),  # inferred=TRUE
+        )
+        # No SELECTS_FROM row
+
+        try:
+            result = con.execute(_Q_CTE_SOURCE_GAP_WRITES).fetchone()
+        finally:
+            con.close()
+
+        assert result is not None
+        count = result[0]
+        assert count == 0, (
+            f"Expected 0: all-inferred write must not be counted as CTE gap, got {count}"
         )
