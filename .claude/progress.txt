@@ -1,7 +1,63 @@
+## Current State [2026-06-13]
+ACTIVE AGENT: developer — IN PROGRESS
+FEATURE: doc-tests-harness — CLI flag staleness guard + markdown link checker + gain --metrics-path fix (v1.25.1)
+BRANCH: feat/doc-tests-harness
+
+## Previous State [2026-06-13]
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: unfilled_table_impact PR 4 — SELECTS_FROM-completeness fix (v1.24.1)
+BRANCH: feat/selects-from-completeness
+PR: https://github.com/Warhorze/sql-code-graph/pull/98
+
+## Handoff — developer: unfilled_table_impact PR 4 — SELECTS_FROM-completeness bugfix (v1.24.1) [2026-06-13]
+
+SUMMARY: Implemented PR 4 from plan/sprints/unfilled_table_impact.md.
+
+FILES CHANGED (11):
+  src/sqlcg/core/queries.sql: rewrite ANALYZE_UNUSED_TABLES to 3-signal union; add FIND_TABLE_USAGES_VIA_LINEAGE
+  src/sqlcg/core/queries.py:44: add FIND_TABLE_USAGES_VIA_LINEAGE_QUERY constant
+  src/sqlcg/server/models.py:106: add usage_kind: Literal["direct","via_lineage"] = "direct" to TableUsage
+  src/sqlcg/server/tools.py:936-995: augment find_table_usages (direct + via_lineage + dedup + new hint)
+  src/sqlcg/cli/commands/analyze.py:L283-L315: rewrite unused inlined SQL + docstring caveat
+  pyproject.toml: 1.24.0 → 1.24.1
+  src/sqlcg/__init__.py: 1.24.0 → 1.24.1
+  uv.lock: updated
+  tests/integration/test_selects_from_completeness.py: 19 new tests
+  tests/unit/test_selects_from_completeness_unit.py: 7 new tests
+  tests/unit/test_tools_hints.py: updated 2 tests (3rd run_read mock added)
+
+PYTEST TOTALS:
+  Unit+integration: 1426 passed, 4 skipped, 1 xfailed, 0 failed
+  4 perf-invariant suites (13 tests): all pass unmodified
+  ruff check: clean (pre-existing E501 in untracked test_bare_twin_third_residual.py only)
+  ruff format: clean
+  pyright: 0 errors
+
+LIVE DWH ACCEPTANCE:
+  OLD (SELECTS_FROM-only): 4,972 tables falsely flagged unused
+  NEW (three-signal union): 4,500 tables flagged unused
+  Reduction: 472 tables no longer falsely flagged
+  da.htavp_drwsorg (432 COLUMN_LINEAGE source edges): NOT in new unused list — CONFIRMED
+  (DWH graph: 1,369 files, 53,285 COLUMN_LINEAGE edges — last indexed v1.24.0)
+
+NAMED TEST RESULTS:
+  T0c: da.x (CTE-derived-only) NOT in unused, FIND_TABLE_USAGES_VIA_LINEAGE returns row — PASS
+  Genuinely-unreferenced: da.ghost still in unused — PASS
+  T0d: da.x_gate (pure-gating gap, defined via DDL) still in unused — PASS
+  4 perf-invariant suites: all 13 pass — PASS
+
+DEVIATIONS:
+  Deviation 1: T0d fixture adds DDL to register da.x_gate in SqlTable (see plan/sprints/unfilled_table_impact.md §Deviations).
+
+CALL SITES CONFIRMED:
+  FIND_TABLE_USAGES_VIA_LINEAGE_QUERY ← tools.py find_table_usages (L963)
+  Rewritten unused CLI SQL ← analyze.py unused command (L305)
+
 ## Current State [2026-06-12]
-ACTIVE AGENT: developer — HANDOFF (operational task complete, no PR)
-FEATURE: v1.21.2 from-scratch DWH rebuild + definitive temp-namespacing acceptance
-BRANCH: master (no code changes)
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: unfilled_table_impact PR 3 — gating-join supplement retrofit (v1.24.0)
+BRANCH: feat/gating-join-retrofit
+PR: https://github.com/Warhorze/sql-code-graph/pull/97
 
 ## Handoff — operational: v1.21.2 from-scratch DWH rebuild + definitive temp acceptance [2026-06-12]
 
