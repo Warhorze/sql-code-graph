@@ -7,12 +7,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-# Module-level imports so tests can patch sqlcg.parsers.base.qualify / build_scope
+# Module-level imports so tests can patch sqlcg.parsers.base.qualify / build_scope /
+# traverse_scope — inline imports would make the patch binding site unpatchable.
 from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
 from sqlglot.optimizer.scope import build_scope as sqlglot_build_scope
+from sqlglot.optimizer.scope import traverse_scope as sqlglot_traverse_scope
 
 qualify = sqlglot_qualify
 build_scope = sqlglot_build_scope
+traverse_scope = sqlglot_traverse_scope
 
 if TYPE_CHECKING:
     from sqlcg.lineage.schema_resolver import SchemaResolver
@@ -604,7 +607,7 @@ class SqlParser(ABC):
     def _real_tables(self, scope: Any) -> list[TableRef]:
         """Return real (non-CTE) tables referenced in a scope.
 
-        Collects tables from two places:
+        Collects tables from three passes:
         1. The top-level scope (``scope.tables``), filtering out CTE aliases.
         2. Each CTE child scope (``scope.cte_sources.values()``), filtering the
            child's table list against the **root** scope's flat CTE alias set.
@@ -615,6 +618,16 @@ class SqlParser(ABC):
            ``root.cte_sources.keys() == ['cte1', 'cte2']``, so filtering each child's
            tables against root's flat key set correctly drops inner CTE-alias references
            (e.g. cte2 references cte1 → cte1 is in root.cte_sources → dropped).
+        3. All subscopes reachable via ``traverse_scope`` on the original statement
+           (``scope.expression.parent``).  This handles ``INSERT … SELECT FROM (SELECT
+           … FROM real)`` and ``CREATE TABLE t AS (SELECT … FROM real_a JOIN real_b)``
+           where the root scope's ``.tables`` is empty because the real source tables
+           live in derived-table / subquery subscopes.  ``traverse_scope`` walks the
+           already-built scope tree — it does NOT call ``build_scope``, ``qualify``, or
+           ``expand``.  The CTE-alias filter is widened to the **union of every
+           subscope's ``cte_sources.keys()``** so CTE aliases referenced as table names
+           in nested scopes are correctly dropped.  (#38 PR-3 fix,
+           plan/sprints/issue-38-residual-source-extraction.md)
 
         Known gap — recursive CTEs (``WITH RECURSIVE r AS (… UNION ALL … FROM r)``):
         the flat ``cte_sources`` walk yields zero real tables for recursive CTEs because
@@ -624,14 +637,14 @@ class SqlParser(ABC):
         so this is documented as a known gap for a future ticket rather than implemented here.
 
         Schema-alias remap (e.g. ``ba_tmp → ba``) is applied via ``_apply_table_alias``
-        to CTE-body tables exactly as it is applied to top-level tables, so new edges land
-        on the correct giant-component table ids.
+        to CTE-body and subscope tables exactly as it is applied to top-level tables,
+        so new edges land on the correct giant-component table ids.
 
         The returned list is de-duplicated: a real table reachable both top-level and via
-        a CTE body appears only once.
+        a CTE body or subscope appears only once.
 
         Args:
-            scope: sqlglot scope object
+            scope: sqlglot root scope object for the statement (from ``build_scope``).
 
         Returns:
             De-duplicated list of TableRef objects for real (non-CTE) tables.
@@ -639,10 +652,27 @@ class SqlParser(ABC):
         if not scope:
             return []
 
-        # Flat set of ALL CTE alias names at the root scope.  Used to filter both the
-        # top-level tables and each CTE child's tables.
-        cte_sources = set(scope.cte_sources.keys()) if hasattr(scope, "cte_sources") else set()
-        # Track seen full_ids to de-duplicate across top-level + CTE-body contributions.
+        # Step 3 pre-pass: collect ALL subscopes via traverse_scope on the original
+        # statement node (scope.expression.parent).  This single pointer-walk over the
+        # cached scope tree is done ONCE per statement, independent of column count.
+        # traverse_scope does NOT call build_scope / qualify / expand.
+        stmt_node = scope.expression.parent if hasattr(scope, "expression") else None
+        all_subscopes: list[Any] = list(traverse_scope(stmt_node)) if stmt_node is not None else []
+
+        # Build the global CTE-alias filter as the UNION of every subscope's
+        # cte_sources.keys() so a CTE alias referenced in any nested scope is dropped.
+        all_cte_aliases: set[str] = set()
+        for sc in all_subscopes:
+            if hasattr(sc, "cte_sources"):
+                all_cte_aliases.update(sc.cte_sources.keys())
+
+        # Flat set of ALL CTE alias names at the root scope (kept for Steps 1+2
+        # backward compat; widened by all_cte_aliases for Step 3).
+        root_cte_aliases = set(scope.cte_sources.keys()) if hasattr(scope, "cte_sources") else set()
+        # Combined filter: root CTE aliases ∪ aliases from all nested subscopes.
+        cte_sources = root_cte_aliases | all_cte_aliases
+
+        # Track seen full_ids to de-duplicate across all three passes.
         seen: set[str] = set()
         tables: list[TableRef] = []
 
@@ -665,11 +695,30 @@ class SqlParser(ABC):
         # Each value in scope.cte_sources is the child Scope for that CTE.  We collect
         # real tables from the child's .tables list, filtering against the ROOT's flat
         # cte_sources key set (not the child's own cte_sources).
-        if cte_sources and hasattr(scope, "cte_sources"):
+        if root_cte_aliases and hasattr(scope, "cte_sources"):
             for child_scope in scope.cte_sources.values():
                 if not hasattr(child_scope, "tables") or not isinstance(child_scope.tables, list):
                     continue
                 _collect_from_table_list(child_scope.tables)
+
+        # Step 3: descend all subscopes to recover tables in derived / subquery scopes.
+        # Skips the root scope (already handled in Steps 1+2) and the direct CTE child
+        # scopes (Step 2, avoid double-emit).  The de-dup `seen` set handles any
+        # residual overlap.
+        if all_subscopes:
+            root_cte_child_scope_ids: set[int] = {
+                id(cs)
+                for cs in (scope.cte_sources.values() if hasattr(scope, "cte_sources") else [])
+            }
+            for sub_scope in all_subscopes:
+                # Skip the root scope (already handled).
+                if sub_scope is scope:
+                    continue
+                # Skip direct CTE child scopes (handled in Step 2, avoid double-emit).
+                if id(sub_scope) in root_cte_child_scope_ids:
+                    continue
+                if hasattr(sub_scope, "tables") and isinstance(sub_scope.tables, list):
+                    _collect_from_table_list(sub_scope.tables)
 
         return tables
 
