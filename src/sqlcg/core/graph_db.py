@@ -80,7 +80,7 @@ class GraphBackend(ABC):
         plus any other properties to SET. All rows must share the same property-key
         set; backends MAY raise if rows are heterogeneous (DuckDBBackend does).
 
-        Idempotent MERGE semantics, identical to upsert_node per row.
+        Idempotent upsert semantics, identical to upsert_node per row.
 
         Args:
             label: Node label (e.g., NodeLabel.COLUMN)
@@ -102,10 +102,10 @@ class GraphBackend(ABC):
           - "dst_key": destination primary-key value (matches dst_label _pk_field)
           - Any additional keys are set as edge properties.
 
-        Idempotent MERGE semantics, identical to upsert_edge per row. Rows whose
-        src or dst node does not exist are silently skipped by KuzuDB's MERGE
-        semantics — callers must ensure node upserts happen first within the same
-        transaction (see indexer ordering rules in _upsert_parsed_file).
+        Idempotent upsert semantics, identical to upsert_edge per row. Rows whose
+        src or dst node does not exist are silently skipped by DuckDB's INSERT OR
+        REPLACE path — callers must ensure node upserts happen first within the
+        same transaction (see indexer ordering rules in _upsert_parsed_file).
 
         Args:
             src_label: Source node label
@@ -246,13 +246,13 @@ class GraphBackend(ABC):
         except Exception:
             raise
 
+    @abstractmethod
     def clear_all_tables(self) -> None:
         """Delete all node and edge rows, preserving the schema structure.
 
         Used by the server drain body for the full-rebuild-in-transaction
-        reindex path. Concrete backends must override this.
+        reindex path. DuckDBBackend is the sole concrete implementation.
         """
-        raise NotImplementedError(f"{type(self).__name__} does not support clear_all_tables")
 
     def expand_star_sources(self) -> int:
         """Expand SELECT * lineage into per-column STAR_EXPANSION edges.

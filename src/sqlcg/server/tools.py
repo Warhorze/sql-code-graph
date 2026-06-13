@@ -6,10 +6,6 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import anyio
 
 from sqlcg.core.config import get_db_path, get_presentation_prefixes
 from sqlcg.core.duckdb_backend import DuckDBBackend
@@ -113,25 +109,10 @@ _backend: GraphBackend | None = None
 # Module-level metrics store singleton
 _metrics: MetricsStore | None = None
 
-# Module-level backend lock — injected by server.py _run_with_control so that
-# MCP write tools (index_repo) share the same lock as the drain loop.
-# None when no server event-loop is running (unit tests, direct DB access).
-_backend_lock: "anyio.Lock | None" = None
-
 # The path that init_backend() actually opened.  Captured at init time so
 # MCP write tools use this path, not get_db_path() which returns the default
 # ~/.sqlcg/graph.db regardless of what was passed to init_backend.
 _init_db_path: str | None = None
-
-
-def _set_backend_lock(lock: "anyio.Lock | None") -> None:
-    """Register the backend lock from the server's task group.
-
-    Called by server.py _run_with_control so MCP write tools use the same
-    lock as the drain loop — ensuring no concurrent RW access.
-    """
-    global _backend_lock
-    _backend_lock = lock
 
 
 def init_backend(db_path: str | None = None) -> None:
