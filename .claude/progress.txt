@@ -1,7 +1,8 @@
 ## Current State [2026-06-13]
-ACTIVE AGENT: developer — IN PROGRESS
-FEATURE: doc-tests-harness — CLI flag staleness guard + markdown link checker + gain --metrics-path fix (v1.25.1)
-BRANCH: feat/doc-tests-harness
+ACTIVE AGENT: developer — HANDOFF (PR ready for review)
+FEATURE: pypi-publish-pipeline — workflow_dispatch re-publish + runbook (v1.25.4)
+BRANCH: fix/pypi-publish-pipeline
+PR: (see handoff below)
 
 ## Previous State [2026-06-13]
 ACTIVE AGENT: developer — HANDOFF (PR ready for review)
