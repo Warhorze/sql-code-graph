@@ -489,3 +489,22 @@ separate known issue, not a PR-2/PR-3 gate).
 - No schema-version change in any PR (PR-1 reads existing `parse_failed`; PR-2/PR-3 change
   edge emission, not the graph schema). Re-index is the migration path (no compat shim).
 - Tagging and issue-closing are user-gated (house rule) — not done by the agent pipeline.
+
+---
+
+### Deviations
+
+#### Deviation 1: Integration test uses two E5 files instead of one E5 + one E8
+- **Reason**: E8 (`dynamic_source`) only reproduces on the Snowflake **scripting** path
+  (`_qualify_bare_tables` key-mismatch inside `BEGIN…END` blocks). The plain Snowflake parser
+  resolves `CREATE TEMP TABLE … AS SELECT` chains correctly intra-file (the temp body is
+  registered in `sources_map` and `sg_lineage` traces through it to the leaf). Reproducing
+  E8 in a unit fixture would require a scripting-block fixture with the key-mismatch, which
+  is the PR-3 fix scope — not appropriate to simulate as a pre-fix integration test.
+- **Change**: `test_degraded_files_count_matches_two_e5_fixture_files` uses two distinct
+  E5-shape view files instead of one E5 + one E8 file. The second E5 file has two E5 column
+  errors so the test still validates that `degraded_files` counts distinct files (not error
+  strings) — the file contributes 1, not 2.
+- **Impact**: The PR-1 integration test pins the distinct-file counting invariant via two E5
+  files. The E8 integration test will be added in PR-3 alongside the fix.
+- **Date**: 2026-06-13
