@@ -116,9 +116,11 @@ async def _control_socket_task(
       as ``index``.  The handler enqueues only — it never touches the backend
       (B1 invariant: only the drain task resolves a backend, under backend_lock).
     - ``{"op": "query", "cypher": ..., "params": ...}`` → executes a
-      read-only SQL query on the single backend connection, serialised
-      behind *backend_lock*.  (The ``cypher`` field name is a legacy wire-key
-      retained for protocol compatibility; the value is SQL.)
+      read-only SQL query via a cursor snapshot on the shared connection.
+      Does NOT acquire ``backend_lock`` — ``run_read`` uses a per-call cursor
+      so it sees the last committed graph without blocking on an active drain.
+      (The ``cypher`` field name is a legacy wire-key retained for protocol
+      compatibility; the value is SQL.)
       **Length-prefixed framing** (v1.2.0):
       ``<decimal-byte-length>\\n<json-body>`` on both request and response.
 
@@ -137,8 +139,10 @@ async def _control_socket_task(
       The client reads frames in a loop and stops when it sees ``done == true``
       — it does NOT rely on EOF as the terminator.
 
-    R2 (single connection): all backend operations go through ``backend_lock``
-    so concurrent calls never touch the single DuckDB connection simultaneously.
+    R2 (single connection, write path): write operations (index/reindex drain)
+    go through ``backend_lock`` so concurrent writes are serialised.  Read
+    queries (``op=query``) bypass the lock and use cursor snapshots instead —
+    see ``run_read`` concurrency contract in ``duckdb_backend.py``.
 
     R8 teardown ordering: the caller must cancel this task BEFORE calling
     ``shutdown_backend()``.  This is guaranteed by the ``anyio.CancelScope``
@@ -366,10 +370,16 @@ async def _control_socket_task(
                             def _do_query() -> list:
                                 return db.run_read(sql, params)
 
-                            async with backend_lock:
-                                # R1: run off event-loop thread; R2: lock serialises
-                                # reads and writes on the single DuckDB connection.
-                                rows = await _to_thread.run_sync(_do_query)
+                            # R1: run off event-loop thread so blocking DB I/O
+                            # does not stall the event loop.
+                            # NOTE: backend_lock is NOT acquired here.  run_read
+                            # uses a cursor snapshot (self._conn.cursor()) so it
+                            # sees the last committed graph without waiting for any
+                            # active drain to commit.  The drain (writer.py:330)
+                            # still holds backend_lock for its full write
+                            # transaction — this change is read-side only.
+                            # Resolves ARCHITECTURE_REVIEW §5 F2 (v1.28.2).
+                            rows = await _to_thread.run_sync(_do_query)
                             resp = {"ok": True, "rows": rows}
 
                 else:
