@@ -107,14 +107,24 @@ def test_degraded_files_count_distinct_files():
     ]
 
     degraded_files = 0
+    degraded_by_cause: dict[str, int] = {}
     for parsed in parsed_files:
-        _, parse_failed = dominant_cause(parsed.errors)
+        cause, parse_failed = dominant_cause(parsed.errors)
         if parse_failed:
             degraded_files += 1
+            degraded_by_cause[cause] = degraded_by_cause.get(cause, 0) + 1
 
     assert degraded_files == 2, (
         f"Expected 2 degraded files (1 E5 + 1 E8), not sum of error strings; "
         f"got degraded_files={degraded_files}"
+    )
+    # degraded_by_cause must partition the headline: buckets sum to degraded_files
+    assert degraded_by_cause == {"E5": 1, "E8": 1}, (
+        f"Expected degraded_by_cause={{'E5': 1, 'E8': 1}}; got {degraded_by_cause}"
+    )
+    assert sum(degraded_by_cause.values()) == degraded_files, (
+        f"degraded_by_cause values must sum to degraded_files ({degraded_files}); "
+        f"got sum={sum(degraded_by_cause.values())}"
     )
 
 
@@ -145,6 +155,9 @@ def _build_base_summary(**overrides) -> dict:
             "other": 0,
         },
         "degraded_files": 0,
+        # degraded_by_cause: FILE counts per dominant cause (partitions degraded_files).
+        # Sum of values must equal degraded_files.
+        "degraded_by_cause": {},
         "batch_size": 50,
         "external_consumers": 0,
         "external_consumer_edges": 0,
@@ -204,16 +217,29 @@ def _call_index_cmd_capture_output(summary: dict) -> list[str]:
 
 
 def test_degraded_line_rendered_with_correct_count():
-    """CLI prints degraded-files line when degraded_files > 0; count matches.
+    """CLI prints degraded-files line with FILE-based buckets that sum to the headline.
 
-    The line must contain the integer count of degraded files and bucket breakdowns.
+    degraded_by_cause partitions degraded_files by dominant cause (one file = one bucket
+    entry), so the sum of bucket values must equal the headline count.  The previous
+    error_summary-based breakdown counted error STRINGS and would show "E5: 1141" when
+    only ~217 files had E5 as their dominant cause — this test pins the corrected
+    file-count behaviour described in the review finding on PR #109.
+
+    Fixture: file1 dominant-E5, file2 dominant-E8, file3 clean → degraded_files=2,
+    degraded_by_cause={"E5": 1, "E8": 1}.  Rendered line buckets must sum to 2.
+
     Plan doc: plan/sprints/coverage_parse_failures.md §PR-1 Step 1.2.
     """
     summary = _build_base_summary(
-        degraded_files=5,
+        degraded_files=2,
+        # degraded_by_cause: FILE counts — 1 file dominated by E5, 1 by E8.
+        # Sum (1+1=2) must equal degraded_files (2).
+        degraded_by_cause={"E5": 1, "E8": 1},
         error_summary={
-            "E5": 3,
-            "E8": 2,
+            # error_summary has more error strings than files (e.g. 39 E5 strings
+            # for the one E5-dominant file) — but the CLI line must NOT use these.
+            "E5": 39,
+            "E8": 5,
             "E1": 0,
             "E2": 0,
             "E3": 0,
@@ -227,13 +253,29 @@ def test_degraded_line_rendered_with_correct_count():
     output = _call_index_cmd_capture_output(summary)
     joined = " ".join(output)
 
-    # The degraded count "5" must appear somewhere in the output
-    assert "5" in joined, f"Expected degraded count 5 in output; got: {output}"
-    # Bucket breakdown lines must appear
+    # The headline "2" must appear
+    assert "2" in joined, f"Expected degraded count 2 in output; got: {output}"
+    # Both cause buckets must appear
     assert "E5" in joined, f"Expected E5 bucket in output; got: {output}"
     assert "E8" in joined, f"Expected E8 bucket in output; got: {output}"
     # The key phrase from the plan's wording
     assert "degraded" in joined.lower(), f"Expected 'degraded' in output; got: {output}"
+
+    # Critical: the rendered bucket values must be FILE counts (1 each), NOT error-string
+    # counts (39 / 5).  Parse the degraded line and verify bucket values sum to the headline.
+    degraded_line = next((line for line in output if "degraded" in line.lower()), "")
+    assert "E5: 1" in degraded_line, (
+        f"Expected 'E5: 1' (file count) in degraded line, not error-string count; "
+        f"got: {degraded_line!r}"
+    )
+    assert "E8: 1" in degraded_line, (
+        f"Expected 'E8: 1' (file count) in degraded line, not error-string count; "
+        f"got: {degraded_line!r}"
+    )
+    # Verify "39" (the error-string count) does NOT appear in the degraded line
+    assert "39" not in degraded_line, (
+        f"Degraded line must use file counts, not error-string counts; got: {degraded_line!r}"
+    )
 
 
 def test_existing_failed_line_unchanged_when_degraded():
@@ -246,6 +288,7 @@ def test_existing_failed_line_unchanged_when_degraded():
     """
     summary = _build_base_summary(
         degraded_files=3,
+        degraded_by_cause={"E5": 2, "timeout": 1},
         quality={"full": 7, "table_only": 1, "scripting_fallback": 0, "failed": 1},
         error_summary={
             "E5": 3,

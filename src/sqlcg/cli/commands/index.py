@@ -16,7 +16,6 @@ from rich.progress import (
 )
 
 from sqlcg.core.config import DbConfig, config_file_present, get_backend, get_db_path, get_dialect
-from sqlcg.indexer.error_classify import _DEGRADING
 from sqlcg.indexer.indexer import Indexer, atomic_full_index
 
 console = Console()
@@ -447,13 +446,16 @@ def _run_index(
             # Additive degraded-files line: distinct-file count whose dominant cause is
             # in _DEGRADING (per plan/sprints/coverage_parse_failures.md §PR-1 Step 1.2).
             # Distinct-file count comes from summary["degraded_files"]; per-bucket breakdown
-            # is from error_summary filtered to _DEGRADING buckets with non-zero counts.
+            # comes from summary["degraded_by_cause"] which partitions that total by dominant
+            # cause (one entry per file, not one per error string) so the bucket counts sum
+            # exactly to n_degraded.
             n_degraded = summary.get("degraded_files", 0)
             if n_degraded:
-                # Build per-bucket breakdown from the degrading buckets only, ordered by count
-                # descending so the dominant cause appears first (E5/E8 on the DWH).
+                # Build per-bucket breakdown from degraded_by_cause (FILE counts, not error-
+                # string counts), ordered by count descending so the dominant cause appears
+                # first (E5/E8 on the DWH).  Sum of buckets == n_degraded.
                 degraded_buckets = sorted(
-                    ((k, v) for k, v in err.items() if k in _DEGRADING and v > 0),
+                    summary.get("degraded_by_cause", {}).items(),
                     key=lambda kv: kv[1],
                     reverse=True,
                 )

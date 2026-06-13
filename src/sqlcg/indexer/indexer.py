@@ -712,19 +712,23 @@ class Indexer:
             "qualify_failed": 0,
             "other": 0,
         }
-        # Denominator: number of distinct files whose dominant cause is in _DEGRADING.
-        # Uses dominant_cause(parsed.errors) — one call per file, not one per error string —
-        # so a file with 39 E5 errors counts as 1, not 39 (matches the "410 files" metric
-        # named in ARCHITECTURE_REVIEW F8 and plan/sprints/coverage_parse_failures.md §PR-1).
+        # Distinct-file counts: degraded_files is the total number of files whose dominant
+        # cause is in _DEGRADING; degraded_by_cause partitions that total by dominant cause
+        # so the per-bucket numbers sum exactly to degraded_files.  Both use dominant_cause()
+        # — one call per file — so a file with 39 E5 errors counts as 1 file with cause E5,
+        # not 39 error strings.  (error_summary still counts raw error strings per bucket and
+        # is kept for log diagnostics; it is NOT used for the CLI breakdown line.)
         degraded_files = 0
+        degraded_by_cause: dict[str, int] = {}
         for parsed in pass2_results:
             for msg in parsed.errors:
                 bucket = _classify_error(msg)
                 if bucket in error_summary:
                     error_summary[bucket] += 1
-            _, parse_failed = dominant_cause(parsed.errors)
+            cause, parse_failed = dominant_cause(parsed.errors)
             if parse_failed:
                 degraded_files += 1
+                degraded_by_cause[cause] = degraded_by_cause.get(cause, 0) + 1
 
         # Emit summary log line
         summary_parts = [f"{k}: {v}" for k, v in error_summary.items() if v > 0]
@@ -747,6 +751,7 @@ class Indexer:
             "quality": nonlocal_counts["quality"],
             "error_summary": error_summary,
             "degraded_files": degraded_files,
+            "degraded_by_cause": degraded_by_cause,
             "batch_size": batch_size,
             "external_consumers": ingest_result["consumers"],
             "external_consumer_edges": ingest_result["edges"],
