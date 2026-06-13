@@ -179,6 +179,45 @@ def test_round_trip_schema_version(db: DuckDBBackend) -> None:
     assert sha == "deadbeef1234"
 
 
+def test_get_indexed_sha_ignores_stale_version_rows(db: DuckDBBackend) -> None:
+    """get_indexed_sha returns the sha for the current schema version only.
+
+    A DB that was migrated through multiple schema versions keeps one row per
+    version in SchemaVersion.  The old LIMIT-1 query returned an arbitrary/stale
+    row instead of the current version's sha, breaking the self-heal post-check.
+    This test pins the fix: inject stale rows for older versions, write the
+    current-version sha via set_indexed_sha, and assert get_indexed_sha returns
+    the current-version sha, not a stale one.
+
+    Guards the get_indexed_sha version-keying fix
+    ([plan doc](plan/sprints/pr_f_self_healing_reindex.md)).
+    """
+    # Simulate a DB that was migrated from older schema versions by injecting
+    # stale rows (INSERT OR REPLACE would only affect the current version row,
+    # so we write directly into the table).
+    stale_sha = "stale_old_sha_aabbcc"
+    db._conn.execute(
+        'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha) VALUES (?, ?)',
+        ["1", stale_sha],
+    )
+    db._conn.execute(
+        'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha) VALUES (?, ?)',
+        ["8", stale_sha],
+    )
+
+    # Write the correct sha for the current schema version.
+    current_sha = "current_version_sha_112233"
+    db.set_indexed_sha(current_sha)
+
+    # get_indexed_sha must return the current schema version's sha, not the
+    # stale row that LIMIT 1 would have returned.
+    result = db.get_indexed_sha()
+    assert result == current_sha, (
+        f"Expected current sha {current_sha!r}, got {result!r}. "
+        "LIMIT-1 without WHERE version likely returned a stale row."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bulk upsert
 # ---------------------------------------------------------------------------
