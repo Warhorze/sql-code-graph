@@ -17,7 +17,12 @@ from pathlib import Path
 import sqlcg.server.tools as tools
 from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.indexer.indexer import Indexer
-from sqlcg.server.tools import _capture_producer_set, _compute_pr_impact, get_pr_impact
+from sqlcg.server.tools import (
+    _capture_producer_set,
+    _compute_pr_impact,
+    _reindex_to_sha,
+    get_pr_impact,
+)
 
 # ---------------------------------------------------------------------------
 # Git + index helpers
@@ -451,3 +456,130 @@ def test_rename_still_excluded_from_blast_radius_after_bug_b_fix(tmp_path):
         assert "da.consumer_result" not in blast_affected, (
             "da.consumer_result must NOT be in blast radius — it now reads da.bar"
         )
+
+
+# ---------------------------------------------------------------------------
+# PR-F self-healing reindex — real integration tests (v1.28.3, #128)
+# ---------------------------------------------------------------------------
+
+
+def test_backward_incremental_heal_stamps_target_sha(tmp_path):
+    """_reindex_to_sha heals a backward delta and stamps base_sha on the graph.
+
+    Scenario: graph indexed at commit B (HEAD); caller wants analysis at commit A
+    (a small, backward delta within max_closure_depth=3).  Calls _reindex_to_sha
+    with the real Indexer.resync_changed (no mocks of the reindex machinery).
+
+    Asserts:
+      - _reindex_to_sha returns True (heal succeeded).
+      - db.get_indexed_sha() == commit_a_sha after the call (base_sha stamped).
+      - A subsequent _compute_pr_impact against commit_a_sha returns a valid result
+        with no 'manually' hint (the heal is end-to-end functional).
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F incremental backward heal.
+    """
+    _init_repo(tmp_path)
+
+    # --- Commit A: base state ---
+    # da.source_raw → da.orders (one simple producer)
+    (tmp_path / "orders.sql").write_text(
+        "INSERT INTO da.orders SELECT id, amount FROM da.source_raw"
+    )
+    commit_a_sha = _commit_all(tmp_path, "commit A: base")
+
+    # Index at commit A.
+    backend = _make_backend()
+    _index(tmp_path, backend, commit_a_sha)
+    assert backend.get_indexed_sha() == commit_a_sha
+
+    # --- Commit B: add one file (small forward delta) ---
+    # da.orders → da.report (downstream consumer added)
+    (tmp_path / "report.sql").write_text(
+        "INSERT INTO da.report SELECT orders.amount FROM da.orders"
+    )
+    commit_b_sha = _commit_all(tmp_path, "commit B: add report.sql")
+
+    # Advance the graph to commit B (simulate the normal forward-resync path).
+    Indexer().resync_changed(tmp_path, commit_a_sha, commit_b_sha, backend, dialect=None)
+    assert backend.get_indexed_sha() == commit_b_sha, (
+        "Graph should be at commit B after forward resync"
+    )
+
+    # Now test the BACKWARD heal: graph is at B, we want it at A.
+    healed = _reindex_to_sha(backend, tmp_path, commit_a_sha)
+
+    assert healed is True, (
+        "_reindex_to_sha must return True for an incremental backward delta "
+        f"(git delta: commit B → commit A is 1 file within max_closure_depth=3). "
+        f"get_indexed_sha() after call: {backend.get_indexed_sha()!r}"
+    )
+    assert backend.get_indexed_sha() == commit_a_sha, (
+        f"Graph must be stamped at commit_a_sha={commit_a_sha!r} after successful heal; "
+        f"got {backend.get_indexed_sha()!r}"
+    )
+
+    # End-to-end: a pr-impact call at base=commit_a_sha must not return 'manually' hint.
+    # Advance working tree to commit B so HEAD != base_sha (non-trivial delta).
+    tools._backend = backend
+    tools._metrics = None
+
+    # HEAD in the tmp git repo is already at commit B; pass commit_a_sha as base.
+    result = _compute_pr_impact(backend, commit_a_sha, max_depth=None)
+    assert result.hint is None or "manually" not in result.hint, (
+        f"After successful heal, _compute_pr_impact must not return 'manually' hint; "
+        f"got hint={result.hint!r}"
+    )
+    # Verify the result is a real analysis: base_sha should match commit_a_sha.
+    assert result.base_sha == commit_a_sha, (
+        f"result.base_sha should be commit_a_sha={commit_a_sha!r}; got {result.base_sha!r}"
+    )
+
+
+def test_pr_impact_end_to_end_with_backward_heal(tmp_path):
+    """get_pr_impact fires backward self-heal and returns a valid, non-error result.
+
+    Scenario (the #128 bug): graph indexed at HEAD (commit B); user calls
+    get_pr_impact(base_ref=<commit A sha>).  Before PR-F the tool returned
+    the 'manually' error hint because it never attempted to reindex.  After PR-F
+    the tool heals (backward resync A←B) and returns a real analysis.
+
+    Asserts:
+      - result carries no 'manually' hint (heal succeeded at the tool level).
+      - result.base_sha == commit_a_sha (the right base was used).
+      - The tool produced a real analysis (detection_only_code_regression=True, no
+        error-exit path).
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F get_pr_impact end-to-end.
+    """
+    _init_repo(tmp_path)
+
+    # Commit A: da.source → da.summary
+    (tmp_path / "summary.sql").write_text("INSERT INTO da.summary SELECT id, val FROM da.source")
+    commit_a_sha = _commit_all(tmp_path, "commit A")
+
+    backend = _make_backend()
+    _index(tmp_path, backend, commit_a_sha)
+
+    # Commit B: add a downstream consumer (small 1-file delta)
+    (tmp_path / "report.sql").write_text("INSERT INTO da.report SELECT summary.val FROM da.summary")
+    commit_b_sha = _commit_all(tmp_path, "commit B: add report.sql")
+
+    # Advance graph to B (simulates normal resync after the branch advance).
+    Indexer().resync_changed(tmp_path, commit_a_sha, commit_b_sha, backend, dialect=None)
+    assert backend.get_indexed_sha() == commit_b_sha
+
+    # Wire the tool to this backend (graph is at B).
+    tools._backend = backend
+    tools._metrics = None
+
+    # Call get_pr_impact with base=commit_a_sha — triggers the backward self-heal.
+    result = get_pr_impact(base_ref=commit_a_sha)
+
+    assert result.hint is None or "manually" not in result.hint, (
+        f"get_pr_impact must not return 'manually' hint after successful backward heal; "
+        f"got hint={result.hint!r}"
+    )
+    assert result.base_sha == commit_a_sha, (
+        f"result.base_sha must be commit_a_sha={commit_a_sha!r}; got {result.base_sha!r}"
+    )
+    assert result.detection_only_code_regression is True

@@ -819,9 +819,17 @@ class DuckDBBackend(GraphBackend):
             logger.warning("Failed to write indexed_sha: %s", exc)
 
     def get_indexed_sha(self) -> str | None:
-        """Return the stored git SHA, or None."""
+        """Return the stored git SHA for the current schema version, or None.
+
+        Keyed by SCHEMA_VERSION so that DBs migrated through multiple versions
+        (which keep one row per version) return the sha for the *current* schema
+        version, not an arbitrary stale row.
+        """
         try:
-            result = self._conn.execute('SELECT indexed_sha FROM "SchemaVersion" LIMIT 1')
+            result = self._conn.execute(
+                'SELECT indexed_sha FROM "SchemaVersion" WHERE version = ?',
+                [SCHEMA_VERSION],
+            )
             row = result.fetchone()
             return row[0] if row else None
         except Exception as exc:

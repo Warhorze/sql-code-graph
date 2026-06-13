@@ -2706,6 +2706,59 @@ def _compute_empty_propagation_empty(sources: list[str]) -> "EmptyPropagationRes
     )
 
 
+def _reindex_to_sha(db: GraphBackend, root: Path, target_sha: str) -> bool:
+    """Incrementally reindex the graph from its current SHA to *target_sha*.
+
+    Uses ``Indexer.resync_changed`` (the same incremental path as the CLI
+    ``sqlcg reindex`` command) to move the graph from the SHA it is currently
+    indexed at to *target_sha*.
+
+    Args:
+        db:         An open, writable GraphBackend.
+        root:       Repository root directory.
+        target_sha: The git commit SHA the graph should be at after the call.
+
+    Returns:
+        ``True`` when ``db.get_indexed_sha() == target_sha`` after the reindex;
+        ``False`` on any failure (exception or SHA mismatch after the call).
+    """
+    from_sha = db.get_indexed_sha()
+    if from_sha is None:
+        logger.error(
+            "_reindex_to_sha: db.get_indexed_sha() returned None — cannot compute git delta"
+        )
+        return False
+    try:
+        dialect: str | None = None
+        try:
+            from sqlcg.core.config import get_dialect
+
+            dialect = get_dialect(root)
+        except Exception:  # noqa: BLE001
+            pass
+
+        indexer = Indexer()
+        indexer.resync_changed(root, from_sha, target_sha, db, dialect)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "_reindex_to_sha: resync_changed from '%s' to '%s' raised: %s",
+            from_sha,
+            target_sha,
+            exc,
+            exc_info=True,
+        )
+        return False
+    actual_sha = db.get_indexed_sha()
+    if actual_sha != target_sha:
+        logger.error(
+            "_reindex_to_sha: reindex completed but get_indexed_sha()='%s' != target='%s'",
+            actual_sha,
+            target_sha,
+        )
+        return False
+    return True
+
+
 def _compute_pr_impact(
     db: GraphBackend,
     base_ref: str,
@@ -2736,6 +2789,20 @@ def _compute_pr_impact(
     detection non-destructive (Option ii — removing the internal resync) is a
     follow-up tracked in plan/sprints/unfilled_table_impact.md §Deviations and
     the O2 note.
+
+    **SELF-HEALING REINDEX:** When the graph is at a different SHA than
+    ``base_ref``, this function attempts to automatically reindex to ``base_sha``
+    via ``_reindex_to_sha`` before running the analysis.  The full analysis
+    (including the ``resync_changed`` restore to HEAD) runs after a successful
+    heal, so the graph is always left at HEAD on exit.
+
+    **KNOWN RACE — hook interference:** installed ``post-checkout`` /
+    ``post-merge`` git hooks trigger background ``sqlcg reindex`` calls on every
+    branch switch.  These background reindexes race ``pr-impact`` off the
+    base-ref mid-analysis, defeating the self-heal.  Users who run ``pr-impact``
+    frequently should consider disabling background hooks with
+    ``sqlcg git uninstall-hooks`` or scheduling ``pr-impact`` runs outside
+    hook-active windows.  Full hook-coordination is a follow-up.
 
     **CODE REGRESSION DETECTION ONLY** — ``detection_only_code_regression`` is
     always ``True``.  An edge disappears only when the SQL that produced it is
@@ -2770,20 +2837,21 @@ def _compute_pr_impact(
             ),
         )
 
-    # 2. Assert graph is indexed at base_sha.
+    # 2. Assert graph is indexed at base_sha; self-heal when it is not.
     indexed_sha = db.get_indexed_sha()
     if indexed_sha != base_sha:
-        return PrImpactResult(
-            base_ref=base_ref,
-            base_sha=base_sha,
-            head_sha=None,
-            detection_only_code_regression=True,
-            hint=(
-                f"Graph is indexed at '{indexed_sha}' but base_ref resolves to '{base_sha}'. "
-                f"Run 'sqlcg index <path>' or 'sqlcg reindex' at '{base_ref}' first, "
-                "then call get_pr_impact."
-            ),
-        )
+        healed = _reindex_to_sha(db, root, base_sha)
+        if not healed:
+            return PrImpactResult(
+                base_ref=base_ref,
+                base_sha=base_sha,
+                head_sha=None,
+                detection_only_code_regression=True,
+                hint=(
+                    f"Graph is at '{indexed_sha}'; auto-reindex to '{base_sha}' failed. "
+                    "Run 'sqlcg reindex --from HEAD --to <base>' manually, then retry."
+                ),
+            )
 
     # 3. Capture producers_before.
     producers_before = _capture_producer_set(db)
