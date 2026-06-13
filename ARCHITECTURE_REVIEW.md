@@ -300,6 +300,17 @@ clean-parse standalone DDL tables are confidently business isolates.
 This orphan belt is the main driver of the coverage sprint (F8 +
 `plan/sprints/coverage_parse_failures.md` — being produced separately).
 
+> **Correction — 2026-06-13:** An earlier version of this section characterised
+> `ia_*` schema tables as ~550 "zero-edge export mirrors / orphans." That claim
+> was wrong. Live measurement on the graph shows **of 596 produced `ia_*` tables,
+> 589 have ≥1 incoming table-level (`SELECTS_FROM`) edge from their source** —
+> `CREATE VIEW` indexes the source→view edge, so these nodes are connected, not
+> orphans. The error was the same `SELECTS_FROM`-vs-`COLUMN_LINEAGE` conflation
+> described in [`plan/reports/e8_temp_chain_postmortem.md`](plan/reports/e8_temp_chain_postmortem.md).
+> The genuinely-edgeless `ia_*` nodes are mostly reference-only tables whose
+> `CREATE` statement is not in the indexed corpus (e.g. ~756 `ia_analytics` tables)
+> — a different population from the view mirrors.
+
 ### 6.5 Tier-2 "refactor advisor" candidate (feature opportunity)
 
 The `wtfv_`/`wtfs_` prefix-split pattern surfaces as a recurring topology signal: 7

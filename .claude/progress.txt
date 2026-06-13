@@ -1,4 +1,10 @@
 ## Current State [2026-06-13]
+ACTIVE AGENT: developer — IN PROGRESS
+FEATURE: docs/e8-postmortem-and-corrections — E8 postmortem + MCP self-heal verification + ARCHITECTURE_REVIEW §6.4 correction
+BRANCH: docs/e8-postmortem-and-corrections
+PLAN: user-specified (docs only, no code, no version bump)
+
+## Previous State [2026-06-13]
 ACTIVE AGENT: architect-planner — IN PROGRESS
 FEATURE: coverage_parse_failures — recover lineage lost to E5/E8 degradation on DWH (3-PR plan)
 BRANCH: plan/coverage-parse-failures
