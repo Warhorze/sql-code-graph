@@ -1,12 +1,12 @@
 # Architecture Review — sql-code-graph (`sqlcg`)
 
-**Current as of:** v1.5.1 · DuckDB backend · Python 3.12
+**Current as of:** v1.25.0 · DuckDB backend · Python 3.12
 **Status:** living document — describes the system as it stands today.
 **History:** the pre-1.4 blueprint review, PR/issue reviews, and every sprint
 postmortem (§1–20 + the Kuzu→DuckDB migration review) are preserved verbatim in
 [`ARCHITECTURE_REVIEW_ARCHIVE.md`](ARCHITECTURE_REVIEW_ARCHIVE.md). This file was
 overhauled on 2026-06-08 to drop content made stale by the DuckDB migration and the
-v1.x releases. See [§7 History](#7-history) for the timeline.
+v1.x releases. See [§8 History](#8-history) for the timeline.
 
 > **Link convention.** Links here use real repo paths (e.g.
 > [`base.py`](src/sqlcg/parsers/base.py)) so a rename breaks the link *visibly*. The
@@ -226,11 +226,110 @@ Only genuinely-open items live here. Resolved findings and their reasoning are i
 | F5 | LOW | **TC6b guard reconstructs the query.** The terminal-sink test rebuilds the downstream Cypher/SQL string instead of running `analyze downstream` end-to-end, so it can drift from the shipped query. Replace with a `CliRunner`-based guard. | [`test_user_surface_recall_guard.py`](tests/integration/test_user_surface_recall_guard.py) | none yet |
 | F6 | LOW | **Dead `_set_backend_lock` stub.** Defined but never called (the escalation plumbing it belonged to was deleted in the DuckDB migration). Violates the CLAUDE.md "every new method has a grep-confirmed call site" rule — remove it. | [`tools.py`](src/sqlcg/server/tools.py) | none yet |
 | F7 | MED | **95 % edge-health milestone is ~30 points short after P1/P3/P4.** With the scoped metric (CTE/derived excluded) the DWH baseline is ≈41 %; P3 (+6,045 edges) + P4 lift it to ≈55–65 %. Reaching ≥95 % needs catalogs for ~566 residual **real-table** blindspots — the P2 cohort (temp / cross-file / unseen-DDL tables) and the deferred P5 `USE SCHEMA` bare-name group (956 tables). The 95 % milestone must be re-baselined or scoped to a follow-up sprint (BQ-2). | [`coverage.py`](src/sqlcg/cli/coverage.py), [`base.py`](src/sqlcg/parsers/base.py) | [coverage_p1_p3_p4](plan/sprints/coverage_p1_p3_p4.md) §95 % Feasibility Analysis |
+| F8 | MED | **Index-summary metric undercount masks coverage gaps.** End-of-`sqlcg index` prints "1 failed" while 410 files carry `parse_failed=True` in the live DWH (1,335 files indexed, v1.25.0). The printed count reflects only the final-phase summary, not the full parse-failure population. Users and agents see a misleadingly-healthy finish line. Being addressed in the coverage sprint. | [`indexer.py`](src/sqlcg/indexer/indexer.py) summary path | `plan/sprints/coverage_parse_failures.md` (pending creation) |
+| F9 | LOW | **`pr-impact` rename suppression renders no "verify consumers updated" label.** The help text promises a dedicated labelled section when a rename is detected with consumers updated; the actual output emits only "No genuine lost producers detected" with no rename callout. Suppression logic is correct; the label is missing. | [`server/tools.py`](src/sqlcg/server/tools.py) `get_pr_impact` | none yet |
+| F10 | LOW | **`git install-hooks` embeds venv path, not user-installed binary.** Hooks installed via `sqlcg git install-hooks` point at `.venv/bin/sqlcg`, not `~/.local/bin/sqlcg`. If the project venv is rebuilt or deleted, the hooks become stale silently while the user-installed PyPI copy is current. Observed live on v1.25.0 (both pointed at 1.25.0 coincidentally — but this is a version-skew surface). | [`indexer/`](src/sqlcg/indexer/) install path | none yet |
+| F11 | LOW | **`mcp restart` is stop-only by design but misnamed.** The command stops the server and instructs the user to reconnect via `/mcp`; it does NOT restart the server process. For a stdio MCP server this is architecturally correct (the client owns the lifecycle), but the name and the live-verify expectation are contradicted by the observed behaviour. Either rename to `mcp stop` or document prominently in `--help` that the client must reconnect. Honest reframe shipped in v1.20.0; the naming gap remains. | [`server/control.py`](src/sqlcg/server/control.py), [`cli/commands/`](src/sqlcg/cli/commands) | none yet |
+| F12 | MED | **`pr-impact` requires graph to be indexed at base-ref; not self-healing.** Each `pr-impact --base X` run leaves the graph indexed at HEAD. A second run fails with a hint to manually reindex. Worse, the installed git post-checkout/post-merge hooks fire a background `sqlcg reindex` on every branch switch, racing `pr-impact` off the base. Reproduced on the live DWH (2026-06-13). Working protocol: chain `reindex --from <current_sha> --to <base>` immediately before `pr-impact`. A self-healing reindex-to-base step inside `pr-impact` itself is the right fix. | [`server/tools.py`](src/sqlcg/server/tools.py) `get_pr_impact`, [`indexer/git_delta.py`](src/sqlcg/indexer/git_delta.py) | backlog (deferred post data-loss-impact sprint) |
 
 ---
 
-## 6. Deferred / roadmap
+## 6. DWH graph topology insights (2026-06-13, v1.25.0)
 
+Source: [`plan/reports/dwh_graph_analysis.md`](plan/reports/dwh_graph_analysis.md) —
+full tables, method, and candidate lists live there; this section captures the
+actionable architectural findings only.
+
+Graph: **2,030 nodes · 2,930 directed edges** (table-level, noise-filtered), built from
+1,335 files, 52,514 column-lineage edges (schema v8, DWH corpus, 2026-06-13).
+
+### 6.1 Centrality — VALIDATED
+
+Ground-truth check: `ba.wtdh_artikel` (degree rank #3, total=107) and
+`ba.wtfe_verkoopinfo` (rank #6, total=57) independently reproduced as top hubs.
+**Out-degree / total-degree is the right blast-radius metric** — it answers "what breaks
+the most downstream if this table is wrong". PageRank is the wrong metric here: it ranks
+hubs low because they are *sources*, not sinks.
+
+The warehouse is anchored on five conformed dimensions (store, banner, article, date,
+week) and one dominant fact hub (verkoopinfo) — exactly the expected retail star-schema
+shape.
+
+**Surprising high-centrality tables** (not obvious from name alone):
+`da.ttint_verkooptransactie` (PageRank #4 — a quiet integration staging table is the
+single biggest convergence point with in=25), `ba.wtfe_korting` (PageRank #1 — discount
+logic far more central than its name suggests), `ba.wtfi_axi_ail` +
+`ba.wtfe_artikel_inteken_lijst` (intake-list pipeline dense hub, not a leaf report).
+
+### 6.2 Named single-points-of-failure (high betweenness bridges)
+
+These four permanent tables sit on the most shortest-paths; an outage in any of them
+**fragments lineage across subject areas**. Directly actionable for outage planning.
+
+| Table | Betweenness | Role |
+|---|---|---|
+| `ba.wtfe_verkoopinfo` | 0.00372 | #1 bridge AND top hub (sales fact) |
+| `da.ttint_verkooptransactie` | 0.00340 | Transaction integration bridge (in=25 → upstream of sales + promotions) |
+| `ba.wtfe_promotie_artikel_bouwmarkt` | 0.00175 | Bridges promotions ↔ sales ↔ store |
+| `ba.wtfv_voorraad_dagstand` | 0.00120 | Inventory daily-snapshot bridge |
+
+Betweenness floats are meaningful only as a ranking; computed on the 2,030-node
+filtered DiGraph.
+
+### 6.3 Communities
+
+171 communities, modularity **0.763** (strong, well-separated). Communities map
+cleanly onto retail subject areas. Two notable anomalies:
+
+- `ba.wtfe_loyalty` sits in the **Webshop** community (#32), not a
+  customer/CRM community — candidate for a real coupling or mis-placement.
+- **HR/workforce fused into the Store community (#4)** — staffing data has no independent
+  lineage island; it only exists hanging off the store dimension.
+
+Cross-community bridge edges concentrate on the same four betweenness tables (§6.2) —
+confirming that any refactor touching those tables has the widest blast radius.
+
+### 6.4 Orphan / satellite belt
+
+~4,417 SqlTable nodes have zero table-level lineage edges. The headline is **not
+"4,000 dead tables"**: that population is dominated by parse-failure coverage gaps
+(410 parse-failed files) + targetless write queries (1,090 of 2,349) + downstream
+export mirrors (`ia_*` schemas) — not genuinely standalone business tables. Only ~57
+clean-parse standalone DDL tables are confidently business isolates.
+
+This orphan belt is the main driver of the coverage sprint (F8 +
+`plan/sprints/coverage_parse_failures.md` — being produced separately).
+
+### 6.5 Tier-2 "refactor advisor" candidate (feature opportunity)
+
+The `wtfv_`/`wtfs_` prefix-split pattern surfaces as a recurring topology signal: 7
+ranked candidate groups where a fact-view and a fact-snapshot table share J=1.0 leaf
+sets and 8–71 shared columns (see the full table in
+[`plan/reports/dwh_graph_analysis.md`](plan/reports/dwh_graph_analysis.md) §Lens 4).
+The strongest candidate is the `*voorraad_dagstand*` inventory family (3 tables, J=1.0,
+33 shared leaves, 33–71 shared columns).
+
+**This is a topology + column-name hypothesis, NOT a confirmed refactor recommendation.**
+The `manus_export` false positive (J=1.0, 50 shared leaves, only 5 shared columns of 84)
+proves same inputs ≠ same logic. Confirming evidence a tier-2 pass needs before any
+prescriptive recommendation:
+
+- **(a) SQL-expression comparison** — prove the *logic* (not just the inputs) is duplicated.
+  Compare actual SELECT projections / WHERE / join logic per `SqlQuery.sql`.
+- **(b) Shared grain / PK** — a conformed hub is only legal if the candidates share a
+  grain. PK/grain metadata is **not in the graph today**.
+
+Record as a feature opportunity. Do not implement until (a) and (b) are available.
+
+---
+
+## 7. Deferred / roadmap
+
+- **Coverage sprint — parse-failure diagnosis (active).** 410/1,335 files
+  parse-failed on the live DWH, dominated by error classes **E5 (217)** and **E8 (184)**;
+  only 1 timeout. This is the dominant driver of the satellite/orphan belt (§6.4) and the
+  F7/F8 findings. Diagnosis: [`plan/research/coverage_parse_failure_diagnosis.md`](plan/research/coverage_parse_failure_diagnosis.md);
+  sprint plan: `plan/sprints/coverage_parse_failures.md` (being produced separately).
 - **v2 — Snowflake `ACCESS_HISTORY` as a second lineage source.** Fuse query-history lineage
   to *enrich* (not replace) static parsing. This is the main reason the `GraphBackend` ABC
   (F4) is kept rather than collapsed.
@@ -241,10 +340,16 @@ Only genuinely-open items live here. Resolved findings and their reasoning are i
   [archive §6](ARCHITECTURE_REVIEW_ARCHIVE.md).
 - **Incremental reindex** (vs. full rebuild) — the real fix for F2/F3's lock-duration and
   memory pressure; explicitly deferred during the DuckDB migration.
+- **PyPI publish pipeline — batch-push root cause resolved; re-publish backlog pending.**
+  PyPI is stuck at v1.5.1 because tags v1.6.0–v1.14.2 were pushed as a batch (GitHub
+  Actions silently drops triggers for all but ~3 tags in a single push). The v1.14.2
+  `workflow_dispatch` run also failed its `test` gate. A `workflow_dispatch` re-publish
+  path exists (`docs/releasing-pypi.md`); actual tagging and per-tag republishing are
+  user-gated. v1.15.0–v1.25.x are not yet tagged or published.
 
 ---
 
-## 7. History
+## 8. History
 
 Earlier content is preserved verbatim in
 [`ARCHITECTURE_REVIEW_ARCHIVE.md`](ARCHITECTURE_REVIEW_ARCHIVE.md). Detailed per-release
