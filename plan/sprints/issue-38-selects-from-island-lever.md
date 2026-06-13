@@ -6,6 +6,13 @@
 > Charter: [`plan/reports/e8_temp_chain_postmortem.md`](../reports/e8_temp_chain_postmortem.md) Rec #3
 > ("the table-level island lever is elsewhere; a separate investigation is needed").
 
+> **Plan review (2026-06-13):** REVIEWED with amendments. plan-reviewer returned
+> APPROVE-WITH-AMENDMENTS; all four amendments applied — A1 (BLOCKER: flat `cte_sources` walk + recursive-CTE
+> `union_scopes` known gap, sqlglot-probe-confirmed), A2 (`kind IN _WRITE_KINDS` discriminator on the
+> metric), A3 (alias-remap acceptance criterion for CTE-body tables), A4 (explicit from→to version
+> bumps). Framing, measure-first ordering, hot-path safety, and non-overlap with
+> `issue-38-backfill-cte-bridge.md` were all confirmed clean by the reviewer.
+
 ## Summary
 Many CTE-wrapped write queries — `INSERT INTO ba.X WITH cte AS (SELECT … FROM ba.real_table) SELECT … FROM cte` —
 resolve their target *and* their `COLUMN_LINEAGE` correctly, but emit **zero `SELECTS_FROM` source
@@ -117,10 +124,21 @@ emitted nothing). SQL shape (mirror the existing `_Q_*` constants; DuckDB double
 ```sql
 SELECT COUNT(*) AS cte_source_gap_writes
 FROM "SqlQuery" q
-WHERE q.target_table <> ''
+WHERE q.kind IN ('INSERT', 'MERGE', 'CREATE_TABLE', 'UPDATE')   -- write kinds only (reuse coverage._WRITE_KINDS)
+  AND q.target_table <> ''
   AND EXISTS (SELECT 1 FROM "COLUMN_LINEAGE" cl WHERE cl.query_id = q.id)
   AND NOT EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id);
 ```
+
+> **Amendment 2 — discriminator (do not skip):** filter on `q.kind IN _WRITE_KINDS`
+> (`INSERT, MERGE, CREATE_TABLE, UPDATE` — reuse [`coverage._WRITE_KINDS`](../../src/sqlcg/cli/coverage.py#L33)),
+> **not** `target_table <> ''` alone. `target_table <> ''` is **not** a strict subset of write kinds:
+> a `SELECT`-kind query (e.g. a CTAS parsed as `SELECT`) can carry an inferred `target_table` and would
+> inflate the metric. Keep `target_table <> ''` **in addition** (a write with an unresolved target is a
+> target-resolution problem, not this lever). The Step 1.4 unit test must include a `SELECT`-kind row
+> with a non-empty `target_table` and assert it is **excluded** from the count, so the
+> "inverse complement of `zero_edge_write_queries`" claim is provably correct (both now share the same
+> `_WRITE_KINDS` discriminator).
 
 > **Developer: confirm the `SELECTS_FROM.src_key`/`query_id` join key against the schema before
 > coding** — the SELECTS_FROM emission writes `{"src_key": query_id, "dst_key": src_table.full_id}`
@@ -153,16 +171,38 @@ The emitted `stmt.sources` then flows unchanged through the existing emission lo
 [`indexer.py:1372–1385`](../../src/sqlcg/indexer/indexer.py#L1372) (`for src_table in stmt.sources: …
 rows.selects_from_edges.append(...)`), so the `SELECTS_FROM` rows appear with **no indexer change**.
 
-**Mechanics the developer must pin (do not guess):**
-- Descend via `scope.cte_sources` values (the child `Scope` objects), recursively if a CTE references
-  another CTE, but collect only **real** tables (re-apply the same `cte_sources` filter at each level
-  so a CTE that selects from another CTE does not re-emit the inner alias).
+**Mechanics the developer must pin (do not guess) — sqlglot probe-confirmed (sqlglot 30.6.0, this repo):**
+- **`root_scope.cte_sources` is already FLAT — this is NOT a recursive nested descent.** Probed on
+  `INSERT INTO s.b WITH cte1 AS (SELECT x FROM s.a), cte2 AS (SELECT x FROM cte1) SELECT x FROM cte2`:
+  `root.cte_sources.keys() == ['cte1', 'cte2']` (ALL CTEs flat at the root), `cte1_scope.tables` name
+  set `== {'a'}`, `cte2_scope.tables` name set `== {'cte1'}` (the inner alias appears as a table inside
+  the outer CTE's scope), `root.tables == {'cte2'}`. The correct algorithm is a **single-level pass over
+  `root_scope.cte_sources.values()`**, and for each CTE child scope filter its `.tables` against
+  **`root_scope.cte_sources.keys()`** (the flat set of ALL CTE alias names) — **NOT** against that child
+  scope's own `cte_sources`. Filtering against the root's flat key set is exactly what drops the `cte1`
+  alias out of `cte2`'s table list and removes any self-reference loop risk. Do **not** implement a
+  recursive nested descent; it is unnecessary and would risk re-emitting aliases.
+- **Recursive CTEs (`WITH RECURSIVE r AS (… UNION ALL … FROM r)`) are a KNOWN GAP the flat walk does
+  not cover.** Probed: the recursive CTE scope has `tables == []` and its real source lives in
+  `scope.union_scopes[i].tables` (2 union scopes for the `UNION ALL` recursion). The flat `cte_sources`
+  walk therefore yields **zero** real tables for a recursive CTE — **silent data loss, not a crash.**
+  Recursive CTEs do **not** appear in the 46-query DWH gap population (research §4), so PR-2 **may
+  document this as a known gap for a future ticket** rather than implement `union_scopes` descent now —
+  but this plan states the API fact explicitly so the developer does not silently assume it works. If
+  the developer chooses to handle it, descend `scope.union_scopes[i].tables` (or use `traverse_scope()`),
+  and a test must then pin a recursive CTE producing its real source row.
 - De-duplicate: a real table reachable both top-level and via a CTE body must not produce duplicate
-  `SELECTS_FROM` rows. Confirm whether the existing emission de-dupes (`indexer.py` `table_rows` /
-  `selects_from_edges`) or whether `_real_tables` must return a de-duplicated list.
+  `SELECTS_FROM` rows. The existing emission already de-dupes on `(src_key, dst_key)`
+  ([`indexer.py:237–239`](../../src/sqlcg/indexer/indexer.py#L237)), so duplicates are not fatal — but
+  `_real_tables` must still return a de-duplicated list for defense-in-depth, so the unit test can
+  assert no duplicate at the source.
 - Apply `_apply_table_alias` (schema-alias remap `ba_tmp→ba` etc.) on the CTE-body tables exactly as
   the top-level path does (line 631) — otherwise the new edges land on un-aliased table ids and miss
-  the giant component.
+  the giant component. CTE-body table expressions carry the same `db`/`name` structure as top-level
+  ones (e.g. `BA.WTDH_ARTIKEL` → `db='BA'`, `name='WTDH_ARTIKEL'`), so `_convert_table_expr_to_ref` +
+  `_apply_table_alias` apply unchanged. **A CTE body referencing an aliased schema (e.g.
+  `ba_tmp.real_table` where `ba_tmp→ba` is configured) must emit `SELECTS_FROM dst_key = 'ba.real_table'`,
+  not `'ba_tmp.real_table'`** — pinned by an acceptance criterion in PR-2 (Amendment 3).
 
 **Why this is OFF the perf hot-path (must be stated in the PR):**
 [`_real_tables()`](../../src/sqlcg/parsers/base.py#L604) runs **once per statement** during parse,
@@ -213,7 +253,7 @@ assert the count is exactly 1. Assert observable output (the integer), not "no e
   [`test_selects_from_completeness_unit.py`](../../tests/unit/test_selects_from_completeness_unit.py)
   style).
 
-**Step 1.5** — Version + housekeeping: bump to **1.26.0** (minor — new metric surface) in
+**Step 1.5** — Version + housekeeping: bump **1.25.8 → 1.26.0** (minor — new metric surface) in
 [`pyproject.toml`](../../pyproject.toml) + [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py),
 `uv lock`. Do not tag, do not close the issue (user verifies + tags).
 
@@ -265,7 +305,7 @@ Re-index the DWH from scratch into a throwaway DB and report:
   negligible — confirm no regression).
 - Record the verdict in the PR description (not in the DWH repo).
 
-**Step 2.5** — Version: bump to **1.26.1** (patch — the fix alone adds no new surface) in
+**Step 2.5** — Version: bump **1.26.0 → 1.26.1** (patch — the fix alone adds no new surface) in
 [`pyproject.toml`](../../pyproject.toml) + [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py),
 `uv lock`. Do not tag, do not close the issue.
 
@@ -329,6 +369,12 @@ complementary by edge type.
       collects real source tables, with de-dup, schema-alias remap, and recursive-CTE handling.
 - [ ] Indexing a CTE-wrapped INSERT…SELECT emits the expected raw `SELECTS_FROM` source row(s);
       direct-insert control unchanged; no duplicate rows.
+- [ ] **(Amendment 3)** A CTE body referencing an aliased schema (`ba_tmp.real_table` with `ba_tmp→ba`
+      configured) emits a `SELECTS_FROM` row with `dst_key = 'ba.real_table'` (alias remap applied to
+      CTE-body tables, not just top-level), so the new edges land on the giant-component table ids.
+- [ ] **(Amendment 1)** Multi-CTE `cte2 selects from cte1` does **not** emit a `SELECTS_FROM` row for
+      the `cte1` alias (the flat `root.cte_sources.keys()` filter is applied to each CTE child scope);
+      recursive-CTE behaviour is either covered by a `union_scopes` test or documented as a known gap.
 - [ ] A `SELECTS_FROM`-specific regression guard asserts the raw rows and references this plan;
       it lives separately from the column-level #38 guard (coordinated with issue #40).
 - [ ] No change to [`indexer.py`](../../src/sqlcg/indexer/indexer.py) emission path is required (the
