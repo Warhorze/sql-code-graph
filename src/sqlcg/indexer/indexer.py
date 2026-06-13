@@ -712,11 +712,19 @@ class Indexer:
             "qualify_failed": 0,
             "other": 0,
         }
+        # Denominator: number of distinct files whose dominant cause is in _DEGRADING.
+        # Uses dominant_cause(parsed.errors) — one call per file, not one per error string —
+        # so a file with 39 E5 errors counts as 1, not 39 (matches the "410 files" metric
+        # named in ARCHITECTURE_REVIEW F8 and plan/sprints/coverage_parse_failures.md §PR-1).
+        degraded_files = 0
         for parsed in pass2_results:
             for msg in parsed.errors:
                 bucket = _classify_error(msg)
                 if bucket in error_summary:
                     error_summary[bucket] += 1
+            _, parse_failed = dominant_cause(parsed.errors)
+            if parse_failed:
+                degraded_files += 1
 
         # Emit summary log line
         summary_parts = [f"{k}: {v}" for k, v in error_summary.items() if v > 0]
@@ -738,6 +746,7 @@ class Indexer:
             "star_edges_expanded": star_edges_expanded,
             "quality": nonlocal_counts["quality"],
             "error_summary": error_summary,
+            "degraded_files": degraded_files,
             "batch_size": batch_size,
             "external_consumers": ingest_result["consumers"],
             "external_consumer_edges": ingest_result["edges"],
