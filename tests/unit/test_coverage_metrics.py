@@ -35,7 +35,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 #
-# collect_coverage() issues 14 run_read_routed calls in this order (PR 1 + PR 4):
+# collect_coverage() issues 16 run_read_routed calls in this order (PR 1 + PR 4 + PR-1/issue-38):
 #   1  catalog_coverage          {catalogued_tables, total_tables}
 #   2  edge_health (legacy)      {good_edges, total_edges}
 #   3  edge_health_strict        {good_edges_strict, total_edges}
@@ -50,6 +50,9 @@ except ImportError:
 #   12 zero_edge_writes          {zero_edge_writes, total_write_queries}
 #   13 cte_collisions            {cte_collisions}   <- PR 4
 #   14 rescuable_unqualified     {rescuable_unqualified}  <- PR 4
+#   15 info_schema_rows          {info_schema_rows}  <- PR 4 Step 4.3
+#   16 cte_source_gap_writes     {cte_source_gap_writes}  <- PR-1 issue-38
+#   17 Repo path (inline)        {path}
 # ---------------------------------------------------------------------------
 
 _CANNED_ROWS = [
@@ -76,6 +79,8 @@ _CANNED_ROWS = [
     [{"rescuable_unqualified": 828}],
     # PR 4 Step 4.3 — info-schema row count
     [{"info_schema_rows": 45000}],
+    # PR-1 issue-38 — CTE-source gap writes
+    [{"cte_source_gap_writes": 46}],
     # PR 4 Step 4.3 — Repo path (for catalog-path check)
     [{"path": "/repo"}],
 ]
@@ -210,6 +215,8 @@ def test_coverage_metrics_collect_handles_empty_graph():
         [{"rescuable_unqualified": 0}],
         # PR 4 Step 4.3 — info-schema row count (zero for empty graph)
         [{"info_schema_rows": 0}],
+        # PR-1 issue-38 — CTE-source gap writes (zero for empty graph)
+        [{"cte_source_gap_writes": 0}],
         # PR 4 Step 4.3 — Repo path (empty for empty graph)
         [],
     ]
