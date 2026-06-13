@@ -393,7 +393,9 @@ Lineage analysis
 | `downstream` | Trace downstream column lineage. |
 | `impact` | Show all queries impacted by a table. |
 | `failures` | List files that failed to parse, with their dominant cause (E-code bucket). |
-| `unused` | Find tables with no query references. |
+| `unused` | Find tables with no within-corpus consumers (3-signal: direct SELECT, SELECT *, or CTE-derived column read). |
+| `empty-impact` | Downstream blast radius when named table(s) are empty — two views: value-derivation (primary) + row-reachability (supplement). |
+| `pr-impact` | Detect producers a PR dropped + their blast radius (code-regression detection only). |
 
 ## `sqlcg analyze upstream`
 
@@ -462,7 +464,16 @@ List files that failed to parse, with their dominant cause (E-code bucket).
 sqlcg analyze unused [OPTIONS]
 ```
 
-Find tables with no query references.
+Find tables with no within-corpus consumers.
+
+A table is considered **used** if any of the following three signals fires:
+- **(D1)** a direct `SELECTS_FROM` read
+- **(D2)** a `STAR_SOURCE` (`SELECT *`) read
+- **(D3)** a value flows out of one of its columns via `COLUMN_LINEAGE` (captures CTE-wrapped derived reads, the dominant corpus pattern)
+
+**Known gap**: a table read ONLY inside a CTE without deriving any column
+(a pure-gating read — e.g. used only as a join filter, no value selected from it)
+is NOT detected by any of the three signals and will still appear as "unused".
 
 ### Options
 
@@ -470,6 +481,61 @@ Find tables with no query references.
 | --- | --- | --- | --- | --- | --- |
 | --threshold | INTEGER | No | No | 0 | Minimum reference count threshold |
 | --raw | BOOLEAN | No | No | False | Disable noise filtering on results |
+
+## `sqlcg analyze empty-impact`
+
+```bash
+sqlcg analyze empty-impact [OPTIONS] TABLE...
+```
+
+Show the downstream blast radius when one or more named tables are empty.
+
+Returns **two views**:
+
+- **View 2 — Value derivation (PRIMARY)**: downstream columns/tables whose values are
+  transitively derived from the source table's columns (column-lineage refinement).
+  This is the reliable headline answer — captures CTE-wrapped derived reads.
+- **View 1 — Row reachability (SUPPLEMENT)**: the union of View 2's affected tables
+  and tables with a direct `SELECTS_FROM`/`STAR_SOURCE` read (inner-join gating case).
+
+**Known gap**: CTE-wrapped pure-gating reads are NOT detected. Results are an upper
+bound that depends on join type (not recorded on edges).
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering (re-includes backup/noise/synthetic tables) |
+| --max-depth | INTEGER | No | No | unbounded | Maximum traversal depth (1–100). Default: unbounded. |
+
+## `sqlcg analyze pr-impact`
+
+```bash
+sqlcg analyze pr-impact [OPTIONS]
+```
+
+Detect tables that lose their producer between a base git ref and HEAD, then show
+the PR 1 two-view blast radius for genuinely lost producers.
+
+**Code-regression detection only.** This tool detects SQL that was removed,
+renamed, or broken between `--base` and HEAD. It cannot detect runtime emptiness —
+a job that runs and produces 0 rows while the SQL is unchanged will NOT be flagged.
+
+**Rename handling**: tables whose producer was renamed (both column-set AND consumer
+Jaccard ≥ 0.6) are shown under "verify consumers updated" and excluded from the
+data-loss blast radius. This classification is a heuristic — callers should verify.
+
+**Note (v1.24.2)**: the blast radius is computed on the pre-resync graph. The tool
+resyncs the graph to HEAD as a side effect; making detection non-destructive is a
+known follow-up.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --base | TEXT | **Yes** | No | — | Base git ref (branch, tag, or SHA) that the graph is indexed at |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering |
+| --max-depth | INTEGER | No | No | unbounded | Maximum traversal depth (1–100). Default: unbounded. |
 
 ## `sqlcg mcp`
 

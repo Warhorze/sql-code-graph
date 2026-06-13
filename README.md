@@ -212,16 +212,18 @@ full rebuild. If the file is missing, indexing succeeds with a warning.
 | `trace_column_lineage(table_col)` | Trace a column's value upstream to its sources |
 | `get_upstream_dependencies(table_col)` | Full upstream dependency chain |
 | `get_downstream_dependencies(table_col)` | Full downstream dependency chain |
-| `find_table_usages(table_name)` | Find all queries that read a table |
+| `find_table_usages(table_name)` | Find all queries that read a table (3-signal: direct SELECT, SELECT *, or column-lineage CTE read) |
 | `find_definition(table_qualified)` | Find where a table/view is defined |
 | **Change impact** | |
-| `get_change_scope(table_qualified)` | Blast radius of changing a table (impact + risk) |
-| `diff_impact(changed_files)` | What a set of changed files affects downstream |
+| `get_change_scope(table_qualified)` | Blast radius of changing a table (impact + risk); `gating_join_tables` field adds row-reachability supplement (see caveats) |
+| `diff_impact(changed_files)` | What a set of changed files affects downstream; `gating_join_tables` field adds row-reachability supplement (see caveats) |
 | `get_backfill_order(table_qualified)` | Topological rebuild/backfill order |
 | `scope_change(target)` | Synthesised change-scope summary for a target |
+| `get_empty_propagation(tables)` | Downstream blast radius when named table(s) are empty — two views: value-derivation (primary) + row-reachability (supplement) |
+| `get_pr_impact(base_ref)` | Detect producers a PR dropped + their blast radius; code-regression detection, not runtime monitoring |
 | **Analysis** | |
 | `get_hub_ranking(k)` | Top-k tables by downstream dependent count (hub/centrality) |
-| `analyze_unused()` | Tables with no within-corpus consumers (dead-code candidates, heuristic) |
+| `analyze_unused()` | Tables with no within-corpus consumers (dead-code candidates, heuristic); uses 3-signal "used" definition — direct SELECT, SELECT *, or CTE-derived column read |
 | **Search & meta** | |
 | `search_sql_pattern(query)` | Full-text search across indexed SQL |
 | `list_dialects_and_repos()` | List indexed repos and dialects (catalogue) |
@@ -257,7 +259,9 @@ sqlcg index <path> --dialect auto      # read dialect from .sqlcg.toml
 sqlcg index <path> --profile           # index + print per-stage timing and slowest files
 sqlcg index <path> --include-working-tree  # also index uncommitted changes (marks graph dirty)
 sqlcg reindex <path> --from <sha> --to <sha>  # incremental resync of only changed files
-sqlcg analyze unused                   # tables with no query references
+sqlcg analyze unused                   # tables with no within-corpus consumers (3-signal: direct SELECT, SELECT *, or CTE-derived column read)
+sqlcg analyze empty-impact <table>...  # downstream blast radius when named table(s) are empty (two views)
+sqlcg analyze pr-impact --base <ref>   # detect producers a PR dropped + their blast radius (code-regression detection)
 sqlcg analyze upstream/downstream      # trace lineage from the CLI
 sqlcg find table/column/pattern        # search the graph
 sqlcg watch <path>                     # watch for file changes
