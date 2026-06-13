@@ -35,24 +35,26 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 #
-# collect_coverage() issues 16 run_read_routed calls in this order (PR 1 + PR 4 + PR-1/issue-38):
-#   1  catalog_coverage          {catalogued_tables, total_tables}
-#   2  edge_health (legacy)      {good_edges, total_edges}
-#   3  edge_health_strict        {good_edges_strict, total_edges}
-#   4  edge_health_scoped        {good_edges_scoped, total_edges_scoped}
-#   5  phantom_rate (legacy)     {phantom, total}
-#   6  phantom_split             {phantom_confirmed, phantom_contradicted, phantom_unverified}
-#   7  blindspot (legacy)        {blindspot}
-#   8  blindspot_weighted        list of {dst_table, bad_count, rn, running_total, grand_total}
-#   9  fingerprint               {files_indexed, indexed_sha}
-#   10 degraded_parse_overall    {degraded, total}
-#   11 degraded_parse_by_dir     list of {top_dir, degraded, total}
-#   12 zero_edge_writes          {zero_edge_writes, total_write_queries}
-#   13 cte_collisions            {cte_collisions}   <- PR 4
-#   14 rescuable_unqualified     {rescuable_unqualified}  <- PR 4
-#   15 info_schema_rows          {info_schema_rows}  <- PR 4 Step 4.3
-#   16 cte_source_gap_writes     {cte_source_gap_writes}  <- PR-1 issue-38
-#   17 Repo path (inline)        {path}
+# collect_coverage() issues 17 run_read_routed calls in this order
+# (PR 1 + PR 4 + PR-1/issue-38 + column_lineage_recall_metric.md):
+#   1  catalog_coverage              {catalogued_tables, total_tables}
+#   2  edge_health (legacy)          {good_edges, total_edges}
+#   3  edge_health_strict            {good_edges_strict, total_edges}
+#   4  edge_health_scoped            {good_edges_scoped, total_edges_scoped}
+#   5  phantom_rate (legacy)         {phantom, total}
+#   6  phantom_split                 {phantom_confirmed, phantom_contradicted, phantom_unverified}
+#   7  blindspot (legacy)            {blindspot}
+#   8  blindspot_weighted            list of {dst_table, bad_count, rn, running_total, grand_total}
+#   9  fingerprint                   {files_indexed, indexed_sha}
+#   10 degraded_parse_overall        {degraded, total}
+#   11 degraded_parse_by_dir         list of {top_dir, degraded, total}
+#   12 zero_edge_writes              {zero_edge_writes, total_write_queries}
+#   13 cte_collisions                {cte_collisions}   <- PR 4
+#   14 rescuable_unqualified         {rescuable_unqualified}  <- PR 4
+#   15 info_schema_rows              {info_schema_rows}  <- PR 4 Step 4.3
+#   16 cte_source_gap_writes         {cte_source_gap_writes}  <- PR-1 issue-38
+#   17 resolvable_write_col_edges    {resolvable_write_col_edges}  <- column_lineage_recall_metric
+#   18 Repo path (inline)            {path}
 # ---------------------------------------------------------------------------
 
 _CANNED_ROWS = [
@@ -81,6 +83,8 @@ _CANNED_ROWS = [
     [{"info_schema_rows": 45000}],
     # PR-1 issue-38 — CTE-source gap writes
     [{"cte_source_gap_writes": 46}],
+    # column_lineage_recall_metric.md — resolvable-write column-lineage edge volume
+    [{"resolvable_write_col_edges": 25246}],
     # PR 4 Step 4.3 — Repo path (for catalog-path check)
     [{"path": "/repo"}],
 ]
@@ -167,6 +171,9 @@ def test_coverage_metrics_collect_returns_populated_stats():
     assert stats.zero_edge_write_queries == 92
     assert stats.total_write_queries == 500
 
+    # column_lineage_recall_metric.md — resolvable-write edge volume (E8 revival gate)
+    assert stats.resolvable_write_col_edges == 25246
+
 
 # ---------------------------------------------------------------------------
 # collect_coverage — degrade to None on exception
@@ -217,6 +224,8 @@ def test_coverage_metrics_collect_handles_empty_graph():
         [{"info_schema_rows": 0}],
         # PR-1 issue-38 — CTE-source gap writes (zero for empty graph)
         [{"cte_source_gap_writes": 0}],
+        # column_lineage_recall_metric.md — resolvable-write col edges (zero for empty graph)
+        [{"resolvable_write_col_edges": 0}],
         # PR 4 Step 4.3 — Repo path (empty for empty graph)
         [],
     ]
