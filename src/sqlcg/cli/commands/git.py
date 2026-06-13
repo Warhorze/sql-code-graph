@@ -1,6 +1,7 @@
 """Git integration commands for sqlcg."""
 
 import shutil
+import site
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -64,15 +65,33 @@ def _resolve_sqlcg_bin() -> str:
     """Resolve the absolute path of the installing sqlcg binary.
 
     Resolution order:
-    1. shutil.which("sqlcg") — the binary on the installer's $PATH.
+    0. Path(site.getuserbase()) / "bin" / "sqlcg" — stable user-installed PyPI binary.
+       Preferred over the venv binary because it survives venv rebuilds.
+    1. shutil.which("sqlcg") — the binary on the installer's $PATH (demoted fallback).
+       Emits a warning if the resolved path is inside a virtualenv (.venv directory),
+       as the hook may go stale if the venv is rebuilt.
     2. sys.argv[0] resolved via Path(...).resolve() if it ends in "sqlcg" and is executable.
-    3. Bare "sqlcg" fallback (current behaviour) — prints a warning so the user knows.
+    3. Bare "sqlcg" fallback — prints a warning so the user knows.
 
     Returns the resolved path string (absolute when resolvable, bare "sqlcg" otherwise).
     """
-    # 1. Try $PATH first — the binary the user means
+    # 0. Prefer the stable user-installed binary (survives venv rebuilds)
+    user_bin = Path(site.getuserbase()) / "bin" / "sqlcg"
+    if user_bin.is_file() and user_bin.stat().st_mode & 0o111:
+        return str(user_bin)
+
+    # 1. Try $PATH — demoted fallback (may resolve inside .venv on editable installs)
     which_result = shutil.which("sqlcg")
     if which_result:
+        # Warn when the resolved binary is inside a virtualenv: the hook embeds this
+        # path and will break if the venv is deleted and rebuilt.
+        if "/.venv/" in which_result or "\\.venv\\" in which_result:
+            console.print(
+                "[yellow]Warning: resolved sqlcg binary is inside a virtualenv "
+                f"('.venv'): {which_result}\n"
+                "The installed git hook may go stale if the venv is rebuilt. "
+                "Consider `uv tool install sqlcg` for a stable path.[/yellow]"
+            )
         return which_result
 
     # 2. Try sys.argv[0] for python -m / editable-install invocations
