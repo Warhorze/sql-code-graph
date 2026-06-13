@@ -526,3 +526,177 @@ def test_coverage_json_exposes_new_keys_and_legacy_key_unchanged(pr1_fixture_bac
     assert payload["phantom_confirmed"] == 1
     assert payload["phantom_contradicted"] == 1
     assert payload["indexed_sha"] == "deadbeef"
+
+
+# ---------------------------------------------------------------------------
+# #116 — cte_source_gap_writes floor-filter tests
+#
+# Two independent fixtures prove that the inferred_from_source_name=FALSE
+# filter correctly handles both ends of the spectrum:
+#
+# literal_insert_fixture:
+#   A single INSERT write query whose COLUMN_LINEAGE edges are ALL
+#   inferred_from_source_name=TRUE (no-FROM literal insert, e.g.
+#   INSERT INTO t SELECT NULL AS x).  No SELECTS_FROM row.
+#   The metric must return 0 — this is not an addressable CTE gap.
+#
+# real_cte_gap_fixture:
+#   A single INSERT write query with ≥1 scope-derived (inferred=FALSE)
+#   COLUMN_LINEAGE edge and zero SELECTS_FROM rows.  This IS an
+#   addressable CTE gap; the metric must return ≥1.
+#
+# Plan: plan/sprints/sprint_backlog_q2_bugfix.md §PR-A, Scenario A + B.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def literal_insert_fixture():
+    """Single INSERT with only inferred COLUMN_LINEAGE edges and no SELECTS_FROM.
+
+    Guards #116 floor-filter: no-FROM literal inserts must not be counted
+    ([plan doc](plan/sprints/sprint_backlog_q2_bugfix.md)).
+    """
+    b = DuckDBBackend(":memory:")
+    b.init_schema()
+
+    b.run_write(
+        'INSERT INTO "Repo" (path, name) VALUES (?, ?)',
+        {"path": "/repo", "name": "testrepo"},
+    )
+    b.run_write(
+        'INSERT INTO "File" (path, repo_path, sha, dialect, parse_failed) VALUES (?, ?, ?, ?, ?)',
+        {
+            "path": "/repo/etl/literal.sql",
+            "repo_path": "/repo",
+            "sha": "aaa",
+            "dialect": "ansi",
+            "parse_failed": False,
+        },
+    )
+    b.run_write(
+        'INSERT INTO "SqlQuery" (id, file_path, statement_index, sql, kind,'
+        " target_table, parse_failed, confidence, parsing_mode, start_line)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        {
+            "id": "/repo/etl/literal.sql:0",
+            "file_path": "/repo/etl/literal.sql",
+            "statement_index": 0,
+            "sql": "INSERT INTO t SELECT NULL AS x",
+            "kind": "INSERT",
+            "target_table": "t",
+            "parse_failed": False,
+            "confidence": 1.0,
+            "parsing_mode": "sqlglot",
+            "start_line": 1,
+        },
+    )
+    # All edges are inferred_from_source_name=TRUE — literal-only, no real source
+    b.run_write(
+        'INSERT INTO "COLUMN_LINEAGE" (src_key, dst_key, inferred_from_source_name, query_id)'
+        " VALUES (?, ?, ?, ?)",
+        {
+            "src_key": "t.x",
+            "dst_key": "t.x",
+            "inferred_from_source_name": True,
+            "query_id": "/repo/etl/literal.sql:0",
+        },
+    )
+    # No SELECTS_FROM row — literal inserts have no real source table
+
+    b.set_indexed_sha("lit111")
+    yield b
+    b.close()
+
+
+@pytest.fixture(scope="module")
+def real_cte_gap_fixture():
+    """Single INSERT with a real COLUMN_LINEAGE edge but no SELECTS_FROM row.
+
+    Guards #116 floor-filter: real (non-inferred) CTE gaps must still be counted
+    ([plan doc](plan/sprints/sprint_backlog_q2_bugfix.md)).
+    """
+    b = DuckDBBackend(":memory:")
+    b.init_schema()
+
+    b.run_write(
+        'INSERT INTO "Repo" (path, name) VALUES (?, ?)',
+        {"path": "/repo", "name": "testrepo"},
+    )
+    b.run_write(
+        'INSERT INTO "File" (path, repo_path, sha, dialect, parse_failed) VALUES (?, ?, ?, ?, ?)',
+        {
+            "path": "/repo/etl/cte_write.sql",
+            "repo_path": "/repo",
+            "sha": "bbb",
+            "dialect": "ansi",
+            "parse_failed": False,
+        },
+    )
+    b.run_write(
+        'INSERT INTO "SqlQuery" (id, file_path, statement_index, sql, kind,'
+        " target_table, parse_failed, confidence, parsing_mode, start_line)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        {
+            "id": "/repo/etl/cte_write.sql:0",
+            "file_path": "/repo/etl/cte_write.sql",
+            "statement_index": 0,
+            "sql": "INSERT INTO dst SELECT src.col FROM cte",
+            "kind": "INSERT",
+            "target_table": "dst",
+            "parse_failed": False,
+            "confidence": 1.0,
+            "parsing_mode": "sqlglot",
+            "start_line": 1,
+        },
+    )
+    # One real (inferred=FALSE) edge — scope-derived column lineage
+    b.run_write(
+        'INSERT INTO "COLUMN_LINEAGE" (src_key, dst_key, inferred_from_source_name, query_id)'
+        " VALUES (?, ?, ?, ?)",
+        {
+            "src_key": "src.col",
+            "dst_key": "dst.col",
+            "inferred_from_source_name": False,
+            "query_id": "/repo/etl/cte_write.sql:0",
+        },
+    )
+    # No SELECTS_FROM row — this is the CTE gap that should be counted
+
+    b.set_indexed_sha("gap222")
+    yield b
+    b.close()
+
+
+def test_cte_source_gap_excludes_literal_insert_floor(literal_insert_fixture):
+    """cte_source_gap_writes is 0 when the only write has all-inferred COLUMN_LINEAGE edges.
+
+    No-FROM literal inserts (INSERT … SELECT NULL AS x) produce only
+    inferred_from_source_name=TRUE edges and can never gain a SELECTS_FROM row
+    — they are not an addressable CTE gap.  The floor-filter added in #116 must
+    exclude them so the metric reports 0 for a graph containing only such writes.
+
+    Guards #116 ([plan doc](plan/sprints/sprint_backlog_q2_bugfix.md)).
+    """
+    stats = collect_coverage_with(literal_insert_fixture)
+
+    assert stats is not None
+    assert stats.cte_source_gap_writes == 0, (
+        f"Expected 0 (literal-insert floor excluded), got {stats.cte_source_gap_writes}"
+    )
+
+
+def test_cte_source_gap_counts_real_cte_gap_writes(real_cte_gap_fixture):
+    """cte_source_gap_writes is ≥1 when a write has a real COLUMN_LINEAGE edge but no SELECTS_FROM.
+
+    A write query with at least one scope-derived (inferred_from_source_name=FALSE)
+    COLUMN_LINEAGE edge but no SELECTS_FROM source row is an addressable CTE gap
+    and must be counted.
+
+    Guards #116 ([plan doc](plan/sprints/sprint_backlog_q2_bugfix.md)).
+    """
+    stats = collect_coverage_with(real_cte_gap_fixture)
+
+    assert stats is not None
+    assert stats.cte_source_gap_writes >= 1, (
+        f"Expected ≥1 (real CTE gap counted), got {stats.cte_source_gap_writes}"
+    )

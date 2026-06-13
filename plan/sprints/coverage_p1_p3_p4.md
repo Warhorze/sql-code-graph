@@ -492,7 +492,7 @@ decision — do **not** treat a sub-95 % result here as a failure of this sprint
 | P3 `table_name` qualification breaks a query that filters on bare `table_name` | Only names **containing a space** are qualified; normal names unchanged. Join keys use `table_qualified`/`full_id`, not `table_name`. Full gate catches any consumer that filters on `table_name`. |
 | New `defined_columns` on AS-SELECT shifts a table into the `ddl_columns_by_bare` ambiguity set, perturbing Part-B positional INSERT mapping | The aggregator already de-duplicates identical catalogs and excludes genuinely-ambiguous bare names (L98–103); a CTAS-derived catalog matching its own DDL is identical → no new ambiguity. Regression: clone-blindspot / backfill tests stay green. |
 | Perf regression from a hot-path scaling flip | No new per-column op; all changes once-per-statement or once-per-row. Four perf-guard files run after each phase; whole-corpus timing ≤180s checked post-merge. |
-| Edge health misses ≥95% because residual P2 phantom edges remain | Findings project P2 residual collapses once P3/P4 supply catalogs; if measured health lands below 95%, that is a **stop condition** — re-run the diagnostic (`scripts/column_coverage_check.py`) to identify the residual pattern before claiming the milestone, do not relax the gate. |
+| 95% numeric gate dropped (GitHub #124) | 95% gate removed — coverage is reported as an observed metric (no pass/fail target). Post-P1/P3/P4 baseline: ~55–65% scoped. Next improvement sprint: BQ-2. See GitHub #124. |
 
 ## 95% Feasibility Analysis (added 2026-06-08)
 

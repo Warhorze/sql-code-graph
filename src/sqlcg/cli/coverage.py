@@ -295,25 +295,38 @@ WHERE source = 'information_schema'
 """
 
 # ---------------------------------------------------------------------------
-# Query §G-4 (PR-1, issue-38-selects-from-island-lever.md §PR-1 Step 1.1):
-# CTE-source gap — write-kind queries that have ≥1 outgoing COLUMN_LINEAGE
-# edge but zero SELECTS_FROM source rows.  These are CTE-wrapped writes whose
-# column path resolved correctly but whose table path emitted nothing, leaving
-# the written table a table-level island.  Establishes the falsifiable baseline
-# PR-2 must move toward 0.
+# Query §G-4 (PR-1, issue-38-selects-from-island-lever.md §PR-1 Step 1.1;
+# floor-filter added #116):
+# CTE-source gap — write-kind queries that have ≥1 REAL (non-inferred)
+# COLUMN_LINEAGE edge but zero SELECTS_FROM source rows.  These are
+# CTE-wrapped writes whose column path resolved correctly but whose table path
+# emitted nothing, leaving the written table a table-level island.
+# Establishes the falsifiable baseline PR-2 must move toward 0.
 #
 # Discriminator: kind IN _WRITE_KINDS AND target_table <> '' — ensures
 # SELECT-kind CTAS rows with an inferred target do NOT inflate the count
 # (Amendment A2 of the plan review).  Inverse complement of
 # zero_edge_write_queries (writes with zero COLUMN_LINEAGE); kept distinct by
 # field name and rendered label.
+#
+# Floor filter (#116): no-FROM literal inserts (INSERT … SELECT NULL AS x)
+# carry only inferred_from_source_name=TRUE COLUMN_LINEAGE edges because the
+# column names are taken from the INSERT column list with no real source table.
+# They can never gain a SELECTS_FROM row by construction, so they are not an
+# addressable CTE gap.  The EXISTS … inferred_from_source_name=FALSE clause
+# excludes them: a write must have at least one scope-derived (real) edge to be
+# counted.  This removes the permanent ~48-unit floor measured on DWH v1.27.1.
 # ---------------------------------------------------------------------------
 _Q_CTE_SOURCE_GAP_WRITES = f"""
 SELECT COUNT(*) AS cte_source_gap_writes
 FROM "SqlQuery" q
 WHERE q.kind IN ({_WRITE_KINDS_SQL})
   AND q.target_table <> ''
-  AND EXISTS (SELECT 1 FROM "COLUMN_LINEAGE" cl WHERE cl.query_id = q.id)
+  AND EXISTS (
+      SELECT 1 FROM "COLUMN_LINEAGE" cl
+      WHERE cl.query_id = q.id
+        AND cl.inferred_from_source_name = FALSE
+  )
   AND NOT EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
 """
 
@@ -410,10 +423,16 @@ class CoverageStats:
     # the §G catalog-missing warning line in render_coverage_lines.
     info_schema_has_column_rows: int = 0
 
-    # --- CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1) ---
-    # Write-kind queries with ≥1 COLUMN_LINEAGE edge but zero SELECTS_FROM rows.
-    # Inverse complement of zero_edge_write_queries; distinct field + label.
-    # Baseline on DWH (schema v8, sha fdf1b551): 46.
+    # --- CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1;
+    #     floor-filter #116) ---
+    # Write-kind queries with ≥1 REAL (non-inferred) COLUMN_LINEAGE edge but
+    # zero SELECTS_FROM rows.  Excludes no-FROM literal inserts (INSERT …
+    # SELECT NULL AS x) which carry only inferred_from_source_name=TRUE edges
+    # and can never gain a SELECTS_FROM row by construction — they are not an
+    # addressable CTE gap.  Inverse complement of zero_edge_write_queries;
+    # distinct field + label.
+    # Pre-filter baseline on DWH (schema v8, sha fdf1b551): 168 graph-wide.
+    # Post-filter baseline (v1.27.1): ~120 (permanent ~48-unit floor removed).
     cte_source_gap_writes: int = 0
 
     # --- column-lineage recall (column_lineage_recall_metric.md) ---
@@ -751,7 +770,8 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f"{coverage.zero_edge_write_queries} / {coverage.total_write_queries}"
     )
     lines.append(
-        f"{indent}CTE-wrapped writes missing SELECTS_FROM source: {coverage.cte_source_gap_writes}"
+        f"{indent}CTE-wrapped writes missing SELECTS_FROM source"
+        f" (real edges only, excludes literal-insert floor): {coverage.cte_source_gap_writes}"
     )
     lines.append(
         f"{indent}Column-lineage edges on resolvable-source writes: "
