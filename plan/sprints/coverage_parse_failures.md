@@ -1,5 +1,8 @@
 # Feature Plan: Coverage Parse-Failure Recovery (E5/E8) + Honest Index Metric
 
+**Status: REVIEWED** — plan-reviewer verdict APPROVE-WITH-AMENDMENTS (2026-06-13); all required
+amendments + notes applied in place. Ready for implementation.
+
 ## Summary
 
 Recover lineage coverage lost to the two dominant parse-degradation classes on the live
@@ -153,8 +156,9 @@ this plan is the executable form. Linked findings: ARCHITECTURE_REVIEW.md **F7**
 
 ### PR-1: Honest index-summary metric
 
-**API/CLI surface change:** a new summary line in `sqlcg index` output. Minor surface
-addition (a new printed line, no flag, no schema change).
+**API/CLI surface change:** a new informational summary line in `sqlcg index` output.
+**PATCH bump (plan-review):** an informational CLI output line is not new API/command surface,
+so PR-1 is a **patch** (→ 1.25.6), not a minor. No flag, no schema change.
 
 The summary path at [`index.py:417-444`](../../src/sqlcg/cli/commands/index.py#L417) reads
 `summary["error_summary"]` (already in the result dict). Add a degrading-total line that
@@ -170,17 +174,25 @@ denominators, and they differ:
 
 **Choose the file-level count (#2)** — it is the number F8 names and the one that maps to the
 orphan belt. `dominant_cause()` ([`error_classify.py:32`](../../src/sqlcg/indexer/error_classify.py#L32))
-already returns `(parse_cause, parse_failed)` per file; `parse_failed` is persisted on the
-`File` node and was the basis for the diagnosis count. The developer must:
-- Surface a **count of files with `parse_failed=True`** into the result dict alongside
-  `error_summary` (add an aggregate in the same `pass2_results` loop at
-  [`indexer.py:715`](../../src/sqlcg/indexer/indexer.py#L715) that calls `dominant_cause()`
-  per file — or reuse the already-computed `parse_cause`/`parse_failed` if available on the
-  parsed objects; grep the parsed object for an existing field before adding a new loop).
-- Print it as a **distinct, non-replacing** line, e.g.:
+already returns `(parse_cause, parse_failed)` per file. **Correction (plan-review):**
+`ParsedFile` does **NOT** carry a `parse_failed` field — that field lives on `QueryNode`
+([`base.py:255`](../../src/sqlcg/parsers/base.py#L255)). `ParsedFile` has only
+`errors: list[str]` and `parse_quality: ParseQuality`, and the pass2 loop at
+[`indexer.py:715`](../../src/sqlcg/indexer/indexer.py#L715) iterates `ParsedFile` objects. The
+developer must:
+- In the **EXISTING** `for parsed in pass2_results` loop at
+  [`indexer.py:715`](../../src/sqlcg/indexer/indexer.py#L715), call `dominant_cause(parsed.errors)`
+  (`dominant_cause` is already imported at [`indexer.py:13`](../../src/sqlcg/indexer/indexer.py#L13))
+  and accumulate a count of files whose result is in `_DEGRADING`. **Do NOT add a second loop.**
+- Surface that distinct-file count in the `summary` dict for the CLI line (a NEW key alongside
+  `error_summary`). Document the exact denominator chosen in a code comment.
+- Print it as a **distinct, ADDITIVE** line, e.g.:
   `  410 files degraded (parse_failed) — E5: 217 · E8: 184 · timeout: 1 · …`
-  alongside the existing quality line. Keep the existing "N failed" / "N timed out" wording
-  untouched (it correctly reports row-build crashes + timeouts respectively).
+  alongside the existing quality line. The CLI line is built at
+  [`index.py:417-444`](../../src/sqlcg/cli/commands/index.py#L417) from
+  `summary["quality"]` / `error_summary`; the new degraded-files count must be a NEW key
+  surfaced there and printed as an ADDITIVE line. Keep the existing "N failed" / "N timed out"
+  wording untouched (it correctly reports row-build crashes + timeouts respectively).
 
 **No parser changes. No hot-path touch. Lowest risk — ships first.**
 
@@ -201,7 +213,12 @@ path and break the perf invariants). Options for the developer, in preference or
    normalization, then restore the original quoted case for the emitted `dst_col_name`. This
    keeps `sg_lineage` resolving against the scope but stops the case mismatch.
 
-The developer chooses based on what keeps the perf invariants intact (see Risk section).
+**Tiebreaker (plan-review) — prefer option 1 as the default.** For renamed view aliases (the
+`AS '<quoted>'` path at [`base.py:1351-1352`](../../src/sqlcg/parsers/base.py#L1351)), prefer
+**option 1** (resolve on the source expression by position): it does not change `body_scope`
+construction or `sg_lineage` lookup semantics and is perf-invariant-safe by construction. Use
+**option 2 only if option 1 is structurally impossible** for a fixture-exposed case.
+
 **The emitted edge's destination column name MUST be the original quoted case
 (`"Afdelingsnummer"`), not the uppercased form** — the graph column identity must match the
 view's declared output.
@@ -213,31 +230,37 @@ affects the renamed-alias case and does not change resolution for already-workin
 
 ### PR-3: E8 — intra-file temp-table-chain intermediate resolution
 
-**Mirror the existing CTE-as-intermediate handling.** CTE bodies are already added to
-`combined_sources` ([`base.py:1017-1039`](../../src/sqlcg/parsers/base.py#L1017)) so outer
-columns resolve through CTE names, and CTEs are emitted as intermediate `role="cte"`
-destinations ([`base.py:1471-1495`](../../src/sqlcg/parsers/base.py#L1471)). PR-3 does the
-analogous thing for intra-file `CREATE TEMP TABLE x AS SELECT …`:
+**Correction (plan-review) — `combined_sources` is the WRONG hook.** `combined_sources` in
+`base.py` is a purely local dict NEVER consumed by `sg_lineage` (it only seeds the
+per-statement CTE dict). The real cross-statement temp-body mechanism is **`sources_map`**
+(ANSI [`ansi_parser.py:196`](../../src/sqlcg/parsers/ansi_parser.py#L196), Snowflake
+[`snowflake_parser.py:502`](../../src/sqlcg/parsers/snowflake_parser.py#L502)), seeded from
+`xfile_sources` and extended by CTAS registration
+([`ansi_parser.py:222-232`](../../src/sqlcg/parsers/ansi_parser.py#L222),
+[`snowflake_parser.py:543-551`](../../src/sqlcg/parsers/snowflake_parser.py#L543)), passed to
+`_extract_column_lineage` as `sources=` and fed to `exp.expand()`. **Both parsers ALREADY
+register `CREATE TEMP TABLE` bodies into `sources_map` under the bare lowercase target name.**
 
-- Harvest the `CREATE TEMP TABLE`/`CREATE TEMPORARY TABLE … AS SELECT` bodies from the file
-  (the same pass that already populates `_current_file_temp_keys` for namespacing — grep
-  `_current_file_temp_keys` for the existing harvest site and reuse it; do NOT add a second
-  scan of the file).
-- When a downstream write's lineage root resolves to a temp-table name registered in-file,
-  feed that temp's SELECT body as an intermediate source so the chain resolves to the temp's
-  own leaf sources — exactly as `combined_sources` does for CTEs.
-- Respect the existing temp **namespacing** (v1.21.x): the intermediate node must use the
-  per-file namespaced key (`<rel_path>::<db>.<name>`, `role="temp"`), never a bare key — the
-  dual-write footgun fixed in v1.21.1 must not be reopened. Grep `_temp_identity` /
-  `namespace` for the convention.
+**E8 is NOT a missing registration — it is a KEY-MISMATCH.** `_qualify_bare_tables` (the
+Snowflake scripting path) may qualify the temp name (e.g. `tmp_inkooporder` →
+`schema.tmp_inkooporder`) at `exp.expand()` lookup time, while `sources_map` holds the **bare**
+key. The lookup misses → no leaf resolves → `dynamic_source` → E8. PR-3:
+
+- **Do NOT add a `combined_sources` registration path.** Investigate the key-mismatch between
+  the `_qualify_bare_tables`-qualified temp name and the bare-name key in `sources_map`; fix the
+  lookup/registration key normalization so `exp.expand()` finds the temp body.
+- The `sources_map` key used by `exp.expand()` **must stay a BARE SQL identifier**. The
+  namespaced `<rel_path>::<db>.<name>` `role='temp'` key applies ONLY to the emitted **GRAPH
+  NODE** via `_lineage_node_to_table_ref` (Step 3.2, unchanged) — the dual-write footgun fixed
+  in v1.21.1 must not be reopened.
 
 **Statement ordering:** a temp must be CREATEd before it is READ in the same file (the
-v1.21.2 acceptance W1 case). The harvest is file-level so this is satisfied for the common
-case; document any backward-reference as out of scope.
+v1.21.2 acceptance W1 case). Registration into `sources_map` is statement-ordered already, so
+this is satisfied for the common case; document any backward-reference as out of scope.
 
-**Performance constraint (critical):** the temp bodies must be added to the **file-level**
-`combined_sources` and filtered by `dependency_filter` in pass 2, exactly like CTE/CTAS
-bodies — NOT the full corpus (CLAUDE.md invariant: `exp.expand()` with only file-level
+**Performance constraint (critical):** the fix is a key-normalization correction inside the
+existing `sources_map` → `exp.expand()` path; it must NOT widen the source set beyond the
+already-file-level `sources_map` (CLAUDE.md invariant: `exp.expand()` with only file-level
 sources, O(N_refs) not O(N_files × N_corpus_ctas)). The `body_scope`-once-per-statement and
 `copy=False`/`trim_selects=False` invariants must hold unchanged.
 
@@ -273,14 +296,19 @@ one of these PRs MUST, as a merge gate:**
 
 ## Implementation Steps
 
-### PR-1 (ships first — instrumentation): honest index-summary metric — v1.25.6 (minor)
+### PR-1 (ships first — instrumentation): honest index-summary metric — v1.25.6 (patch)
 
-**Step 1.1** — Aggregate the file-level `parse_failed` count into the index result.
+**Step 1.1** — Aggregate the file-level degraded count into the index result.
 - Files: [`indexer.py`](../../src/sqlcg/indexer/indexer.py) (~L715 `pass2_results` loop / the
   result dict at L729-747).
-- First **grep the parsed objects** for an existing `parse_failed` / `parse_cause` field
-  (PR 5 / sprint_postmortem_fixes persisted `skip_counts` and `parse_cause` on the File node).
-  Reuse it; only call `dominant_cause()` per file if no field already carries the verdict.
+- **Correction (plan-review):** `ParsedFile` does **NOT** carry `parse_failed` — only
+  `ParsedFile.errors: list[str]` (the `parse_failed` field is on `QueryNode`,
+  [`base.py:255`](../../src/sqlcg/parsers/base.py#L255), not the per-file object the pass2 loop
+  iterates). In the **EXISTING** `for parsed in pass2_results` loop at
+  [`indexer.py:715`](../../src/sqlcg/indexer/indexer.py#L715), call
+  `dominant_cause(parsed.errors)` (already imported at
+  [`indexer.py:13`](../../src/sqlcg/indexer/indexer.py#L13)) and accumulate a count of files
+  whose result is in `_DEGRADING`. **Do NOT add a second loop.**
 - Add `degraded_files` (int) and a per-bucket breakdown (reuse `error_summary`) to the result
   dict. Document the exact denominator chosen in a code comment.
 - Acceptance: result dict contains `degraded_files` equal to the number of files whose
@@ -294,8 +322,8 @@ one of these PRs MUST, as a merge gate:**
 - Acceptance: on a fixture with ≥1 E5 file and ≥1 E8 file, the printed output contains the
   degraded-files line with the correct count; the existing "N failed" line is unchanged.
 
-**Step 1.3** — Version bump 1.25.5 → **1.25.6** (minor — new user-visible summary line).
-Update `pyproject.toml`, `src/sqlcg/__init__.py`, `uv lock`.
+**Step 1.3** — Version bump 1.25.5 → **1.25.6** (**patch** — an informational CLI output line
+is not new API/command surface). Update `pyproject.toml`, `src/sqlcg/__init__.py`, `uv lock`.
 
 ### PR-2: E5 fix — v1.25.7 (patch — added resolution, no new surface)
 
@@ -314,18 +342,27 @@ Update `pyproject.toml`, `src/sqlcg/__init__.py`, `uv lock`.
 
 ### PR-3: E8 `dynamic_source` temp-chain fix — v1.25.8 (patch)
 
-**Step 3.1** — Reuse the existing in-file temp harvest; feed temp bodies as file-level
-intermediate sources.
-- Files: [`base.py`](../../src/sqlcg/parsers/base.py) (`combined_sources` construction ~L1015,
-  the temp-key harvest site — grep `_current_file_temp_keys`).
-- Add temp `AS SELECT` bodies to `combined_sources` under their namespaced key, filtered by
-  `dependency_filter` in pass 2. Do NOT scan the corpus.
+**Step 3.1** — Fix the `sources_map` key-mismatch so the existing temp-body registration
+resolves at `exp.expand()` lookup time.
+- Files: [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py) (`sources_map` seed ~L196,
+  CTAS/temp registration ~L222-232), [`snowflake_parser.py`](../../src/sqlcg/parsers/snowflake_parser.py)
+  (`sources_map` seed ~L502, temp registration ~L543-551), and the `_qualify_bare_tables` path.
+- **Do NOT add a `combined_sources` registration path** — `combined_sources` is never consumed
+  by `sg_lineage`. The temp body is ALREADY registered in `sources_map` under the bare
+  lowercase target name. The bug is the KEY-MISMATCH: `_qualify_bare_tables` may qualify the
+  temp name (`tmp_inkooporder` → `schema.tmp_inkooporder`) at `exp.expand()` lookup time while
+  `sources_map` holds the bare key. Fix the lookup/registration key normalization so
+  `exp.expand()` finds the temp body. The `sources_map` key fed to `exp.expand()` **must stay a
+  BARE SQL identifier**. Do NOT scan the corpus.
 - Acceptance: on the E8 fixture (below), the final `INSERT INTO target SELECT … FROM tmp_x`
   resolves through `tmp_x` to its leaf source table; the target gains incoming
   `COLUMN_LINEAGE`; the `col_lineage_skip:dynamic_source` count for that column drops to 0.
 
-**Step 3.2** — Preserve temp namespacing (no bare keys, no dual-write regression). Grep
-`_temp_identity` / `namespace`. Acceptance: the intermediate node is the namespaced
+**Step 3.2** — Preserve temp namespacing on the emitted GRAPH NODE (no bare keys, no
+dual-write regression). The namespaced `<rel_path>::<db>.<name>` `role='temp'` key applies ONLY
+to the emitted graph node via `_lineage_node_to_table_ref` — NOT to the `sources_map` key fed
+to `exp.expand()` (which stays bare per Step 3.1). Grep `_temp_identity` / `namespace` /
+`_lineage_node_to_table_ref`. Acceptance: the intermediate node is the namespaced
 `<rel_path>::<db>.<name>` `role="temp"` node, and no bare `tmp_*` `kind='table'` node is
 created for it.
 
@@ -414,6 +451,8 @@ separate known issue, not a PR-2/PR-3 gate).
 - [ ] Before/after **island / WCC count is flat** (E5 does not create islands — if islands
       drop materially, the fix did something unexpected; investigate).
 - [ ] `degraded_files` (from PR-1 metric) drops by ~211 (E5 view files flip off `parse_failed`).
+      **Depends on PR-1 being merged first** — the metric must exist to measure it; if PR-2 lands
+      before PR-1 this criterion cannot be evaluated.
 - [ ] E5 error-bucket count on the DWH drops to ~6 (the 4 `htdyn_*` + any residual), not ~217.
 - [ ] All four perf-guard suites GREEN and UNMODIFIED; all CLAUDE.md invariants intact.
 
