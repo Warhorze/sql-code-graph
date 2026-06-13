@@ -1348,10 +1348,36 @@ class SqlParser(ABC):
                 if not list(col_expr.find_all(exp.Column)):
                     continue
 
+                # _sg_col_arg is what we pass to sg_lineage: a quoted exp.Column for
+                # aliased expressions (E5 fix), or the plain string col_name otherwise.
                 if col_expr.alias:
                     col_name = col_expr.alias
+                    # E5 fix (PR-2, coverage_parse_failures.md): qualify() uppercases
+                    # single-token unquoted-looking aliases (e.g. "Afdelingsnummer" →
+                    # AFDELINGSNUMMER in the scope) so sg_lineage("Afdelingsnummer", ...)
+                    # fails with "Cannot find column 'AFDELINGSNUMMER'". Space-containing
+                    # aliases are unaffected because spaces prevent normalization.
+                    #
+                    # Fix: when the alias identifier is QUOTED in the source SQL
+                    # (alias_node.quoted=True), pass a quoted exp.Column expression so
+                    # normalize_identifiers() preserves case through the scope lookup.
+                    # For UNQUOTED aliases (e.g. `d.id AS dim_listing_id`), the scope
+                    # stores the uppercase form (DIM_LISTING_ID), so we pass the plain
+                    # string so sg_lineage uppercases it to match — the pre-fix behavior.
+                    # This O(1) guard (one attribute read + one tiny AST node for quoted
+                    # aliases) does not touch body_scope or qualify/build_scope.
+                    # dst_col_name in _lineage_node_to_edges uses col_name (original case).
+                    _alias_node = col_expr.args.get("alias")
+                    _alias_is_quoted = _alias_node is not None and getattr(
+                        _alias_node, "quoted", False
+                    )
+                    if _alias_is_quoted:
+                        _sg_col_arg = exp.Column(this=exp.Identifier(this=col_name, quoted=True))
+                    else:
+                        _sg_col_arg = col_name
                 elif isinstance(col_expr, exp.Column):
                     col_name = col_expr.name
+                    _sg_col_arg = col_name
                     if not col_name or col_name == "*":
                         out.errors.append("col_lineage_skip:star:<empty_name>")
                         continue
@@ -1419,7 +1445,7 @@ class SqlParser(ABC):
                         sg_kwargs["trim_selects"] = False
                     else:
                         sg_kwargs["sources"] = sources or {}
-                    root = sg_lineage(col_name, body, **sg_kwargs)
+                    root = sg_lineage(_sg_col_arg, body, **sg_kwargs)
                     if root:
                         # Successfully extracted lineage — walk tree and emit edges.
                         #

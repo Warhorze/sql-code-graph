@@ -508,3 +508,15 @@ separate known issue, not a PR-2/PR-3 gate).
 - **Impact**: The PR-1 integration test pins the distinct-file counting invariant via two E5
   files. The E8 integration test will be added in PR-3 alongside the fix.
 - **Date**: 2026-06-13
+
+#### Deviation 2: PR-1 integration test updated in PR-2 to use func_fallback fixtures
+- **Reason**: PR-2 fixed E5, so the E5-shape view fixtures used by the PR-1 integration test
+  (`test_degraded_files_count_matches_two_e5_fixture_files`) now parse cleanly with zero errors.
+  The test was asserting `degraded_files == 2` which became `degraded_files == 0` after PR-2.
+- **Change**: Updated `test_degraded_files_count_matches_two_e5_fixture_files` to use
+  `func_fallback` fixtures (unaliased function expressions: `UPPER`, `LOWER`, etc.) as the
+  stable degradation trigger. Added `test_e5_view_fixture_now_clean_after_pr2_fix` as a
+  regression guard: pins that the E5 view fixture now produces `degraded_files == 0`.
+- **Impact**: The PR-1 distinct-file counting invariant is still pinned, now via func_fallback
+  rather than E5. The change is confined to `tests/integration/test_index_degraded_files_metric.py`.
+- **Date**: 2026-06-13
