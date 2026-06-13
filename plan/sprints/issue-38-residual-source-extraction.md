@@ -1,6 +1,10 @@
 # Feature Plan: #38 PR-3 — residual `SELECTS_FROM` source-extraction (subscope descent)
 
-> **Status: PLANNED — not yet implemented.**
+> **Status: REVIEWED** (plan-reviewer 2026-06-13: BLOCKED→resolved; corrected the §5 gate from
+> 110→≤~10 to **110→≤~50** reconciling the planner's probe against the live-test classification
+> [`issue38_pr2_live_acceptance.md`](../reports/issue38_pr2_live_acceptance.md), added `traverse_scope`
+> module-level import discipline, named the ~48 literal + ~29 self-reload buckets as out-of-scope.
+> Ready to implement as **v1.28.0** AFTER v1.27.0 merges. Not yet implemented.
 > Predecessors: PR-1 (metric `cte_source_gap_writes`, v1.26.0) + PR-2 (`_real_tables` CTE-body
 > descent, v1.26.1) — both shipped; see
 > [`issue-38-selects-from-island-lever.md`](issue-38-selects-from-island-lever.md) for format/context.
@@ -46,7 +50,7 @@ returns `[]`. PR-3 extends `_real_tables` to descend the **already-built** scope
 - A `SELECTS_FROM`-specific integration guard for the new shapes (subquery-source SELECT, CTAS-as-
   subquery, comment-prefixed INSERT, BA_TMP→BA alias remap on a subscope table).
 - Live-DWH re-acceptance: the `cte_source_gap_writes` metric must drop substantially from **110**.
-- Version bump (PR-3 = patch — bug fix, no new surface).
+- Version bump (PR-3 = **minor → v1.28.0**; additive `SELECTS_FROM` coverage class, per CLAUDE.md).
 
 ### Non-Goals
 - **The ~97 table-level islands are NOT the target.** Their missing-DDL source tables are already
@@ -60,6 +64,15 @@ returns `[]`. PR-3 extends `_real_tables` to descend the **already-built** scope
   already-built scopes. No new ingestion source is introduced.
 - The **744 graph-wide source-less writes that have NO column lineage** (out-of-corpus / literal-only
   SELECTs) — not column-resolvable, so not in this lever's population.
+- **The ~48 sourceless literal inserts INSIDE the 110** (`INSERT … SELECT NULL AS …` with no FROM, that
+  carry `COLUMN_LINEAGE` only via the `inferred_from_source_name` heuristic) — `traverse_scope` finds no
+  scope table for them, so they stay in `cte_source_gap_writes` after PR-3. They inflate the metric
+  numerator by construction; **excluding no-FROM writes from the metric (or renaming it) is a valid
+  follow-up ticket, NOT a PR-3 defect.** Do not investigate them as a PR-3 failure.
+- **The ~29 self-reload writes INSIDE the 110** (`INSERT INTO da_tmp.X SELECT … FROM DA.X`) — after
+  `da_tmp→da` remap the source id equals the target id and is correctly dropped by the
+  [`ansi_parser.py:455`](../../src/sqlcg/parsers/ansi_parser.py#L455) target-exclusion filter (a
+  self-reload IS a self-loop). Unfixable by subscope descent and correct as-is; out of scope.
 - **Recursive CTEs** (`WITH RECURSIVE`) — measured **0** in the residual (confirmed below). The
   PR-2-documented `union_scopes` known gap does not bite the live corpus; not addressed here.
 - Any parse-time schema-CSV feeding into `exp.expand()`/`qualify()` (forbidden per CLAUDE.md).
@@ -115,7 +128,14 @@ For each of the 110, `build_scope(stmt)` was run on the real statement and `_rea
 **The single uniform mechanism:** in **all 110**, the source tables are **NOT in the root scope's
 `.tables`**. They are reachable only by descending the scope tree. Proof — a `traverse_scope`-based
 descent (collect every subscope's `.tables`, drop names in any subscope's `cte_sources`, drop the
-target) **recovers source tables for 110 / 110** (`recovered=110, still_empty=0`).
+target) **descends to source tables for 110 / 110** (`recovered=110, still_empty=0`).
+
+> **Plan-review correction:** `still_empty=0` reflects what `traverse_scope` *descends to* — it does
+> **not** account for the [`ansi_parser.py:455`](../../src/sqlcg/parsers/ansi_parser.py#L455)
+> target-exclusion filter that re-suppresses self-reload sources after `da_tmp→da` alias remap (source
+> id == target id → dropped). The live expected residual is therefore **~50, not ~10**: ~48 sourceless
+> literal inserts + ~29 self-reload self-loops are out-of-scope-by-design, leaving ~33 genuinely
+> recoverable. See §5 for the corrected, measured gate.
 
 By **source identity** (which tables the descent finds), to confirm we are not chasing dead temp
 plumbing:
@@ -189,6 +209,15 @@ dst_key)`.
 > tighter filter is wanted; either is once-per-statement. Confirm against sqlglot 30.6.0 that
 > `traverse_scope` reaches the CTAS `Subquery` child (the §1d TRANSACTIE_OBT case proves it does —
 > the descent recovered all 8 tables). **Pin the chosen call with a grep-confirmed single call site.**
+>
+> **IMPORT DISCIPLINE (plan-review, REQUIRED):** if `traverse_scope` is used, it MUST be imported at
+> **module level** in [`base.py`](../../src/sqlcg/parsers/base.py) alongside `build_scope`/`qualify`
+> (the existing module-level imports exist precisely so tests can patch
+> `sqlcg.parsers.base.build_scope`/`.qualify`). The §3.3 scaling-guard counter patches
+> `sqlcg.parsers.base.traverse_scope`, which only works if it is a module-level name — an inline import
+> inside `_real_tables` would make that binding site unpatchable, exactly as CLAUDE.md documents for
+> `build_scope`/`qualify`. If the manual-recursion path is chosen instead, the counter must target
+> whatever module-level scope accessor it calls; pick one and keep the guard patchable.
 
 ### Why this is OFF the perf hot path (must be stated verbatim in the PR)
 
@@ -289,12 +318,21 @@ confirm no regression. **A/B method: same 2-state sequential index** as PR-2 (in
       N and 2N; no per-column `build_scope`/`qualify`/`sg_lineage`/`expand`/body-copy introduced.
 - [ ] **Metric gate (graph-wide, off the 110 base) — the falsifiable gate.** `cte_source_gap_writes`
       (write-kind, `COLUMN_LINEAGE > 0`, `SELECTS_FROM = 0`) drops **substantially** from **110** on a
-      2-state A/B DWH re-index. **Projected: 110 → ≤ ~10** — the measured descent recovered sources for
-      **110 / 110**, so the expected residual is small and is whatever the indexer cannot emit for
-      reasons *other* than the subscope gap (e.g. a source filtered as noise `_bck`/`ma.rtetl_delta`,
-      or a pure-self-reference). PR-3 must record the post-fix value **and a one-line residual
-      breakdown** (how many remaining are noise-filtered vs all-temp self-loops vs other). A residual
-      **not** explained by noise-filter / self-reference is a STOP — re-investigate before claiming
+      2-state A/B DWH re-index. **Projected: 110 → ≤ ~50** (corrected at plan-review — the planner's
+      "recovered 110/110, still_empty=0" counted what `traverse_scope` *descends to*, NOT what survives
+      the target-exclusion filter at [`ansi_parser.py:455`](../../src/sqlcg/parsers/ansi_parser.py#L455)
+      and lands as a `SELECTS_FROM` row). Of the 110: **~48 are sourceless literal inserts**
+      (`INSERT … SELECT NULL AS …` — no FROM; `COLUMN_LINEAGE` exists only via the
+      `inferred_from_source_name` heuristic, no scope table at any depth) and **~29 are self-reload
+      writes** (`INSERT INTO da_tmp.X SELECT … FROM DA.X` — after `da_tmp→da` alias canonicalisation the
+      source id equals the target id, so it is correctly removed by the `ansi_parser.py:455`
+      target-exclusion filter; a self-reload IS a self-loop and must drop). These **~77 are
+      out-of-scope-by-design** and remain in the metric by construction. The genuinely subscope-recoverable
+      population is the remaining **~33** (12 `WITH` + ~21 subquery/derived FROM). **Before claiming
+      delivery the developer MUST measure the three sub-populations (literal / self-reload /
+      subscope-recoverable) explicitly from the live residual — not assume the split — and record the
+      breakdown.** A residual **above ~50 that cannot be attributed to the literal/self-reload buckets**
+      is a STOP — re-investigate before claiming
       delivery. (Decoupled from any island count, per PR-2.)
 - [ ] **Edge-coverage corollary (directional, not a hard gate):** `gain` table-health %
       (strict / scoped / catalogued) shows **no regression** and the `SELECTS_FROM` edge total rises
@@ -317,11 +355,10 @@ confirm no regression. **A/B method: same 2-state sequential index** as PR-2 (in
   master **after** v1.27.0 lands so its A/B baseline includes the recall metric and the 110 figure is
   re-confirmed on the then-current master (re-run the §1 query; if v1.27.0 shifts the 110 materially,
   record the new baseline — the *mechanism* is unchanged).
-- **PR-3 = v1.28.0.** SemVer: although a pure bug fix, it materially extends `SELECTS_FROM` coverage
-  (a new resolution class) — treat as **minor** (`1.27.x → 1.28.0`), consistent with the CLAUDE.md
-  "additive capability → minor" rule and PR-1's minor bump for a coverage surface. If the user prefers
-  strict bug-fix semantics, a patch (`1.27.x → 1.27.(x+1)`) is acceptable; the developer confirms the
-  exact from→to against the merged v1.27.0 number at branch time.
+- **PR-3 = v1.28.0 (minor).** It materially extends `SELECTS_FROM` coverage (a new resolution class),
+  so it is a minor bump per the CLAUDE.md "additive capability → minor" rule, consistent with PR-1's
+  minor bump for a coverage surface. The developer confirms the exact from→to against the merged
+  v1.27.0 number at branch time.
 
 ---
 
@@ -338,9 +375,10 @@ confirm no regression. **A/B method: same 2-state sequential index** as PR-2 (in
 - **Risk:** a CTE alias referenced as a table inside another subscope leaks as a phantom source.
   **Mitigation:** filter against the **union of all subscopes' `cte_sources.keys()`** (Design §2),
   the same discipline PR-2 used for the flat-CTE pass; multi-CTE control test pins it.
-- **Risk:** the projected 110 → ≤~10 does not reproduce live. **Mitigation:** the metric shipped in
-  PR-1 makes it falsifiable; PR-3 acceptance is the live re-measurement with a residual breakdown, not
-  CI-green. A residual not explained by noise/self-reference is a STOP, not a silent pass.
+- **Risk:** the projected 110 → ≤~50 does not reproduce live. **Mitigation:** the metric shipped in
+  PR-1 makes it falsifiable; PR-3 acceptance is the live re-measurement with the **measured** three-way
+  residual breakdown (literal / self-reload / subscope-recoverable, §5), not CI-green. A residual above
+  ~50 not attributable to the literal/self-reload buckets is a STOP, not a silent pass.
 - **Risk:** conflation with the island count or with `COLUMN_LINEAGE` numbers. **Mitigation:** the
   framing rule (§⚠) and the explicit non-goal that islands are out of scope (likely dead code,
   already catalogued).
