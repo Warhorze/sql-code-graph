@@ -529,6 +529,8 @@ def test_install_hooks_bare_fallback_when_no_binary_resolvable(temp_git_repo, mo
     monkeypatch.setattr(_git_mod.shutil, "which", lambda name: None)
     # Make sys.argv[0] non-usable (not named sqlcg, not executable)
     monkeypatch.setattr(_git_mod.sys, "argv", ["/usr/bin/python3"])
+    # Make site.getuserbase() point to a directory with no sqlcg binary (step 0 miss)
+    monkeypatch.setattr(_git_mod.site, "getuserbase", lambda: "/tmp/no-user-base-here")
 
     result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
 
@@ -546,3 +548,82 @@ def test_install_hooks_bare_fallback_when_no_binary_resolvable(temp_git_repo, mo
     assert "warning" in result.output.lower() or "warn" in result.output.lower(), (
         f"Expected a warning when no binary resolvable. Output: {result.output!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-D Scenario A — .venv path warning emitted when which() resolves inside venv
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_sqlcg_bin_warns_when_which_returns_venv_path(monkeypatch):
+    """which() returning a .venv path emits a warning via console.print, not bare print.
+
+    Scenario A from plan/sprints/sprint_backlog_q2_bugfix.md §PR-D:
+    - shutil.which("sqlcg") returns a path containing '/.venv/'
+    - site.getuserbase() returns a directory with no sqlcg binary present
+    - _resolve_sqlcg_bin() must emit a warning containing '.venv' via console.print
+    - the returned path must still be the venv path (fallback proceeds normally)
+
+    The monkeypatch targets console.print (not bare print / typer.echo) because the
+    PR-D reviewer amendment explicitly requires the module's console object as the
+    warning surface, making this the canonical monkeypatch target.
+
+    Guards #126.
+    """
+    import sqlcg.cli.commands.git as _git_mod
+
+    venv_path = "/project/.venv/bin/sqlcg"
+    monkeypatch.setattr(_git_mod.shutil, "which", lambda name: venv_path)
+
+    # Patch site.getuserbase to a tmp dir that has no sqlcg binary
+    monkeypatch.setattr(_git_mod.site, "getuserbase", lambda: "/tmp/no-user-base-here")
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        _git_mod.console, "print", lambda msg, *args, **kwargs: printed.append(str(msg))
+    )
+
+    result = _git_mod._resolve_sqlcg_bin()
+
+    # Returned path must be the venv path (not bare fallback)
+    assert result == venv_path, f"Expected venv path, got: {result!r}"
+
+    # Warning must have been printed and mention .venv
+    assert printed, "No warning was printed — console.print was not called"
+    warning_text = " ".join(printed)
+    assert ".venv" in warning_text, f"Warning must mention '.venv'. Got: {warning_text!r}"
+
+
+def test_resolve_sqlcg_bin_prefers_user_base_over_venv(monkeypatch, tmp_path):
+    """user-base binary is preferred over a .venv path returned by shutil.which.
+
+    When Path(site.getuserbase()) / 'bin' / 'sqlcg' exists and is executable,
+    _resolve_sqlcg_bin() must return it without calling shutil.which at all —
+    no warning should be emitted.
+
+    Guards #126 resolution-order step 0 > step 1.
+    """
+    import sqlcg.cli.commands.git as _git_mod
+
+    # Create a fake executable at the user-base bin path
+    user_bin = tmp_path / "bin" / "sqlcg"
+    user_bin.parent.mkdir(parents=True)
+    user_bin.write_text('#!/bin/sh\nexec sqlcg "$@"\n')
+    user_bin.chmod(0o755)
+
+    monkeypatch.setattr(_git_mod.site, "getuserbase", lambda: str(tmp_path))
+
+    # which() would return a .venv path — but it must NOT be called (user-base wins)
+    venv_path = "/project/.venv/bin/sqlcg"
+    monkeypatch.setattr(_git_mod.shutil, "which", lambda name: venv_path)
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        _git_mod.console, "print", lambda msg, *args, **kwargs: printed.append(str(msg))
+    )
+
+    result = _git_mod._resolve_sqlcg_bin()
+
+    assert result == str(user_bin), f"Expected user-base path, got: {result!r}"
+    # No warning should have been printed
+    assert not printed, f"Unexpected warning printed: {printed!r}"
