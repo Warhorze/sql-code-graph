@@ -647,14 +647,25 @@ class TestSchemaAliasDualWriteRegression:
             backend.close()
 
     def test_lineage_chain_through_temp_with_alias(self, tmp_path):
-        """With schema alias ba_tmp→ba, COLUMN_LINEAGE edges flow through the namespaced
-        temp from da.real_src into real_target — the chain is intact end-to-end.
+        """With schema alias ba_tmp→ba, COLUMN_LINEAGE edges reach real_target end-to-end.
 
-        Pre-fix: edges from INSERT used 'ba.tmp_base' (un-namespaced) as src, so the
-        namespaced node had zero outgoing edges (orphaned sink).
-        Post-fix: edges use '<rel>::ba.tmp_base' → both sides of the temp are wired.
+        v1.21.1 fix: the v1.21.0 dual-write produced an orphaned namespaced temp sink
+        (no outgoing edges).  The v1.21.1 fix correct the leaf-stamping so INSERT edges
+        used the namespaced temp as src.
+
+        E8 fix (v1.25.8): the key-mismatch fix now allows exp.expand() to inline the
+        temp body.  The INSERT edges now resolve directly from the leaf sources (da.real_src,
+        ba.ref_table) to real_target — there are no edges "out of" the namespaced temp.
+        The temp node still exists (from the CREATE stmt), but the lineage chain is
+        represented as a direct leaf→final-target path.
+
+        Acceptance (post-E8-fix): edges INTO the temp exist (from CREATE); the final
+        target (real_target) receives incoming COLUMN_LINEAGE from leaf sources, either
+        via a direct path (E8 fix path) or via the temp as intermediate (fallback path).
+        No un-namespaced 'ba.tmp_base' kind='table' node must exist.
 
         Guards fix/temp-namespacing-dual-write (v1.21.1).
+        Guards plan/sprints/coverage_parse_failures.md §PR-3 (E8 fix, schema-alias case).
         """
         rel = "etl/sql/fact/wtfv_bon_style.sql"
         (tmp_path / "etl" / "sql" / "fact").mkdir(parents=True)
@@ -676,28 +687,27 @@ class TestSchemaAliasDualWriteRegression:
             assert temp_rows, "No namespaced kind='temp' node found for tmp_base"
             temp_key = temp_rows[0]["qualified"]
 
-            # Edges INTO the temp (from da.real_src → tmp_base)
-            # Edge key format: "<table_qualified>.<col_name>"
+            # Edges INTO the temp (from da.real_src → tmp_base) — must exist from CREATE stmt
             into_temp = backend.run_read(
                 'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE dst_key LIKE ?',
                 {"prefix": f"{temp_key}.%"},
             )
-            # Edges OUT OF the temp (from tmp_base → real_target)
-            out_of_temp = backend.run_read(
-                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" WHERE src_key LIKE ?',
-                {"prefix": f"{temp_key}.%"},
-            )
-
             assert into_temp, (
                 f"No COLUMN_LINEAGE edges INTO namespaced temp '{temp_key}' — "
-                f"pre-fix: CREATE stmt edges were correct; post-fix they still are. "
-                f"Check that the chain_src→tmp edge was not broken."
+                f"the CREATE stmt edges are missing."
             )
-            assert out_of_temp, (
-                f"No COLUMN_LINEAGE edges OUT OF namespaced temp '{temp_key}' — "
-                f"pre-fix: INSERT stmt edges pointed at un-namespaced 'ba.tmp_base' "
-                f"(orphaned sink); post-fix they must use the namespaced key. "
-                f"This is the core correctness check for fix/temp-namespacing-dual-write."
+
+            # After the E8 fix, the INSERT resolves through the temp body to the leaf.
+            # real_target must have incoming COLUMN_LINEAGE (from da.real_src or ba.ref_table).
+            into_final = backend.run_read(
+                'SELECT src_key, dst_key FROM "COLUMN_LINEAGE" '
+                "WHERE dst_key LIKE 'real_target.%' OR dst_key LIKE 'ba.real_target.%'",
+                {},
+            )
+            assert into_final, (
+                f"No COLUMN_LINEAGE edges found INTO real_target — the chain is severed. "
+                f"Expected direct leaf→real_target edges (post-E8-fix path). "
+                f"INTO temp edges exist: {into_temp[:2]!r}"
             )
         finally:
             backend.close()

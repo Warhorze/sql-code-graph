@@ -246,9 +246,21 @@ class AnsiParser(SqlParser):
                             # statements reference "schema.tmp_x" in the AST.
                             # exp.expand() normalises both key and node identically,
                             # so "schema.tmp_x" in the AST matches "schema.tmp_x" here.
+                            # target_db is the POST-ALIAS db (e.g. "ba" when ba_tmp→ba).
                             target_db = (query_node.target.db or "").lower()
                             if target_db:
                                 sources_map[f"{target_db}.{target_name}"] = _expr
+                            # Also register the PRE-ALIAS db from the AST directly.
+                            # When a schema alias maps ba_tmp→ba, the CREATE target is
+                            # _parse_statement-aliased to "ba", but _qualify_bare_tables
+                            # in subsequent statements still uses the raw USE SCHEMA name
+                            # "ba_tmp".  exp.expand() then normalises "ba_tmp.tmp_x" and
+                            # needs a matching "ba_tmp.tmp_x" key — which is the AST db.
+                            stmt_target = stmt.this  # exp.Table node (pre-alias)
+                            if isinstance(stmt_target, exp.Table):
+                                ast_db = (stmt_target.db or "").lower()
+                                if ast_db and ast_db != target_db:
+                                    sources_map[f"{ast_db}.{target_name}"] = _expr
 
                 # Track defined and referenced tables
                 if query_node.kind in ("CREATE_TABLE", "CREATE_VIEW"):

@@ -127,6 +127,48 @@ class TestE8TempChainKeyMismatchFix:
             f"Insert edges: {edge_srcs!r}. File errors: {result.errors!r}"
         )
 
+    def test_temp_chain_with_schema_alias_resolves_to_leaf(self, tmp_path):
+        """USE SCHEMA + schema alias: INSERT resolves through temp to leaf despite pre/post-alias.
+
+        When schema_aliases={'ba_tmp': 'ba'} and USE SCHEMA BA_TMP is active:
+        - _qualify_bare_tables sets db='ba_tmp' on tmp_x in the AST
+        - _parse_statement's _apply_table_alias maps ba_tmp→ba on the CREATE target
+        - query_node.target.db = 'ba' (post-alias)
+        - The INSERT's FROM tmp_x is qualified to FROM ba_tmp.tmp_x
+        - exp.expand() normalises to 'ba_tmp.tmp_x' and needs that key in sources_map
+
+        Before the fix: sources_map had only 'tmp_x' → mismatch → E8.
+        After the fix: sources_map also has 'ba_tmp.tmp_x' (pre-alias, from AST) AND
+        'ba.tmp_x' (post-alias, from query_node.target.db) → expand succeeds.
+
+        Guards plan/sprints/coverage_parse_failures.md §PR-3 (schema-alias + key-mismatch).
+        """
+        sql = (
+            "USE SCHEMA BA_TMP;\n"
+            "CREATE OR REPLACE TEMPORARY TABLE tmp_inkoop AS SELECT col FROM da.leaf_src;\n"
+            "INSERT INTO ba_tmp.final_tgt SELECT col FROM tmp_inkoop;\n"
+        )
+        rel = "etl/sql/fact/wtfa_inkoop.sql"
+        parser = SnowflakeParser(
+            SchemaResolver(dialect="snowflake"),
+            schema_aliases={"ba_tmp": "ba"},
+        )
+        result = parser.parse_file(tmp_path / rel, sql, rel_path=rel)
+
+        all_edges = []
+        for stmt in result.statements:
+            all_edges.extend(stmt.column_lineage)
+
+        # The INSERT should resolve through ba_tmp.tmp_inkoop (via pre-alias key) to leaf_src
+        leaf_edges = [e for e in all_edges if e.src.table.name == "leaf_src"]
+        all_srcs = [e.src.table.full_id for e in all_edges]
+        assert leaf_edges, (
+            f"Expected COLUMN_LINEAGE edge from da.leaf_src to final_tgt via schema-aliased temp. "
+            f"All edge srcs: {all_srcs!r}. File errors: {result.errors!r}. "
+            f"This indicates the pre-alias db key (ba_tmp.tmp_inkoop) was not registered, "
+            f"causing exp.expand() to miss the temp body."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Footgun guard: no bare tmp_* kind='table' node created
