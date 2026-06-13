@@ -520,3 +520,27 @@ separate known issue, not a PR-2/PR-3 gate).
 - **Impact**: The PR-1 distinct-file counting invariant is still pinned, now via func_fallback
   rather than E5. The change is confined to `tests/integration/test_index_degraded_files_metric.py`.
 - **Date**: 2026-06-13
+
+#### Deviation 3: sources_map registers qualified keys, not only bare keys (PR-3)
+- **Reason**: The plan-review amendment said "the `sources_map` key fed to `exp.expand()` MUST
+  stay a BARE SQL identifier." This guidance was written for the common case (ANSI path, no USE
+  SCHEMA), where `exp.expand()` looks up the bare key `tmp_x`. On the Snowflake USE SCHEMA path,
+  `_qualify_bare_tables` prefixes every bare table reference with the active schema before
+  `_parse_statement` runs. The INSERT's `FROM tmp_x` becomes `FROM schema.tmp_x` in the AST,
+  and `exp.expand()` looks up `schema.tmp_x` — a qualified identifier. No normalization strips
+  it back to bare inside `exp.expand()`. A bare-only key cannot be found → the fix requires
+  registering qualified keys.
+  For the schema-alias sub-case (`ba_tmp→ba`), the pre-alias db (`ba_tmp`) is used by
+  `_qualify_bare_tables` in subsequent statements, but `_parse_statement` aliases the CREATE
+  target to `ba` — so `query_node.target.db` is `ba` (post-alias) while the INSERT sees
+  `ba_tmp.tmp_x`. Both keys must be present.
+- **Change**: `ansi_parser.py` registers three keys in `sources_map`:
+  1. bare key `tmp_x` (bare — the ANSI / non-qualified lookup, always)
+  2. post-alias qualified key `schema.tmp_x` (from `query_node.target.db`)
+  3. pre-alias qualified key `ba_tmp.tmp_x` (from `stmt.this.db`, only when it differs from post-alias)
+  The bare key registration is unchanged and the CLAUDE.md performance invariant is preserved:
+  `sources_map` still contains only bodies from the current file's CTAS/temp statements — the
+  qualified keys are additional aliases of the same body; the source set is not widened.
+- **Impact**: No scope change. The plan's intent (blocking parse-time corpus-feeding) is honoured.
+  The three-key strategy is the minimal change that handles both the common case and the schema-alias case.
+- **Date**: 2026-06-13
