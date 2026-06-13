@@ -43,6 +43,12 @@ def test_index_quiet_flag_suppresses_summary():
                     "sqlcg.cli.commands.index._try_route_index_via_server",
                     return_value=False,
                 ),
+                # Prevent rich.progress.Progress from starting a background refresh
+                # thread that holds a MagicMock get_time.  The thread fires twice and
+                # triggers MagicMock() + 0.5 > MagicMock() → TypeError; pytest's
+                # threading.excepthook catches it and attributes the error to the next
+                # test — the intermittent flake that can block the release gate.
+                patch("sqlcg.cli.commands.index.Progress"),
             ):
                 mock_backend = MagicMock()
                 mock_backend.get_schema_version.return_value = "8"  # Match SCHEMA_VERSION
@@ -107,6 +113,9 @@ def _invoke_index_cmd(tmp_path: Path, **kwargs) -> MagicMock:
         # would otherwise route this through the socket and bypass every mock
         # below, making the test depend on host runtime state.
         patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
+        # Prevent rich.progress.Progress from starting a background refresh thread
+        # that holds a MagicMock get_time — see test_index_cmd.py for full rationale.
+        patch("sqlcg.cli.commands.index.Progress"),
     ):
         mock_backend = MagicMock()
         mock_backend.get_schema_version.return_value = "8"
