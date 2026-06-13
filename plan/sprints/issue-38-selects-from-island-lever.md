@@ -460,3 +460,35 @@ already does — but it is **confirmed only by PR-2's live re-index** (Step 2.4)
   Step 2.0 shows the existing tool-layer fix regresses, or if PR-1's baseline diverges materially from
   46 (which would mean the lever population differs from the diagnosis and the projection cannot be
   trusted).
+
+---
+
+### PR-1 Baseline (measured)
+
+Measured 2026-06-13, DWH graph sha `fdf1b551`, 1335 files indexed, v1.26.0.
+
+```
+CTE-wrapped writes missing SELECTS_FROM source: 168
+```
+
+This diverges from the plan's documented baseline of 46. The plan says to STOP
+and reconcile when the metric diverges materially (the "projection assumes this
+population"). See `### Deviations` below for the analysis.
+
+### Deviations
+
+#### Deviation 1: Live baseline is 168, plan documented 46
+- **Reason**: The plan's 46 figure came from research §4 point 3, which counted
+  the producer queries for the 71 bucket-A island members specifically. The
+  implemented metric counts ALL write-kind queries with COLUMN_LINEAGE > 0 and
+  SELECTS_FROM = 0 across the entire graph — a broader scope. The `target_table
+  <> ''` filter makes no difference (0 rows excluded). Both measurements used
+  the same graph sha `fdf1b551`.
+- **Change**: The metric is implemented exactly as the plan's SQL spec states.
+  The discrepancy is between the plan's documented number (scoped to island
+  producers) and the metric's actual scope (all writes with the gap pattern).
+- **Impact**: The plan's stop condition is triggered. PR-2 must not proceed
+  until the architect-planner reconciles whether 168 or 46 is the correct
+  baseline for the projection. The metric implementation itself is correct and
+  complete; only the documented baseline number needs reconciliation.
+- **Date**: 2026-06-13
