@@ -9,12 +9,14 @@ Concurrency contract (DuckDB single-process MVCC):
   - One R/W connection held for the process lifetime (no RO/RW escalation needed).
   - DuckDB MVCC guarantees no torn reads: a read never observes a partially-applied
     rebuild — it sees either the prior committed graph or the post-COMMIT graph.
-  - NOTE: in the server, reads and the write drain are serialized through a single
-    ``backend_lock`` on the shared connection (server.py / writer.py), so a read
-    issued *during* a rebuild waits for that rebuild to finish rather than being
-    served the old snapshot concurrently. The reindex path is fast (seconds); a
-    full re-index blocks reads for its duration. A cursor-per-read path to deliver
-    true non-blocking reads during a rebuild is a tracked follow-up (v1.4.x).
+  - ``run_read`` uses a per-call cursor (``self._conn.cursor()``) that takes a
+    snapshot at cursor-creation time.  Because the cursor is independent of the
+    connection-level transaction held by the drain, a read issued *during* a rebuild
+    no longer waits for the rebuild to commit — it sees the last committed graph
+    immediately.  The drain (``writer.py``) still holds ``backend_lock`` for the full
+    write transaction; the read dispatch path in ``server.py`` no longer acquires
+    ``backend_lock``, making reads truly non-blocking with respect to active drains.
+    This resolves ARCHITECTURE_REVIEW §5 F2 (v1.28.2).
   - Cross-process: whichever process opens the file first holds an exclusive lock;
     other processes cannot open it at all (even read-only). This is handled by the
     existing socket-routing layer (read_client.py / server.py).
@@ -652,17 +654,27 @@ class DuckDBBackend(GraphBackend):
         return list(params.values())
 
     def run_read(self, query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Execute a read-only SQL query and return results as list of dicts."""
+        """Execute a read-only SQL query via a snapshot cursor.
+
+        Uses a per-call cursor so DuckDB MVCC delivers a snapshot at
+        cursor-creation time.  This is non-blocking with respect to any active
+        write transaction held by the drain (writer.py) on the shared connection
+        — the cursor sees the last committed graph without waiting for the drain
+        to commit.  See the module-level concurrency contract for details.
+        """
+        cursor = self._conn.cursor()
         try:
             if params:
-                result = self._conn.execute(query, self._params_list(params))
+                result = cursor.execute(query, self._params_list(params))
             else:
-                result = self._conn.execute(query)
+                result = cursor.execute(query)
             columns = [desc[0] for desc in result.description or []]
             return [dict(zip(columns, row, strict=False)) for row in result.fetchall()]
         except Exception as exc:
             logger.error("run_read failed: %s", exc)
             raise
+        finally:
+            cursor.close()
 
     def run_write(self, query: str, params: dict[str, Any]) -> None:
         """Execute a write SQL statement."""
