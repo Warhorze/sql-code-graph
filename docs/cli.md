@@ -23,6 +23,7 @@ bash scripts/generate_cli_docs.sh
 | `db` | Database management commands |
 | `find` | Search the graph |
 | `analyze` | Lineage analysis |
+| `catalog` | Catalog enrichment commands |
 | `mcp` | MCP server commands |
 | `git` | Git integration commands |
 
@@ -77,7 +78,7 @@ Schema aliases (staging schema → canonical schema) can be configured in
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
+| --dialect, -d | TEXT | No | No | auto | SQL dialect ('auto' reads from .sqlcg.toml, default) |
 | --dbt-manifest | PATH | No | No |  | Path to dbt manifest |
 | --timeout-per-file | INTEGER | No | No | 10 | Timeout per file in seconds |
 | --batch-size | INTEGER | No | No | 50 | Files per DuckDB transaction in the upsert pass. Default 50 balances commit-overhead reduction (vs. legacy per-file commits) against per-batch memory cost. Lower values are safer for memory-constrained machines; higher values give marginal speedup at the cost of larger working sets. Set to 1 to reproduce legacy per-file commit behaviour. |
@@ -113,7 +114,7 @@ build — run 'sqlcg db reset && sqlcg db init && sqlcg index <path>' to re-init
 | --- | --- | --- | --- | --- | --- |
 | --from | TEXT | No | No |  | Base git SHA (previously-indexed state) |
 | --to | TEXT | No | No |  | Target git SHA (defaults to HEAD when --from is given) |
-| --dialect, -d | TEXT | No | No |  | SQL dialect (or 'auto' to read from .sqlcg.toml) |
+| --dialect, -d | TEXT | No | No | auto | SQL dialect ('auto' reads from .sqlcg.toml, default) |
 | --quiet, -q | BOOLEAN | No | No | False | Suppress summary output |
 | --batch-size | INTEGER | No | No | 50 | Files per KuzuDB transaction (same default as index command) |
 | --timeout-per-file | INTEGER | No | No | 10 | Per-file parse timeout in seconds |
@@ -131,7 +132,7 @@ Watch a directory and re-index on SQL file changes.
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --dialect, -d | TEXT | No | No |  | SQL dialect |
+| --dialect, -d | TEXT | No | No | auto | SQL dialect ('auto' reads from .sqlcg.toml, default) |
 
 ## `sqlcg gain`
 
@@ -162,7 +163,7 @@ If no metrics have been collected, shows a message and exits 0.
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
 | --json | BOOLEAN | No | No | False | Output metrics as JSON |
-| ---metrics-path | PATH | No | No |  |  |
+| --metrics-path | PATH | No | No |  | Override metrics DB path (for testing only). |
 
 ## `sqlcg report`
 
@@ -393,9 +394,9 @@ Lineage analysis
 | `downstream` | Trace downstream column lineage. |
 | `impact` | Show all queries impacted by a table. |
 | `failures` | List files that failed to parse, with their dominant cause (E-code bucket). |
-| `unused` | Find tables with no within-corpus consumers (3-signal: direct SELECT, SELECT *, or CTE-derived column read). |
-| `empty-impact` | Downstream blast radius when named table(s) are empty — two views: value-derivation (primary) + row-reachability (supplement). |
-| `pr-impact` | Detect producers a PR dropped + their blast radius (code-regression detection only). |
+| `unused` | Find tables with no detected read of any kind. |
+| `empty-impact` | Show downstream blast radius when named table(s) are empty. |
+| `pr-impact` | Detect tables that lose their producer between base ref and HEAD. |
 
 ## `sqlcg analyze upstream`
 
@@ -464,16 +465,17 @@ List files that failed to parse, with their dominant cause (E-code bucket).
 sqlcg analyze unused [OPTIONS]
 ```
 
-Find tables with no within-corpus consumers.
+Find tables with no detected read of any kind.
 
-A table is considered **used** if any of the following three signals fires:
-- **(D1)** a direct `SELECTS_FROM` read
-- **(D2)** a `STAR_SOURCE` (`SELECT *`) read
-- **(D3)** a value flows out of one of its columns via `COLUMN_LINEAGE` (captures CTE-wrapped derived reads, the dominant corpus pattern)
+A table is considered USED if any of the following signals fires:
+(D1) a direct SELECTS_FROM read, (D2) a STAR_SOURCE (SELECT *) read, or
+(D3) a value flows out of one of its columns via COLUMN_LINEAGE (captures
+CTE-wrapped derived reads, the dominant corpus pattern).
 
-**Known gap**: a table read ONLY inside a CTE without deriving any column
-(a pure-gating read — e.g. used only as a join filter, no value selected from it)
-is NOT detected by any of the three signals and will still appear as "unused".
+KNOWN GAP: a table read ONLY inside a CTE without deriving any column
+(a pure-gating read — e.g. used only as a join filter, no value selected
+from it) is NOT detected by any of the three signals. Such a table will
+still appear as "unused" even if it is genuinely needed.
 
 ### Options
 
@@ -485,28 +487,21 @@ is NOT detected by any of the three signals and will still appear as "unused".
 ## `sqlcg analyze empty-impact`
 
 ```bash
-sqlcg analyze empty-impact [OPTIONS] TABLE...
+sqlcg analyze empty-impact [OPTIONS] TABLES...
 ```
 
-Show the downstream blast radius when one or more named tables are empty.
+Show downstream blast radius when named table(s) are empty.
 
-Returns **two views**:
-
-- **View 2 — Value derivation (PRIMARY)**: downstream columns/tables whose values are
-  transitively derived from the source table's columns (column-lineage refinement).
-  This is the reliable headline answer — captures CTE-wrapped derived reads.
-- **View 1 — Row reachability (SUPPLEMENT)**: the union of View 2's affected tables
-  and tables with a direct `SELECTS_FROM`/`STAR_SOURCE` read (inner-join gating case).
-
-**Known gap**: CTE-wrapped pure-gating reads are NOT detected. Results are an upper
-bound that depends on join type (not recorded on edges).
+Returns TWO views: View 2 (PRIMARY — column-lineage refinement) lists
+downstream columns/tables that lose their source values. View 1 (SUPPLEMENT)
+adds tables that row-empty via a direct gating join. See result for caveats.
 
 ### Options
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --raw | BOOLEAN | No | No | False | Disable noise filtering (re-includes backup/noise/synthetic tables) |
-| --max-depth | INTEGER | No | No | unbounded | Maximum traversal depth (1–100). Default: unbounded. |
+| --raw | BOOLEAN | No | No | False | Disable noise filtering |
+| --max-depth | INTEGER | No | No |  | Maximum traversal depth (1-100). Default: unbounded. |
 
 ## `sqlcg analyze pr-impact`
 
@@ -514,28 +509,62 @@ bound that depends on join type (not recorded on edges).
 sqlcg analyze pr-impact [OPTIONS]
 ```
 
-Detect tables that lose their producer between a base git ref and HEAD, then show
-the PR 1 two-view blast radius for genuinely lost producers.
+Detect tables that lose their producer between base ref and HEAD.
 
-**Code-regression detection only.** This tool detects SQL that was removed,
-renamed, or broken between `--base` and HEAD. It cannot detect runtime emptiness —
-a job that runs and produces 0 rows while the SQL is unchanged will NOT be flagged.
+Resyncs the graph from ``base`` to HEAD (same as ``sqlcg reindex``), then
+shows which tables had their producer SQL removed/modified away, their
+attribution, and the PR 1 two-view blast radius for genuine losses.
 
-**Rename handling**: tables whose producer was renamed (both column-set AND consumer
-Jaccard ≥ 0.6) are shown under "verify consumers updated" and excluded from the
-data-loss blast radius. This classification is a heuristic — callers should verify.
-
-**Note (v1.24.2)**: the blast radius is computed on the pre-resync graph. The tool
-resyncs the graph to HEAD as a side effect; making detection non-destructive is a
-known follow-up.
+CODE REGRESSION DETECTION ONLY — see printed caveat for the runtime-blind
+limitation.  Rename handling: tables whose producer was renamed (both
+column-set AND consumer Jaccard ≥ 0.6) are shown under "verify consumers
+updated" and produce no blast-radius warning.
 
 ### Options
 
 | Option | Type | Required | Repeatable | Default | Description |
 | --- | --- | --- | --- | --- | --- |
-| --base | TEXT | **Yes** | No | — | Base git ref (branch, tag, or SHA) that the graph is indexed at |
+| --base | TEXT | Yes | No |  | Base git ref (branch, tag, or SHA) the graph is indexed at |
 | --raw | BOOLEAN | No | No | False | Disable noise filtering |
-| --max-depth | INTEGER | No | No | unbounded | Maximum traversal depth (1–100). Default: unbounded. |
+| --max-depth | INTEGER | No | No |  | Maximum traversal depth (1-100). Default: unbounded. |
+
+## `sqlcg catalog`
+
+```bash
+sqlcg catalog [OPTIONS] COMMAND [ARGS]...
+```
+
+Catalog enrichment commands
+
+### Subcommands
+
+| Subcommand | Description |
+| --- | --- |
+| `load` | Load INFORMATION_SCHEMA column metadata from a CSV export. |
+
+## `sqlcg catalog load`
+
+```bash
+sqlcg catalog load [OPTIONS] FILE
+```
+
+Load INFORMATION_SCHEMA column metadata from a CSV export.
+
+Enriches the graph with SqlColumn nodes and HAS_COLUMN edges sourced from
+``information_schema``.  Idempotent — a second load produces no row growth.
+DDL-sourced rows are never overwritten (ddl > information_schema > usage
+precedence).
+
+Expected CSV columns (delimiter sniffed; extra columns ignored):
+  table_catalog (optional), table_schema, table_name, column_name
+
+Names are case-folded to lower to match graph keys.
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| _none_ |  |  |  |  |  |
 
 ## `sqlcg mcp`
 
@@ -554,7 +583,7 @@ MCP server commands
 | `best-practices` | Print MCP tool best-practices (the fact/heuristic boundary). |
 | `status` | Print server status JSON (connects to control socket). |
 | `stop` | Stop the running MCP server gracefully. |
-| `restart` | Stop the server. The client (editor) must respawn. |
+| `restart` | Stop the server (stop-only — the client must reconnect). |
 
 ## `sqlcg mcp setup`
 
@@ -675,18 +704,20 @@ Stop the server (stop-only — the client must reconnect).
 This command STOPS the server and instructs you to reconnect via your
 editor. It does NOT spawn a new server process.
 
-**Why no auto-respawn**: sqlcg runs as a stdio JSON-RPC server. The MCP
+Why no auto-respawn: sqlcg runs as a stdio JSON-RPC server. The MCP
 client (e.g. Claude Code) launches it and holds the stdin/stdout pipe.
 A separate CLI invocation cannot re-attach to that pipe — only the client
 can respawn the server on reconnect.
 
-After running this command, reconnect from your editor (Claude Code: run
-`/mcp` → reconnect `sql-code-graph`, or restart the session).
+After running this command, reconnect from your editor:
+  - Claude Code: run /mcp → reconnect sql-code-graph (or restart the
+    session).
 
-The normal upgrade path does **not** require this command: since v1.20.0 the
-server self-heals — on the next tool call after a reinstall it re-execs
-itself in place. Use `mcp restart` only when the process is unresponsive
-and you need an immediate stop before reconnecting manually.
+The normal upgrade path does NOT require this command: as of v1.20.0 the
+server self-heals — on the next tool call after a reinstall it detects the
+version skew and re-execs itself in place (same PID, same stdio pipe).
+Use this command only when the process is unresponsive and you need an
+immediate stop before reconnecting manually.
 
 ### Options
 

@@ -329,18 +329,23 @@ def test_blast_radius_nonempty_for_deleted_producer_with_downstream(tmp_path):
     _init_repo(tmp_path)
 
     # Base: da.source produces da.orphan; da.child derives columns from da.orphan.
-    # Reuse the exact fixture shape from test_genuine_deletion_lost_producer_and_blast_radius
-    # which is known to give da.orphan kind='table' (da.child's SELECT FROM da.orphan sets
-    # the kind='table' entry before the INSERT INTO da.orphan 'derived' row can downgrade it
-    # via the DB-level guard).  Add a 2nd downstream to make the blast radius non-trivial.
-    (tmp_path / "source.sql").write_text(
-        "INSERT INTO da.orphan SELECT id, amount FROM da.source_raw"
+    # File names are chosen so that walk_sql_files (which now sorts deterministically)
+    # processes downstream2.sql before downstream.sql:
+    #   aaa_downstream2.sql < downstream.sql < source.sql (alphabetical)
+    # This mirrors the local-filesystem ordering that the original test relied on.
+    # With this order, da.child is established as kind='table' by the SELECT FROM da.child
+    # reference in aaa_downstream2.sql BEFORE downstream.sql's INSERT INTO da.child
+    # (derived) can land in the in-batch dedup — so da.child stays kind='table'.
+    # Similarly, da.orphan becomes kind='table' from downstream.sql's SELECT FROM da.orphan
+    # before source.sql's INSERT INTO da.orphan (derived) arrives.
+    (tmp_path / "aaa_downstream2.sql").write_text(
+        "INSERT INTO da.grandchild SELECT child.amount FROM da.child"
     )
     (tmp_path / "downstream.sql").write_text(
         "INSERT INTO da.child SELECT orphan.amount FROM da.orphan"
     )
-    (tmp_path / "downstream2.sql").write_text(
-        "INSERT INTO da.grandchild SELECT child.amount FROM da.child"
+    (tmp_path / "source.sql").write_text(
+        "INSERT INTO da.orphan SELECT id, amount FROM da.source_raw"
     )
     base_sha = _commit_all(tmp_path, "base")
 
@@ -353,6 +358,19 @@ def test_blast_radius_nonempty_for_deleted_producer_with_downstream(tmp_path):
     _commit_all(tmp_path, "delete source.sql")
 
     result = _compute_pr_impact(backend, base_sha, max_depth=None)
+
+    # da.orphan must be kind='table' (downstream.sql sorts before source.sql, so the
+    # SELECT FROM da.orphan reference establishes kind='table' before source.sql's
+    # INSERT INTO da.orphan (derived) arrives in the in-batch dedup — 'derived' does
+    # not downgrade 'table' per the dedup rules).
+    orphan_rows = backend.run_read(
+        'SELECT kind FROM "SqlTable" WHERE qualified = ?',
+        {"qualified": "da.orphan"},
+    )
+    assert orphan_rows and orphan_rows[0]["kind"] == "table", (
+        f"da.orphan must be kind='table'; got {orphan_rows!r}. "
+        "Sorted walker ensures downstream.sql (d<s) precedes source.sql."
+    )
 
     # da.orphan must be in the genuine lost set.
     assert "da.orphan" in result.lost_producer_tables, (

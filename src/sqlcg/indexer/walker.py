@@ -46,11 +46,11 @@ def walk_sql_files(root: Path, spec: pathspec.PathSpec, use_git: bool = True) ->
     if use_git:
         git_files = _git_sql_files(root)
         if git_files is not None:
-            for path in git_files:
+            for path in sorted(git_files):
                 if path.exists() and not is_ignored(path, root, spec):
                     yield path
             return
 
-    for path in root.rglob("*.sql"):
+    for path in sorted(root.rglob("*.sql")):
         if not is_ignored(path, root, spec):
             yield path
