@@ -1,3 +1,36 @@
+## v1.25.0 (2026-06-13)
+
+> **Re-index recommended (no schema change).** `SCHEMA_VERSION` unchanged.
+> View classification (`kind='view'`) and the `gating_join_tables` supplement only
+> take effect on a fresh `sqlcg index <path>`.
+
+### Feat
+
+- **view classification**: `CREATE VIEW` targets now stamped `kind='view'` so they
+  persist as `SqlTable.kind='view'` instead of being indistinguishable from tables;
+  live-verified on a ~1,400-file DWH (582 views classified)
+- **empty-impact** (`sqlcg analyze empty-impact` / `get_empty_propagation` MCP tool):
+  downstream blast radius when named table(s) are empty — two views: value-derivation
+  (primary, column-lineage refinement) and row-reachability (supplement, direct
+  gating-join reads)
+- **pr-impact** (`sqlcg analyze pr-impact` / `get_pr_impact` MCP tool): detect
+  producers a PR dropped + their blast radius; code-regression detection (not runtime
+  monitoring); rename-handling via column-set AND consumer Jaccard ≥ 0.6
+- **gating-join supplement** (`get_change_scope` / `diff_impact`): `gating_join_tables`
+  field added — tables that row-empty via direct gating-join reads supplementing the
+  column-lineage blast radius; caveat: depends on join type (not recorded on edges)
+- **3-signal unused** (`analyze_unused` / `sqlcg analyze unused`): redefines "used"
+  as the union of (D1) direct `SELECTS_FROM`, (D2) `STAR_SOURCE`, and (D3)
+  column-lineage CTE-derived read; `find_table_usages` augmented with `via_lineage`
+  entries for the same D3 signal
+
+### Fix
+
+- **pr-impact BUG-A**: CLI path was not initialising the backend before calling
+  `_compute_pr_impact`, causing `RuntimeError: Backend not initialized`
+- **pr-impact BUG-B**: blast-radius engine was zeroing the result when the resync
+  produced no new edges; now computed on the pre-resync graph (Option i)
+
 ## v1.1.3 (2026-06-01)
 
 > **Re-index recommended (no schema change).** `SCHEMA_VERSION` stays `6`, so no
