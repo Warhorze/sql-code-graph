@@ -317,6 +317,33 @@ WHERE q.kind IN ({_WRITE_KINDS_SQL})
   AND NOT EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
 """
 
+# ---------------------------------------------------------------------------
+# Query §G-5 (column_lineage_recall_metric.md — issue #38, E8 revival gate):
+# Resolvable-write column-lineage edge volume — COLUMN_LINEAGE edges whose
+# query_id belongs to a write-kind query (kind IN _WRITE_KINDS AND
+# target_table <> '') that has ≥1 SELECTS_FROM source row.
+#
+# Monotone-up productivity counter: a recall improvement (e.g. E8 temp-chain
+# fix) can only add COLUMN_LINEAGE rows → this counter is non-decreasing in
+# the improvement direction by construction.  The EXISTS … SELECTS_FROM clause
+# scopes the count to exactly the write queries E8 can help, excluding
+# literal-only / source-less writes whose zero edges are correct-by-design.
+#
+# Baseline (master 1.26.0 proxy, /tmp/e8_without.duckdb, 1,335 files): 25,246.
+# Predicted post-E8: ≈27,036 (+1,790).  Gate rule: revive E8 only if the
+# metric rises by ≥+1,000 on the same corpus (threshold absorbs corpus drift,
+# well above noise).  Uses _WRITE_KINDS_SQL so the write-query population is
+# identical to _Q_CTE_SOURCE_GAP_WRITES — no drift.
+# ---------------------------------------------------------------------------
+_Q_RESOLVABLE_WRITE_COL_EDGES = f"""
+SELECT COUNT(*) AS resolvable_write_col_edges
+FROM "COLUMN_LINEAGE" cl
+JOIN "SqlQuery" q ON q.id = cl.query_id
+WHERE q.kind IN ({_WRITE_KINDS_SQL})
+  AND q.target_table <> ''
+  AND EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
+"""
+
 
 @dataclass
 class BlindspotTable:
@@ -388,6 +415,12 @@ class CoverageStats:
     # Inverse complement of zero_edge_write_queries; distinct field + label.
     # Baseline on DWH (schema v8, sha fdf1b551): 46.
     cte_source_gap_writes: int = 0
+
+    # --- column-lineage recall (column_lineage_recall_metric.md) ---
+    # COLUMN_LINEAGE edges on write-kind queries that have a resolvable SELECTS_FROM
+    # source. Monotone-up productivity counter — the E8 revival gate (issue #38,
+    # closed PR #111). Baseline (master 1.26.0, /tmp/e8_without.duckdb proxy): 25,246.
+    resolvable_write_col_edges: int = 0
 
     # Indexed root (optional) — set when an indexed Repo.path is available, used
     # by render_coverage_lines to strengthen the catalog-missing warning when a
@@ -470,6 +503,7 @@ def collect_coverage() -> CoverageStats | None:
         q_rescuable = run_read_routed(_Q_RESCUABLE_UNQUALIFIED, {})
         q_info_schema = run_read_routed(_Q_INFO_SCHEMA_ROWS, {})
         q_cte_source_gap = run_read_routed(_Q_CTE_SOURCE_GAP_WRITES, {})
+        q_rwce = run_read_routed(_Q_RESOLVABLE_WRITE_COL_EDGES, {})
 
         row1 = q1[0] if q1 else {}
         row2 = q2[0] if q2 else {}
@@ -485,6 +519,7 @@ def collect_coverage() -> CoverageStats | None:
         row_rescuable = q_rescuable[0] if q_rescuable else {}
         row_info_schema = q_info_schema[0] if q_info_schema else {}
         row_cte_source_gap = q_cte_source_gap[0] if q_cte_source_gap else {}
+        row_rwce = q_rwce[0] if q_rwce else {}
 
         top_blindspot = [
             BlindspotTable(table=str(r["dst_table"]), bad_edges=int(r["bad_count"]))
@@ -559,6 +594,7 @@ def collect_coverage() -> CoverageStats | None:
             info_schema_has_column_rows=int(row_info_schema.get("info_schema_rows") or 0),
             indexed_repo_root=indexed_root_str if catalog_configured else None,
             cte_source_gap_writes=int(row_cte_source_gap.get("cte_source_gap_writes") or 0),
+            resolvable_write_col_edges=int(row_rwce.get("resolvable_write_col_edges") or 0),
         )
     except Exception:
         return None
@@ -717,6 +753,10 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
     lines.append(
         f"{indent}CTE-wrapped writes missing SELECTS_FROM source: {coverage.cte_source_gap_writes}"
     )
+    lines.append(
+        f"{indent}Column-lineage edges on resolvable-source writes: "
+        f"{coverage.resolvable_write_col_edges}"
+    )
 
     # Identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4).
     # Baseline DWH v1.14.2: CTE collisions=218, rescuable unqualified=828.
@@ -795,4 +835,6 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         "info_schema_has_column_rows": coverage.info_schema_has_column_rows,
         # CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1)
         "cte_source_gap_writes": coverage.cte_source_gap_writes,
+        # column-lineage recall (column_lineage_recall_metric.md — issue #38, E8 revival gate)
+        "resolvable_write_col_edges": coverage.resolvable_write_col_edges,
     }
