@@ -465,19 +465,36 @@ already does — but it is **confirmed only by PR-2's live re-index** (Step 2.4)
 
 ### PR-1 Baseline (measured)
 
-Measured 2026-06-13, DWH graph sha `fdf1b551`, 1335 files indexed, v1.26.0.
+Measured 2026-06-13, DWH graph sha `fdf1b551a34601a6cf3ce1c8b9f76e27ce2753e6`,
+1335 files indexed, v1.26.0, from-scratch index into throwaway DB
+`/tmp/pr1_baseline.duckdb`.
+
+**`gain` output (Section G, Coverage block):**
 
 ```
-CTE-wrapped writes missing SELECTS_FROM source: 168
+Tables with catalog: 5788 / 6519 (89%)
+Edge health (strict, column-level): 45510 / 53654 (85%)
+Edge health (table-level, legacy): 46563 / 53654 (87%)
+Edge health (scoped, excl. CTE/derived/temp): 36318 / 37421 (97%)
+Write queries with zero outgoing lineage: 1120 / 2343
+CTE-wrapped writes missing SELECTS_FROM source: 164
 ```
 
-This diverges from the plan's documented baseline of 46. The plan says to STOP
-and reconcile when the metric diverges materially (the "projection assumes this
-population"). See `### Deviations` below for the analysis.
+**Wall-time:** ~443 seconds (15:49:41 → 15:57:04 CEST). Exceeds the plan's
+3-minute budget signal (plan §PR-2 Step 2.4) and the canonical 210–256s baseline.
+Per `project_indexer_perf_baseline.md`, >4 min is not treated as an automatic
+regression (WSL2 environment; catalog re-apply of 122 815 columns is included).
+The figure should be re-checked on a clean run closer to PR-2.
+
+**STOP condition:** The observed value (164) diverges materially from the
+plan-documented baseline (46). The plan says to STOP and reconcile. An earlier
+agent run on the same sha recorded 168; this fresh-from-scratch run records 164.
+The ~4-row variance is likely non-deterministic parse outcomes across runs.
+See `### Deviations` below for the discrepancy analysis.
 
 ### Deviations
 
-#### Deviation 1: Live baseline is 168, plan documented 46
+#### Deviation 1: Live baseline is 164, plan documented 46
 - **Reason**: The plan's 46 figure came from research §4 point 3, which counted
   the producer queries for the 71 bucket-A island members specifically. The
   implemented metric counts ALL write-kind queries with COLUMN_LINEAGE > 0 and
@@ -487,8 +504,11 @@ population"). See `### Deviations` below for the analysis.
 - **Change**: The metric is implemented exactly as the plan's SQL spec states.
   The discrepancy is between the plan's documented number (scoped to island
   producers) and the metric's actual scope (all writes with the gap pattern).
-- **Impact**: The plan's stop condition is triggered. PR-2 must not proceed
-  until the architect-planner reconciles whether 168 or 46 is the correct
-  baseline for the projection. The metric implementation itself is correct and
-  complete; only the documented baseline number needs reconciliation.
+- **Impact**: The plan's STOP condition is triggered. PR-2 must not proceed
+  until the architect-planner reconciles whether 164 (full-scope) or 46
+  (island-producer-scoped) is the correct baseline for the projection. The
+  metric implementation itself is correct and complete; only the documented
+  baseline number needs reconciliation. (An earlier agent run on the same sha
+  recorded 168; this fresh-from-scratch run records 164 — the ~4-row variance
+  is within parse non-determinism and does not change the stop condition.)
 - **Date**: 2026-06-13

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import duckdb
 
+from sqlcg.cli.coverage import _Q_CTE_SOURCE_GAP_WRITES
+
 # ---------------------------------------------------------------------------
 # Fixtures — synthetic in-memory DuckDB graph
 # ---------------------------------------------------------------------------
@@ -90,18 +92,6 @@ def _build_synthetic_db() -> duckdb.DuckDBPyConnection:
     # No SELECTS_FROM row for q3 either
 
     return con
-
-
-_WRITE_KINDS_SQL = ", ".join(f"'{k}'" for k in ("INSERT", "MERGE", "CREATE_TABLE", "UPDATE"))
-
-_Q_CTE_SOURCE_GAP_WRITES = f"""
-SELECT COUNT(*) AS cte_source_gap_writes
-FROM "SqlQuery" q
-WHERE q.kind IN ({_WRITE_KINDS_SQL})
-  AND q.target_table <> ''
-  AND EXISTS (SELECT 1 FROM "COLUMN_LINEAGE" cl WHERE cl.query_id = q.id)
-  AND NOT EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
-"""
 
 
 class TestCteSourceGapWritesMetric:
