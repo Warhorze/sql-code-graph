@@ -294,6 +294,29 @@ FROM "HAS_COLUMN"
 WHERE source = 'information_schema'
 """
 
+# ---------------------------------------------------------------------------
+# Query §G-4 (PR-1, issue-38-selects-from-island-lever.md §PR-1 Step 1.1):
+# CTE-source gap — write-kind queries that have ≥1 outgoing COLUMN_LINEAGE
+# edge but zero SELECTS_FROM source rows.  These are CTE-wrapped writes whose
+# column path resolved correctly but whose table path emitted nothing, leaving
+# the written table a table-level island.  Establishes the falsifiable baseline
+# PR-2 must move toward 0.
+#
+# Discriminator: kind IN _WRITE_KINDS AND target_table <> '' — ensures
+# SELECT-kind CTAS rows with an inferred target do NOT inflate the count
+# (Amendment A2 of the plan review).  Inverse complement of
+# zero_edge_write_queries (writes with zero COLUMN_LINEAGE); kept distinct by
+# field name and rendered label.
+# ---------------------------------------------------------------------------
+_Q_CTE_SOURCE_GAP_WRITES = f"""
+SELECT COUNT(*) AS cte_source_gap_writes
+FROM "SqlQuery" q
+WHERE q.kind IN ({_WRITE_KINDS_SQL})
+  AND q.target_table <> ''
+  AND EXISTS (SELECT 1 FROM "COLUMN_LINEAGE" cl WHERE cl.query_id = q.id)
+  AND NOT EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
+"""
+
 
 @dataclass
 class BlindspotTable:
@@ -359,6 +382,12 @@ class CoverageStats:
     # Count of HAS_COLUMN rows sourced from information_schema.  Zero triggers
     # the §G catalog-missing warning line in render_coverage_lines.
     info_schema_has_column_rows: int = 0
+
+    # --- CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1) ---
+    # Write-kind queries with ≥1 COLUMN_LINEAGE edge but zero SELECTS_FROM rows.
+    # Inverse complement of zero_edge_write_queries; distinct field + label.
+    # Baseline on DWH (schema v8, sha fdf1b551): 46.
+    cte_source_gap_writes: int = 0
 
     # Indexed root (optional) — set when an indexed Repo.path is available, used
     # by render_coverage_lines to strengthen the catalog-missing warning when a
@@ -440,6 +469,7 @@ def collect_coverage() -> CoverageStats | None:
         q_cte_collisions = run_read_routed(_Q_CTE_COLLISIONS, {})
         q_rescuable = run_read_routed(_Q_RESCUABLE_UNQUALIFIED, {})
         q_info_schema = run_read_routed(_Q_INFO_SCHEMA_ROWS, {})
+        q_cte_source_gap = run_read_routed(_Q_CTE_SOURCE_GAP_WRITES, {})
 
         row1 = q1[0] if q1 else {}
         row2 = q2[0] if q2 else {}
@@ -454,6 +484,7 @@ def collect_coverage() -> CoverageStats | None:
         row_cte_collisions = q_cte_collisions[0] if q_cte_collisions else {}
         row_rescuable = q_rescuable[0] if q_rescuable else {}
         row_info_schema = q_info_schema[0] if q_info_schema else {}
+        row_cte_source_gap = q_cte_source_gap[0] if q_cte_source_gap else {}
 
         top_blindspot = [
             BlindspotTable(table=str(r["dst_table"]), bad_edges=int(r["bad_count"]))
@@ -527,6 +558,7 @@ def collect_coverage() -> CoverageStats | None:
             rescuable_unqualified_edges=int(row_rescuable.get("rescuable_unqualified") or 0),
             info_schema_has_column_rows=int(row_info_schema.get("info_schema_rows") or 0),
             indexed_repo_root=indexed_root_str if catalog_configured else None,
+            cte_source_gap_writes=int(row_cte_source_gap.get("cte_source_gap_writes") or 0),
         )
     except Exception:
         return None
@@ -682,6 +714,9 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f"{indent}Write queries with zero outgoing lineage: "
         f"{coverage.zero_edge_write_queries} / {coverage.total_write_queries}"
     )
+    lines.append(
+        f"{indent}CTE-wrapped writes missing SELECTS_FROM source: {coverage.cte_source_gap_writes}"
+    )
 
     # Identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4).
     # Baseline DWH v1.14.2: CTE collisions=218, rescuable unqualified=828.
@@ -758,4 +793,6 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         "rescuable_unqualified_edges": coverage.rescuable_unqualified_edges,
         # catalog-missing warning (PR 4, sprint_postmortem_fixes.md §Step 4.3)
         "info_schema_has_column_rows": coverage.info_schema_has_column_rows,
+        # CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1)
+        "cte_source_gap_writes": coverage.cte_source_gap_writes,
     }
