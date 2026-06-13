@@ -57,6 +57,10 @@ class HotOpCounters:
         # SELECT — the INSERT positional block has a legitimate _patched_sql
         # serialisation for sg_lineage, which is separate from classification.
         self.sql_calls_on_classify_path = 0  # .sql() inside _classify_transform
+        # PR-3 (#38): traverse_scope runs once per statement in _real_tables.
+        # It walks the already-built scope tree — no build_scope/qualify/expand.
+        # This counter must stay FLAT when column count doubles (once-per-statement).
+        self.traverse_scope = 0
 
 
 @contextmanager
@@ -85,6 +89,7 @@ def count_hot_ops():
         "lin_lineage": sqlglot_lin.lineage,
         "base_bs": base_mod.build_scope,
         "base_q": base_mod.qualify,
+        "base_ts": base_mod.traverse_scope,
         "exp_copy": sqlglot_exp.Expression.copy,
         "exp_sql": sqlglot_exp.Expression.sql,
     }
@@ -114,6 +119,12 @@ def count_hot_ops():
             return orig[key](*a, **k)
 
         return wrap
+
+    def traverse_scope_wrap(*a, **k):
+        # traverse_scope must be called ONCE per statement in _real_tables (off the
+        # per-column hot path). This counter must stay flat when column count doubles.
+        c.traverse_scope += 1
+        return orig["base_ts"](*a, **k)
 
     def copy_wrap(self, *a, **k):
         # Invariant (regression #3): the multi-projection body in the INSERT
@@ -146,6 +157,7 @@ def count_hot_ops():
     sqlglot_lin.lineage = lineage_wrap
     base_mod.build_scope = build_scope_wrap_factory("base_bs")
     base_mod.qualify = qualify_wrap_factory("base_q")
+    base_mod.traverse_scope = traverse_scope_wrap
     sqlglot_exp.Expression.copy = copy_wrap
     sqlglot_exp.Expression.sql = sql_wrap
     base_mod.SqlParser._classify_transform = staticmethod(classify_wrap)
@@ -155,6 +167,7 @@ def count_hot_ops():
         sqlglot_lin.lineage = orig["lin_lineage"]
         base_mod.build_scope = orig["base_bs"]
         base_mod.qualify = orig["base_q"]
+        base_mod.traverse_scope = orig["base_ts"]
         sqlglot_exp.Expression.copy = orig["exp_copy"]
         sqlglot_exp.Expression.sql = orig["exp_sql"]
         base_mod.SqlParser._classify_transform = staticmethod(orig_classify)
@@ -211,10 +224,12 @@ def _wide_select(n_cols: int) -> str:
 
 
 def test_per_statement_ops_flat_when_columns_double():
-    """build_scope / qualify run once per statement, so doubling the column count
-    of a single statement must not increase their call counts.
+    """build_scope / qualify / traverse_scope run once per statement, so doubling
+    the column count of a single statement must not increase their call counts.
 
     Regression caught: per-column qualify (CLAUDE.md: 176 cols x 11 joins = 7 min).
+    traverse_scope added for #38 PR-3: descends subscopes in _real_tables once per
+    statement (plan/sprints/issue-38-residual-source-extraction.md §3.3).
     """
     parser_base = AnsiParser(SchemaResolver(dialect=None))
     parser_2x = AnsiParser(SchemaResolver(dialect=None))
@@ -232,6 +247,8 @@ def test_per_statement_ops_flat_when_columns_double():
 
     assert_flat(base.build_scope, doubled.build_scope, "build_scope")
     assert_flat(base.qualify, doubled.qualify, "qualify")
+    # traverse_scope is once-per-statement in _real_tables: must stay flat.
+    assert_flat(base.traverse_scope, doubled.traverse_scope, "traverse_scope")
     # sg_lineage is legitimately per-column; only bound its slope.
     assert_at_most_linear(base.sg_lineage, doubled.sg_lineage, "sg_lineage")
 
