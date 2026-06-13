@@ -86,6 +86,7 @@ _NODE_DDLS = [
         kind VARCHAR,
         target_table VARCHAR,
         parse_failed BOOLEAN,
+        qualify_failed BOOLEAN DEFAULT FALSE,
         confidence FLOAT,
         parsing_mode VARCHAR,
         start_line BIGINT
@@ -249,6 +250,7 @@ _NODE_COLUMNS: dict[str, list[str]] = {
         "kind",
         "target_table",
         "parse_failed",
+        "qualify_failed",
         "confidence",
         "parsing_mode",
         "start_line",

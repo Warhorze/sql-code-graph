@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sqlcg.cli.commands.index import index_cmd
+from sqlcg.core.schema import SCHEMA_VERSION
 
 
 def test_zero_edges_warning_appears_in_output():
@@ -51,7 +52,7 @@ def test_zero_edges_warning_appears_in_output():
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "8"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = SCHEMA_VERSION  # Match current version
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with zero edges
@@ -120,7 +121,7 @@ def test_no_warning_when_edges_exist():
 
             # Setup mock backend
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "8"  # Match SCHEMA_VERSION
+            mock_backend.get_schema_version.return_value = SCHEMA_VERSION  # Match current version
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             # Setup mock indexer with edges present

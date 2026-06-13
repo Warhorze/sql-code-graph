@@ -84,8 +84,10 @@ def _run_index_cmd(tmp_path: Path, *, quiet: bool = False) -> list[str]:
         patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
     ):
         mock_console.print = _capture
+        from sqlcg.core.schema import SCHEMA_VERSION
+
         mock_backend = MagicMock()
-        mock_backend.get_schema_version.return_value = "8"
+        mock_backend.get_schema_version.return_value = SCHEMA_VERSION
         mock_get_backend.return_value.__enter__.return_value = mock_backend
         mock_indexer = MagicMock()
         mock_indexer_class.return_value = mock_indexer

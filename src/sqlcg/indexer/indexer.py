@@ -1359,6 +1359,7 @@ class Indexer:
                     "kind": stmt.kind,
                     "target_table": stmt.target.full_id if stmt.target else "",
                     "parse_failed": stmt.parse_failed,
+                    "qualify_failed": stmt.qualify_failed,
                     "confidence": stmt.confidence,
                     "parsing_mode": stmt.parsing_mode,
                     "start_line": stmt.start_line,

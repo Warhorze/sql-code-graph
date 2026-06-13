@@ -493,6 +493,7 @@ class AnsiParser(SqlParser):
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
+        stmt_qualify_failed = extraction.qualify_failed
 
         # Extract defined columns for CREATE TABLE statements
         defined_columns: list[str] = []
@@ -531,6 +532,7 @@ class AnsiParser(SqlParser):
             ctes=ctes,
             column_lineage=column_lineage,
             parse_failed=parse_failed,
+            qualify_failed=stmt_qualify_failed,
             confidence=confidence,
             parsing_mode="sqlglot",
             defined_columns=defined_columns,

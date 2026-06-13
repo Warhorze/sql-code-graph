@@ -357,6 +357,22 @@ WHERE q.kind IN ({_WRITE_KINDS_SQL})
   AND EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
 """
 
+# ---------------------------------------------------------------------------
+# Query §G-6 (PR-C, #118): qualify_failed per-statement counter.
+# Counts SqlQuery rows where qualify_failed = TRUE — these are statements where
+# the qualify() step raised an exception during column-lineage extraction.
+# A non-zero count indicates structural SQL patterns (e.g. ambiguous column
+# references) that degraded the qualify step; the schema-free retry may still
+# have yielded partial lineage.  Use this counter to track A/B improvements in
+# qualify success rate across re-index runs.
+# Plan: plan/sprints/sprint_backlog_q2_bugfix.md §PR-C
+# ---------------------------------------------------------------------------
+_Q_QUALIFY_FAILED_STATEMENTS = """
+SELECT COUNT(*) AS qualify_failed_statements
+FROM "SqlQuery"
+WHERE qualify_failed = TRUE
+"""
+
 
 @dataclass
 class BlindspotTable:
@@ -441,6 +457,12 @@ class CoverageStats:
     # closed PR #111). Baseline (master 1.26.0, /tmp/e8_without.duckdb proxy): 25,246.
     resolvable_write_col_edges: int = 0
 
+    # --- qualify_failed per-statement counter (PR-C, #118) ---
+    # SqlQuery rows where qualify_failed = TRUE — statements where the qualify()
+    # step raised during column-lineage extraction.  Graph-queryable A/B baseline.
+    # Plan: plan/sprints/sprint_backlog_q2_bugfix.md §PR-C
+    qualify_failed_statements: int = 0
+
     # Indexed root (optional) — set when an indexed Repo.path is available, used
     # by render_coverage_lines to strengthen the catalog-missing warning when a
     # catalog path is configured but no rows are present.
@@ -523,6 +545,7 @@ def collect_coverage() -> CoverageStats | None:
         q_info_schema = run_read_routed(_Q_INFO_SCHEMA_ROWS, {})
         q_cte_source_gap = run_read_routed(_Q_CTE_SOURCE_GAP_WRITES, {})
         q_rwce = run_read_routed(_Q_RESOLVABLE_WRITE_COL_EDGES, {})
+        q_qualify_failed = run_read_routed(_Q_QUALIFY_FAILED_STATEMENTS, {})
 
         row1 = q1[0] if q1 else {}
         row2 = q2[0] if q2 else {}
@@ -539,6 +562,7 @@ def collect_coverage() -> CoverageStats | None:
         row_info_schema = q_info_schema[0] if q_info_schema else {}
         row_cte_source_gap = q_cte_source_gap[0] if q_cte_source_gap else {}
         row_rwce = q_rwce[0] if q_rwce else {}
+        row_qualify_failed = q_qualify_failed[0] if q_qualify_failed else {}
 
         top_blindspot = [
             BlindspotTable(table=str(r["dst_table"]), bad_edges=int(r["bad_count"]))
@@ -614,6 +638,7 @@ def collect_coverage() -> CoverageStats | None:
             indexed_repo_root=indexed_root_str if catalog_configured else None,
             cte_source_gap_writes=int(row_cte_source_gap.get("cte_source_gap_writes") or 0),
             resolvable_write_col_edges=int(row_rwce.get("resolvable_write_col_edges") or 0),
+            qualify_failed_statements=int(row_qualify_failed.get("qualify_failed_statements") or 0),
         )
     except Exception:
         return None
@@ -777,6 +802,7 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f"{indent}Column-lineage edges on resolvable-source writes: "
         f"{coverage.resolvable_write_col_edges}"
     )
+    lines.append(f"{indent}Qualify-failed statements: {coverage.qualify_failed_statements}")
 
     # Identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4).
     # Baseline DWH v1.14.2: CTE collisions=218, rescuable unqualified=828.
@@ -857,4 +883,6 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         "cte_source_gap_writes": coverage.cte_source_gap_writes,
         # column-lineage recall (column_lineage_recall_metric.md — issue #38, E8 revival gate)
         "resolvable_write_col_edges": coverage.resolvable_write_col_edges,
+        # qualify_failed per-statement counter (PR-C, #118)
+        "qualify_failed_statements": coverage.qualify_failed_statements,
     }
