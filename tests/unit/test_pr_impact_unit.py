@@ -1,14 +1,16 @@
-"""Unit tests for the PR-impact detector helpers (PR 2 — v1.23.0).
+"""Unit tests for the PR-impact detector helpers (PR 2 — v1.23.0, PR-F — v1.28.3).
 
 Tests _capture_producer_set, _diff_lost_producers (genuine loss + rename
-classification), and the get_pr_impact mismatch path. Uses mock backends —
-no real DuckDB or git required.
+classification), the get_pr_impact mismatch path, and the PR-F self-healing
+reindex behaviour.  Uses mock backends — no real DuckDB or git required.
 
-Guards plan/sprints/unfilled_table_impact.md PR 2 Unit test strategy.
+Guards plan/sprints/unfilled_table_impact.md PR 2 Unit test strategy and
+plan/sprints/sprint_backlog_q2_bugfix.md §PR-F.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sqlcg.server.tools import (
@@ -16,6 +18,7 @@ from sqlcg.server.tools import (
     _capture_producer_set,
     _diff_lost_producers,
     _jaccard,
+    _reindex_to_sha,
 )
 
 # ---------------------------------------------------------------------------
@@ -245,27 +248,33 @@ def test_rename_overlap_threshold_value():
 # ---------------------------------------------------------------------------
 
 
-def test_get_pr_impact_mismatch_returns_hint_no_resync():
-    """When the graph is indexed at a different SHA than base_ref resolves to,
-    get_pr_impact returns a hint and does NOT invoke resync_changed.
+def test_get_pr_impact_mismatch_self_heal_fails_returns_manually_hint():
+    """When the graph SHA mismatches and the self-heal reindex fails,
+    _compute_pr_impact returns the 'manually' error hint.
 
-    Guards plan/sprints/unfilled_table_impact.md PR 2 Step 2.3 O2 contract.
+    Previously (pre-PR-F) this returned immediately without reindexing.
+    Now it attempts self-heal; when that fails it returns the 'manually' hint.
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F (fail path).
     """
     from sqlcg.server.tools import get_pr_impact
 
+    stale_sha = "aaa111bbb222ccc333ddd444eee555fff66677788"
+    base_sha = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
+
     mock_db = MagicMock()
-    mock_db.get_indexed_sha.return_value = "aaa111bbb222ccc333ddd444eee555fff66677788"
+    # get_indexed_sha always returns stale_sha → heal will fail the post-check
+    mock_db.get_indexed_sha.return_value = stale_sha
     mock_db.__enter__ = lambda self: self
     mock_db.__exit__ = MagicMock(return_value=False)
 
-    # _resolve_git_ref returns a different SHA than what's indexed.
     with (
         patch("sqlcg.server.tools._open_backend") as mock_open,
         patch("sqlcg.server.tools._assert_indexed"),
         patch("sqlcg.server.tools._indexed_root", return_value=None),
         patch(
             "sqlcg.server.tools._resolve_git_ref",
-            return_value="bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+            return_value=base_sha,
         ),
         patch("sqlcg.server.tools.Indexer") as mock_indexer_cls,
     ):
@@ -274,10 +283,133 @@ def test_get_pr_impact_mismatch_returns_hint_no_resync():
 
         result = get_pr_impact(base_ref="feature-branch")
 
-    # resync_changed must NOT have been invoked.
-    mock_indexer_cls.return_value.resync_changed.assert_not_called()
+    # resync_changed WAS attempted (self-heal fires).
+    mock_indexer_cls.return_value.resync_changed.assert_called_once()
 
+    # Because get_indexed_sha still returns stale_sha after the reindex,
+    # _reindex_to_sha returns False → error hint contains "manually".
     assert result.hint is not None, "Should have a diagnostic hint"
-    assert "base_ref" in result.hint or "indexed" in result.hint or "index" in result.hint.lower()
+    assert "manually" in result.hint, (
+        f"Hint should contain 'manually' on heal failure; got: {result.hint!r}"
+    )
     assert result.lost_producer_tables == []
     assert result.renamed_tables == {}
+
+
+# ---------------------------------------------------------------------------
+# PR-F — self-healing reindex scenarios (v1.28.3)
+# Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_fires_on_sha_mismatch_and_result_has_no_manually_hint():
+    """Scenario A: stale graph SHA triggers self-heal; when _reindex_to_sha
+    succeeds the result carries no 'manually' hint and is not the error-exit path.
+
+    After the heal, HEAD==base_sha so _compute_pr_impact returns the
+    'same commit' early exit (not an error), proving the error path is bypassed.
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F Scenario A.
+    """
+    from sqlcg.server.tools import get_pr_impact
+
+    stale_sha = "aaa000aaa000aaa000aaa000aaa000aaa000aaa0"
+    base_sha = "bbb111bbb111bbb111bbb111bbb111bbb111bbb1"
+
+    mock_db = MagicMock()
+    # get_indexed_sha: first call (pre-heal check) returns stale_sha;
+    # second call (post-heal verification in _reindex_to_sha) returns base_sha
+    # to simulate a successful heal.
+    mock_db.get_indexed_sha.side_effect = [stale_sha, base_sha, base_sha]
+
+    with (
+        patch("sqlcg.server.tools._open_backend") as mock_open,
+        patch("sqlcg.server.tools._assert_indexed"),
+        patch("sqlcg.server.tools._indexed_root", return_value=Path("/fake/root")),
+        patch("sqlcg.server.tools._resolve_git_ref") as mock_resolve,
+        patch("sqlcg.server.tools.Indexer") as mock_indexer_cls,
+        patch("sqlcg.server.tools._capture_producer_set", return_value=set()),
+        patch("sqlcg.server.tools.get_dialect", return_value=None, create=True),
+    ):
+        # base_sha for base_ref, then base_sha for HEAD → same commit path
+        mock_resolve.side_effect = [base_sha, base_sha]
+        mock_open.return_value.__enter__ = lambda ctx: mock_db
+        mock_open.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = get_pr_impact(base_ref="main")
+
+    # Self-heal was attempted.
+    mock_indexer_cls.return_value.resync_changed.assert_called_once()
+
+    # Result must not carry the "manually" error hint.
+    assert result.hint is None or "manually" not in result.hint, (
+        f"Result should not contain 'manually' hint after successful heal; got hint={result.hint!r}"
+    )
+    # base_sha is set in the result.
+    assert result.base_sha == base_sha
+
+
+def test_reindex_to_sha_returns_true_on_success():
+    """_reindex_to_sha returns True when get_indexed_sha equals target_sha after reindex.
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F _reindex_to_sha contract.
+    """
+    target_sha = "cccc3333cccc3333cccc3333cccc3333cccc3333"
+    from_sha = "dddd4444dddd4444dddd4444dddd4444dddd4444"
+
+    mock_db = MagicMock()
+    # First call in _reindex_to_sha (from_sha); second call post-reindex (should match target).
+    mock_db.get_indexed_sha.side_effect = [from_sha, target_sha]
+
+    with (
+        patch("sqlcg.server.tools.Indexer") as mock_indexer_cls,
+        patch("sqlcg.core.config.get_dialect", return_value=None),
+    ):
+        result = _reindex_to_sha(mock_db, Path("/fake/root"), target_sha)
+
+    assert result is True
+    # Verify resync_changed was called with the right positional args;
+    # dialect may be None or whatever get_dialect returned (patched to None here).
+    actual_call = mock_indexer_cls.return_value.resync_changed.call_args
+    assert actual_call is not None
+    args = actual_call[0]
+    assert args[0] == Path("/fake/root")
+    assert args[1] == from_sha
+    assert args[2] == target_sha
+    assert args[3] is mock_db
+
+
+def test_reindex_to_sha_returns_false_when_sha_still_mismatches_after_reindex():
+    """_reindex_to_sha returns False when get_indexed_sha != target_sha after reindex.
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F _reindex_to_sha fail path.
+    """
+    target_sha = "eeee5555eeee5555eeee5555eeee5555eeee5555"
+    from_sha = "ffff6666ffff6666ffff6666ffff6666ffff6666"
+    wrong_sha = "0000000000000000000000000000000000000000"
+
+    mock_db = MagicMock()
+    mock_db.get_indexed_sha.side_effect = [from_sha, wrong_sha]
+
+    with patch("sqlcg.server.tools.Indexer"):
+        result = _reindex_to_sha(mock_db, Path("/fake/root"), target_sha)
+
+    assert result is False
+
+
+def test_reindex_to_sha_returns_false_on_exception():
+    """_reindex_to_sha returns False (not raises) when resync_changed raises.
+
+    Guards plan/sprints/sprint_backlog_q2_bugfix.md §PR-F no silent exception swallow.
+    """
+    target_sha = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+    from_sha = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
+
+    mock_db = MagicMock()
+    mock_db.get_indexed_sha.return_value = from_sha
+
+    with patch("sqlcg.server.tools.Indexer") as mock_indexer_cls:
+        mock_indexer_cls.return_value.resync_changed.side_effect = RuntimeError("git gone")
+        result = _reindex_to_sha(mock_db, Path("/fake/root"), target_sha)
+
+    assert result is False
