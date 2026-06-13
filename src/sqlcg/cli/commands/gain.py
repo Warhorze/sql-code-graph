@@ -40,7 +40,7 @@ def gain_cmd(
     - Section B: Parse success trend (last 5 index runs)
     - Section C: True positive feedback rate (if ≥5 samples)
     - Section D: Top 3 most-called tools
-    - Section E: execute_cypher ratio (high ratio = LLM falling back to raw Cypher)
+    - Section E: execute_sql ratio (high ratio = LLM falling back to raw SQL)
     - Section F: Parse quality breakdown from graph (FULL / TABLE_ONLY / SCRIPTING_FALLBACK)
 
     Parse quality legend:
