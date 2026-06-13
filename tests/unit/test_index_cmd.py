@@ -37,6 +37,15 @@ def test_zero_edges_warning_appears_in_output():
             # would otherwise route this through the socket and bypass every mock
             # below, making the test depend on host runtime state.
             patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
+            # Prevent rich.progress.Progress from starting a background refresh thread
+            # with a MagicMock console.  Without this patch, Progress.__init__ stores
+            # mock_console.get_time (a MagicMock) as its get_time callable.  The
+            # background _RefreshThread then calls TimeRemainingColumn.get_renderable
+            # twice, triggering MagicMock() + 0.5 > MagicMock() → TypeError in
+            # rich/progress.py.  pytest's threading.excepthook catches that thread
+            # exception and attributes it to the next test that happens to run — the
+            # intermittent flake that blocks the release gate.
+            patch("sqlcg.cli.commands.index.Progress"),
         ):
             mock_console.print = mock_console_print
 
@@ -100,6 +109,12 @@ def test_no_warning_when_edges_exist():
             patch("sqlcg.cli.commands.index.Indexer") as mock_indexer_class,
             patch("sqlcg.cli.commands.index.get_db_path") as mock_get_db_path,
             patch("sqlcg.cli.commands.index.get_dialect") as mock_get_dialect,
+            # Prevent the rich Progress background thread from acquiring a MagicMock
+            # get_time and triggering MagicMock() > MagicMock() in a later test.
+            # See test_zero_edges_warning_appears_in_output for the full explanation.
+            patch("sqlcg.cli.commands.index.Progress"),
+            # Force the direct-write path (no live server socket check).
+            patch("sqlcg.cli.commands.index._try_route_index_via_server", return_value=False),
         ):
             mock_console.print = mock_console_print
 
