@@ -68,6 +68,7 @@ _DOC_PATHS: list[Path] = [
     _ROOT / "CLAUDE.md",
     _ROOT / "ARCHITECTURE_REVIEW.md",
     _ROOT / "docs" / "cli.md",
+    _ROOT / "docs" / "getting-started.md",
 ]
 
 
