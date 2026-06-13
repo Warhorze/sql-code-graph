@@ -171,12 +171,17 @@ def test_raw_topology_two_hop_relay_through_synthetic_cte_nodes(indexed_db):
     produces a TWO-HOP relay producer -> cte -> consumer (NOT a parallel
     direct producer -> consumer edge with a disconnected dead-end cte leaf,
     as an earlier draft of the plan assumed and Phase 1 found does not
-    reproduce). Also pins the empty-SELECTS_FROM signature that is the root
-    cause of defect 1.
+    reproduce).
 
     PR 3 (sprint_lineage_identity_and_session_context.md §PR 3): CTE keys are
     now namespaced with the defining file path (e.g. "/tmp/.../01_insert_b.sql::cte_b").
     The two-hop relay topology is unchanged; only the key format changed.
+
+    PR-2 (#38 island-lever fix, plan/sprints/issue-38-selects-from-island-lever.md):
+    _real_tables() now descends CTE child scopes, so the previously-empty SELECTS_FROM
+    for CTE-wrapped inserts is now populated.  The assertion flips from "empty" to
+    "non-empty" here; the Kahn topological sort (get_backfill_order) still reads
+    COLUMN_LINEAGE adjacency and is unaffected.
     """
     db, tmp_path = indexed_db
     edges = _raw_lineage_edges(db)
@@ -226,13 +231,23 @@ def test_raw_topology_two_hop_relay_through_synthetic_cte_nodes(indexed_db):
     # Control: the direct view edge exists (proves the corpus has a non-CTE consumer).
     assert ("s.tablea.id", "s.v_consumer.id") in pairs, "control view edge missing"
 
-    # The missing adjacency that forces Kahn into the alphabetical fallback (defect 1
-    # root cause): SELECTS_FROM is EMPTY for both CTE-wrapped INSERT...SELECT targets.
-    assert _selects_from_for_target(db, _PRODUCER) == [], (
-        "SELECTS_FROM must be empty for the CTE-wrapped s.tableb target"
+    # PR-2 (#38 island-lever fix, plan/sprints/issue-38-selects-from-island-lever.md):
+    # _real_tables() now descends CTE child scopes, so CTE-wrapped INSERT...SELECT
+    # statements emit SELECTS_FROM source rows.  The empty-SELECTS_FROM signature that
+    # was the root cause of defect 1 (Kahn alphabetical fallback) is now FIXED.
+    # The Kahn topological sort still uses COLUMN_LINEAGE (not SELECTS_FROM) for adjacency
+    # and remains correct; SELECTS_FROM now also has the source rows for island resolution.
+    sf_producer = _selects_from_for_target(db, _PRODUCER)
+    sf_consumer = _selects_from_for_target(db, _CONSUMER)
+    assert len(sf_producer) >= 1, (
+        "SELECTS_FROM must be non-empty for the CTE-wrapped s.tableb target after PR-2 fix.\n"
+        "PR-2 (_real_tables CTE-body descent) should have emitted source rows.\n"
+        f"Got: {sf_producer}"
     )
-    assert _selects_from_for_target(db, _CONSUMER) == [], (
-        "SELECTS_FROM must be empty for the CTE-wrapped s.tablec target"
+    assert len(sf_consumer) >= 1, (
+        "SELECTS_FROM must be non-empty for the CTE-wrapped s.tablec target after PR-2 fix.\n"
+        "PR-2 (_real_tables CTE-body descent) should have emitted source rows.\n"
+        f"Got: {sf_consumer}"
     )
 
 

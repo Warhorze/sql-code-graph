@@ -248,15 +248,20 @@ class TestStarSourceReadCountedAsUsed:
 
 class TestCtePureGatingReadIsDocumentedGap:
     """T0d: `da.x_gate` is read only inside a CTE without deriving any column.
-    Neither D1 (SELECTS_FROM), D2 (STAR_SOURCE), nor D3 (COLUMN_LINEAGE) fire for it.
-    It STILL appears in `ANALYZE_UNUSED_TABLES` — this is the documented known gap.
 
-    The test docstring accepts this as a known limitation: the parser's `_real_tables`
-    (base.py L604) excludes CTE-sourced names (M1 / performance invariant), so no
-    SELECTS_FROM edge is emitted; and no value derives from `x_gate`, so no
-    COLUMN_LINEAGE edge is sourced at it either.
+    Originally documented as a known gap where D1 (SELECTS_FROM) did NOT fire because
+    the parser's ``_real_tables`` (base.py L604) excluded CTE-sourced names.
 
-    Plan: plan/sprints/unfilled_table_impact.md §PR 4 Test T0d (documented gap)
+    PR-2 (#38 island-lever fix, plan/sprints/issue-38-selects-from-island-lever.md):
+    ``_real_tables()`` now descends CTE child scopes and emits SELECTS_FROM rows for
+    tables found there.  The T0d CTE body reads ``da.x_gate``, so D1 NOW fires, the
+    table appears in SELECTS_FROM, and it is correctly removed from "unused".
+    The "documented gap" is now CLOSED by the parser fix.
+
+    D2 (STAR_SOURCE) and D3 (COLUMN_LINEAGE source) remain absent because no column
+    value derives from x_gate — those assertions are unchanged.
+
+    Plan: plan/sprints/unfilled_table_impact.md §PR 4 Test T0d (gap now closed by PR-2).
     """
 
     @pytest.fixture
@@ -267,40 +272,48 @@ class TestCtePureGatingReadIsDocumentedGap:
         Indexer().index_repo(tmp_path, dialect=None, db=db, use_git=False)
         return db
 
-    def test_pure_gating_table_still_in_unused(self, indexed_db):
-        """da.x_gate (CTE-pure-gating, no derived column) is STILL in unused.
+    def test_pure_gating_table_not_in_unused_after_pr2(self, indexed_db):
+        """da.x_gate (CTE-pure-gating, no derived column) is now REMOVED from unused.
 
-        This is an accepted known gap: a pure-gating read inside a CTE is invisible
-        to all three signals (D1/D2/D3). Fixing it would require a parser change that
-        is out of scope (CLAUDE.md performance invariant, M1).
+        After PR-2 _real_tables() descends the CTE child scope and emits a SELECTS_FROM
+        row for da.x_gate.  The D1 signal fires; ANALYZE_UNUSED_TABLES excludes it.
+        The T0d gap is closed.
+
+        Guards plan/sprints/issue-38-selects-from-island-lever.md §Acceptance PR-2.
         """
         rows = indexed_db.run_read(ANALYZE_UNUSED_TABLES_QUERY, {})
         unused_tables = {r["table_qualified"] for r in rows}
 
-        # x_gate has no SELECTS_FROM, STAR_SOURCE, or COLUMN_LINEAGE source edge.
-        # It is the documented gap — it SHOULD still appear as unused.
-        assert "da.x_gate" in unused_tables, (
-            f"da.x_gate unexpectedly removed from unused. Unused: {sorted(unused_tables)}. "
-            "Expected it to remain (documented CTE-pure-gating gap)."
+        assert "da.x_gate" not in unused_tables, (
+            f"da.x_gate still appears as unused after PR-2 fix. "
+            f"Unused: {sorted(unused_tables)}. "
+            "The CTE-body descent should have emitted a SELECTS_FROM row for x_gate."
         )
 
-    def test_pure_gating_table_has_no_signals(self, indexed_db):
-        """Confirm no D1/D2/D3 signal fires for da.x_gate — verifying the gap."""
-        # D1: no SELECTS_FROM
+    def test_pure_gating_table_has_selects_from_after_pr2(self, indexed_db):
+        """D1 (SELECTS_FROM) now fires for da.x_gate after the PR-2 fix.
+
+        D2 (STAR_SOURCE) and D3 (COLUMN_LINEAGE source) remain absent — no column
+        value derives from x_gate.
+        """
+        # D1: NOW has SELECTS_FROM (PR-2 fix)
         sf_rows = indexed_db.run_read(
             'SELECT dst_key FROM "SELECTS_FROM" WHERE dst_key = ?',
             {"dst_key": "da.x_gate"},
         )
-        assert len(sf_rows) == 0, "Unexpected SELECTS_FROM edge for da.x_gate"
+        assert len(sf_rows) >= 1, (
+            "No SELECTS_FROM edge for da.x_gate — PR-2 CTE-body descent did not fire. "
+            "Expected at least one row with dst_key='da.x_gate'."
+        )
 
-        # D2: no STAR_SOURCE
+        # D2: still no STAR_SOURCE (unchanged — no SELECT * from x_gate)
         ss_rows = indexed_db.run_read(
             'SELECT dst_key FROM "STAR_SOURCE" WHERE dst_key = ?',
             {"dst_key": "da.x_gate"},
         )
         assert len(ss_rows) == 0, "Unexpected STAR_SOURCE edge for da.x_gate"
 
-        # D3: no COLUMN_LINEAGE source
+        # D3: still no COLUMN_LINEAGE source (unchanged — no column derives from x_gate)
         from sqlcg.core.queries import FIND_TABLE_USAGES_VIA_LINEAGE_QUERY
 
         cl_rows = indexed_db.run_read(
@@ -308,14 +321,16 @@ class TestCtePureGatingReadIsDocumentedGap:
             {"name": "x_gate"},
         )
         assert len(cl_rows) == 0, (
-            "Unexpected COLUMN_LINEAGE source for da.x_gate (gap unexpectedly closed)"
+            "Unexpected COLUMN_LINEAGE source for da.x_gate — the D3 path is not expected here"
         )
 
-    def test_pure_gating_find_table_usages_empty_hint_contains_gap_string(
+    def test_pure_gating_find_table_usages_returns_direct_usage_after_pr2(
         self, indexed_db, monkeypatch
     ):
-        """find_table_usages for x_gate returns an empty result whose hint mentions
-        the CTE-pure-gating known gap.
+        """find_table_usages for x_gate now returns a direct usage after PR-2 fix.
+
+        After PR-2, the CTE-body read of x_gate emits a SELECTS_FROM row, which
+        is picked up by find_table_usages as a 'direct' usage_kind.
         """
         from unittest.mock import MagicMock
 
@@ -331,10 +346,13 @@ class TestCtePureGatingReadIsDocumentedGap:
         monkeypatch.setattr(tools_mod, "_assert_indexed", lambda db: None)
 
         result = tools_mod.find_table_usages("x_gate")
-        assert result.usages == [], f"Expected no usages, got: {result.usages}"
-        assert result.hint is not None
-        assert "pure-gating" in result.hint or "known gap" in result.hint, (
-            f"Hint does not mention CTE pure-gating known gap.\nHint: {result.hint}"
+        assert len(result.usages) >= 1, (
+            f"Expected at least one usage for x_gate after PR-2 fix; got: {result.usages}. "
+            "The CTE-body descent emits SELECTS_FROM, so find_table_usages should return it."
+        )
+        kinds = {u.usage_kind for u in result.usages}
+        assert "direct" in kinds, (
+            f"Expected usage_kind='direct' (from SELECTS_FROM); got kinds={kinds}"
         )
 
 
