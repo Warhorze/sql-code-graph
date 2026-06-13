@@ -219,7 +219,17 @@ class AnsiParser(SqlParser):
                 )
                 out.statements.append(query_node)
 
-                # Register CTAS bodies in sources_map for downstream temp table references
+                # Register CTAS bodies in sources_map for downstream temp table references.
+                # E8 fix (fix/e8-temp-chain, coverage_parse_failures.md §PR-3):
+                # _qualify_bare_tables (Snowflake USE SCHEMA path) prefixes bare table names
+                # with the active schema (e.g. tmp_x → schema.tmp_x) BEFORE _parse_statement
+                # runs.  Subsequent statements reference "schema.tmp_x"; exp.expand() normalises
+                # table nodes to "schema.tmp_x" and looks that key up in sources_map — which
+                # only held the bare key "tmp_x" → lookup misses → dynamic_source → E8.
+                # Fix: register BOTH the bare key (CLAUDE.md invariant: exp.expand()
+                # file-level sources only) AND the schema-qualified key so exp.expand()
+                # can resolve the post-_qualify_bare_tables reference.  The graph-node key
+                # is separate (namespaced via _lineage_node_to_table_ref — unchanged).
                 if isinstance(stmt, exp.Create):
                     # Unwrap Subquery wrapper: CREATE TABLE t AS (SELECT ...) has
                     # stmt.expression = exp.Subquery, not exp.Select directly
@@ -229,7 +239,16 @@ class AnsiParser(SqlParser):
                     if isinstance(_expr, exp.Select) and query_node.target:
                         target_name = (query_node.target.name or "").lower()
                         if target_name:
+                            # Bare key — required for the non-qualified / ANSI path.
                             sources_map[target_name] = _expr
+                            # Qualified key — for the Snowflake USE SCHEMA path where
+                            # _qualify_bare_tables sets db on the temp name so subsequent
+                            # statements reference "schema.tmp_x" in the AST.
+                            # exp.expand() normalises both key and node identically,
+                            # so "schema.tmp_x" in the AST matches "schema.tmp_x" here.
+                            target_db = (query_node.target.db or "").lower()
+                            if target_db:
+                                sources_map[f"{target_db}.{target_name}"] = _expr
 
                 # Track defined and referenced tables
                 if query_node.kind in ("CREATE_TABLE", "CREATE_VIEW"):

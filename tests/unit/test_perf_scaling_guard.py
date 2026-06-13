@@ -55,6 +55,18 @@ class HotOpCounters:
         # (no serialization). Tracking .sql() calls here pins this invariant.
         # Note: we only count calls whose receiver is NOT a patched body_no_with
         # SELECT — the INSERT positional block has a legitimate _patched_sql
+        # E8 fix (fix/e8-temp-chain, plan/sprints/coverage_parse_failures.md §PR-3):
+        # The CTAS body registration in sources_map must run ONCE per CREATE statement,
+        # not once per column.  exp.expand() is called inside the body-scope path
+        # (once per statement before the column loop), so the existing build_scope /
+        # qualify counters already catch per-statement super-linearity.  This counter
+        # is an additional explicit guard: it counts exp.expand() calls that are caused
+        # by the sources_map being non-empty (i.e. the temp-body expansion path that
+        # the E8 fix enables).  Must stay flat when the COLUMN count of the INSERT
+        # doubles — the CTAS registration does not live in the column loop.
+        # Tracked as the expand_with_sources counter: a call to exp.expand() when
+        # the sources dict passed to it is non-empty (temp or CTE body present).
+        self.expand_with_sources = 0  # exp.expand() calls with non-empty sources
         # serialisation for sg_lineage, which is separate from classification.
         self.sql_calls_on_classify_path = 0  # .sql() inside _classify_transform
 
@@ -87,9 +99,16 @@ def count_hot_ops():
         "base_q": base_mod.qualify,
         "exp_copy": sqlglot_exp.Expression.copy,
         "exp_sql": sqlglot_exp.Expression.sql,
+        "exp_expand": sqlglot_exp.expand,
     }
 
+    # Flag: are we currently inside sg_lineage?  Used by expand_wrap to distinguish
+    # the once-per-statement body-scope expand (outside lineage) from sqlglot's own
+    # per-column expand calls inside lineage — only the former must stay flat.
+    _in_lineage = False
+
     def lineage_wrap(*a, **k):
+        nonlocal _in_lineage
         c.sg_lineage += 1
         # Invariant (regression #1, commit 4234e5d): when a pre-built scope is
         # passed, copy=False MUST accompany it, else sqlglot deep-copies the whole
@@ -99,7 +118,11 @@ def count_hot_ops():
             c.scope_lineage_calls += 1
             if k.get("copy") is not False:
                 c.scope_without_copy_false += 1
-        return orig["lin_lineage"](*a, **k)
+        _in_lineage = True
+        try:
+            return orig["lin_lineage"](*a, **k)
+        finally:
+            _in_lineage = False
 
     def build_scope_wrap_factory(key):
         def wrap(*a, **k):
@@ -122,6 +145,22 @@ def count_hot_ops():
         if isinstance(self, sqlglot_exp.Select) and len(self.expressions) > 1:
             c.multi_proj_body_copy += 1
         return orig["exp_copy"](self, *a, **k)
+
+    def expand_wrap(*a, **k):
+        # E8 fix guard (fix/e8-temp-chain): exp.expand() is called once per statement
+        # in the body-scope path (_extract_column_lineage), OUTSIDE sg_lineage.
+        # sqlglot's own lineage() may also call exp.expand() internally per column —
+        # that is per-column by design and is excluded here (we track only calls
+        # originating outside sg_lineage, i.e. the body-scope preparation path).
+        # When sources_map is non-empty and we are NOT inside sg_lineage, the call
+        # must stay flat as column count doubles.
+        # CLAUDE.md invariant: "exp.expand() called with only file-level sources,
+        # filtered by dependency_filter" — this counter enforces it stays O(1) per stmt.
+        if not _in_lineage:
+            sources_arg = a[1] if len(a) > 1 else k.get("sources", {})
+            if sources_arg:
+                c.expand_with_sources += 1
+        return orig["exp_expand"](*a, **k)
 
     # PR 4 invariant: wrap _classify_transform to count .sql() calls made
     # inside it. We do this by patching Expression.sql only while _classify_transform
@@ -148,6 +187,7 @@ def count_hot_ops():
     base_mod.qualify = qualify_wrap_factory("base_q")
     sqlglot_exp.Expression.copy = copy_wrap
     sqlglot_exp.Expression.sql = sql_wrap
+    sqlglot_exp.expand = expand_wrap
     base_mod.SqlParser._classify_transform = staticmethod(classify_wrap)
     try:
         yield c
@@ -157,6 +197,7 @@ def count_hot_ops():
         base_mod.qualify = orig["base_q"]
         sqlglot_exp.Expression.copy = orig["exp_copy"]
         sqlglot_exp.Expression.sql = orig["exp_sql"]
+        sqlglot_exp.expand = orig["exp_expand"]
         base_mod.SqlParser._classify_transform = staticmethod(orig_classify)
 
 
@@ -350,4 +391,62 @@ def test_classify_transform_calls_sql_zero_times():
         "on a pure SELECT fixture — classification must be AST-only (no serialization). "
         "Serialization inside the classification path is the per-call-cost regression "
         "class from commit 4234e5d. Restore AST-only classification."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 4 (E8 fix, fix/e8-temp-chain) — exp.expand() with sources must not
+# go super-linear when the column count of the consumer INSERT doubles.
+# The CTAS body registration in sources_map and the exp.expand() call happen
+# ONCE per statement (in the body-scope path), not once per column.
+# Regression class: moving expand inside the column loop → O(N_cols × N_sources).
+# ---------------------------------------------------------------------------
+
+
+def _temp_chain_insert(n_cols: int) -> str:
+    """One CREATE TEMP TABLE + one INSERT with n_cols pass-through columns.
+
+    The CREATE registers one body in sources_map; the INSERT with N columns
+    exercises the expand-with-sources path once.  Column count doubling must
+    NOT increase expand_with_sources beyond a flat ceiling (once per statement).
+    """
+    src_cols = ", ".join(f"src.c{i}" for i in range(n_cols))
+    ins_cols = ", ".join(f"c{i}" for i in range(n_cols))
+    return (
+        f"CREATE TEMPORARY TABLE db.s.tmp_x AS SELECT {src_cols} FROM db.s.src;\n"
+        f"INSERT INTO db.s.tgt ({ins_cols}) SELECT {ins_cols} FROM db.s.tmp_x;\n"
+    )
+
+
+def test_expand_with_sources_flat_when_columns_double():
+    """exp.expand() with a non-empty sources dict must stay flat as columns double.
+
+    The E8 fix (fix/e8-temp-chain) adds a qualified-key entry in sources_map
+    alongside the bare key.  exp.expand() is called once per statement (in the
+    body-scope path), not once per column.  Moving it inside the column loop
+    would be the O(N_cols × N_sources) regression class.
+
+    Reports the exact op-count at N and 2N so the reviewer can confirm flatness.
+    Guards plan/sprints/coverage_parse_failures.md §PR-3 (Step 3.3, E8 perf gate).
+    """
+    parser_base = AnsiParser(SchemaResolver(dialect=None))
+    parser_2x = AnsiParser(SchemaResolver(dialect=None))
+
+    with count_hot_ops() as base:
+        parser_base.parse_file(Path("base.sql"), _temp_chain_insert(COLS_BASE))
+    with count_hot_ops() as doubled:
+        parser_2x.parse_file(Path("doubled.sql"), _temp_chain_insert(COLS_2X))
+
+    # Sanity: the temp-chain expand path was exercised (expand_with_sources > 0).
+    assert base.expand_with_sources >= 1, (
+        f"fixture did not exercise the expand-with-sources path "
+        f"(expand_with_sources={base.expand_with_sources}); "
+        "the guard would be vacuously green — check _temp_chain_insert fixture"
+    )
+
+    # expand_with_sources must stay flat (once per INSERT statement) as cols double.
+    assert_flat(
+        base.expand_with_sources,
+        doubled.expand_with_sources,
+        "expand_with_sources (E8 fix — must not enter column loop)",
     )
