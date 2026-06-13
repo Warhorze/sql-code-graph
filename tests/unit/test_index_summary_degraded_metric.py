@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from sqlcg.core.schema import SCHEMA_VERSION
 from sqlcg.indexer.error_classify import _DEGRADING, dominant_cause
 from sqlcg.parsers.base import ParsedFile
 
@@ -194,7 +195,7 @@ def _call_index_cmd_capture_output(summary: dict) -> list[str]:
             mock_console.print = lambda *a, **kw: printed.append(str(a[0]) if a else "")
 
             mock_backend = MagicMock()
-            mock_backend.get_schema_version.return_value = "8"
+            mock_backend.get_schema_version.return_value = SCHEMA_VERSION
             mock_get_backend.return_value.__enter__.return_value = mock_backend
 
             mock_indexer = MagicMock()

@@ -230,9 +230,9 @@ def test_schema_gate_rejects_version_7_graph(tmp_path):
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    # SCHEMA_VERSION must be '8' — the skip_counts bump
-    assert SCHEMA_VERSION == "8", (
-        f"This test pins the v8 migration; SCHEMA_VERSION={SCHEMA_VERSION!r}. "
+    # SCHEMA_VERSION must be '9' — the qualify_failed bump (most recent migration)
+    assert SCHEMA_VERSION == "9", (
+        f"This test pins the v9 migration; SCHEMA_VERSION={SCHEMA_VERSION!r}. "
         "Update the test if the version has been bumped again."
     )
 

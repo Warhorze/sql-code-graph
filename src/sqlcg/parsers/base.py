@@ -211,10 +211,14 @@ class LineageExtraction:
     Attributes:
         edges: List of LineageEdge objects extracted from the statement
         star_sources: List of StarSource markers for SELECT * projections
+        qualify_failed: True when the qualify() step raised an exception for
+            this statement (schema-free retry may still yield a partial scope).
+            Propagated to QueryNode.qualify_failed for per-statement storage.
     """
 
     edges: list[LineageEdge]
     star_sources: list[StarSource]
+    qualify_failed: bool = False
 
 
 @dataclass
@@ -238,6 +242,10 @@ class QueryNode:
         ctes: Dict of CTE names to their TableRef definitions
         column_lineage: List of LineageEdge objects
         parse_failed: Whether parsing failed (fallback to table-only lineage)
+        qualify_failed: True when the qualify() step raised an exception for this
+            statement during column-lineage extraction. Does NOT imply parse_failed;
+            a schema-free retry may still yield a partial scope. Persisted to
+            SqlQuery.qualify_failed in the graph for per-statement diagnostics.
         confidence: Overall confidence score for this query's lineage
         parsing_mode: How the query was parsed (e.g., "sqlglot", "fallback", "scripting")
         defined_body: For CTAS statements, the exp.Select or exp.Subquery body being created
@@ -256,6 +264,7 @@ class QueryNode:
     ctes: dict[str, TableRef] = field(default_factory=dict)
     column_lineage: list[LineageEdge] = field(default_factory=list)
     parse_failed: bool = False
+    qualify_failed: bool = False
     confidence: float = 1.0
     parsing_mode: str = "sqlglot"
     star_sources: list[StarSource] = field(default_factory=list)
@@ -1058,6 +1067,7 @@ class SqlParser(ABC):
 
         edges: list[LineageEdge] = []
         star_sources: list[StarSource] = []
+        _qualify_failed: bool = False
 
         # NEW (T-07-06): Record MERGE statements explicitly as deferred.
         # sqlglot's lineage() API does not handle MERGE branches; implementing
@@ -1159,6 +1169,7 @@ class SqlParser(ABC):
                     )
                     body_scope = build_scope(qualified_body)
                 except Exception as _qualify_exc:
+                    _qualify_failed = True
                     out.errors.append(
                         f"col_lineage_skip:qualify_failed:{type(_qualify_exc).__name__}"
                     )
@@ -1777,7 +1788,9 @@ class SqlParser(ABC):
             )
             out.errors.append(f"col_lineage:statement:{exc}")
 
-        return LineageExtraction(edges=edges, star_sources=star_sources)
+        return LineageExtraction(
+            edges=edges, star_sources=star_sources, qualify_failed=_qualify_failed
+        )
 
     def _resolve_star_source(
         self,

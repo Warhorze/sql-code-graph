@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlcg.core.schema import SCHEMA_VERSION
+
 # ---------------------------------------------------------------------------
 # Scenario A — pool-path timeout appears in the "timeout" bucket
 # ---------------------------------------------------------------------------
@@ -133,7 +135,7 @@ def test_scenario_c_log_file_written_to_configured_path(tmp_path: Path) -> None:
     backend.__enter__ = MagicMock(return_value=backend)
     backend.__exit__ = MagicMock(return_value=False)
     backend.init_schema = MagicMock()
-    backend.get_schema_version = MagicMock(return_value="8")  # matches SCHEMA_VERSION
+    backend.get_schema_version = MagicMock(return_value=SCHEMA_VERSION)  # matches SCHEMA_VERSION
     backend.upsert_node = MagicMock()
     backend.upsert_edge = MagicMock()
     backend.run_read = MagicMock(return_value=[])
