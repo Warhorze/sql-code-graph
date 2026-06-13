@@ -442,6 +442,31 @@ def _run_index(
             )
             if quality_parts:
                 console.print("  " + " · ".join(quality_parts))
+
+            # Additive degraded-files line: distinct-file count whose dominant cause is
+            # in _DEGRADING (per plan/sprints/coverage_parse_failures.md §PR-1 Step 1.2).
+            # Distinct-file count comes from summary["degraded_files"]; per-bucket breakdown
+            # comes from summary["degraded_by_cause"] which partitions that total by dominant
+            # cause (one entry per file, not one per error string) so the bucket counts sum
+            # exactly to n_degraded.
+            n_degraded = summary.get("degraded_files", 0)
+            if n_degraded:
+                # Build per-bucket breakdown from degraded_by_cause (FILE counts, not error-
+                # string counts), ordered by count descending so the dominant cause appears
+                # first (E5/E8 on the DWH).  Sum of buckets == n_degraded.
+                degraded_buckets = sorted(
+                    summary.get("degraded_by_cause", {}).items(),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                bucket_str = " · ".join(f"{k}: {v}" for k, v in degraded_buckets)
+                degraded_suffix = f" — {bucket_str}" if bucket_str else ""
+                line = (
+                    f"  [yellow]{n_degraded} files degraded (parse_failed)"
+                    f"[/yellow]{degraded_suffix}"
+                )
+                console.print(line)
+
             if summary.get("lineage_edges_created", 0) == 0:
                 console.print(
                     "[yellow]Warning: 0 lineage edges extracted — column lineage "
