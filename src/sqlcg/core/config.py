@@ -223,6 +223,46 @@ def get_ignore_table_regexes(path: Path) -> list[str]:
     return []
 
 
+def get_index_filter_enabled(path: Path) -> bool:
+    """Return whether destructive index-time table-name exclusion is enabled.
+
+    Reads ``[sqlcg.index_filter] enabled`` from ``.sqlcg.toml``.  **Defaults to
+    False.**  This is a SEPARATE block from ``[sqlcg.noise_filter]`` on purpose:
+    the query-time noise filter is non-destructive (it only hides rows at read
+    time; the data stays in the graph and the hide is reversible), whereas
+    index-time exclusion is destructive and irreversible without a re-index (the
+    table is never written to the graph). The distinct block signals that
+    destructive semantics at the config surface::
+
+        [sqlcg.index_filter]
+        enabled = true
+
+    When false (the default) — even when ``[sqlcg.noise_filter]`` patterns ARE
+    defined — no index-time filtering runs and the graph is byte-identical to a
+    no-filter index.  The pattern/name/regex lists themselves are read from the
+    SAME readers as the query-time filter (``get_noise_filter_patterns`` /
+    ``get_ignored_tables`` / ``get_ignore_table_regexes``); this flag is only the
+    on/off switch.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        True only when ``[sqlcg.index_filter] enabled = true``; False otherwise.
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("index_filter", {}).get("enabled")
+            if isinstance(raw, bool):
+                return raw
+        except Exception:
+            pass
+    return False
+
+
 # Conservative built-in file-discovery ignore patterns for backup/snapshot SQL
 # artifacts (issue #27a). These are gitwildmatch globs matched against the
 # repo-relative file path, so they exclude a *whole file* whose name marks it as

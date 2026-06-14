@@ -7,8 +7,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sqlcg.core.config import get_catalog_path, get_external_consumers, get_presentation_prefixes
+from sqlcg.core.config import (
+    get_catalog_path,
+    get_external_consumers,
+    get_index_filter_enabled,
+    get_presentation_prefixes,
+)
 from sqlcg.core.graph_db import GraphBackend
+from sqlcg.core.noise_match import TableNameMatcher
 from sqlcg.core.schema import NodeLabel, RelType
 from sqlcg.indexer.error_classify import _classify_error, dominant_cause, skip_counts_json
 from sqlcg.indexer.pool import HardKillPool
@@ -196,7 +202,20 @@ def _dedup_column_lineage_edges(rows: list[dict]) -> list[dict]:
     return list(deduped.values())
 
 
-def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
+def _table_of_column_id(col_id: str) -> str:
+    """Return the owning table qualified id for a column id.
+
+    Column ids are ``{table_qualified}.{col_name}``; the table part is
+    everything before the LAST dot (table_qualified itself may contain dots,
+    e.g. ``schema.table`` or a ``path/file.sql::cte`` namespace).
+    """
+    dot = col_id.rfind(".")
+    return col_id[:dot] if dot >= 0 else col_id
+
+
+def _flush_row_batch(
+    db: GraphBackend, buf: BatchRowBuffer, exclude: TableNameMatcher | None = None
+) -> None:
     """Dedup accumulated rows across the batch, then issue the 10 bulk calls ONCE.
 
     This is the v1.1.1 batch-flush core: called once per batch (not once per file).
@@ -300,6 +319,42 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
             for r in usage_has_column_edges
             if (r["src_key"], r["dst_key"]) not in existing_hc_keys
         ]
+
+    # --- PR-2b (#27a): destructive index-time table-name exclusion, opt-in ---
+    # Runs at/after :302 (post usage-catalog merge), immediately before the
+    # Phase-C flush, so it also covers usage rows merged above (filtering at
+    # row-assembly time would miss them).  Guarded list comprehensions over the
+    # already-deduped collections — no new execute(), no per-row upsert, so the
+    # bulk-upsert / op-count scaling invariants hold.  The pre-flush filter is
+    # NECESSARY BUT NOT SUFFICIENT: the two post-flush emitters (clone
+    # inheritance, catalog re-apply) are filtered separately at their sites.
+    # query_defined_in_edges is intentionally untouched (keyed QUERY->FILE).
+    if exclude is not None:
+        excluded_tables = {r["qualified"] for r in table_rows if exclude(r["qualified"])}
+        excluded_tables |= {
+            r["table_qualified"] for r in column_rows if exclude(r["table_qualified"])
+        }
+        if excluded_tables:
+            table_rows = [r for r in table_rows if r["qualified"] not in excluded_tables]
+            column_rows = [r for r in column_rows if r["table_qualified"] not in excluded_tables]
+            has_column_edges = [r for r in has_column_edges if r["src_key"] not in excluded_tables]
+            defined_in_edges = [r for r in defined_in_edges if r["src_key"] not in excluded_tables]
+            selects_from_edges = [
+                r for r in selects_from_edges if r["dst_key"] not in excluded_tables
+            ]
+            star_source_edges = [
+                r for r in star_source_edges if r["dst_key"] not in excluded_tables
+            ]
+            column_lineage_edges = [
+                r
+                for r in column_lineage_edges
+                if _table_of_column_id(r["src_key"]) not in excluded_tables
+                and _table_of_column_id(r["dst_key"]) not in excluded_tables
+            ]
+            logger.info(
+                "index_filter: excluded %d backup/ignored table(s) at index time",
+                len(excluded_tables),
+            )
 
     # --- Phase C: flush in dependency order (nodes before their edges) ---
     db.upsert_nodes_bulk(NodeLabel.FILE, file_rows)
@@ -476,6 +531,16 @@ class Indexer:
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+        # PR-2b (#27a): build the destructive index-time exclusion matcher ONCE,
+        # only when [sqlcg.index_filter] enabled = true (default OFF).  None when
+        # disabled — even if [sqlcg.noise_filter] patterns ARE defined — so the
+        # default index is a true no-op (byte-identical to no-filter).  Shared
+        # core predicate, so the same names excluded here are what NoiseFilter
+        # would hide at query time.
+        index_filter: TableNameMatcher | None = (
+            TableNameMatcher.from_config(path) if get_index_filter_enabled(path) else None
+        )
 
         # Timing accumulators — only assigned when profile=True; zero-initialised
         # here so pyright can infer their types as float throughout the method.
@@ -749,6 +814,7 @@ class Indexer:
                 nonlocal_counts,
                 canonical_by_bare=aggregator.canonical_by_bare,
                 ambiguous_bare=aggregator._ambiguous_bare,
+                index_filter=index_filter,
             )
 
         if profile:
@@ -774,7 +840,7 @@ class Indexer:
         # after the main batch loop, over the (small) set of CLONE targets that
         # resolved an inherited catalog; rides the existing bulk-upsert path
         # (idempotent INSERT OR REPLACE — safe as a standalone follow-up flush).
-        self._emit_clone_inherited_rows(aggregator, db, nonlocal_counts)
+        self._emit_clone_inherited_rows(aggregator, db, nonlocal_counts, index_filter=index_filter)
 
         if profile:
             _t_upsert_end = time.perf_counter()
@@ -812,7 +878,7 @@ class Indexer:
         # hot loops. One-shot bulk path: zero parse-time work, constant execute() count.
         if profile:
             _t_catalog_start = time.perf_counter()
-        catalog_result = self._reapply_catalog_if_configured(db, path)
+        catalog_result = self._reapply_catalog_if_configured(db, path, index_filter=index_filter)
         if profile:
             _t_catalog_end = time.perf_counter()
 
@@ -1699,6 +1765,7 @@ class Indexer:
         aggregator: "CrossFileAggregator",
         db: GraphBackend,
         nonlocal_counts: dict,
+        index_filter: TableNameMatcher | None = None,
     ) -> None:
         """Flush CLONE-inherited SqlColumn / HAS_COLUMN rows (Part C2 step 4).
 
@@ -1726,6 +1793,13 @@ class Indexer:
         column_rows: list[dict] = []
         has_column_edges: list[dict] = []
         for target_ref, inherited_cols in catalog_rows:
+            # PR-2b (#27a): the backup singletons ARE clone targets
+            # (CREATE TABLE …_BCK_<date> … CLONE).  When index filtering is on,
+            # skip excluded targets BEFORE appending their inherited rows so this
+            # post-flush emitter does not re-introduce the orphan columns the
+            # zero-orphan criterion forbids.  Same core predicate as the flush.
+            if index_filter is not None and index_filter(target_ref.full_id):
+                continue
             for col_name in inherited_cols:
                 col_id = f"{target_ref.full_id}.{col_name}"
                 column_rows.append(
@@ -1770,6 +1844,7 @@ class Indexer:
         warning_prefix: str = "",
         canonical_by_bare: dict[str, str] | None = None,
         ambiguous_bare: set[str] | None = None,
+        index_filter: TableNameMatcher | None = None,
     ) -> None:
         """Accumulate rows for all files in batch, then flush once in one transaction.
 
@@ -1788,6 +1863,9 @@ class Indexer:
                 When provided, unqualified INSERT targets are rewritten to their DDL
                 canonical full_id.  None on single-file / reindex_file paths.
             ambiguous_bare: Optional set of bare names defined in >1 schema.
+            index_filter: Optional PR-2b (#27a) table-name exclusion matcher.
+                When provided (only when [sqlcg.index_filter] enabled = true),
+                excluded backup/ignored tables are dropped before the flush.
         """
         if not batch:
             return
@@ -1813,7 +1891,7 @@ class Indexer:
             nonlocal_counts["columns_defined"] += file_rows.counts.get("columns_defined", 0)
             nonlocal_counts["quality"][file_rows.parse_quality_key] += 1
         with db.transaction():
-            _flush_row_batch(db, buf)
+            _flush_row_batch(db, buf, exclude=index_filter)
 
     def _upsert_parsed_file(
         self,
@@ -1923,7 +2001,9 @@ class Indexer:
             "warnings": warnings,
         }
 
-    def _reapply_catalog_if_configured(self, db: GraphBackend, path: Path) -> dict:
+    def _reapply_catalog_if_configured(
+        self, db: GraphBackend, path: Path, index_filter: TableNameMatcher | None = None
+    ) -> dict:
         """Re-apply the INFORMATION_SCHEMA catalog if configured in .sqlcg.toml.
 
         Decision B2 (plan §4 §2): reads ``[sqlcg.catalog] path`` from .sqlcg.toml
@@ -1952,7 +2032,9 @@ class Indexer:
             from sqlcg.core.config import get_schema_aliases
 
             schema_aliases = get_schema_aliases(path)
-            result = apply_catalog_to_backend(catalog_csv, db, schema_aliases=schema_aliases)
+            result = apply_catalog_to_backend(
+                catalog_csv, db, schema_aliases=schema_aliases, exclude=index_filter
+            )
             logger.info(
                 "catalog re-applied: %d columns from %s",
                 result["columns_loaded"],
