@@ -8,7 +8,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from sqlcg.core.queries import GET_TABLE_EXTERNAL_CONSUMERS_QUERY
+from sqlcg.core.queries import (
+    GET_TABLE_EXTERNAL_CONSUMERS_QUERY,
+    IMPACT_CONSUMERS_VIA_LINEAGE_QUERY,
+)
 from sqlcg.server.read_client import resolved_repo_root, run_read_routed
 
 if TYPE_CHECKING:
@@ -312,8 +315,16 @@ def impact(  # noqa: B008
     table: str = typer.Argument(..., help="Table name to analyze"),  # noqa: B008
     raw: bool = typer.Option(False, "--raw", help="Disable noise filtering on results"),  # noqa: B008
 ) -> None:
-    """Show all queries impacted by a table."""
-    results = run_read_routed(
+    """Show all queries impacted by a table.
+
+    One-hop "who reads this table" — the union of direct SELECTS_FROM consumers
+    and consumers that read the table only via COLUMN_LINEAGE / STAR_SOURCE
+    (CTE-wrapped / promoted-intermediate reads, e.g. the live DWH node
+    ``ba.all_rows_in_selection``). Bug #6 fix: brings ``impact`` to the same
+    one-hop consumer completeness ``find_table_usages`` already has. Stays
+    one-hop (NOT transitive — that is ``downstream``'s job).
+    """
+    direct = run_read_routed(
         "SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target"
         ' FROM "SqlTable" t'
         ' JOIN "SELECTS_FROM" sf ON sf.dst_key = t.qualified'
@@ -321,6 +332,17 @@ def impact(  # noqa: B008
         " WHERE t.qualified = ? LIMIT 100",
         {"t": table},
     )
+    # Consumers reachable only via COLUMN_LINEAGE / STAR_SOURCE. Two "?" both
+    # bound to the qualified table name: _params_list returns list(values()) in
+    # insertion order, so the ordered dict {"t":..., "t2":...} binds correctly.
+    via = run_read_routed(
+        IMPACT_CONSUMERS_VIA_LINEAGE_QUERY,
+        {"t": table, "t2": table},
+    )
+    seen = {r["id"] for r in direct}
+    results = direct + [r for r in via if r["id"] not in seen]
+    # Preserve the existing 100-row bound on the merged consumer set.
+    results = results[:100]
     if not raw:
         from sqlcg.server.noise_filter import NoiseFilter
 
