@@ -35,8 +35,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Helpers
 #
-# collect_coverage() issues 17 run_read_routed calls in this order
-# (PR 1 + PR 4 + PR-1/issue-38 + column_lineage_recall_metric.md):
+# collect_coverage() issues 20 run_read_routed calls in this order
+# (PR 1 + PR 4 + PR-1/issue-38 + column_lineage_recall_metric.md +
+#  #151 tool-version stamp):
 #   1  catalog_coverage              {catalogued_tables, total_tables}
 #   2  edge_health (legacy)          {good_edges, total_edges}
 #   3  edge_health_strict            {good_edges_strict, total_edges}
@@ -45,7 +46,7 @@ except ImportError:
 #   6  phantom_split                 {phantom_confirmed, phantom_contradicted, phantom_unverified}
 #   7  blindspot (legacy)            {blindspot}
 #   8  blindspot_weighted            list of {dst_table, bad_count, rn, running_total, grand_total}
-#   9  fingerprint                   {files_indexed, indexed_sha}
+#   9  fingerprint                   {files_indexed, indexed_sha, indexed_sqlcg_version}  ← #151
 #   10 degraded_parse_overall        {degraded, total}
 #   11 degraded_parse_by_dir         list of {top_dir, degraded, total}
 #   12 zero_edge_writes              {zero_edge_writes, total_write_queries}
@@ -54,7 +55,9 @@ except ImportError:
 #   15 info_schema_rows              {info_schema_rows}  <- PR 4 Step 4.3
 #   16 cte_source_gap_writes         {cte_source_gap_writes}  <- PR-1 issue-38
 #   17 resolvable_write_col_edges    {resolvable_write_col_edges}  <- column_lineage_recall_metric
-#   18 Repo path (inline)            {path}
+#   18 transitive_col_edges          {transitive_col_edges}
+#   19 qualify_failed_statements     {qualify_failed_statements}
+#   20 Repo path (inline)            {path}
 # ---------------------------------------------------------------------------
 
 _CANNED_ROWS = [
@@ -69,7 +72,8 @@ _CANNED_ROWS = [
         {"dst_table": "tbl_a", "bad_count": 100, "rn": 1, "running_total": 100, "grand_total": 200},
         {"dst_table": "tbl_b", "bad_count": 100, "rn": 2, "running_total": 200, "grand_total": 200},
     ],
-    [{"files_indexed": 1340, "indexed_sha": "abc123"}],
+    # #151 — indexed_sqlcg_version added to fingerprint row
+    [{"files_indexed": 1340, "indexed_sha": "abc123", "indexed_sqlcg_version": "1.32.1"}],
     [{"degraded": 1855, "total": 3225}],
     [
         {"top_dir": "etl", "degraded": 1855, "total": 3225},
@@ -85,6 +89,10 @@ _CANNED_ROWS = [
     [{"cte_source_gap_writes": 46}],
     # column_lineage_recall_metric.md — resolvable-write column-lineage edge volume
     [{"resolvable_write_col_edges": 25246}],
+    # transitive temp edges (E8 dual-emission §6.1)
+    [{"transitive_col_edges": 500}],
+    # qualify_failed per-statement counter (PR-C, #118)
+    [{"qualify_failed_statements": 3}],
     # PR 4 Step 4.3 — Repo path (for catalog-path check)
     [{"path": "/repo"}],
 ]

@@ -1840,10 +1840,16 @@ def db_info() -> DbInfoResult:
     _freshness_kwargs: dict = {}
     try:
         _indexed_sha = db.get_indexed_sha()
+        _indexed_ver = db.get_indexed_version()
         _repo_rows = db.run_read('SELECT path FROM "Repo" LIMIT 1', {})
         if _repo_rows and _indexed_sha is not None and _repo_rows[0].get("path"):
             _root = Path(_repo_rows[0]["path"])
-            _f = compute_freshness(_root, _indexed_sha)
+            _f = compute_freshness(
+                _root,
+                _indexed_sha,
+                indexed_version=_indexed_ver,
+                running_version=__version__,
+            )
             _freshness_kwargs = {
                 "indexed_sha": _f.indexed_sha,
                 "head_sha": _f.head_sha,

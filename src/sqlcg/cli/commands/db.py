@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+import sqlcg as _sqlcg_pkg
 from sqlcg.cli.coverage import (
     CoverageStats,  # noqa: F401 — re-exported for patch targets in tests
     collect_coverage,
@@ -101,12 +102,20 @@ def db_info() -> None:
 
     # Freshness block
     try:
-        sha_rows = run_read_routed('SELECT indexed_sha AS sha FROM "SchemaVersion" LIMIT 1', {})
+        sha_rows = run_read_routed(
+            'SELECT indexed_sha AS sha, sqlcg_version FROM "SchemaVersion" LIMIT 1', {}
+        )
         indexed_sha = sha_rows[0]["sha"] if sha_rows else None
+        indexed_version = sha_rows[0].get("sqlcg_version") if sha_rows else None
         repo_rows = run_read_routed('SELECT path FROM "Repo" LIMIT 1', {})
         if repo_rows and indexed_sha is not None and repo_rows[0].get("path"):
             repo_root = Path(repo_rows[0]["path"])
-            f = compute_freshness(repo_root, indexed_sha)
+            f = compute_freshness(
+                repo_root,
+                indexed_sha,
+                indexed_version=indexed_version,
+                running_version=_sqlcg_pkg.__version__,
+            )
             console.print(render_freshness_line(f))
     except Exception as e:
         logger.debug(f"Freshness check skipped: {e}")

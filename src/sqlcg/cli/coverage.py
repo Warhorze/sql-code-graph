@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from sqlcg import __version__ as _SQLCG_VERSION
 from sqlcg.core.config import get_catalog_path, get_db_path
 from sqlcg.server.read_client import run_read_routed
 
@@ -185,7 +186,8 @@ ORDER BY bad_count DESC, dst_table
 _Q_FINGERPRINT = """
 SELECT
     (SELECT COUNT(*) FROM "File") AS files_indexed,
-    (SELECT indexed_sha FROM "SchemaVersion" LIMIT 1) AS indexed_sha
+    (SELECT indexed_sha FROM "SchemaVersion" LIMIT 1) AS indexed_sha,
+    (SELECT sqlcg_version FROM "SchemaVersion" LIMIT 1) AS indexed_sqlcg_version
 """
 
 # ---------------------------------------------------------------------------
@@ -446,6 +448,15 @@ class CoverageStats:
     db_path: str = ""
     index_timestamp: float | None = None
 
+    # --- tool-version staleness (#151 — gain over-reports health on stale graph) ---
+    # Set when the sqlcg version that indexed the graph differs from the running version.
+    # False when indexed_version is None (pre-v1.33.0 graph or never indexed) so we
+    # never claim staleness we cannot prove.
+    # Plan: plan/sprints/bugfix_audit_findings_151_153.md §PR-A
+    tool_version_stale: bool = False
+    indexed_tool_version: str | None = None
+    running_tool_version: str | None = None
+
     # --- recall ---
     degraded_parse_total: int = 0
     degraded_parse_queries: int = 0
@@ -643,6 +654,14 @@ def collect_coverage() -> CoverageStats | None:
             except Exception:
                 catalog_configured = False
 
+        # Tool-version staleness: only flag when both versions are known and differ.
+        # Null indexed_sqlcg_version (pre-v1.33.0 graph) → False, no false positive.
+        _indexed_tool_ver: str | None = row_fp.get("indexed_sqlcg_version")
+        _running_tool_ver: str = _SQLCG_VERSION
+        _tool_version_stale: bool = (
+            _indexed_tool_ver is not None and _indexed_tool_ver != _running_tool_ver
+        )
+
         return CoverageStats(
             catalogued_tables=int(row1.get("catalogued_tables") or 0),
             total_tables=int(row1.get("total_tables") or 0),
@@ -675,6 +694,9 @@ def collect_coverage() -> CoverageStats | None:
             resolvable_write_col_edges=int(row_rwce.get("resolvable_write_col_edges") or 0),
             transitive_col_edges=int(row_transitive.get("transitive_col_edges") or 0),
             qualify_failed_statements=int(row_qualify_failed.get("qualify_failed_statements") or 0),
+            tool_version_stale=_tool_version_stale,
+            indexed_tool_version=_indexed_tool_ver,
+            running_tool_version=_running_tool_ver,
         )
     except Exception:
         return None
@@ -850,6 +872,16 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
     lines.append(f"{indent}CTE key collisions: {coverage.cte_key_collisions}")
     lines.append(f"{indent}Rescuable unqualified edges: {coverage.rescuable_unqualified_edges}")
 
+    # Tool-version staleness (#151, bugfix_audit_findings_151_153.md §PR-A).
+    # Warn when the graph was indexed by an older sqlcg than is currently running.
+    if coverage.tool_version_stale:
+        lines.append(
+            f"{indent}[yellow]Warning:[/yellow] graph indexed with sqlcg"
+            f" {coverage.indexed_tool_version},"
+            f" running {coverage.running_tool_version}"
+            " — reindex to pick up parser improvements"
+        )
+
     # §G catalog-missing warning (PR 4, sprint_postmortem_fixes.md §Step 4.3).
     # Warn when the graph has zero information_schema-sourced HAS_COLUMN rows.
     # When a catalog path is configured but no rows are present the wording is
@@ -927,4 +959,8 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         "transitive_col_edges": coverage.transitive_col_edges,
         # qualify_failed per-statement counter (PR-C, #118)
         "qualify_failed_statements": coverage.qualify_failed_statements,
+        # tool-version staleness (#151, bugfix_audit_findings_151_153.md §PR-A)
+        "tool_version_stale": coverage.tool_version_stale,
+        "indexed_tool_version": coverage.indexed_tool_version,
+        "running_tool_version": coverage.running_tool_version,
     }

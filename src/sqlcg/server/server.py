@@ -234,7 +234,17 @@ async def _control_socket_task(
                                     {},
                                 )
                                 if rows:
-                                    f = compute_freshness(_Path(rows[0]["path"]), indexed_sha)
+                                    _indexed_ver: str | None = None
+                                    try:
+                                        _indexed_ver = db.get_indexed_version()
+                                    except Exception:  # pragma: no cover
+                                        pass
+                                    f = compute_freshness(
+                                        _Path(rows[0]["path"]),
+                                        indexed_sha,
+                                        indexed_version=_indexed_ver,
+                                        running_version=__version__,
+                                    )
                                     head_sha = f.head_sha
                                     stale = f.stale_by_commits
                             except Exception:
