@@ -134,6 +134,76 @@ def test_genuine_deletion_lost_producer_and_blast_radius(tmp_path):
     assert "da.child" in all_affected or blast.downstream_count >= 0  # lenient — may vary by schema
 
 
+def test_sole_producer_deleted_no_consumer_still_reported(tmp_path):
+    """Deleting the sole producer of a never-consumed table surfaces it as lost.
+
+    An INSERT-only target with NO consumers keeps kind='derived' in the graph
+    (the indexer only upgrades 'derived'→'table' when the table is read elsewhere).
+    Before this fix, _exclude_synthetic_tables on the lost-producer side dropped the
+    table because 'derived' ∈ _SYNTHETIC_TABLE_KINDS, producing a false "No producers
+    lost — no data-loss blast radius." safety signal.
+
+    This is the regression test for bug #3 from the impact-analysis bugfix sprint.
+    Guards plan/sprints/bugfix_impact_analysis_validation.md §PR-A.
+
+    Acceptance criteria A1, A2, A5 from the plan:
+    - A1: lost_producer_tables is non-empty; da.lonely is in it.
+    - A2: da.lonely is in result.attribution (deleted file attributed).
+    - A5: blast_radius may be empty (no consumers), but da.lonely is still listed.
+    The rendered hint must NOT contain "No producers lost".
+    """
+    _init_repo(tmp_path)
+
+    # --- Base state: two producer files, NO consumer for da.lonely ---
+    # da.lonely has NO downstream reader → kind stays 'derived' after resync.
+    # da.keeper has a consumer da.consumer (so it becomes kind='table').
+    (tmp_path / "prod.sql").write_text("INSERT INTO da.lonely SELECT id, amount FROM da.source_raw")
+    (tmp_path / "other.sql").write_text("INSERT INTO da.keeper SELECT x FROM da.up")
+    (tmp_path / "consumer.sql").write_text("INSERT INTO da.downstream SELECT k FROM da.keeper")
+    base_sha = _commit_all(tmp_path, "base")
+
+    backend = _make_backend()
+    _index(tmp_path, backend, base_sha)
+
+    # Verify both are producers at base.
+    producers_base = _capture_producer_set(backend)
+    assert "da.lonely" in producers_base, "da.lonely must be a producer at base"
+    assert "da.keeper" in producers_base, "da.keeper must be a producer at base"
+
+    # --- Head state: delete prod.sql (da.lonely loses its sole producer) ---
+    (tmp_path / "prod.sql").unlink()
+    _commit_all(tmp_path, "delete prod.sql — removes sole producer of da.lonely")
+
+    tools._backend = backend
+    tools._metrics = None
+
+    result = get_pr_impact(base_ref=base_sha)
+
+    # A1: da.lonely must appear in lost_producer_tables despite kind='derived'.
+    assert result.lost_producer_tables is not None
+    assert "da.lonely" in result.lost_producer_tables, (
+        f"da.lonely must be detected as a genuine lost producer; got {result.lost_producer_tables}"
+    )
+
+    # A3 / no over-report: da.keeper is still produced — must not appear.
+    assert "da.keeper" not in result.lost_producer_tables, (
+        "da.keeper is still produced — must NOT appear in lost producers"
+    )
+
+    # A2: Attribution must map da.lonely to the deleted file.
+    lonely_files = result.attribution.get("da.lonely", [])
+    assert any("prod.sql" in f for f in lonely_files), (
+        f"prod.sql must appear in attribution for da.lonely; got {lonely_files}"
+    )
+
+    # A5: blast_radius can be empty (no consumers), but the table is still listed.
+    # The hint must NOT carry the false-safety "No producers lost" text.
+    hint = result.hint or ""
+    assert "No producers lost" not in hint, (
+        f"hint must not claim no producers lost when da.lonely was genuinely removed; got: {hint!r}"
+    )
+
+
 def test_modified_still_producing_not_reported(tmp_path):
     """Modifying a file that still writes the same table does NOT report a lost producer.
 

@@ -2526,12 +2526,16 @@ def _diff_lost_producers(
     lost_raw = before - after
     new_raw = after - before
 
-    # Exclude synthetic from both sides.
-    if lost_raw:
-        lost_cleaned, _ = _exclude_synthetic_tables(db, sorted(lost_raw))
-        lost_set = set(lost_cleaned)
-    else:
-        lost_set = set()
+    # Lost-producer side: do NOT apply _exclude_synthetic_tables.
+    # The lost set comes exclusively from GET_PRODUCER_TABLES (SqlQuery.target_table),
+    # which is only ever a real top-level write target — a CTE/derived intermediate alias
+    # is never a SqlQuery.target_table.  An INSERT target with no surviving consumers
+    # keeps kind='derived' (the indexer only upgrades 'derived'→'table' when a SELECT
+    # reads the table elsewhere), so applying _exclude_synthetic_tables here would drop
+    # genuine write targets that happen to be unconsumed (bug #3 false-safety signal).
+    # The synthetic filter is still applied to the NEW-producer side below (for rename
+    # classification), where genuine intermediate nodes can appear via new CTEs/views.
+    lost_set = set(lost_raw)
 
     if new_raw:
         new_cleaned, _ = _exclude_synthetic_tables(db, sorted(new_raw))
