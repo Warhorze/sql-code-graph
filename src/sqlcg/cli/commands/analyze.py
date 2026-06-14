@@ -18,6 +18,94 @@ app = typer.Typer(help="Lineage analysis")
 console = Console()
 
 
+# --------------------------------------------------------------------------
+# Shared kind-filter predicate (single source of truth — #40).
+#
+# The CLI/MCP read surface only exposes COLUMN_LINEAGE edges that resolve to a
+# physical table/external source: kind IS NULL OR kind IN ('table','external').
+# CTE/derived/temp intermediates are filtered out.  These module-private
+# constants/helpers are imported by the golden/anchor lineage guards
+# (tests/e2e/test_golden_lineage.py) so the test traversal exercises the SAME
+# filter the product applies — preventing the guards from drifting away from the
+# real read surface (issue #40).  Kept module-private: no public surface change,
+# so the version bump stays PATCH.
+# --------------------------------------------------------------------------
+
+#: Physical kinds the read surface keeps.  NULL kind is also kept (unknown
+#: tables are treated as physical) — see _kind_predicate_sql.
+_KIND_FILTER_VALUES: tuple[str, ...] = ("table", "external")
+
+#: COLUMN_LINEAGE.transform value emitted for inlined temp tables (E8
+#: dual-emission, PR #142).  These edges exist in the raw layer but are NOT part
+#: of the filtered read surface, so the guards must exclude them.
+_TEMP_INLINE_TRANSFORM = "TEMP_INLINE"
+
+
+def _kind_in_list_sql() -> str:
+    """SQL literal list for the kind IN (...) clause, e.g. ``'table', 'external'``."""
+    return ", ".join(f"'{v}'" for v in _KIND_FILTER_VALUES)
+
+
+def _kind_predicate_sql(alias: str) -> str:
+    """The ``kind IS NULL OR kind IN (...)`` predicate on SqlTable alias *alias*.
+
+    Single source of truth for both the CLI recursive-CTE queries and the test
+    BFS step queries — keep a table whose kind row is absent (NULL) or whose
+    kind is one of the physical kinds.
+    """
+    return f"{alias}.kind IS NULL OR {alias}.kind IN ({_kind_in_list_sql()})"
+
+
+def _kind_filter_join_clause(table_alias: str, qualified_col: str) -> str:
+    """The CLI's kind-filter JOIN+WHERE fragment.
+
+    Builds::
+
+        LEFT JOIN "SqlTable" t ON t.qualified = <qualified_col>
+        WHERE <kind predicate>
+
+    Both ``_upstream_sql`` and ``_downstream_sql`` use this so the predicate
+    cannot drift between the two directions or away from the shared constant.
+    """
+    return (
+        f'  LEFT JOIN "SqlTable" {table_alias} ON {table_alias}.qualified = {qualified_col}\n'
+        f"  WHERE {_kind_predicate_sql(table_alias)}\n"
+    )
+
+
+def _filtered_one_hop_sql(*, direction: str) -> str:
+    """One-hop COLUMN_LINEAGE step query, kind-filtered + TEMP_INLINE-excluded.
+
+    Returns a parameterised SQL string with a single ``?`` placeholder (the
+    pivot column id).  ``direction='upstream'`` returns source columns feeding
+    the pivot (``dst_key = ?`` → ``src_key``); ``direction='downstream'``
+    returns destination columns the pivot feeds (``src_key = ?`` → ``dst_key``).
+
+    The neighbour columns are restricted to the same kind-filtered surface the
+    CLI exposes (the table the neighbour endpoint belongs to is
+    ``table``/``external`` or unknown), and ``transform = 'TEMP_INLINE'`` edges
+    are excluded.  This is the shared step the golden/anchor BFS guards traverse
+    so they exercise the real filter (issue #40), not the raw edge set.
+
+    Result column is aliased ``nid`` (the neighbour column id).
+    """
+    if direction == "upstream":
+        pivot_col, neighbour_col = "dst_key", "src_key"
+    elif direction == "downstream":
+        pivot_col, neighbour_col = "src_key", "dst_key"
+    else:  # pragma: no cover - guarded by callers
+        raise ValueError(f"direction must be 'upstream' or 'downstream', got {direction!r}")
+    return (
+        f"SELECT DISTINCT cl.{neighbour_col} AS nid\n"
+        'FROM "COLUMN_LINEAGE" cl\n'
+        f'JOIN "SqlColumn" nc ON nc.id = cl.{neighbour_col}\n'
+        '  LEFT JOIN "SqlTable" t ON t.qualified = nc.table_qualified\n'
+        f"WHERE cl.{pivot_col} = ?\n"
+        f"  AND (cl.transform IS DISTINCT FROM '{_TEMP_INLINE_TRANSFORM}')\n"
+        f"  AND ({_kind_predicate_sql('t')})"
+    )
+
+
 def _upstream_sql(depth: int, include_intermediate: bool) -> str:
     """Build the upstream recursive-CTE SQL query.
 
@@ -28,12 +116,7 @@ def _upstream_sql(depth: int, include_intermediate: bool) -> str:
     semantics (#38/#40/19.2).
     """
     kind_filter = (
-        ""
-        if include_intermediate
-        else (
-            '  LEFT JOIN "SqlTable" t ON t.qualified = dr.table_qualified\n'
-            "  WHERE t.kind IS NULL OR t.kind IN ('table', 'external')\n"
-        )
+        "" if include_intermediate else _kind_filter_join_clause("t", "dr.table_qualified")
     )
     return f"""
 WITH RECURSIVE reach(id, table_qualified, depth, path) AS (
@@ -80,12 +163,7 @@ def _downstream_sql(depth: int, include_intermediate: bool) -> str:
     Kind-filter mirrors upstream: LEFT JOIN SqlTable + IS NULL OR 'table'/'external'.
     """
     kind_filter = (
-        ""
-        if include_intermediate
-        else (
-            '  LEFT JOIN "SqlTable" t ON t.qualified = dr.table_qualified\n'
-            "  WHERE t.kind IS NULL OR t.kind IN ('table', 'external')\n"
-        )
+        "" if include_intermediate else _kind_filter_join_clause("t", "dr.table_qualified")
     )
     return f"""
 WITH RECURSIVE reach(id, table_qualified, depth, path) AS (

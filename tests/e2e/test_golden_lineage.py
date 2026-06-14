@@ -41,6 +41,18 @@ from pathlib import Path
 
 import pytest
 
+# Shared kind-filter step query (single source of truth — #40).  The CLI/MCP
+# read surface only exposes COLUMN_LINEAGE edges that resolve to a physical
+# table/external source and excludes transform='TEMP_INLINE' edges.  By routing
+# the golden/anchor BFS through this SAME helper the CLI uses, the guards
+# exercise the real filter instead of the raw edge set (issue #40).  Importing
+# the helper (rather than re-spelling the predicate here) prevents drift.
+from sqlcg.cli.commands.analyze import _filtered_one_hop_sql
+
+#: One-hop step queries, built once from the shared CLI helper.
+_UPSTREAM_STEP_SQL = _filtered_one_hop_sql(direction="upstream")
+_DOWNSTREAM_STEP_SQL = _filtered_one_hop_sql(direction="downstream")
+
 GOLDEN_FILE = Path(__file__).parent / "golden_lineage.yaml"
 RECALL_FLOOR = float(os.getenv("SQLCG_GOLDEN_RECALL_FLOOR", "0.8"))
 PRECISION_FLOOR = float(os.getenv("SQLCG_GOLDEN_PRECISION_FLOOR", "0.8"))
@@ -84,8 +96,13 @@ def _open_db():
 
 
 def _reachable_physical_leaves(db, col_id: str, max_nodes: int = 5000) -> set[str]:
-    """BFS upstream over COLUMN_LINEAGE; return ultimate physical source columns
-    (schema-qualified nodes with no further upstream edge)."""
+    """BFS upstream over the KIND-FILTERED COLUMN_LINEAGE surface; return the
+    ultimate physical source columns (schema-qualified nodes with no further
+    upstream edge).
+
+    Routes through the shared CLI step query (_UPSTREAM_STEP_SQL) so the
+    traversal sees the same edge set the product exposes: kind IN
+    ('table','external') (or NULL) and no transform='TEMP_INLINE' edges (#40)."""
     seen: set[str] = set()
     leaves: set[str] = set()
     frontier: deque[str] = deque([col_id])
@@ -94,26 +111,20 @@ def _reachable_physical_leaves(db, col_id: str, max_nodes: int = 5000) -> set[st
         if cid in seen:
             continue
         seen.add(cid)
-        rows = db.run_read(
-            'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
-            {"cid": cid},
-        )
+        rows = db.run_read(_UPSTREAM_STEP_SQL, {"cid": cid})
         if not rows:
             if cid != col_id and "." in _table_of(cid):
                 leaves.add(cid)
             continue
         for r in rows:
-            frontier.append(r["sid"])
+            frontier.append(r["nid"])
     return leaves
 
 
 def _direct_sources(db, col_id: str) -> set[str]:
-    """One-hop physical sources feeding this column directly."""
-    rows = db.run_read(
-        'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
-        {"cid": col_id},
-    )
-    return {r["sid"] for r in rows if "." in _table_of(r["sid"])}
+    """One-hop physical sources feeding this column directly (kind-filtered)."""
+    rows = db.run_read(_UPSTREAM_STEP_SQL, {"cid": col_id})
+    return {r["nid"] for r in rows if "." in _table_of(r["nid"])}
 
 
 # Default backup-table patterns — mirror the PR-02 NoiseFilter defaults so the
@@ -139,9 +150,14 @@ def _columns_of(db, table_qualified: str) -> list[str]:
 def _table_blast_radius(
     db, table_qualified: str, patterns: list[str] | None = None, max_nodes: int = 50000
 ) -> set[str]:
-    """BFS downstream over COLUMN_LINEAGE from all columns of `table_qualified`,
-    roll up to table_qualified, drop the table itself and any backup-pattern
-    noise. Returns the set of affected downstream tables."""
+    """BFS downstream over the KIND-FILTERED COLUMN_LINEAGE surface from all
+    columns of `table_qualified`, roll up to table_qualified, drop the table
+    itself and any backup-pattern noise. Returns the set of affected downstream
+    tables.
+
+    Routes through the shared CLI step query (_DOWNSTREAM_STEP_SQL): only edges
+    into kind IN ('table','external')/NULL tables, no transform='TEMP_INLINE'
+    edges (#40)."""
     patterns = patterns if patterns is not None else _DEFAULT_BACKUP_PATTERNS
     seen: set[str] = set()
     frontier: deque[str] = deque(_columns_of(db, table_qualified))
@@ -151,12 +167,9 @@ def _table_blast_radius(
         if cid in seen:
             continue
         seen.add(cid)
-        rows = db.run_read(
-            'SELECT DISTINCT dst_key AS did FROM "COLUMN_LINEAGE" WHERE src_key = ?',
-            {"cid": cid},
-        )
+        rows = db.run_read(_DOWNSTREAM_STEP_SQL, {"cid": cid})
         for r in rows:
-            did = r["did"]
+            did = r["nid"]
             if did not in seen:
                 frontier.append(did)
             tq = _table_of(did)
@@ -168,8 +181,12 @@ def _table_blast_radius(
 def _upstream_tables(
     db, table_qualified: str, patterns: list[str] | None = None, max_nodes: int = 50000
 ) -> set[str]:
-    """BFS upstream over COLUMN_LINEAGE from all columns of `table_qualified`,
-    roll up to table_qualified, drop the table itself and backup noise."""
+    """BFS upstream over the KIND-FILTERED COLUMN_LINEAGE surface from all
+    columns of `table_qualified`, roll up to table_qualified, drop the table
+    itself and backup noise.
+
+    Routes through the shared CLI step query (_UPSTREAM_STEP_SQL): kind-filtered
+    + transform='TEMP_INLINE' excluded (#40)."""
     patterns = patterns if patterns is not None else _DEFAULT_BACKUP_PATTERNS
     seen: set[str] = set()
     frontier: deque[str] = deque(_columns_of(db, table_qualified))
@@ -179,12 +196,9 @@ def _upstream_tables(
         if cid in seen:
             continue
         seen.add(cid)
-        rows = db.run_read(
-            'SELECT DISTINCT src_key AS sid FROM "COLUMN_LINEAGE" WHERE dst_key = ?',
-            {"cid": cid},
-        )
+        rows = db.run_read(_UPSTREAM_STEP_SQL, {"cid": cid})
         for r in rows:
-            sid = r["sid"]
+            sid = r["nid"]
             if sid not in seen:
                 frontier.append(sid)
             tq = _table_of(sid)
@@ -485,7 +499,12 @@ def _mk_chain(backend, tables: list[str]) -> None:
                 "catalog": "",
                 "db": "",
                 "name": name,
-                "kind": "TABLE",
+                # Lowercase 'table' matches what the indexer writes (indexer.py
+                # emits kind='table'); the shared kind-filter is
+                # case-sensitive (kind IN ('table','external')).  Using the
+                # production casing keeps these guards exercising the real
+                # filter surface (#40).
+                "kind": "table",
                 "defined_in_file": "",
             },
         )
@@ -539,6 +558,136 @@ def test_table_blast_radius_excludes_noise():
 
     assert "ba.source_bck" not in result, f"backup must be filtered: {result}"
     assert "ba.mart" in result
+
+
+# --------------------------------------------------------------------------
+# #40 regression — the guards must exercise the CLI kind-filter, NOT the raw
+# COLUMN_LINEAGE edge set.  These tests insert edges that exist in the raw
+# layer but are NOT part of the filtered read surface (a transform='TEMP_INLINE'
+# edge — emitted by E8 dual-emission / PR #142 — and an edge into a non-physical
+# kind='temp' table) and assert the BFS guards EXCLUDE them.  `transform` is
+# already a COLUMN_LINEAGE column on master, so these are writable today; they do
+# NOT depend on #142 landing.  Before #40, the helpers traversed raw edges, so
+# these edges would have polluted the blast radius / count.
+# --------------------------------------------------------------------------
+
+
+def _add_table_and_column(backend, table_qualified: str, kind: str) -> str:
+    """Upsert a SqlTable (with *kind*) + its single `.col` SqlColumn; return col id."""
+    name = table_qualified.rsplit(".", 1)[-1]
+    backend.upsert_node(
+        "SqlTable",
+        table_qualified,
+        {
+            "qualified": table_qualified,
+            "catalog": "",
+            "db": "",
+            "name": name,
+            "kind": kind,
+            "defined_in_file": "",
+        },
+    )
+    cid = f"{table_qualified}.col"
+    backend.upsert_node(
+        "SqlColumn",
+        cid,
+        {
+            "id": cid,
+            "catalog": "",
+            "db": "",
+            "table_name": name,
+            "col_name": "col",
+            "table_qualified": table_qualified,
+        },
+    )
+    backend.upsert_edge("SqlTable", table_qualified, "SqlColumn", cid, "HAS_COLUMN", {"source": ""})
+    return cid
+
+
+def test_blast_radius_excludes_temp_inline_edges():
+    """#40 — a transform='TEMP_INLINE' edge is excluded from the blast radius.
+
+    Raw layer: ba.source.col --(SELECT)--> ba.mart.col   (real, kept)
+               ba.source.col --(TEMP_INLINE)--> ba.tmp_inline.col (excluded)
+    The guard must NOT report ba.tmp_inline as downstream, and the count must be
+    unaffected by the TEMP_INLINE edge (still exactly 1: ba.mart)."""
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+
+    backend = DuckDBBackend(":memory:")
+    _mk_chain(backend, ["ba.source", "ba.mart"])  # real SELECT edge source->mart
+    # Add a TEMP_INLINE edge from the same source column into a temp table.
+    tmp_cid = _add_table_and_column(backend, "ba.tmp_inline", kind="table")
+    backend.upsert_edge(
+        "SqlColumn",
+        "ba.source.col",
+        "SqlColumn",
+        tmp_cid,
+        "COLUMN_LINEAGE",
+        {"transform": "TEMP_INLINE", "confidence": 1.0, "query_id": "qti"},
+    )
+
+    result = _table_blast_radius(backend, "ba.source")
+
+    assert "ba.tmp_inline" not in result, (
+        f"TEMP_INLINE edge must be excluded from blast radius (#40); got {result}"
+    )
+    assert "ba.mart" in result, f"real SELECT edge must survive the filter; got {result}"
+    assert _downstream_count(backend, "ba.source") == 1, (
+        "downstream count must be unaffected by the TEMP_INLINE edge (only ba.mart)"
+    )
+
+
+def test_blast_radius_excludes_non_physical_kind():
+    """#40 — an edge into a non-physical kind ('temp') is excluded.
+
+    The shared kind-filter keeps only kind IN ('table','external') / NULL.  A
+    real SELECT edge into a kind='temp' table is in the raw layer but not the
+    filtered surface, so the guard must drop it."""
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+
+    backend = DuckDBBackend(":memory:")
+    _mk_chain(backend, ["ba.source", "ba.mart"])
+    tmp_cid = _add_table_and_column(backend, "ba.scratch", kind="temp")
+    backend.upsert_edge(
+        "SqlColumn",
+        "ba.source.col",
+        "SqlColumn",
+        tmp_cid,
+        "COLUMN_LINEAGE",
+        {"transform": "SELECT", "confidence": 1.0, "query_id": "qtmp"},
+    )
+
+    result = _table_blast_radius(backend, "ba.source")
+
+    assert "ba.scratch" not in result, (
+        f"kind='temp' table must be excluded by the kind-filter (#40); got {result}"
+    )
+    assert "ba.mart" in result
+
+
+def test_upstream_tables_excludes_temp_inline_edges():
+    """#40 — TEMP_INLINE upstream edges are excluded from _upstream_tables."""
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+
+    backend = DuckDBBackend(":memory:")
+    _mk_chain(backend, ["ba.source", "ba.mart"])  # source.col -> mart.col
+    # A TEMP_INLINE edge feeding mart.col from a temp source.
+    tmp_cid = _add_table_and_column(backend, "ba.tmp_inline", kind="table")
+    backend.upsert_edge(
+        "SqlColumn",
+        tmp_cid,
+        "SqlColumn",
+        "ba.mart.col",
+        "COLUMN_LINEAGE",
+        {"transform": "TEMP_INLINE", "confidence": 1.0, "query_id": "qti"},
+    )
+
+    upstream = _upstream_tables(backend, "ba.mart")
+
+    assert "ba.tmp_inline" not in upstream, (
+        f"TEMP_INLINE upstream edge must be excluded (#40); got {upstream}"
+    )
+    assert "ba.source" in upstream, f"real upstream must survive; got {upstream}"
 
 
 def test_evaluate_handles_missing_downstream_key(tmp_path, monkeypatch):
@@ -596,7 +745,12 @@ def _mk_selects_from_chain(backend, tables: list[str]) -> None:
                 "catalog": "",
                 "db": "",
                 "name": name,
-                "kind": "TABLE",
+                # Lowercase 'table' matches what the indexer writes (indexer.py
+                # emits kind='table'); the shared kind-filter is
+                # case-sensitive (kind IN ('table','external')).  Using the
+                # production casing keeps these guards exercising the real
+                # filter surface (#40).
+                "kind": "table",
                 "defined_in_file": "",
             },
         )
@@ -685,7 +839,12 @@ def test_hub_rank_most_referenced_first():
                 "catalog": "",
                 "db": "",
                 "name": name,
-                "kind": "TABLE",
+                # Lowercase 'table' matches what the indexer writes (indexer.py
+                # emits kind='table'); the shared kind-filter is
+                # case-sensitive (kind IN ('table','external')).  Using the
+                # production casing keeps these guards exercising the real
+                # filter surface (#40).
+                "kind": "table",
                 "defined_in_file": "",
             },
         )
