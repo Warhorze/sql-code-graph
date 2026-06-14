@@ -129,6 +129,7 @@ _EXPECTED_PROFILE_KEYS = {
     "pass2_resolve_s",
     "upsert_s",
     "star_expand_s",
+    "catalog_reapply_s",
     "total_s",
     "files",
     "ms_per_file",

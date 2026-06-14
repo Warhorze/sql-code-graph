@@ -487,6 +487,8 @@ class Indexer:
         _t_upsert_end: float = 0.0
         _t_star_start: float = 0.0
         _t_star_end: float = 0.0
+        _t_catalog_start: float = 0.0
+        _t_catalog_end: float = 0.0
 
         spec = load_ignore_spec(path)
         aggregator = CrossFileAggregator()
@@ -808,7 +810,11 @@ class Indexer:
         # Post-ingestion: re-apply INFORMATION_SCHEMA catalog if configured in .sqlcg.toml
         # (Decision B2 — plan §4 §2). Runs once after the last batch flush, outside all
         # hot loops. One-shot bulk path: zero parse-time work, constant execute() count.
+        if profile:
+            _t_catalog_start = time.perf_counter()
         catalog_result = self._reapply_catalog_if_configured(db, path)
+        if profile:
+            _t_catalog_end = time.perf_counter()
 
         # Classify all errors into buckets for measurement and reporting
         error_summary: dict[str, int] = {
@@ -876,7 +882,8 @@ class Indexer:
             pass2_s = _t_pass2_end - _t_pass2_start
             upsert_s = _t_upsert_end - _t_upsert_start
             star_s = _t_star_end - _t_star_start
-            total_s = pass1_s + pass2_s + upsert_s + star_s
+            catalog_s = _t_catalog_end - _t_catalog_start
+            total_s = pass1_s + pass2_s + upsert_s + star_s + catalog_s
             n_files = max(len(pass2_results), 1)
             slowest = sorted(_file_parse_times, key=lambda x: x[1], reverse=True)[:10]
             result["profile"] = {
@@ -884,6 +891,7 @@ class Indexer:
                 "pass2_resolve_s": pass2_s,
                 "upsert_s": upsert_s,
                 "star_expand_s": star_s,
+                "catalog_reapply_s": catalog_s,
                 "total_s": total_s,
                 "files": len(pass2_results),
                 "ms_per_file": total_s / n_files * 1000.0,

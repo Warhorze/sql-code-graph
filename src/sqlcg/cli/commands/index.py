@@ -404,15 +404,15 @@ def _run_index(
         from sqlcg.core.schema import RelType
 
         file_rows = backend.run_read(INDEX_REPO_FILES_QUERY, {"repo_prefix": abs_path})
-        for row in file_rows:
-            backend.upsert_edge(
-                NodeLabel.FILE,
-                row["path"],
-                NodeLabel.REPO,
-                abs_path,
-                RelType.BELONGS_TO,
-                {},
-            )
+        # Bulk BELONGS_TO upsert — one execute() for all edges (mirrors the Phase-C
+        # bulk pattern in indexer._upsert_parsed_file). Rows carry src_key/dst_key.
+        belongs_to_edges = [{"src_key": row["path"], "dst_key": abs_path} for row in file_rows]
+        backend.upsert_edges_bulk(
+            NodeLabel.FILE,
+            NodeLabel.REPO,
+            RelType.BELONGS_TO,
+            belongs_to_edges,
+        )
 
         # Print summary unless --quiet is specified
         if not quiet:
@@ -480,6 +480,7 @@ def _run_index(
                 f"  pass2 resolve:  {prof['pass2_resolve_s']:.2f}s\n"
                 f"  upsert:         {prof['upsert_s']:.2f}s\n"
                 f"  star expand:    {prof['star_expand_s']:.2f}s\n"
+                f"  catalog reapply:{prof['catalog_reapply_s']:.2f}s\n"
                 f"  total:          {prof['total_s']:.2f}s\n"
                 f"  ms/file:        {prof['ms_per_file']:.1f}ms  ({prof['files']} files)"
             )
