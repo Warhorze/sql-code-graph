@@ -1,6 +1,19 @@
 # E8 revival — temp-chain `dynamic_source` multi-key COLUMN_LINEAGE fix
 
-Status: REVIEWED
+Status: BLOCKED — NEEDS USER DECISION
+
+> **BLOCKED (2026-06-14, implementation conflict).** The §1.2 "register all three
+> `sources_map` key forms unconditionally" instruction is **incompatible** with the
+> shipped temp-table-namespacing feature (PR `b08e238`, which postdates this E8 branch).
+> Implementing it verbatim regresses 3 namespacing tests. **Option (a)** — scoping the
+> qualified-key registration to "db injected by the `USE SCHEMA`/`_qualify_bare_tables`
+> session-context path" — was investigated and is **INFEASIBLE**: the failing namespacing
+> test `test_lineage_chain_through_temp_with_alias` is *itself* a USE-SCHEMA-injected-db
+> case, so the proposed distinguisher does not separate the two. E8 and temp-namespacing
+> demand **opposite lineage shapes for the identical SQL pattern**. This is a genuine
+> product fork. See **§0.1 (conflict) and §0.2 (user decision required)** below; the
+> original REVIEWED runbook (§2–§9) is preserved verbatim and is only mergeable AFTER the
+> fork in §0.2 is resolved.
 
 **Author role:** architect-planner
 **Date:** 2026-06-14
@@ -22,6 +35,154 @@ The prior A/B measured **+1,728 COLUMN_LINEAGE edges** on the 1,335-file DWH cor
 `exp.expand()`/`qualify()`, does not touch the per-column loop, and does not change the SELECTS_FROM
 emission path). It is now gate-able by the `resolvable_write_col_edges` monotone recall counter
 (shipped v1.27.0), which did not exist when E8 was parked on the wrong (island) ruler.
+
+---
+
+## 0.1 The implementation conflict (discovered 2026-06-14)
+
+Implementing the §1.2 three-key registration **verbatim** (unconditional bare +
+post-alias-qualified `db.name` + pre-alias `ast_db.name`) makes the full suite fail:
+**3 temp-table-namespacing tests regress** (the namespacing feature, PR `b08e238`,
+postdates this E8 branch — the E8 branch's own copies of those test files predated the
+stricter `b08e238` assertions, so the branch never caught this):
+
+- [`tests/unit/test_temp_table_namespacing.py`](../../tests/unit/test_temp_table_namespacing.py)`::TestLineageLeafStamping::test_column_lineage_src_from_temp_is_namespaced`
+- [`tests/integration/test_temp_table_namespacing.py`](../../tests/integration/test_temp_table_namespacing.py)`::TestLineageChainThroughTemp::test_column_lineage_edges_span_the_temp`
+- [`tests/integration/test_temp_table_namespacing.py`](../../tests/integration/test_temp_table_namespacing.py)`::TestSchemaAliasDualWriteRegression::test_lineage_chain_through_temp_with_alias`
+
+**Root cause.** For an explicitly-or-injected-qualified temp write
+(`CREATE TEMPORARY TABLE ba.tmp_x AS SELECT a FROM ba.src; INSERT INTO ba.dst SELECT a FROM ba.tmp_x;`),
+registering the **qualified** key `ba.tmp_x` in `sources_map` makes `exp.expand()` **inline**
+the temp body → the INSERT's column lineage collapses to a direct `ba.src → ba.dst` edge,
+**bypassing** the namespaced `role='temp'` intermediate node. The temp-namespacing feature
+**deliberately requires** the temp to remain a *visible* node with COLUMN_LINEAGE edges on
+*both* sides (`src → temp → dst`). E8 wants the opposite: column lineage resolved *through*
+(i.e. inlining) the temp.
+
+The `role='temp'` stamping + namespacing happens at
+[`ansi_parser.py:343-352`](../../src/sqlcg/parsers/ansi_parser.py#L343) (detect
+`exp.TemporaryProperty`, stamp `role="temp"`, record `_temp_identity` in
+`_current_file_temp_keys`); the namespaced INSERT-source rewrite that keeps the temp a
+distinct node is at [`base.py:993-1007`](../../src/sqlcg/parsers/base.py#L993). The E8
+qualified-key write would land in `sources_map` at the CTAS block
+[`ansi_parser.py:222-232`](../../src/sqlcg/parsers/ansi_parser.py#L222), consumed by
+`exp.expand()` *before* that namespaced rewrite matters — so the temp body is inlined and
+the namespaced node is left with zero edges on the inlined side.
+
+### Empirical confirmation (this investigation, 2026-06-14)
+
+Applied the §1.2 three-key block to
+[`ansi_parser.py:229-232`](../../src/sqlcg/parsers/ansi_parser.py#L229) and ran both suites
+(changes reverted afterward — investigation only):
+
+- All **8** E8 tests in `tests/unit/test_e8_temp_chain_key_mismatch.py` **PASS**.
+- All **3** namespacing tests above **FAIL** (e.g. `test_lineage_chain_through_temp_with_alias`:
+  `out_of_temp == []` — the temp `etl/sql/fact/wtfv_bon_style.sql::ba.tmp_base` has zero
+  outgoing COLUMN_LINEAGE edges; the INSERT edge went `da.real_src → real_target` directly).
+- Direct edge probe of E8's own alias test fixture (`USE SCHEMA BA_TMP; CREATE OR REPLACE
+  TEMPORARY TABLE tmp_inkoop AS SELECT col FROM da.leaf_src; INSERT INTO ba_tmp.final_tgt
+  SELECT col FROM tmp_inkoop;`, alias `ba_tmp→ba`) with E8 applied yields:
+  - `stmt0 (CREATE): da.leaf_src.col → etl/x.sql::ba.tmp_inkoop.col`  ← into the temp
+  - `stmt1 (INSERT): da.leaf_src.col → ba.final_tgt.col`  ← **bypasses** the temp
+
+## 0.2 Feasibility verdict on Option (a) — INFEASIBLE → USER DECISION REQUIRED
+
+**Option (a)** asked: scope the qualified-key registration to *only* the case where the
+target's `.db` was **injected** by the `USE SCHEMA`/`_qualify_bare_tables` session-context
+qualify path (not when `.db` is a literal `ba.tmp_x` in the SQL).
+
+**VERDICT: INFEASIBLE.** Option (a) rests on the premise that the failing namespacing tests
+are *literal-db* cases and E8's wanted cases are *injected-db* cases — i.e. that the
+injection source is the discriminator. **It is not.** The decisive counter-evidence:
+
+1. The third failing namespacing test,
+   [`TestSchemaAliasDualWriteRegression::test_lineage_chain_through_temp_with_alias`](../../tests/integration/test_temp_table_namespacing.py),
+   uses fixture `_WTFV_BON_STYLE_SQL`
+   ([`test_temp_table_namespacing.py:535-547`](../../tests/integration/test_temp_table_namespacing.py#L535)):
+   `USE SCHEMA BA_TMP;` + bare `CREATE OR REPLACE TEMPORARY TABLE tmp_base AS …` +
+   `INSERT INTO real_target … FROM tmp_base`, with alias `ba_tmp→ba`. The temp's `.db` here
+   is **INJECTED** by `_qualify_bare_tables` ([`snowflake_parser.py:404`](../../src/sqlcg/parsers/snowflake_parser.py#L404)
+   `table.set("db", …)`), then folded `ba_tmp→ba`. This is **exactly** the injected-db case
+   Option (a) would scope the qualified-key registration *into* — yet this test requires the
+   temp to **NOT** be inlined.
+
+2. E8's own alias test,
+   [`TestE8TempChainKeyMismatchFix::test_temp_chain_with_schema_alias_resolves_to_leaf`](../../tests/unit/test_e8_temp_chain_key_mismatch.py)
+   (ported from `origin/fix/e8-temp-chain`, lines 130-172), uses a **structurally identical**
+   fixture (`USE SCHEMA BA_TMP;` + bare `CREATE OR REPLACE TEMPORARY TABLE tmp_inkoop AS …` +
+   `INSERT INTO ba_tmp.final_tgt … FROM tmp_inkoop`, alias `ba_tmp→ba`) and asserts the **leaf
+   edge** `da.leaf_src → final_tgt` exists — i.e. the temp **IS** inlined.
+
+Both fixtures are the same SQL shape — `USE SCHEMA` + injected-db + alias-folded bare
+`CREATE TEMPORARY TABLE` + downstream INSERT — and they assert **opposite** lineage shapes
+(one demands the temp be inlined/bypassed; the other demands it be preserved as a visible
+node with edges on both sides). **No registration-time flag** (an injection marker on the
+ref, comparison of `target.db` against the session USE-SCHEMA context, or raw-statement-text
+inspection) can separate them, because the disagreement is **not about how the `.db` arrived**
+— it is about **what lineage shape a USE-SCHEMA temp chain should have**. The two features
+encode contradictory product intents for identical input. This is a genuine fork, not a
+parser-mechanism gap.
+
+(For completeness, the *other* E8 wins — e.g.
+[`test_temp_chain_with_use_schema_resolves_to_leaf`](../../tests/unit/test_e8_temp_chain_key_mismatch.py)
+with plain `USE SCHEMA da; CREATE TEMP TABLE tmp_inkoop …` and **no** schema alias — are
+*also* injected-db cases that demand inlining. So even the simplest E8 target case sits on
+the same side of the contradiction as the namespacing tests it breaks.)
+
+### THE USER FORK
+
+The user must choose one of these two mutually-exclusive product behaviours for the
+**USE-SCHEMA / injected-db temp chain** (`CREATE TEMPORARY TABLE <bare> … ; INSERT … FROM <bare temp>`):
+
+#### Option (a-collapse): accept E8 collapsing temps — re-decide the 3 namespacing assertions
+- **Mechanism:** ship E8's unconditional three-key registration (§1.2 as written). The temp
+  body is inlined; COLUMN_LINEAGE resolves `real_source → final_target` directly.
+- **Lineage the user GAINS:** end-to-end source→sink column lineage across USE-SCHEMA temp
+  chains (the +1,728-edge / `dynamic_source` recall win E8 was built for). A consumer asking
+  "what real table feeds `final_target.col`?" gets `real_source.col` in one hop.
+- **Lineage the user LOSES:** the temp stops being a queryable intermediate node on the
+  inlined (INSERT) side. The `<rel>::<db>.<name>` `role='temp'` node still EXISTS (the CREATE
+  side still wires `real_source → temp`), but it has **zero outgoing** edges — a consumer can
+  no longer trace "what reads from `tmp_base`?" through column lineage. The 3 namespacing
+  tests must be **re-decided** (relaxed to allow the inlined shape, or scoped to non-injected
+  cases). NOTE: this is a behaviour change to a SHIPPED feature (`b08e238`); it needs the
+  namespacing feature's owner to sign off, and a postmortem note on why the temp-visible
+  invariant was loosened.
+- **Risk:** the namespacing dual-write footgun (v1.21.1) was specifically about temps being
+  collapsed into shared bare nodes; re-decide carefully so collapsing does not reintroduce
+  cross-file temp fusion (the two-file `_FILE_A/_FILE_B` defusion tests must stay green —
+  inlining the *body* into the consumer is NOT the same as fusing the temp *node*, but verify).
+
+#### Option (b-preserve): keep temp-namespacing visible — drop/limit E8 to non-namespaced cases
+- **Mechanism:** do NOT register the qualified key for a target that was stamped `role='temp'`
+  (i.e. when `_temp_identity(target.db, target.name) ∈ self._current_file_temp_keys` at the
+  CTAS block, [`ansi_parser.py:343-352`](../../src/sqlcg/parsers/ansi_parser.py#L343)). Register
+  the qualified key ONLY for non-temp CTAS targets (plain `CREATE TABLE … AS`). The bare-key
+  write stays unconditional (no regression to the existing ANSI path).
+- **Lineage the user GAINS:** the temp-namespacing invariant is preserved — every temp stays a
+  visible node with edges on both sides (`src → temp → dst`); the two-file defusion guarantee
+  holds. Non-temp CTAS qualified-key resolution (if any exists on the USE-SCHEMA path) still
+  gets the E8 fix.
+- **Lineage the user LOSES:** the headline E8 win is **forfeited for temps** — the USE-SCHEMA
+  *temporary*-table `dynamic_source` dead-end is NOT fixed (the temp is kept, not resolved
+  through). Since E8's measured +1,728-edge win was driven by `CREATE TEMP TABLE` chains, the
+  recall delta would be **far below** the gate's +1,000 floor — likely near zero on temp-heavy
+  corpora. **E8 as a recall lever is effectively a no-op under (b-preserve)** unless a material
+  population of non-temp `CREATE TABLE AS` chains on the USE-SCHEMA path exists (UNMEASURED —
+  would need an A/B before committing to (b)).
+- **Risk:** low (it strictly narrows E8); but the recall win that justified reviving E8 may
+  evaporate — re-measure before merging, and if the non-temp delta is < +1,000, **do not revive
+  E8** (gate item 1 already says so).
+
+#### Recommendation for the user to weigh
+The decision hinges on **one product question**: *for a USE-SCHEMA temporary-table ETL chain,
+is the temp a meaningful lineage node (keep it — option b) or a transient that should be seen
+through (collapse it — option a)?* The namespacing feature (`b08e238`, the LATER decision)
+already answered "keep it" and shipped tests pinning that. Reviving E8 reverses that answer
+for the temp case. Absent a new product reason to reverse `b08e238`, **(b-preserve) is the
+lower-risk default** — but it likely guts E8's recall value, so the honest framing is: *E8 and
+temp-namespacing-visibility cannot both hold for the same chain; pick which lineage shape the
+product wants.*
 
 ---
 
@@ -435,3 +596,36 @@ NEEDS-REVIEW → **REVIEWED**.
    (gate item 3). Port ONLY `test_e8_temp_chain_key_mismatch.py` and the two surgical ansi_parser.py
    changes from `a841c4b` + `3a31953` — a cherry-pick of three artifacts, NOT a branch merge (the branch
    has drifted 70 files).
+
+---
+
+## 10. Changelog / Review-Trail — 2026-06-14 BLOCKED amendment
+
+**Status moved REVIEWED → BLOCKED — NEEDS USER DECISION** (architect-planner, implementation-conflict revision).
+
+**What happened.** During implementation, applying §1.2's "register all three `sources_map` key forms
+unconditionally" verbatim regressed **3 shipped temp-table-namespacing tests** (PR `b08e238`, which
+postdates this E8 branch — the branch's stale copies of those test files predated `b08e238`'s stricter
+assertions, so the conflict was invisible on-branch). The qualified key makes `exp.expand()` inline the
+temp body, collapsing `src → temp → dst` to `src → dst` and stripping the namespaced `role='temp'` node's
+outgoing edges. Full root cause + empirical run captured in new **§0.1**.
+
+**Option (a) investigated and found INFEASIBLE** (new **§0.2**). Option (a) — scope the qualified-key
+registration to "db injected by `USE SCHEMA`/`_qualify_bare_tables`" — does NOT resolve the conflict: the
+failing namespacing test `test_lineage_chain_through_temp_with_alias` is *itself* an injected-db USE-SCHEMA
+case (fixture `_WTFV_BON_STYLE_SQL`, [`test_temp_table_namespacing.py:535`](../../tests/integration/test_temp_table_namespacing.py#L535)),
+structurally identical to E8's own `test_temp_chain_with_schema_alias_resolves_to_leaf`
+([`test_e8_temp_chain_key_mismatch.py`](../../tests/unit/test_e8_temp_chain_key_mismatch.py) on
+`origin/fix/e8-temp-chain`), yet the two demand opposite lineage shapes. The injection-source is not the
+discriminator; the features encode contradictory product intent for identical SQL.
+
+**The fork** (new **§0.2 → THE USER FORK**): **(a-collapse)** ship E8, re-decide the 3 namespacing
+assertions (gain end-to-end source→sink column lineage; lose the temp as a traceable intermediate on the
+inlined side; requires namespacing-owner sign-off + a v1.21.1-footgun re-check) vs **(b-preserve)** keep
+temp-namespacing visible, scope E8's qualified-key write to non-`role='temp'` CTAS targets (preserve the
+temp node + defusion guarantee; forfeit E8's headline temp-driven recall win — likely below the +1,000 gate
+floor; re-measure before merging).
+
+**The original REVIEWED runbook (§1–§9) is preserved verbatim.** It is only mergeable AFTER the user picks
+a fork branch; under (b-preserve) the §1.2 registration instruction and gate item 1's +1,000 floor must be
+revised (re-enter NEEDS-REVIEW); under (a-collapse) the gate must add the namespacing re-decision.
