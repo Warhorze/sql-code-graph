@@ -148,6 +148,53 @@ JOIN "SqlTable" tgt ON tgt.qualified = q.target_table
 WHERE q.target_table <> ''
   AND q.target_table <> t.qualified
 
+-- RESOLVE_JOIN_COLUMNS
+-- Resolve JOIN_COL_RESOLVE markers (bare unqualified join columns whose owning
+-- table was only knowable post-index, e.g. catalogued via information_schema)
+-- into concrete COLUMN_LINEAGE edges.
+--
+-- For each marker (src_key=query_id, dst_key=<dst_table>.<dst_col>, bare_col):
+--   find which of the query's SELECTS_FROM source tables OWNS a column named
+--   bare_col (any HAS_COLUMN source: ddl | information_schema | star_expansion |
+--   usage).  Casing is normalised on BOTH sides of the owner-match join because
+--   information_schema stores col_name as exported (e.g. STATUS) while the parsed
+--   bare name is lowercased (status).
+--
+-- Confidence contract:
+--   - exactly one owning table  -> HIGH confidence (0.9), the resolved edge
+--   - more than one owning table -> one LOW confidence (0.5) edge per owner
+--     (genuine ambiguity: over-attribute, never silently mis-pick)
+--   - zero owning tables         -> emit nothing (honest empty; XML-DDL gap)
+-- A window COUNT over the owning tables per marker selects the confidence in one
+-- pass.
+-- params: []
+INSERT OR REPLACE INTO "COLUMN_LINEAGE"
+  (src_key, dst_key, transform, confidence, query_id, inferred_from_source_name)
+SELECT
+  src_key,
+  dst_key,
+  'JOIN_COL_RESOLVED' AS transform,
+  CASE WHEN n_owners = 1 THEN 0.9 ELSE 0.5 END AS confidence,
+  query_id,
+  FALSE AS inferred_from_source_name
+FROM (
+  SELECT
+    c.id AS src_key,
+    m.dst_key AS dst_key,
+    m.src_key AS query_id,
+    count(*) OVER (PARTITION BY m.src_key, m.dst_key) AS n_owners
+  FROM "JOIN_COL_RESOLVE" m
+  JOIN "SELECTS_FROM" sf ON sf.src_key = m.src_key
+  JOIN "HAS_COLUMN" hc ON hc.src_key = sf.dst_key
+  JOIN "SqlColumn" c
+    ON c.id = hc.dst_key
+   AND lower(c.col_name) = lower(m.bare_col)
+) owners
+
+-- COUNT_JOIN_COL_RESOLVED
+-- params: []
+SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE transform = 'JOIN_COL_RESOLVED'
+
 -- COUNT_STAR_SOURCES
 -- params: []
 SELECT count(*) AS n FROM "STAR_SOURCE"

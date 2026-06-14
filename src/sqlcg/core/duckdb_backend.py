@@ -203,6 +203,14 @@ _EDGE_DDLS = [
         PRIMARY KEY (src_key, dst_key)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS "JOIN_COL_RESOLVE" (
+        src_key VARCHAR NOT NULL,
+        dst_key VARCHAR NOT NULL,
+        bare_col VARCHAR,
+        PRIMARY KEY (src_key, dst_key)
+    )
+    """,
 ]
 
 _INDEX_DDLS = [
@@ -230,6 +238,8 @@ _INDEX_DDLS = [
     'CREATE INDEX IF NOT EXISTS idx_STAR_SOURCE_dst ON "STAR_SOURCE" (dst_key)',
     'CREATE INDEX IF NOT EXISTS idx_CONSUMED_BY_src ON "CONSUMED_BY" (src_key)',
     'CREATE INDEX IF NOT EXISTS idx_CONSUMED_BY_dst ON "CONSUMED_BY" (dst_key)',
+    'CREATE INDEX IF NOT EXISTS idx_JOIN_COL_RESOLVE_src ON "JOIN_COL_RESOLVE" (src_key)',
+    'CREATE INDEX IF NOT EXISTS idx_JOIN_COL_RESOLVE_dst ON "JOIN_COL_RESOLVE" (dst_key)',
 ]
 
 # Node label → column list (all columns of that table, in order)
@@ -304,6 +314,7 @@ _EDGE_EXTRA_COLUMNS: dict[str, list[str]] = {
     RelType.DECLARES: [],
     RelType.STAR_SOURCE: ["qualifier", "target_table", "confidence"],
     RelType.CONSUMED_BY: [],
+    RelType.JOIN_COL_RESOLVE: ["bare_col"],
 }
 
 
@@ -752,6 +763,7 @@ class DuckDBBackend(GraphBackend):
                     "UPDATES",
                     "DECLARES",
                     "STAR_SOURCE",
+                    "JOIN_COL_RESOLVE",
                 ):
                     self._conn.execute(
                         f'DELETE FROM "{edge_table}" WHERE src_key IN ({placeholders})',
@@ -891,6 +903,39 @@ class DuckDBBackend(GraphBackend):
         row = result.fetchone()
         return int(row[0]) if row else 0
 
+    def resolve_join_columns(self) -> int:
+        """Resolve JOIN_COL_RESOLVE markers into concrete COLUMN_LINEAGE edges.
+
+        Runs AFTER ingestion AND after the catalog has been applied, so that
+        information_schema ``HAS_COLUMN`` rows are present.  For each parse-time
+        marker (a bare unqualified column in a >=2-table join projection), it
+        finds which of the query's source tables owns a column with that bare
+        name (any HAS_COLUMN source), normalising casing on both sides:
+
+          - exactly one owner  -> one high-confidence (0.9) edge (the dominant
+            live case: the second table is visible only via information_schema);
+          - more than one owner -> one low-confidence (0.5) edge per owner
+            (genuine ambiguity; over-attribute, never silently mis-pick);
+          - zero owners         -> emit nothing (honest empty; XML-DDL gap).
+
+        Mirrors :meth:`expand_star_sources` (post-index SQL pass).  The
+        suppressed sqlglot mis-bind edge is never emitted at parse time, so this
+        pass is the SOLE producer of these columns' edges — it MUST run in every
+        path that re-creates the markers (full index + both incremental paths).
+
+        Returns:
+            Number of COLUMN_LINEAGE JOIN_COL_RESOLVED edges present afterward.
+        """
+        from sqlcg.core.queries import RESOLVE_JOIN_COLUMNS_QUERY
+
+        self._conn.execute(RESOLVE_JOIN_COLUMNS_QUERY)
+        result = self._conn.execute(
+            'SELECT count(*) AS n FROM "COLUMN_LINEAGE" WHERE transform = ?',
+            ["JOIN_COL_RESOLVED"],
+        )
+        row = result.fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------
     # Full-rebuild helpers
     # ------------------------------------------------------------------
@@ -927,6 +972,7 @@ class DuckDBBackend(GraphBackend):
             "DECLARES",
             "STAR_SOURCE",
             "CONSUMED_BY",
+            "JOIN_COL_RESOLVE",
         ]
         for tbl in edge_tables + node_tables:
             self._conn.execute(f'DELETE FROM "{tbl}"')

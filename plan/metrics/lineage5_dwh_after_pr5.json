@@ -1,0 +1,9 @@
+{
+  "elapsed_sec": 184.3,
+  "files_parsed": 1335,
+  "join_cols_resolved_summary": 1142,
+  "join_col_resolve_markers": 1039,
+  "join_col_resolved_edges": 1142,
+  "rescuable_unqualified_edges": 125,
+  "resolvable_write_col_edges": 35759
+}

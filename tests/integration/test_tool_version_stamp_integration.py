@@ -3,7 +3,7 @@
 Exercises the real DuckDB backend (in-memory) to verify:
 - A fresh index writes non-null sqlcg_version == sqlcg.__version__ (AC-5)
 - get_indexed_version() reads it back correctly
-- The schema initialises cleanly at SCHEMA_VERSION == "10" (AC-6)
+- The schema initialises cleanly at SCHEMA_VERSION == "11" (AC-6)
 - Tool-version staleness round-trips through collect_coverage (AC-4) via
   a patched run_read_routed that delegates to the fixture backend
 
@@ -17,28 +17,29 @@ from sqlcg.core.duckdb_backend import DuckDBBackend
 from sqlcg.core.schema import SCHEMA_VERSION
 
 # ---------------------------------------------------------------------------
-# Schema version gate — must be "10" after this PR
+# Schema version gate — must be "11" after the JOIN_COL_RESOLVE edge table
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_ten() -> None:
-    """SCHEMA_VERSION constant equals '10' after the v9→v10 bump.
+def test_schema_version_is_current() -> None:
+    """SCHEMA_VERSION constant equals '11' after the v10→v11 bump.
 
-    Guards plan/sprints/bugfix_audit_findings_151_153.md §PR-A AC-6.
+    Bumped for the JOIN_COL_RESOLVE edge table
+    (plan/sprints/bugfix_lineage_correctness_validation.md §PR-5).
     """
-    assert SCHEMA_VERSION == "10"
+    assert SCHEMA_VERSION == "11"
 
 
-def test_schema_initialises_cleanly_at_v10() -> None:
-    """Opening a fresh in-memory graph at schema v10 succeeds without error.
+def test_schema_initialises_cleanly_at_current_version() -> None:
+    """Opening a fresh in-memory graph at the current schema version succeeds.
 
-    Guards plan/sprints/bugfix_audit_findings_151_153.md §PR-A AC-6.
+    Guards plan/sprints/bugfix_lineage_correctness_validation.md §PR-5.
     """
     b = DuckDBBackend(":memory:")
     b.init_schema()
     stored = b.get_schema_version()
     b.close()
-    assert stored == "10"
+    assert stored == "11"
 
 
 # ---------------------------------------------------------------------------

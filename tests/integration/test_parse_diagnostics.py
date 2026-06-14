@@ -117,7 +117,7 @@ def test_schema_version_matches_current_migration():
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "10", f"Expected SCHEMA_VERSION='10', got {SCHEMA_VERSION!r}"
+    assert SCHEMA_VERSION == "11", f"Expected SCHEMA_VERSION='11', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------

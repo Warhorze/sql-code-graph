@@ -139,7 +139,7 @@ def test_qualify_failed_column_exists_in_schema():
 
 
 def test_old_schema_db_raises_refuse_to_start_message():
-    """Migration: an old-schema (v8) DB raises the refuse-to-start message on v10 build.
+    """Migration: an old-schema (v8) DB raises the refuse-to-start message on v11 build.
 
     The guard at tools.py:197-219 (_assert_schema_current) checks the stored
     SCHEMA_VERSION and raises RuntimeError with a 'db reset && index' message on
@@ -148,7 +148,8 @@ def test_old_schema_db_raises_refuse_to_start_message():
     message contains the expected remedy instructions.
 
     Guards: plan/sprints/sprint_backlog_q2_bugfix.md §PR-C migration blocker test.
-    Updated for v9→v10 schema bump (plan/sprints/bugfix_audit_findings_151_153.md §PR-A).
+    Updated for v10→v11 schema bump
+    (plan/sprints/bugfix_lineage_correctness_validation.md §PR-5).
     """
     from sqlcg.server.tools import _assert_schema_current
 
@@ -156,8 +157,8 @@ def test_old_schema_db_raises_refuse_to_start_message():
     backend.init_schema()
 
     # Clear the schema version and insert v8 to simulate an old-schema DB.
-    # init_schema() inserts v10 as the only row; we delete it and insert v8 so
-    # get_schema_version() (LIMIT 1) returns "8", not "10".
+    # init_schema() inserts v11 as the only row; we delete it and insert v8 so
+    # get_schema_version() (LIMIT 1) returns "8", not "11".
     backend.run_write('DELETE FROM "SchemaVersion"', {})
     backend.run_write(
         'INSERT INTO "SchemaVersion" (version, indexed_sha) VALUES (?, ?)',
@@ -170,6 +171,6 @@ def test_old_schema_db_raises_refuse_to_start_message():
         msg = str(exc_info.value)
         assert "db reset" in msg, f"Expected 'db reset' in refuse-to-start message, got: {msg!r}"
         assert "v8" in msg, f"Expected 'v8' (old version) in message, got: {msg!r}"
-        assert "v10" in msg, f"Expected 'v10' (new version) in message, got: {msg!r}"
+        assert "v11" in msg, f"Expected 'v11' (new version) in message, got: {msg!r}"
     finally:
         backend.close()
