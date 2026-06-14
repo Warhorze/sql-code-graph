@@ -56,12 +56,21 @@ def test_find_definition_single_authoritative(tmp_path, monkeypatch):
 
 
 def test_find_definition_backup_flagged(tmp_path, monkeypatch):
-    """Scenario B — a backup-named table is flagged is_backup, not hidden."""
+    """Scenario B — a backup-named table is flagged is_backup, not hidden.
+
+    The backup table is declared INLINE in a legitimately-named DDL file (the
+    real DWH ``CREATE OR REPLACE TABLE foo_bck_<ts> CLONE foo`` rebuild pattern),
+    so the file-discovery backup-FILE ignore (issue #27a) does not skip it — the
+    table is still indexed and surfaced by ``find_definition`` with
+    ``is_backup=True``. This is the read-surface (table-NAME) noise layer, which
+    is distinct from and unchanged by the file-discovery default ignore.
+    """
     _index_fixture(
         tmp_path,
         {
-            "dim_date.sql": "CREATE TABLE ba.dim_date (id INT);",
-            "dim_date_bck.sql": "CREATE TABLE ba.dim_date_bck (id INT);",
+            "dim_date.sql": (
+                "CREATE TABLE ba.dim_date (id INT);\nCREATE TABLE ba.dim_date_bck (id INT);"
+            ),
         },
         monkeypatch,
     )
@@ -73,7 +82,8 @@ def test_find_definition_backup_flagged(tmp_path, monkeypatch):
         "ba.dim_date_bck must match the default *_bck backup pattern"
     )
     assert result.definitions[0].is_authoritative is False
-    assert any(p.endswith("dim_date_bck.sql") for p in result.noise_excluded)
+    # the backup definition's producer file is reported in noise_excluded
+    assert any("dim_date.sql" in str(p) for p in result.noise_excluded)
 
 
 def test_find_definition_duplicate_ddl(tmp_path, monkeypatch):

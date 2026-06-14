@@ -223,6 +223,85 @@ def get_ignore_table_regexes(path: Path) -> list[str]:
     return []
 
 
+# Conservative built-in file-discovery ignore patterns for backup/snapshot SQL
+# artifacts (issue #27a). These are gitwildmatch globs matched against the
+# repo-relative file path, so they exclude a *whole file* whose name marks it as
+# a backup clone — e.g. ``wtdh_artikel_bck.sql`` or ``foo_backup_20240716.sql`` —
+# at discovery time, before it is ever parsed or turned into orphan deg-0 nodes.
+#
+# Conservative on purpose (the issue's "do NOT drop legitimate tables" rule):
+#   * ``_bck`` / ``_backup`` are unambiguous backup markers in this corpus.
+#   * ``_eenmalig`` (one-time-load) is a LEGITIMATE production table name in the
+#     DWH (e.g. ``wtda_artikel_eenmalig.sql``), so bare ``_eenmalig`` is NOT a
+#     default — only the dated ``_eenmalig_<timestamp>`` clone form is, and only
+#     when the dated-suffix opt-in is enabled (see ``get_file_ignore_defaults``).
+#   * Bare date suffixes are NEVER a default (legitimate dated marts exist);
+#     dated forms are gated behind the explicit opt-in below.
+_DEFAULT_BACKUP_FILE_PATTERNS: list[str] = [
+    "*_bck.sql",
+    "*_bck_*.sql",  # foo_bck_us39553.sql, bar_bck_20240716.sql, dim _bck_us*
+    "*_backup.sql",
+    "*_backup_*.sql",
+]
+
+# Dated/timestamped backup clone forms — opt-in only (off by default) because a
+# bare numeric suffix can collide with legitimate dated marts. Enabled via
+# ``[sqlcg.file_discovery] exclude_dated_backups = true``.
+_DATED_BACKUP_FILE_PATTERNS: list[str] = [
+    "*_eenmalig_[0-9]*.sql",  # one-time-load CLONE with a timestamp/ticket id
+    "*_bck_[0-9]*.sql",
+    "*_backup_[0-9]*.sql",
+]
+
+
+def get_file_ignore_defaults(path: Path) -> list[str]:
+    """Get built-in file-discovery ignore globs for backup/snapshot artifacts.
+
+    Returns gitwildmatch glob patterns that the walker seeds into its PathSpec
+    so backup SQL *files* are skipped at discovery (issue #27a) — the layer that
+    previously had no default ignore (``load_ignore_spec`` returned an empty
+    spec). A user's ``.sqlcgignore`` is still applied on top, so they can extend
+    the set; and the whole default can be disabled or extended via
+    ``.sqlcg.toml``::
+
+        [sqlcg.file_discovery]
+        exclude_backups = false        # disable the built-in backup globs
+        exclude_dated_backups = true   # opt in to dated *_bck_<digits>.sql etc.
+
+    The defaults are conservative by design (see ``_DEFAULT_BACKUP_FILE_PATTERNS``):
+    unambiguous ``_bck``/``_backup`` markers only; the dated/``_eenmalig_<ts>``
+    forms are added only when ``exclude_dated_backups`` is true.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of gitwildmatch glob strings. Defaults to the built-in backup
+        markers; empty when ``exclude_backups = false``.
+    """
+    exclude_backups = True
+    exclude_dated = False
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            fd = config.get("sqlcg", {}).get("file_discovery", {})
+            if isinstance(fd, dict):
+                if isinstance(fd.get("exclude_backups"), bool):
+                    exclude_backups = fd["exclude_backups"]
+                if isinstance(fd.get("exclude_dated_backups"), bool):
+                    exclude_dated = fd["exclude_dated_backups"]
+        except Exception:
+            pass
+    if not exclude_backups:
+        return []
+    patterns = list(_DEFAULT_BACKUP_FILE_PATTERNS)
+    if exclude_dated:
+        patterns += _DATED_BACKUP_FILE_PATTERNS
+    return patterns
+
+
 def get_presentation_prefixes(path: Path) -> list[str]:
     """Get presentation-facing schema prefixes from .sqlcg.toml.
 
