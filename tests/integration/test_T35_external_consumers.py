@@ -129,8 +129,8 @@ def test_schema_version_matches_current_migration():
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "10", (
-        f"SCHEMA_VERSION must be '10' after the SchemaVersion.sqlcg_version column addition; "
+    assert SCHEMA_VERSION == "11", (
+        f"SCHEMA_VERSION must be '11' after the JOIN_COL_RESOLVE edge-table addition; "
         f"currently {SCHEMA_VERSION!r}"
     )
 

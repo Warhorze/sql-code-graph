@@ -205,12 +205,40 @@ class StarSource:
 
 
 @dataclass(frozen=True)
+class JoinColResolve:
+    """A deferred-resolution marker for a bare unqualified join-projection column.
+
+    Emitted (instead of the sqlglot mis-bind edge) when a top-level INSERT/CREATE
+    SELECT projection contains a bare column (``exp.Column`` with no ``.table``)
+    AND the statement has >=2 source tables.  The owning source table is only
+    knowable AFTER indexing (e.g. catalogued via information_schema), so the
+    binding is deferred to ``DuckDBBackend.resolve_join_columns`` — the post-index
+    pass is the SOLE producer of the resolved COLUMN_LINEAGE edge for this column.
+
+    Mirrors the over-attribution-instead-of-mis-bind discipline of the
+    ``CTE_PROJECTION_AMBIGUOUS`` precedent (see PR-5 in
+    plan/sprints/bugfix_lineage_correctness_validation.md).
+
+    Attributes:
+        dst: The destination ColumnRef the projection would have produced
+            (``<dst_table>.<dst_col_name>``); its full_id is the marker's dst_key.
+        bare_col: The bare (unqualified) column name to resolve against source
+            tables' HAS_COLUMN catalog.
+    """
+
+    dst: ColumnRef
+    bare_col: str = ""
+
+
+@dataclass(frozen=True)
 class LineageExtraction:
     """Result of column lineage extraction, including both edges and star markers.
 
     Attributes:
         edges: List of LineageEdge objects extracted from the statement
         star_sources: List of StarSource markers for SELECT * projections
+        join_col_resolves: List of JoinColResolve markers for bare unqualified
+            >=2-table join projections, resolved post-index against HAS_COLUMN.
         qualify_failed: True when the qualify() step raised an exception for
             this statement (schema-free retry may still yield a partial scope).
             Propagated to QueryNode.qualify_failed for per-statement storage.
@@ -218,6 +246,7 @@ class LineageExtraction:
 
     edges: list[LineageEdge]
     star_sources: list[StarSource]
+    join_col_resolves: list[JoinColResolve] = field(default_factory=list)
     qualify_failed: bool = False
 
 
@@ -268,6 +297,7 @@ class QueryNode:
     confidence: float = 1.0
     parsing_mode: str = "sqlglot"
     star_sources: list[StarSource] = field(default_factory=list)
+    join_col_resolves: list[JoinColResolve] = field(default_factory=list)
     defined_columns: list[str] = field(default_factory=list)
     defined_body: Any | None = None
     start_line: int = 0  # 1-based start line of statement in file; 0 = unknown
@@ -412,6 +442,22 @@ def normalize_keys(parsed: "ParsedFile", aliases: dict[str, str]) -> None:
         # clone_source
         if stmt.clone_source is not None:
             stmt.clone_source = _norm_ref(stmt.clone_source)
+
+        # join_col_resolves (JoinColResolve.dst is a ColumnRef over a TableRef).
+        # The dst table is the INSERT/CREATE target, which is aliased above; keep
+        # the marker's dst_key in lockstep so the post-index resolver writes a
+        # COLUMN_LINEAGE edge with the same dst key as the rest of the graph.
+        new_join_col_resolves: list[JoinColResolve] = []
+        for jcr in stmt.join_col_resolves:
+            new_dst_table = _norm_ref(jcr.dst.table)
+            if new_dst_table is None:
+                # Empty-identity target — drop the marker (skip already logged).
+                continue
+            if new_dst_table is not jcr.dst.table:
+                new_dst = dataclasses.replace(jcr.dst, table=new_dst_table)
+                jcr = dataclasses.replace(jcr, dst=new_dst)
+            new_join_col_resolves.append(jcr)
+        stmt.join_col_resolves = new_join_col_resolves
 
         # column_lineage — LineageEdge and ColumnRef are frozen; rewrite via replace
         new_edges: list[LineageEdge] = []
@@ -1067,6 +1113,7 @@ class SqlParser(ABC):
 
         edges: list[LineageEdge] = []
         star_sources: list[StarSource] = []
+        join_col_resolves: list[JoinColResolve] = []
         _qualify_failed: bool = False
 
         # NEW (T-07-06): Record MERGE statements explicitly as deferred.
@@ -1417,6 +1464,23 @@ class SqlParser(ABC):
                         except Exception:
                             pass
 
+            # Bug #5 (PR-5, option b): count distinct PHYSICAL source tables ONCE per
+            # statement (never per column — CLAUDE.md hot-loop invariant). When a
+            # top-level INSERT/CREATE-SELECT join has >=2 physical sources, bare
+            # unqualified projection columns cannot be reliably bound at parse time
+            # (the owning table may be catalogued only via information_schema, which
+            # is unavailable to qualify()). For those columns we SUPPRESS the sqlglot
+            # mis-bind edge and record a JoinColResolve marker instead — resolved
+            # post-index against the full HAS_COLUMN catalog by
+            # DuckDBBackend.resolve_join_columns(). This mirrors the
+            # CTE_PROJECTION_AMBIGUOUS over-attribution discipline above, but defers
+            # resolution rather than over-attributing immediately. No new
+            # qualify/build_scope/exp.expand/sg_lineage call is added.
+            _physical_source_count = sum(
+                1 for _s in (query_sources or []) if getattr(_s, "role", "table") == "table"
+            )
+            _join_resolve_active = dst_table is not None and _physical_source_count >= 2
+
             # Extract output columns — skip positions handled by the positional INSERT block
             for loop_idx, col_expr in enumerate(col_expressions):
                 if loop_idx in positional_col_names:
@@ -1490,6 +1554,26 @@ class SqlParser(ABC):
                     expr_type = type(col_expr).__name__
                     out.errors.append(f"col_lineage_skip:func_fallback:{expr_type}")
                     continue
+
+                # Bug #5 (PR-5, option b): bare unqualified column in a >=2-physical-
+                # table join. SUPPRESS the sqlglot mis-bind edge (continue past
+                # sg_lineage) and record a JoinColResolve marker; the post-index
+                # resolver is the SOLE producer of this column's edge(s). A qualified
+                # reference (o.amount) has c.table set and fails the bare test, so it
+                # takes the existing sg_lineage path unchanged. This is the same
+                # cardinality as the existing edge append — no new hot-loop op.
+                if _join_resolve_active and dst_table is not None:
+                    _bare_cols = [c for c in col_expr.find_all(exp.Column) if not c.table]
+                    if _bare_cols:
+                        _bare_name = _bare_cols[0].name or col_name
+                        join_col_resolves.append(
+                            JoinColResolve(
+                                dst=ColumnRef(dst_table, col_name),
+                                bare_col=_bare_name,
+                            )
+                        )
+                        continue  # skip sg_lineage for this projection
+
                 # Schema validation: if schema is loaded and column isn't in it,
                 # emit a reduced-confidence edge rather than a full-confidence one.
                 # Skip when the expression has an explicit alias — the alias is the
@@ -1789,7 +1873,10 @@ class SqlParser(ABC):
             out.errors.append(f"col_lineage:statement:{exc}")
 
         return LineageExtraction(
-            edges=edges, star_sources=star_sources, qualify_failed=_qualify_failed
+            edges=edges,
+            star_sources=star_sources,
+            join_col_resolves=join_col_resolves,
+            qualify_failed=_qualify_failed,
         )
 
     def _resolve_star_source(

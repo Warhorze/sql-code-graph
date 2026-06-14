@@ -230,9 +230,9 @@ def test_schema_gate_rejects_version_7_graph(tmp_path):
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    # SCHEMA_VERSION must be '10' — the sqlcg_version column addition (most recent migration)
-    assert SCHEMA_VERSION == "10", (
-        f"This test pins the v10 migration; SCHEMA_VERSION={SCHEMA_VERSION!r}. "
+    # SCHEMA_VERSION must be '11' — the JOIN_COL_RESOLVE edge table (most recent migration)
+    assert SCHEMA_VERSION == "11", (
+        f"This test pins the v11 migration; SCHEMA_VERSION={SCHEMA_VERSION!r}. "
         "Update the test if the version has been bumped again."
     )
 

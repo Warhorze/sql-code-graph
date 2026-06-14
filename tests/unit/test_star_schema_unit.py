@@ -21,16 +21,17 @@ def test_rel_type_star_source_enum_value():
 
 
 def test_schema_version_matches_current_migration():
-    """SCHEMA_VERSION must be '10' after the SchemaVersion.sqlcg_version column addition.
+    """SCHEMA_VERSION must be '11' after the JOIN_COL_RESOLVE edge-table addition.
 
     Each schema-shape change forces a re-index (no backward compatibility — CLAUDE.md);
-    bumping this constant is the gate. Bumped 9 -> 10 for the ``sqlcg_version`` column
-    added by plan/sprints/bugfix_audit_findings_151_153.md §PR-A (tool-version stamp).
+    bumping this constant is the gate. Bumped 10 -> 11 for the ``JOIN_COL_RESOLVE``
+    edge table added by plan/sprints/bugfix_lineage_correctness_validation.md §PR-5
+    (post-index join-column resolution).
     """
     from sqlcg.core.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == "10", (
-        f"Expected SCHEMA_VERSION='10', got {SCHEMA_VERSION!r}. "
+    assert SCHEMA_VERSION == "11", (
+        f"Expected SCHEMA_VERSION='11', got {SCHEMA_VERSION!r}. "
         "Bump SCHEMA_VERSION in src/sqlcg/core/schema.py when the schema shape changes."
     )
 
