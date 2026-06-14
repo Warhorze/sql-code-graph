@@ -358,10 +358,29 @@ class SnowflakeParser(AnsiParser):
         # case); a concatenation / CONCAT / bind-var RHS is not a literal and is skipped.
         var_literals: dict[str, str] = {}
         for stmt in statements:
+            # LET / `:=` scripting form: `var := '<literal>'` → exp.PropertyEQ.
             if isinstance(stmt, exp.PropertyEQ) and isinstance(stmt.expression, exp.Literal):
                 lit = stmt.expression
                 if lit.is_string and stmt.this is not None and stmt.this.name:
                     var_literals[stmt.this.name.lower()] = str(lit.this)
+            # Snowflake session-variable form: `SET v = '<literal>'` →
+            # exp.Set ▸ exp.SetItem ▸ exp.EQ(Column, Literal).  This is the form the
+            # IDENTIFIER($v) table-indirection files use; it is NOT captured by the
+            # PropertyEQ branch above.  Last-write-wins within the file (a var
+            # reassigned later resolves to its latest literal in source order).  A
+            # concatenation / non-literal RHS is not an exp.Literal and falls through
+            # to the empty-id drop (same as today) — no regression.
+            if isinstance(stmt, exp.Set):
+                for item in stmt.find_all(exp.SetItem):
+                    eq = item.this
+                    if (
+                        isinstance(eq, exp.EQ)
+                        and eq.this is not None
+                        and eq.this.name
+                        and isinstance(eq.expression, exp.Literal)
+                        and eq.expression.is_string
+                    ):
+                        var_literals[eq.this.name.lower()] = str(eq.expression.this)
 
         for stmt in statements:
             if stmt is None:
@@ -423,6 +442,13 @@ class SnowflakeParser(AnsiParser):
                 result.append(None)
                 continue
 
+            # Resolve FROM/INSERT-INTO IDENTIFIER($var) table indirection to a real
+            # table using the file's SET/LET literal map, BEFORE _qualify_bare_tables so
+            # a resolved-but-bare literal (no schema) still inherits the active USE
+            # SCHEMA prefix.  Pure AST walk, once per statement; no qualify/build_scope/
+            # expand/sg_lineage — perf-safe.
+            self._resolve_identifier_tables(stmt, var_literals)
+
             # Qualify bare table references in this statement if we have a schema context.
             if current_schema:
                 self._qualify_bare_tables(stmt, current_schema)
@@ -430,6 +456,47 @@ class SnowflakeParser(AnsiParser):
             result.append(stmt)
 
         return result
+
+    @staticmethod
+    def _resolve_identifier_tables(stmt: Any, var_literals: dict[str, str]) -> None:
+        """Rewrite ``FROM``/``INSERT INTO`` ``IDENTIFIER($var)`` table nodes to real
+        tables using the file's ``SET``/``LET`` literal map.
+
+        ``FROM IDENTIFIER($v)`` and ``INSERT INTO IDENTIFIER($v)`` parse to an
+        ``exp.Table`` whose ``.this`` is an ``exp.Anonymous`` named ``identifier``
+        wrapping an ``exp.Parameter`` — so ``table.name == ''`` and the empty-id guard
+        in ``base.py`` silently drops the source/target.  When the parameter name maps
+        to a string literal seen earlier in the file (``SET v='da.x'``), rewrite the
+        node in place to that real table, preserving the FROM/INSERT alias.
+
+        Both ``FROM`` and ``INSERT INTO`` targets are reached: ``exp.Insert.this`` is
+        itself an ``exp.Table`` and is visited by ``find_all(exp.Table)``.
+
+        Perf invariant: pure AST walk, once per statement; no qualify / build_scope /
+        exp.expand / sg_lineage call.  No-op when ``var_literals`` is empty.
+
+        Args:
+            stmt: sqlglot AST node to mutate in place.
+            var_literals: lowercased var name → string literal (from the file pre-scan).
+        """
+        if not var_literals:
+            return
+        for table in stmt.find_all(exp.Table):
+            inner = table.this
+            if not isinstance(inner, exp.Anonymous) or inner.name.lower() != "identifier":
+                continue
+            param = inner.find(exp.Parameter)
+            if param is None or not param.name:
+                continue
+            literal = var_literals.get(param.name.lower())
+            if literal is None:
+                # Unresolved var — leave untouched; the empty-id guard drops it.
+                continue
+            new_table = sqlglot.to_table(literal, dialect="snowflake")
+            alias = table.args.get("alias")  # preserve the FROM/INSERT alias
+            if alias is not None:
+                new_table.set("alias", alias)
+            table.replace(new_table)
 
     @staticmethod
     def _qualify_bare_tables(stmt: Any, schema: str) -> None:
