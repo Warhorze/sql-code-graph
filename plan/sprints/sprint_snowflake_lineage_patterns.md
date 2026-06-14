@@ -1,6 +1,21 @@
 # Sprint Plan: Snowflake Lineage Pattern Fixes
 
-**Status:** DRAFT (awaiting plan-reviewer gate)
+**Status:** REVIEWED (plan-reviewer gate 2026-06-14 — VERDICT REVIEWED, no blockers. PR-A's AST claims
+empirically VERIFIED on master v1.34.3: `SET v='…'`→`exp.Set` (NOT scanned today — widening to `exp.Set`
+is load-bearing); `identifier($v)`→`exp.Table(name='')` w/ `exp.Anonymous`+`exp.Parameter`; the
+`to_table(literal)`+alias+`replace()` rewrite resolves end-to-end, once-per-statement, perf-safe. PR-B
+single source-gate feeds all 3 extend sites, edge-neutral on TABLE/VIEW. PR-C MERGE extraction feasible
+without lineage().
+**FORKS RESOLVED:** (1) SET-form REQUIRED + last-write-wins SAFE; (2) PR-B broad `kind not in (TABLE,VIEW)`
+gate — PROCEDURE exposes only its own name (phantom), gating it is edge-neutral + beneficial (gain-gate
+proves it); (3) PR-C INSERT-without-collist → **skip-and-log** (`col_lineage_skip:merge_no_collist:`), NO
+positional fallback (grep the 17 files first; escalate only if material); (4) PR-D/E **defer-with-fixture**.
+**Mechanical corrections to FOLD AT PR-OPEN (per gate):** PR-A AC-A3 skip code is `stage:` not `star:`
+(base.py:411); BEFORE-state = empty-id edge present (not fully dropped). PR-B source block `ansi_parser.py:536-580`,
+gate at ~536. PR-C **REPLACES the existing MERGE early-return at base.py:1124-1132** (not "add branch") + DELETE
+the `# TODO` at :1120-1123 (CLAUDE.md no-TODO-on-happy-path); `_can_have_column_lineage` is base.py:635-661 (not
+588-614); iterate `whens` via `exp.Whens.expressions`/`find_all(exp.When)`. Optional: suppress `exp.Set` like
+`exp.PropertyEQ` in `_transform_statements` to drop the phantom OTHER node. READY FOR DISPATCH (PR-A first).)
 **Branch:** `plan/snowflake-lineage-patterns` (off `master`)
 **Author:** architect-planner (Opus)
 **Date:** 2026-06-14
