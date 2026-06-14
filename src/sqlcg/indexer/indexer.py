@@ -364,7 +364,17 @@ class Indexer:
                     exc.stderr or exc,
                 )
                 raise
-            self.index_repo(
+            # Clear+rebuild atomically so the healed base graph contains ONLY
+            # target_sha's nodes. A bare index_repo UPSERTs without purging, so
+            # nodes that exist only in the newer SHA would linger and pollute the
+            # base graph (corrupting pr-impact blast-radius). atomic_full_index
+            # wraps clear_all_tables() + index_repo in one db.transaction()
+            # (reentrant/MVCC-safe; rolls back to the prior graph on failure) —
+            # the same primitive the CLI rebuild and MCP drain paths use, so the
+            # semantics cannot diverge. The stamp still writes target_sha because
+            # index_repo runs git rev-parse HEAD with cwd=worktree.
+            atomic_full_index(
+                self,
                 Path(tmp_dir),
                 dialect,
                 db,
@@ -937,6 +947,11 @@ class Indexer:
                     timeout_per_file=timeout_per_file,
                 )
             else:
+                # Forward fallback (new_sha == HEAD): bare index_repo retains the
+                # pre-existing orphan-on-full-fallback behaviour (UPSERT without
+                # purge). Intentionally NOT switched to atomic_full_index here —
+                # the orphan-purge fix is scoped to the backward heal above;
+                # forward purge is tracked separately so the asymmetry is by design.
                 self.index_repo(
                     root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
                 )
@@ -1057,6 +1072,11 @@ class Indexer:
                     timeout_per_file=timeout_per_file,
                 )
             else:
+                # Forward fallback (new_sha == HEAD): bare index_repo retains the
+                # pre-existing orphan-on-full-fallback behaviour (UPSERT without
+                # purge). Intentionally NOT switched to atomic_full_index here —
+                # the orphan-purge fix is scoped to the backward heal above;
+                # forward purge is tracked separately so the asymmetry is by design.
                 self.index_repo(
                     root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
                 )

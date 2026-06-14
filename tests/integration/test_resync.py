@@ -474,6 +474,23 @@ def test_large_backward_heal_via_worktree_stamps_base_sha(git_repo, db):
         "a SELECTS_FROM edge to raw1 must exist (proves the worktree indexed the "
         "base-SHA tree, where a.sql reads raw1 — not HEAD, where it reads raw2)"
     )
+    # Gate-1 graph-state criterion: the commit-2-ONLY node (raw2) must be ABSENT.
+    # raw2 is referenced only at commit 2 (a.sql reads raw2). A bare index_repo
+    # UPSERTs without purging, so the commit-2 index of raw2 would LINGER in the
+    # healed base graph — polluting pr-impact blast-radius. atomic_full_index
+    # clears the graph before rebuilding, so raw2 must not survive the heal.
+    assert not _sqltable_exists(db, "raw2"), (
+        "raw2 (commit-2-only) must be ABSENT after backward heal — a lingering raw2 "
+        "means the base graph was UPSERTed (not cleared+rebuilt), corrupting blast-radius"
+    )
+    raw2_edges = db.run_read(
+        'SELECT dst_key FROM "SELECTS_FROM" WHERE dst_key LIKE ?',
+        {"like": "%raw2%"},
+    )
+    assert not raw2_edges, (
+        "no SELECTS_FROM edge to raw2 may survive the backward heal — its presence "
+        "proves stale commit-2 nodes were not purged (orphan-on-heal regression)"
+    )
     # The user's working tree is untouched — still at commit 2.
     assert _get_current_head(git_repo) == commit_2_sha, (
         "the detached worktree must not move the user's working tree off HEAD"
