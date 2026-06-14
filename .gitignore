@@ -65,6 +65,8 @@ tests/e2e/test_dwh_schema_e2e.py
 .claude/progress.txt
 columns.csv
 results_*.json
+# Large scratch data export (811k rows) — never commit
+anomaly.csv
 
 # Local-only golden lineage ground truth — names private DWH columns
 tests/e2e/golden_lineage.yaml
