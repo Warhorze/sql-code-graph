@@ -536,95 +536,190 @@ weigh against the perf cost.
 
 ---
 
-# PR-6 (#NEW) — EXECUTE IMMEDIATE / dynamic-SQL string-literal blindspot: indexed-but-unextracted DDL
+# PR-6 (#NEW) — Dynamic-SQL lineage recovery: unwrap static-literal EXECUTE IMMEDIATE, then compose the intermediate via #142
 
 **Status: DRAFT (needs plan-review).** Does **not** inherit PR-1..PR-4's REVIEWED status.
 **Rank: TBD (set by plan-reviewer). Version bump: MINOR (new extraction surface).**
+**Shape: ONE PR, two phases (re-scoped 2026-06-14).** **Depends on #142 (E8 dual-emission,
+`feat/e8-dual-emission`) — sequence PR-6 AFTER #142 merges.**
 
-## Problem
-A `CREATE ... DYNAMIC TABLE ... AS WITH ... FROM ...` wrapped inside a PL/SQL block as
-`ddl_statement := '<the whole CREATE...AS...SELECT>'; EXECUTE IMMEDIATE (:ddl_statement);`
-is **invisible to the parser** — the actual SQL lives in a **string literal**, so the parser
-sees only a variable assignment + an EXECUTE IMMEDIATE call, never the CREATE/SELECT. The file
-**is indexed** (`parse_failed=False`) but yields **0 `SqlQuery` rows and 0 edges**. This is a
-genuine **parser-extraction** lever, **distinct from PR-5**: PR-5's files are *excluded* before
-parsing (`.sqlcgignore`); this file *is* parsed but the literal-wrapping defeats extraction.
+## Framing — same shape, reuse #142's machinery
+The maintainer's design call: dynamic-SQL extraction and "pick up the intermediate" are the
+**same shape** — *lineage hidden behind an indirection → recover it, then thread through the
+intermediate*. #142 **already built the composition engine** (`_emit_transitive_temp_edges` +
+`transform='TEMP_INLINE'` provenance, `feat/e8-dual-emission`). So PR-6 is re-scoped as a
+**single PR with two phases that REUSE #142's machinery** rather than building a parallel
+mechanism:
+- **Phase 1 (new work):** unwrap a static-literal `EXECUTE IMMEDIATE` DDL so the inner CREATE
+  becomes a normal parsed statement in the file.
+- **Phase 2 (reuse, likely free):** whatever Phase 1 surfaces — especially TEMP tables created
+  *inside* the dynamic SQL — is composed through by the **existing** #142 dual-emission pass,
+  not a new one.
+
+This is **distinct from PR-5**: PR-5's files are *excluded* before parsing (`.sqlcgignore`);
+PR-6's file *is* parsed but the literal-wrapping defeats extraction.
 
 ## Root cause (file:line — verified, fresh index)
 - Confirmed on `ba.wtfa_artikel_formule_dagomzet`, file
   [`/home/ignwrad/Projects/dwh/ddl/changelogs/BA-DYNAMIC-TABLES/WTFA_ARTIKEL_FORMULE_DAGOMZET.sql`](file:///home/ignwrad/Projects/dwh/ddl/changelogs/BA-DYNAMIC-TABLES/WTFA_ARTIKEL_FORMULE_DAGOMZET.sql).
   The `CREATE OR REPLACE DYNAMIC TABLE BA.WTFA_ARTIKEL_FORMULE_DAGOMZET ... AS WITH ... SELECT`
   lives inside the `ddl_statement := '...'` string literal (~lines 12-46), executed at
-  `EXECUTE IMMEDIATE (:ddl_statement);` (line 48). Index result: indexed, `parse_failed=False`,
+  `EXECUTE IMMEDIATE (:ddl_statement);` (line 48). The parser sees only a variable assignment +
+  an EXECUTE IMMEDIATE call, never the CREATE/SELECT. Index result: indexed, `parse_failed=False`,
   **0 SqlQuery / 0 edges**. Extracting it pulls a **4-node island (the table + its 3 IA views)**
   into the giant.
 
-## (a) Prevalence — MEASURED FIRST (sizes the lever)
+## (a) Prevalence — MEASURED FIRST (sizes the lever; honest ROI)
 Grep over the corpus [`/home/ignwrad/Projects/dwh`](file:///home/ignwrad/Projects/dwh):
 - **21 files** total use `EXECUTE IMMEDIATE`.
-- **Recoverable by PR-6 = exactly 1 file today.** Only the WTFA dynamic table matches the
+- **Phase-1 recoverable = exactly 1 file today.** Only the WTFA dynamic table matches the
   in-scope pattern `var := '<static CREATE...AS...SELECT>'; EXECUTE IMMEDIATE` (a static literal
   CREATE-DDL string). Grep: `:= 'CREATE ...` → 1 hit; that hit contains `DYNAMIC TABLE`.
 - **Out of scope (the other 20):**
   - 1 file (`MA-PROCEDURES/MSSPR_COMPARE_DATA.sql`) does `EXECUTE IMMEDIATE 'CREATE OR REPLACE
     TEMP TABLE ... AS SELECT * FROM (' || :sql_source || ')'` — **concatenated with bind
     variables** (`||`, `:sql_source`) and targeting transient diagnostic `TEMP` tables, **not**
-    static and **not** lineage targets.
+    static. Note: this is the *shape* Phase 2 generalizes (temp-inside-dynamic-SQL), but this
+    specific file is **not Phase-1-recoverable** because its body is concatenated, not a static
+    literal — it stays out of scope.
   - The rest assign via `CONCAT(...)` / `||` concatenation or are non-CREATE statements (ALTER
     external-table refresh, INFORMATION_SCHEMA selects, MERGE/UPDATE plumbing).
-- **Conclusion:** the immediate lever is **small (1 file, 1 table, a 4-node island)**, but the
-  pattern is a **structural class** (Snowflake dynamic-table-via-EXECUTE-IMMEDIATE) likely to
-  recur as more dynamic tables are authored this way. Plan-reviewer should weigh "1 island now"
-  against "new extraction surface for a growing authoring pattern" when ranking.
+- **Honest ROI:** the immediate lever is **small — 1 file, 1 table, a 4-node island today**.
+  Phase 2 adds **zero islands today** (the one temp-inside-dynamic-SQL file is concatenated, so
+  Phase 1 can't unwrap it). The value is **structural, not volumetric**: (i) Phase 1's
+  static-literal-CREATE is a recurring authoring class (Snowflake dynamic-table-via-EXECUTE-
+  IMMEDIATE) likely to grow; (ii) Phase 2 is near-free (reuses #142) and future-proofs the
+  temp-inside-dynamic-SQL case for when a *static-literal* instance appears. Plan-reviewer
+  should rank "1 island now + new extraction surface for a growing pattern, Phase 2 ~free"
+  against the higher-volume PR-2 / PR-4 levers — this is a low-immediate-yield, low-cost,
+  structurally-strategic PR.
 
-## (b) Design
-Detect an `EXECUTE IMMEDIATE` of a **literal** (or a **simply-assigned literal** — a `var :=
-'<string literal>'` immediately preceding/feeding the `EXECUTE IMMEDIATE (:var)`) DDL string,
-extract the inner SQL from the literal, and **re-parse it as a nested statement** in the same
-file context.
-- **In scope:** static literal DDL only — a single string literal, or a single
-  `var := '<literal>'` assignment with no concatenation, fed to `EXECUTE IMMEDIATE`.
-- **Out of scope (explicit, do not attempt):** non-literal / concatenated dynamic SQL
-  (`|| $WAREHOUSENAME ||`, `CONCAT(...)`, bind-variable interpolation `:sql_source`) — only
-  **static-literal** DDL is recoverable; anything assembled at runtime cannot be statically
-  parsed and must be skipped, not guessed.
-  - Note: the WTFA literal itself contains one `|| $WAREHOUSENAME ||` concatenation **in the
-    WAREHOUSE clause only**; the `AS WITH ... SELECT` body is fully static. The design must
-    tolerate a concatenation in non-lineage-bearing clauses (warehouse/options) while still
-    extracting the static `AS SELECT` body — e.g. parse the literal segment, accept partial
-    reconstruction of the body, or substitute a placeholder for the runtime fragment. This
-    nuance is a plan-reviewer design point.
-- **Session context inheritance:** the inner SQL must inherit the file's `USE SCHEMA` / session
-  context (the WTFA file sets `USE SCHEMA BA;` at line 5) so the extracted CREATE resolves to
-  `BA.WTFA_ARTIKEL_FORMULE_DAGOMZET` and its `FROM ba.wtfe_verkoopinfo` / `ba.wtda_datum`
-  sources resolve correctly. Reuse the existing session-context mechanism; do not invent a
-  parallel one.
+## (b) Phase 1 — unwrap dynamic SQL (the new work)
+Detect an `EXECUTE IMMEDIATE` of a **STATIC literal** DDL — `CREATE [OR REPLACE] [DYNAMIC]
+TABLE … AS SELECT …` held either in a `ddl_statement := '<literal>'` assignment immediately
+feeding `EXECUTE IMMEDIATE (:ddl_statement)` or as an inline literal `EXECUTE IMMEDIATE
+'<literal>'`. Extract the inner SQL string, **re-parse it as a nested statement**, and attribute
+the producing-query + source edges to the produced table.
+- **In scope:** static literal DDL only — a single string literal, or a single `var :=
+  '<literal>'` assignment with **no** concatenation in the lineage-bearing body, fed to
+  `EXECUTE IMMEDIATE`.
+- **Out of scope (explicit, do not attempt):** concatenated / bind-variable dynamic SQL
+  (`|| :var ||`, `CONCAT(...)`, bind-variable interpolation `:sql_source`). Only **static-literal**
+  DDL is statically recoverable; anything assembled at runtime cannot be parsed and must be
+  **skipped, not guessed**.
+- **WAREHOUSE-clause concatenation (the WTFA nuance):** the WTFA literal contains one
+  `|| $WAREHOUSENAME ||` concatenation **in the WAREHOUSE clause only** — a **non-lineage**
+  clause. The `AS WITH ... SELECT` body is fully static. Design: extract the static literal body
+  and substitute a **placeholder** for the runtime `$WAREHOUSENAME` fragment in the WAREHOUSE
+  clause (the WAREHOUSE clause carries no lineage, so a placeholder is lossless for graph
+  purposes). A concatenation **inside the `AS SELECT` body** would, by contrast, make the file
+  non-recoverable → skip.
+- **Session-context inheritance:** the inner SQL must inherit the enclosing file's `USE SCHEMA` /
+  session context (WTFA sets `USE SCHEMA BA;` at line 5) so the extracted CREATE resolves to
+  `BA.WTFA_ARTIKEL_FORMULE_DAGOMZET` and its `FROM ba.wtfe_verkoopinfo` / `ba.wtda_datum` sources
+  resolve. **Reuse the existing session-context mechanism** (`SnowflakeParser`'s `USE SCHEMA`
+  tracking / `_transform_statements` per-file context — [`ansi_parser.py:137-143`](../../src/sqlcg/parsers/ansi_parser.py)),
+  do not invent a parallel one. The cleanest landing is to have the unwrapped inner statement(s)
+  join the same `statements` list the per-file loop iterates, so they pass through
+  `_transform_statements` and the normal `_parse_statement` path with the file's context already
+  applied.
+
+## (c) Phase 2 — pick up the intermediate (REUSE #142, verified ~free)
+Whatever Phase 1's unwrapped body surfaces — especially TEMP tables created **inside** the
+dynamic SQL (the `EXECUTE IMMEDIATE 'CREATE … TEMP TABLE …'` pattern, e.g. the shape in
+`MA-PROCEDURES/MSSPR_COMPARE_DATA.sql`) — must be composed through using the **existing #142
+dual-emission engine** (`_emit_transitive_temp_edges`, the `(src,dst,col)` ledger,
+`transform='TEMP_INLINE'`), **not a new mechanism**: keep the intermediate temp node visible
+AND emit the transitive source→sink edge.
+
+**Design-point verification — is Phase 2 FREE? YES (composition already applies).** Verified by
+reading the engine and the parse pipeline on `feat/e8-dual-emission`:
+- `_emit_transitive_temp_edges` is defined at
+  [`ansi_parser.py:273`](../../src/sqlcg/parsers/ansi_parser.py) and is invoked
+  **unconditionally at [`ansi_parser.py:264`](../../src/sqlcg/parsers/ansi_parser.py)**, i.e.
+  **after the per-statement loop** (loop at `:206-254`), over `out.statements`.
+- The pass is **pure in-memory composition over the file's already-extracted edges**: it builds
+  `incoming_to_temp[(temp_full_id, col)] → [edges]` by scanning `stmt.column_lineage` for every
+  statement where `e.dst.table.role == "temp"` ([`ansi_parser.py:326-329`](../../src/sqlcg/parsers/ansi_parser.py)),
+  then composes out-of-temp edges to a bounded fixpoint. It does **no** `exp.expand` / `qualify` /
+  `build_scope` / `sg_lineage` — purely off the hot path.
+- **Therefore:** once Phase 1 makes the inner CREATE (and any inner `CREATE TEMP TABLE`)
+  **land in `out.statements` with their `column_lineage` populated by the normal
+  `_parse_statement` path** (i.e. the unwrapped statements are appended to the same `statements`
+  list before the `_emit_transitive_temp_edges` call at `:264`), the #142 pass **automatically**
+  picks up any temp role node among them and emits the transitive `source→sink` `TEMP_INLINE`
+  edge. **No extra wiring is needed in the composition engine.**
+- **The one wiring requirement is in Phase 1, not Phase 2:** the unwrapped inner statements must
+  be inserted into the `statements` list (and processed by the statement loop, marking inner temp
+  targets with `role == "temp"`) **before** line `:264` runs. If Phase 1 instead parses the inner
+  SQL in a *separate* `parse_file` sub-invocation whose `out` is discarded or merged after the
+  composition pass, Phase 2 would NOT see those edges → it must merge inner statements into the
+  enclosing `out.statements` ahead of the `_emit_transitive_temp_edges` call. **Verdict:
+  Phase 2's composition is free; the only obligation is that Phase 1 surfaces the inner
+  statements into the same `out` before the post-loop pass.**
+
+## Verdict — one PR or two?
+**ONE PR, two phases (confirm the maintainer's instinct).** Reasons:
+- **Same shape, shared machinery:** both phases are "recover hidden lineage, thread through the
+  intermediate"; Phase 2 is the existing #142 engine, not new code. Splitting would create a
+  Phase-1-only PR that surfaces inner statements but a reviewer can't see the temp-composition
+  payoff in the same change.
+- **Phase 2 is ~free:** it's verified to be automatic composition, not a separate build — there's
+  no independent implementation cost to isolate into its own PR.
+- **One acceptance surface, one metric snapshot:** the island-closure + edge assertions + the
+  `gain --json` delta are one coherent before/after.
+- **Caveat for the plan-reviewer:** if Phase-1 unwrapping turns out to need a non-trivial new
+  re-parse entry point (e.g. a recursive nested-parse that risks a perf-invariant), the reviewer
+  may split *Phase 1 mechanics* from *the WTFA acceptance* — but the default and recommendation
+  is the single PR.
+
+## Dependency / sequence
+- **Depends on #142 (E8 dual-emission, `feat/e8-dual-emission`). Sequence PR-6 AFTER #142
+  merges** — Phase 2 *is* #142's engine; without #142 on master, the transitive-temp
+  composition does not exist and Phase 2 has nothing to reuse. (Phase 1's unwrap is independent
+  of #142, but the PR's Phase-2 acceptance and "reuse not duplicate" framing require #142
+  present.)
+- Independent of PR-1..PR-5 otherwise. Distinct from PR-5 (extraction, not exclusion).
+- Metric-moving → `gain --json` required. Rank set by plan-reviewer.
 
 ## Acceptance criteria
-- The **artikel-formule-dagomzet 4-node island closes** (table + its 3 IA views join the
-  giant): observable before/after island membership for `ba.wtfa_artikel_formule_dagomzet`.
+- **Phase 1:** the **artikel-formule-dagomzet 4-node island closes** (table + its 3 IA views join
+  the giant): observable before/after island membership for `ba.wtfa_artikel_formule_dagomzet`.
 - The extracted inner CREATE produces a `SqlQuery` row + SELECTS_FROM edges into
   `ba.wtfe_verkoopinfo` and `ba.wtda_datum` (assert the edges, not "no exception").
+- The inner SQL inherits the file's `USE SCHEMA` context (resolution lands in `BA`, not
+  unqualified), via the **reused** session-context mechanism.
+- The WTFA `|| $WAREHOUSENAME ||` in the WAREHOUSE clause is handled (static body extracted with
+  a placeholder for the runtime fragment); the WAREHOUSE clause carries no lineage so no edge is
+  expected from it.
 - Concatenated / bind-variable dynamic SQL (e.g. `MSSPR_COMPARE_DATA.sql`) is **skipped**, not
   mis-extracted — a negative test asserts no spurious nodes/edges from a concatenated
   EXECUTE IMMEDIATE.
-- The inner SQL inherits the file's `USE SCHEMA` context (resolution lands in `BA`, not unqualified).
-- **All four perf-invariant suites pass UNMODIFIED** (nested re-parse must not regress the
-  qualify-once / bulk-upsert invariants).
+- **Phase 2 (composition):** **if** a temp table is created inside the unwrapped dynamic SQL, its
+  `source→sink` lineage **composes through the existing #142 `_emit_transitive_temp_edges` pass**
+  (`transform='TEMP_INLINE'`), with the intermediate temp node still visible — assert the
+  transitive edge carries `transform='TEMP_INLINE'` and the intermediate node is not deleted. (No
+  static-literal temp-inside-dynamic-SQL instance exists in the corpus *today*, so this is
+  asserted via a **synthetic fixture** — a static-literal `EXECUTE IMMEDIATE 'CREATE TEMP TABLE …
+  AS SELECT …'` followed by a sink reading the temp — proving Phase 2 is wired, not just claimed.)
+- **All four perf-invariant suites pass UNMODIFIED** (nested re-parse must reuse the existing
+  parse path; the composition pass is already off the hot path per #142).
 - `gain --json` snapshot committed to [`plan/metrics/`](../metrics/) showing the island delta
   (metric-moving PR).
 - `pyright` + `ruff` clean.
+- **Status stays DRAFT (needs plan-review).**
 
 ## Risk
-- Over-eager literal extraction could pick up non-DDL or concatenated strings → spurious
-  nodes. Mitigate by restricting to static literals and DDL-shaped inner SQL (CREATE/INSERT),
-  plus the concatenation negative test.
+- Over-eager literal extraction could pick up non-DDL or concatenated strings → spurious nodes.
+  Mitigate by restricting to static literals and DDL-shaped inner SQL (CREATE/INSERT), plus the
+  concatenation negative test.
 - Nested re-parse on the hot path could trip a perf invariant if not bounded — the inner parse
-  must reuse the existing parse path, not add a per-column re-entry; re-confirm the four suites.
-
-## Dependency / sequence
-- Independent of PR-1..PR-4 and PR-5. Distinct mechanism from PR-5 (extraction, not exclusion).
-  Metric-moving → `gain --json` required. Rank set by plan-reviewer.
+  must reuse the existing `_parse_statement` path and surface statements into the enclosing `out`
+  (no per-column re-entry); re-confirm the four suites. The Phase-2 composition itself is already
+  proven off the hot path by #142 (pure O(edges) in-memory, no expand/qualify/build_scope).
+- **Sequencing risk:** if PR-6 is implemented before #142 merges, Phase 2 has no engine to reuse
+  and the PR would either stub it (bad) or duplicate the composition (explicitly rejected). Hard
+  gate: do not open PR-6 until #142 is on master.
 
 ---
 
@@ -660,7 +755,7 @@ against #142's edge set before either merges.**
 | 4 | PR-4 #94 | Perf; benefits from stable server start | patch | **Yes** |
 | 5a | PR-5 (DRAFT) | Correct stale `.sqlcgignore` rationale — cheap, ship anytime | patch (docs-ish) | No |
 | 5b | PR-5 (DRAFT) | **Gated** on subprocess isolation + maintainer priority decision | deferred | Yes (when it lands) |
-| — | PR-6 (DRAFT) | Dynamic-SQL literal extraction; rank set by plan-reviewer | minor | **Yes** |
+| — | PR-6 (DRAFT) | Dynamic-SQL unwrap (Phase 1) + #142 temp composition (Phase 2); **after #142**; rank set by plan-reviewer | minor | **Yes** |
 
 > **PR-5 / PR-6 are Status: DRAFT (needs plan-review)** — folded in 2026-06-14 from the fresh
 > index; they have **not** cleared the plan-reviewer gate and are sequenced provisionally.
@@ -687,8 +782,25 @@ against #142's edge set before either merges.**
    (recover 124 orphan nodes into the giant, accept the dynamic-table indexing cost) **or keep
    the perf workaround** (leave ignored)? Maintainer priority decision; gates 5b. 5a (the
    stale-comment fix) ships regardless of this decision.
-7. **PR-6 (DRAFT):** how to handle a literal that mixes a static `AS SELECT` body with a
-   runtime concatenation in a non-lineage clause (the WTFA `|| $WAREHOUSENAME ||` in the
-   WAREHOUSE option) — extract the static body with a placeholder for the runtime fragment, or
-   skip the whole literal? Planner leans extract-the-body; plan-reviewer to settle. Also: rank
-   PR-6 given the lever is 1 file / 1 island *today* vs. a recurring structural authoring pattern.
+7. **PR-6 (DRAFT) — re-scoped 2026-06-14 to ONE PR, two phases, reusing #142.** Resolved
+   design points (planner positions, plan-reviewer to confirm):
+   - **One PR, two phases** (Phase 1 unwrap static-literal EXECUTE IMMEDIATE; Phase 2 compose the
+     intermediate via #142's existing `_emit_transitive_temp_edges`). Confirms the maintainer's
+     single-PR instinct — Phase 2 is the existing engine, not new code, so there is nothing to
+     split out. Planner recommends keeping it one PR.
+   - **Phase 2 is FREE (no extra wiring in the composition engine).** Verified: the #142 pass runs
+     unconditionally after the per-statement loop ([`ansi_parser.py:264`](../../src/sqlcg/parsers/ansi_parser.py),
+     def at `:273`) over `out.statements`. If Phase 1 surfaces the unwrapped inner statements into
+     the same `out.statements` (so inner temps get `role == "temp"`) before `:264`, the transitive
+     `TEMP_INLINE` composition applies automatically. **The only obligation is on Phase 1** —
+     merge inner statements into the enclosing `out` ahead of the post-loop pass; do not parse the
+     inner SQL into a discarded sub-`out`.
+   - **WTFA `|| $WAREHOUSENAME ||`:** extract the static `AS SELECT` body, placeholder the runtime
+     fragment in the (non-lineage) WAREHOUSE clause. Planner leans extract-the-body; reviewer to
+     confirm.
+   - **#142 dependency is explicit:** sequence PR-6 AFTER #142 (`feat/e8-dual-emission`) merges —
+     Phase 2 reuses #142's engine.
+   - **Honest ROI:** 1 file / 1 table / 4-node island *today*; Phase 2 adds zero islands today
+     (the one temp-inside-dynamic-SQL file is concatenated, hence out of scope). Value is
+     structural (recurring authoring class + near-free future-proofing), not volumetric.
+     Plan-reviewer to rank against the higher-volume PR-2 / PR-4 levers.
