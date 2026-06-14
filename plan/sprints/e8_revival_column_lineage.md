@@ -1,6 +1,6 @@
 # E8 revival — temp-chain `dynamic_source` multi-key COLUMN_LINEAGE fix
 
-Status: NEEDS-REVIEW
+Status: REVIEWED
 
 **Author role:** architect-planner
 **Date:** 2026-06-14
@@ -175,10 +175,12 @@ master commits) and **must not be merged wholesale**. Only the two surgical chan
    node). The developer must run them **failing-then-passing** against the revert/restore boundary
    to prove the change is what carries the behaviour (the remeasure did exactly this).
 
-3. **Version bump** (per [`CLAUDE.md`](../../CLAUDE.md) "Releasing", in the feature branch before merge):
-   - [`pyproject.toml`](../../pyproject.toml) `version = "1.29.0"`
-   - [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py) `__version__ = "1.29.0"`
-   - `uv lock`
+3. **Version parity — bump ALL THREE to `1.29.0`** (per [`CLAUDE.md`](../../CLAUDE.md) "Releasing",
+   in the feature branch before merge). Current master is **`1.28.3` in both source files** (not yet
+   bumped); the three must move together or version-skew detection fires:
+   - [`pyproject.toml`](../../pyproject.toml) **line 7** — `version = "1.29.0"`
+   - [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py) **line 3** — `__version__ = "1.29.0"`
+   - `uv lock` (refreshes the lockfile's own version entry), then `uv sync` (so the installed env matches)
 
 **No other source change is in scope.** In particular: do NOT port any of the test deletions/edits
 on the drifted E8 branch, do NOT modify `coverage.py` (the gate metric already exists), do NOT touch
@@ -192,6 +194,17 @@ on the drifted E8 branch, do NOT modify `coverage.py` (the gate metric already e
 - Must NOT modify any of the four perf-invariant suites to make them pass (see §3 gate).
 - Must NOT raise the slack in [`test_perf_scaling_guard.py`](../../tests/unit/test_perf_scaling_guard.py)
   if it goes red — a red there means E8 started something scaling; find and fix it, do not loosen the guard.
+- **Must NOT port the E8 branch's [`tests/unit/test_perf_scaling_guard.py`](../../tests/unit/test_perf_scaling_guard.py)
+  edits (anti-regression NOTE).** The `origin/fix/e8-temp-chain` version of this file **DELETES master's
+  `traverse_scope` counter** — a PR-3 (#134 / #38) addition that postdates the branch (the branch predates
+  it; `git diff master origin/fix/e8-temp-chain -- tests/unit/test_perf_scaling_guard.py` shows the
+  `traverse_scope` counter/wrapper/assertion removed and a NEW `expand_with_sources` guard added). Porting
+  the branch's version would silently drop a live master perf invariant. The four perf-invariant suites
+  MUST pass **UNMODIFIED** (gate item 3) — that includes keeping master's `traverse_scope` counter intact.
+  Port ONLY [`tests/unit/test_e8_temp_chain_key_mismatch.py`](../../tests/unit/test_e8_temp_chain_key_mismatch.py)
+  and the two surgical [`ansi_parser.py`](../../src/sqlcg/parsers/ansi_parser.py) changes from commits
+  `a841c4b` + `3a31953` — this is a **cherry-pick of three artifacts, NOT a branch merge** (the branch has
+  drifted 70 files).
 
 ---
 
@@ -206,12 +219,24 @@ on the drifted E8 branch, do NOT modify `coverage.py` (the gate metric already e
 >    **delta on one corpus**, not an absolute value — the baseline is corpus-relative, 33,475 on
 >    `/tmp/ab_pr2.duckdb`, 25,246 on the `/tmp/e8_without.duckdb` proxy.) **If the delta is < +1,000,
 >    do NOT revive E8.**
-> 2. **No quality regression:** the **strict %**, **scoped %**, and **catalogued %** column-lineage
->    health metrics (from the same `gain --json`) do **NOT** regress WITH-E8 vs the WITHOUT-E8
->    control. A ≤1pp dip in strict OR scoped that is explained by denominator growth (new edges
->    landing on legitimate temp/CTE/derived intermediate dst nodes — exactly the remeasure's −1pp
->    scoped) is acceptable and is NOT a regression; a drop in the absolute count of *strict-good*
->    or *scoped-good* edges IS a regression. Catalogued % must not move.
+> 2. **No quality regression (pinned to the exact `gain --json` keys).** `gain --json` emits NO
+>    "catalogued %" field — that metric does not exist. The catalog key it DOES emit is
+>    `catalogued_tables`, a legacy table COUNT (verified: [`coverage.py:852`](../../src/sqlcg/cli/coverage.py#L852)
+>    `"catalogued_tables": coverage.catalogued_tables` — sourced from `_Q_CATALOG_COVERAGE`,
+>    `COUNT(DISTINCT src_key)` in HAS_COLUMN at [`coverage.py:38-42`](../../src/sqlcg/cli/coverage.py#L38)).
+>    The gate compares these exact JSON keys WITH-E8 vs the WITHOUT-E8 control:
+>    - **`catalogued_tables` count must NOT decrease.**
+>    - **`good_edges_strict`** ([`coverage.py:859`](../../src/sqlcg/cli/coverage.py#L859)) + its ratio
+>      **`edge_health_strict_pct`** ([`coverage.py:860`](../../src/sqlcg/cli/coverage.py#L860)).
+>    - **`good_edges_scoped`** ([`coverage.py:862`](../../src/sqlcg/cli/coverage.py#L862)) + its ratio
+>      **`edge_health_scoped_pct`** ([`coverage.py:864`](../../src/sqlcg/cli/coverage.py#L864)).
+>
+>    Rule: the **absolute good-edge COUNT** (`good_edges_strict`, `good_edges_scoped`) must **NOT drop**.
+>    A **≤1pp dip in `edge_health_strict_pct` OR `edge_health_scoped_pct`** that is explained by
+>    denominator growth (new edges landing on legitimate temp/CTE/derived intermediate dst nodes —
+>    exactly the remeasure's −1pp scoped) is **acceptable** and is NOT a regression. A drop in either
+>    absolute good-count IS a regression. (Catalog config MUST be identical across both runs — see §3 D1
+>    — so this comparison is apples-to-apples, since `catalogued_tables`/strict/scoped ARE catalog-sensitive.)
 > 3. **Perf invariants intact, UNMODIFIED:** all four perf-invariant suites pass with **zero edits**
 >    to the test files:
 >    - [`tests/unit/test_T09_01_qualify_once.py`](../../tests/unit/test_T09_01_qualify_once.py)
@@ -220,15 +245,54 @@ on the drifted E8 branch, do NOT modify `coverage.py` (the gate metric already e
 >    - [`tests/unit/test_perf_scaling_guard.py`](../../tests/unit/test_perf_scaling_guard.py)
 >      (op-counts `build_scope`, `qualify`, `traverse_scope` stay flat; `sg_lineage` at most linear;
 >      `scope_without_copy_false == 0`; INSERT body copied once — all assertions green unchanged).
-> 4. **Perf budget held:** a full-corpus index (~1,335–1,600 files) completes under the **~3-minute**
->    budget on the reference laptop (excluding the catalog re-apply phase, which is independently
->    measured and not attributable to E8). If wall-time exceeds budget, the developer must show via
+> 4. **Perf budget held (measured by phase, not raw wall-clock).** The **parse + CLONE + ingest phase**
+>    of a full-corpus index (~1,335–1,600 files) completes **under ~2m30**, as measured by the indexer's
+>    own phase timing (`profile=True` — the pass-1/pass-2/upsert/star accumulators at
+>    [`indexer.py:369-377`](../../src/sqlcg/indexer/indexer.py#L369)), with the **catalog re-apply phase
+>    measured and reported SEPARATELY**. The catalog re-apply is a one-shot bulk path at
+>    [`indexer.py:700`](../../src/sqlcg/indexer/indexer.py#L700) (`_reapply_catalog_if_configured`), is
+>    **off the E8 code path**, and dominated the remeasure's 5m57 (with) / 4m18 (without) WSL2 wall-times —
+>    so a raw "~3-min total, catalog excluded" wall-clock is unmeasurable as an E8 signal and is dropped.
+>    If the parse+CLONE+ingest phase exceeds ~2m30, the developer must show via
 >    `test_perf_scaling_guard.py` op-counts that E8 did not introduce the regression before proceeding.
-> 5. **No silent edge loss:** confirm the open postmortem question — the column-graph "−46 table-nodes
->    / −25 tables-with-incoming" — is benign temp-node consolidation and that **no real table lost its
->    only incoming COLUMN_LINEAGE edge** WITH-E8 vs the control. (Query the WITHOUT/WITH graphs for the
->    set of real, non-temp/CTE/derived, non-noise tables with ≥1 incoming COLUMN_LINEAGE; the WITH set
->    must be a superset of the WITHOUT set.)
+> 5. **No silent edge loss (literal SQL — no hand-waving).** Confirm the open postmortem question —
+>    the column-graph "−46 table-nodes / −25 tables-with-incoming" — is benign temp-node consolidation
+>    and that **no REAL table lost its only incoming COLUMN_LINEAGE edge** WITH-E8 vs the control.
+>
+>    A COLUMN_LINEAGE edge is `SqlColumn → SqlColumn` ([`schema.cypher:93-99`](../../src/sqlcg/core/schema.cypher#L93)),
+>    exposed relationally with `src_key`/`dst_key` (the SqlColumn ids). The destination **table**'s
+>    key is the `dst_key` with its trailing `.<column>` stripped — which equals `SqlTable.qualified`
+>    (the `<rel>::<db>.<name>` primary key, [`schema.cypher:18-25`](../../src/sqlcg/core/schema.cypher#L18));
+>    the strip expression is the committed `_DST_TABLE` at [`coverage.py:29`](../../src/sqlcg/cli/coverage.py#L29).
+>    A **real** table is one whose `SqlTable.kind` is NOT a synthetic kind. The canonical synthetic set
+>    is `{'cte','derived','temp'}` — [`tools.py:385`](../../src/sqlcg/server/tools.py#L385)
+>    `_SYNTHETIC_TABLE_KINDS = frozenset({"cte", "derived", "temp"})` — and is exactly the predicate the
+>    *scoped* health metric already excludes ([`coverage.py:84`](../../src/sqlcg/cli/coverage.py#L84)
+>    `t.kind IN ('cte', 'derived', 'temp')`). Real-table filter (the EXACT predicate):
+>    `kind NOT IN ('cte','derived','temp','external') AND kind IS NOT NULL` — `external` is excluded as
+>    out-of-corpus noise, NULL-kind rows are excluded as unresolved.
+>
+>    Run this **committed** query against BOTH the control db (`/tmp/e8_without.duckdb`) and the
+>    WITH-E8 db; it returns the SET of real tables having ≥1 incoming COLUMN_LINEAGE edge:
+>
+>    ```sql
+>    -- gate-5: real tables with ≥1 incoming COLUMN_LINEAGE edge.
+>    -- dst_key strip == _DST_TABLE (coverage.py:29); real == kind not synthetic/external/null.
+>    SELECT DISTINCT t.qualified
+>    FROM "COLUMN_LINEAGE" cl
+>    JOIN "SqlTable" t
+>      ON t.qualified =
+>         left(cl.dst_key, len(cl.dst_key) - instr(reverse(cl.dst_key), '.'))
+>    WHERE t.kind NOT IN ('cte', 'derived', 'temp', 'external')
+>      AND t.kind IS NOT NULL
+>    ORDER BY t.qualified;
+>    ```
+>
+>    **Gate:** the WITH-E8 result set must be a **SUPERSET** of the control result set — i.e.
+>    `(control_set EXCEPT with_set)` must be **EMPTY**. If any real table present in the control is
+>    absent WITH-E8, a real table lost its only provenance ⇒ **FAIL**. (Set difference, runnable directly:
+>    `SELECT ... FROM control EXCEPT SELECT ... FROM with;` against the two dbs, or diff the two committed
+>    result lists.)
 > 6. **Full suite green:** `uv run pytest` passes, including the new
 >    `tests/unit/test_e8_temp_chain_key_mismatch.py`; `uv run ruff check src tests` and
 >    `uv run pyright` clean.
@@ -245,8 +309,31 @@ uv run sqlcg gain --json > plan/metrics/gain_1.29.0_<shortsha>.json
 
 where `<shortsha>` is the indexed commit's short SHA. Capture **both** the WITHOUT-E8 control and the
 WITH-E8 run (e.g. `gain_1.29.0_<sha>_without.json` / `gain_1.29.0_<sha>_with.json`) so the
-`resolvable_write_col_edges` delta and the strict/scoped/catalogued comparison in the gate are
+`resolvable_write_col_edges` delta and the strict/scoped/`catalogued_tables` comparison in the gate are
 reproducible from committed artifacts, not transient terminal output.
+
+### 3.2 Runbook decisions (folded from review — formerly open questions)
+
+**D1 — `resolvable_write_col_edges` is catalog-INSENSITIVE; the +1,000 delta is attributable to E8
+alone (DECISION, not an open question).** The catalog re-apply path
+(`_reapply_catalog_if_configured` → `apply_catalog_to_backend`,
+[`catalog.py:217-224`](../../src/sqlcg/cli/commands/catalog.py#L217)) writes ONLY `SqlTable` (insert-if-absent),
+`SqlColumn`, and `HAS_COLUMN(source='information_schema')` rows, plus a `derived→table` kind upgrade
+([`catalog.py:230-231`](../../src/sqlcg/cli/commands/catalog.py#L230)). It writes **ZERO** `COLUMN_LINEAGE`
+and **ZERO** `SELECTS_FROM` rows — and those two tables are the **only** ones the recall metric reads
+(`_Q_RESOLVABLE_WRITE_COL_EDGES`, [`coverage.py:358-365`](../../src/sqlcg/cli/coverage.py#L358):
+`FROM "COLUMN_LINEAGE" cl JOIN "SqlQuery" … EXISTS (SELECT 1 FROM "SELECTS_FROM" …)`). Therefore the
+catalog state cannot move `resolvable_write_col_edges`, and the +1,000 delta is attributable to E8's
+`sources_map` keys alone — **PROVIDED both control and treatment use the IDENTICAL catalog config**.
+That identical-config requirement is mandatory anyway so gate item 2's
+`catalogued_tables`/strict/scoped comparison is apples-to-apples, since THOSE keys ARE catalog-sensitive
+(they read `HAS_COLUMN`, which the catalog path writes).
+
+**D2 — perf budget is the parse+CLONE+ingest phase under ~2m30, catalog measured separately (DECISION).**
+See gate item 4 above. The unmeasurable "~3-min total, catalog excluded" wall-clock framing is dropped:
+the catalog re-apply is a one-shot off-E8 bulk path ([`indexer.py:700`](../../src/sqlcg/indexer/indexer.py#L700))
+that dominated the remeasure's WSL2 wall-times (5m57 / 4m18), so only the indexer's own `profile=True`
+phase timing is a valid E8 signal.
 
 ---
 
@@ -298,19 +385,53 @@ on the merge commit, pushed alone.
 
 ---
 
-## 8. Unresolved design question (for plan-reviewer)
+## 8. Unresolved design questions
 
-1. **Recall metric vs catalog state.** `resolvable_write_col_edges` joins COLUMN_LINEAGE to write
-   queries that have ≥1 SELECTS_FROM source. E8 adds COLUMN_LINEAGE edges but does **not** change
-   SELECTS_FROM. The prior A/B predicts ≈+1,790 of the +1,728 new edges land on already-SELECTS_FROM-
-   resolved write queries — but that depends on the temp-chain targets being write queries that
-   themselves already have a SELECTS_FROM source. Should the gate ALSO require a +1,000 rise to be
-   measured on the **same catalog** (`columns.csv`, 122,815 cols) for both control and treatment, to
-   avoid the catalog re-apply confounding the count? (The plan assumes "same config both runs"; the
-   reviewer should confirm whether catalog application happens before or after the metric snapshot and
-   pin it explicitly in the runbook.)
-2. **3-min budget vs measured wall-times.** The remeasure clocked 5m57 (with) / 4m18 (without) on a
-   loaded WSL2 box, both over the ~3-min budget, attributed to WSL2 load + the 122k-column catalog
-   re-apply, not E8. Gate item 4 carves out the catalog phase — the reviewer should confirm that
-   carve-out is acceptable, or tighten it to "parse+CLONE phase under ~2m30 as measured", since a
-   strict 3-min wall-clock could fail for reasons unrelated to E8.
+**None.** Both questions raised at NEEDS-REVIEW were resolved at review and folded into the runbook as
+affirmative decisions:
+
+- Former Q1 (recall metric vs catalog state) → **§3.2 D1** (catalog-insensitive; +1,000 delta is E8's).
+- Former Q2 (3-min budget vs measured wall-times) → **gate item 4 + §3.2 D2** (phase-timed ~2m30
+  parse+CLONE+ingest, catalog measured separately).
+
+---
+
+## 9. Review Trail
+
+**Verdict: APPROVE-WITH-AMENDMENTS** (plan-reviewer). All six amendments below are applied; Status moved
+NEEDS-REVIEW → **REVIEWED**.
+
+1. **Gate item 2 named a non-existent metric.** `gain --json` emits no "catalogued %" field — only
+   `catalogued_tables`, a legacy table COUNT (verified at [`coverage.py:852`](../../src/sqlcg/cli/coverage.py#L852),
+   sourced from `_Q_CATALOG_COVERAGE`, [`coverage.py:38-42`](../../src/sqlcg/cli/coverage.py#L38)). Gate
+   item 2 rewritten: "`catalogued_tables` count must not decrease" and pinned to the exact JSON keys
+   `good_edges_strict` + `edge_health_strict_pct` and `good_edges_scoped` + `edge_health_scoped_pct`
+   (absolute good-edge COUNT must not drop; a ≤1pp ratio dip from denominator growth is acceptable).
+2. **Gate item 5 was hand-wavy — authored literal SQL.** Wrote a committed query returning the SET of
+   REAL tables (`kind NOT IN ('cte','derived','temp','external') AND kind IS NOT NULL`) with ≥1 incoming
+   COLUMN_LINEAGE edge, runnable against `/tmp/e8_without.duckdb` and the with-E8 db; gate = treatment
+   set is a SUPERSET of control. Predicate justified by `_SYNTHETIC_TABLE_KINDS` at
+   [`tools.py:385`](../../src/sqlcg/server/tools.py#L385), the scoped exclusion at
+   [`coverage.py:84`](../../src/sqlcg/cli/coverage.py#L84), `_DST_TABLE` strip at
+   [`coverage.py:29`](../../src/sqlcg/cli/coverage.py#L29), and the SqlTable.qualified/kind schema at
+   [`schema.cypher:18-25`](../../src/sqlcg/core/schema.cypher#L18).
+3. **Folded former Q1 into the runbook as DECISION §3.2 D1** (removed from §8). `resolvable_write_col_edges`
+   is catalog-INSENSITIVE — the catalog path writes only SqlTable/SqlColumn/HAS_COLUMN + a derived→table
+   upgrade ([`catalog.py:217-231`](../../src/sqlcg/cli/commands/catalog.py#L217)) and zero
+   COLUMN_LINEAGE/SELECTS_FROM, the only two tables the metric reads
+   ([`coverage.py:358-365`](../../src/sqlcg/cli/coverage.py#L358)); +1,000 delta is E8's, given identical
+   catalog config both runs.
+4. **Folded former Q2 into gate item 4 as DECISION §3.2 D2** (removed from §8). Perf budget retargeted to
+   "parse+CLONE+ingest under ~2m30 via the indexer's `profile=True` phase timing
+   ([`indexer.py:369-377`](../../src/sqlcg/indexer/indexer.py#L369)), catalog re-apply
+   ([`indexer.py:700`](../../src/sqlcg/indexer/indexer.py#L700)) measured separately". Dropped the
+   unmeasurable "~3-min total" framing.
+5. **Version parity prerequisite.** §2.2 item 3 now bumps ALL THREE to 1.29.0 — `pyproject.toml` line 7,
+   `src/sqlcg/__init__.py` line 3, and `uv lock` (+ `uv sync`). Noted current master is 1.28.3 in both
+   source files.
+6. **Anti-regression NOTE (§2.3).** Do NOT port the E8 branch's `test_perf_scaling_guard.py` edits — that
+   branch DELETES master's `traverse_scope` counter (a PR-3 #134/#38 addition postdating the branch) and
+   adds an E8-specific `expand_with_sources` guard. The four perf-invariant suites must pass UNMODIFIED
+   (gate item 3). Port ONLY `test_e8_temp_chain_key_mismatch.py` and the two surgical ansi_parser.py
+   changes from `a841c4b` + `3a31953` — a cherry-pick of three artifacts, NOT a branch merge (the branch
+   has drifted 70 files).
