@@ -1,6 +1,7 @@
 # Bugfix sprint — live-DWH audit findings (#151, #152, #153)
 
-**Status: REVIEWED-PENDING** (sprint-planner hardened; plan-reviewer gate runs next).
+**Status: REVIEWED** (sprint-planner hardened → plan-reviewer gate returned REWORK → shepherd folded
+the 3 blockers + the #1 stale-binary cross-ref, 2026-06-14 — see **Plan-review REWORK fold** below).
 **Current version:** `1.32.1` (master). **Origin:** skeptical data-engineer live-DWH audit
 (2026-06-14), filed as [#151](https://github.com/Warhorze/sql-code-graph/issues/151) /
 [#152](https://github.com/Warhorze/sql-code-graph/issues/152) /
@@ -77,11 +78,29 @@ PR-2b improvements stay invisible until a manual reindex, with no signal.
      we cannot claim staleness we cannot prove).
    - `render_freshness_line` appends, when stale: `; indexed with sqlcg <old>, running <new> — reindex
      to pick up parser improvements`. Non-fatal.
-5. **Surface in every freshness render site.** Grep `compute_freshness`/`render_freshness_line` callers
-   and pass the new args: at minimum [`cli/commands/db.py`](../../src/sqlcg/cli/commands/db.py),
-   [`cli/commands/index.py`](../../src/sqlcg/cli/commands/index.py), and
-   [`cli/coverage.py`](../../src/sqlcg/cli/coverage.py) (the `gain` path). The dev must grep all callers
-   — the new args must reach each.
+5. **Surface in every freshness render site — CORRECTED caller list (REWORK blocker 1).** The DRAFT's
+   caller list was WRONG. Grep-verified `compute_freshness` callers are exactly three:
+   [`cli/commands/db.py:109`](../../src/sqlcg/cli/commands/db.py),
+   [`server/server.py:237`](../../src/sqlcg/server/server.py) (import `:213`), and
+   [`server/tools.py:1846`](../../src/sqlcg/server/tools.py). **`index.py` and `coverage.py` are NOT callers.**
+   `render_freshness_line` is called **only at `db.py:110`** — so the `gain`/coverage path has **NO freshness
+   render path** to extend. Thread the new args (`indexed_version`, `running_version=sqlcg.__version__`) into
+   each of the three `compute_freshness` callers; at `db.py:110` the existing `render_freshness_line(f)` now
+   emits the stale-hint line.
+6. **`gain` surfaces tool-version staleness via `CoverageStats`, NOT via `render_freshness_line` (REWORK
+   blocker 1, cont.).** Because `gain` (`cli/coverage.py`) never renders a freshness line, thread
+   `indexed_version` + `running_version` into `collect_coverage()` and add **`tool_version_stale: bool`**
+   (and the two version strings) to `CoverageStats` (recall block, `coverage.py:449-454`). Render a stale
+   line in `render_coverage_lines` when set, and add the fields to `coverage_to_json()`. This is the only
+   way the `gain` over-report (#151's exact symptom) becomes visible — confirm with a grep that
+   `collect_coverage` has the `SchemaVersion` row available (it opens the same backend) to read
+   `get_indexed_version()`.
+7. **Cross-ref to validation BLOCKER #1 (stale post-checkout hook binary).** The live-DWH validation
+   surfaced that the auto-resync `post-checkout` hook is pinned to a stale `~/.local/bin/sqlcg` (v1.25.6,
+   schema v8) → it silently dies on a v9+ DB. PR-A's `tool_version_stale` signal is the **in-graph detector**
+   for exactly that class of "indexed by an older tool than is running" drift, but it does **not** fix the
+   hook itself (an OPS action: repoint the hook to `uv run sqlcg` / upgrade the binary). Note this linkage so
+   the OPS fix and this signal are reconciled; PR-A does not own the hook change.
 
 ### Acceptance criteria (observable)
 - [ ] Index with the running version; `compute_freshness(...)` returns `tool_version_stale == False`
@@ -90,6 +109,10 @@ PR-2b improvements stay invisible until a manual reindex, with no signal.
       `tool_version_stale is True` and `render_freshness_line(...)` **contains** the substring
       `"reindex to pick up parser improvements"` — even when `stale_by_commits == 0` ("up to date").
 - [ ] `indexed_version is None` → `tool_version_stale is False` (degrade gracefully; no crash).
+- [ ] `gain` path: `collect_coverage(...)` returns a `CoverageStats` with `tool_version_stale == True`
+      when the stamped version ≠ running version; `render_coverage_lines` contains the stale line and
+      `coverage_to_json()` carries `tool_version_stale` + both version strings. (This is the #151 symptom —
+      `gain` over-reporting health on a stale graph — so it MUST surface in `gain`, not only `db info`.)
 - [ ] A fresh index writes a non-null `sqlcg_version` equal to `sqlcg.__version__`
       (integration assertion: read the `SchemaVersion` row).
 - [ ] `SCHEMA_VERSION == "10"`; opening a graph still initializes cleanly.
@@ -141,6 +164,14 @@ Make the skipped site **visible in the graph** so the metric is derived graph-si
    body — no guessing). If the target table name is statically knowable from the `CREATE TABLE <name> AS`
    prefix, stamp `target_table`; otherwise leave it null. **Scope strictly to CREATE-shaped sites** (reuse
    `_CREATE_DDL_PREFIX_RE`) so SHOW/CALL/DML EXECUTE IMMEDIATE never counts.
+   - **REWORK blocker 3 — emit on BOTH recovery paths, not just scripting.** `_unwrap_execute_immediate`
+     ([`snowflake_parser.py:598`](../../src/sqlcg/parsers/snowflake_parser.py)) returns an empty list for
+     non-static SQL at **two** call sites: the scripting raw-text path `_emit_dynamic_sql_statements_scripting`
+     (`:743`) **and** the structured/var path `_inner_stmts_from_command` (`:691`). The marker node must be
+     emitted at **both** skip points (or factored into a shared helper both call when `_unwrap` returns empty
+     **and** `_CREATE_DDL_PREFIX_RE` matched the command text). Hooking only the scripting path — the DRAFT's
+     implicit assumption — undercounts every structured-var-form EXECUTE IMMEDIATE. Acceptance must include a
+     structured-var-form fixture, not only a scripting-block one.
    - *Why a node, not just a `ParsedFile.errors` string:* it lets `gain` and `db info` derive the count
      from one SQL query (consistent with every other coverage number) and makes the incomplete table
      addressable later. `ParsedFile.errors` (`base.py:296`, list[str]) remains a secondary diagnostic.
@@ -153,6 +184,15 @@ Make the skipped site **visible in the graph** so the metric is derived graph-si
      AND NOT EXISTS (SELECT 1 FROM "COLUMN_LINEAGE" cl WHERE cl.query_id = q.id)
    ```
    Wire it into `collect_coverage()` (`:554-680`) alongside the other recall reads.
+   - **REWORK blocker 2 — exclude the marker from `zero_edge_write_queries` (avoid double-count).** The
+     marker node uses the **`CREATE_TABLE` kind**, which is in `_WRITE_KINDS` ([`coverage.py:33`](../../src/sqlcg/cli/coverage.py)),
+     and it has **zero** COLUMN_LINEAGE edges — so as-is it would be swept into `_Q_ZERO_EDGE_WRITES`
+     (`:226-234`) and inflate `zero_edge_write_queries` (the existing "bad write" metric). That is wrong:
+     a `dynamic_sql_unresolved` site is *known-incomplete*, not a *failed-to-resolve write*. Add
+     `AND q.parsing_mode IS DISTINCT FROM 'dynamic_sql_unresolved'` to the `_Q_ZERO_EDGE_WRITES` predicate
+     (NULL-safe, matching the existing TEMP_INLINE filter style) so the two metrics are disjoint. Acceptance
+     MUST assert `zero_edge_write_queries` is **unchanged** by the new marker (compute it before and after on
+     the same fixture corpus; delta == 0) in addition to `lineage_incomplete_dynamic == 1`.
 3. **Render.** Add a line in `render_coverage_lines` (`coverage.py:740+`, near the `:830` zero-edge line):
    `N table(s) defined via non-static dynamic SQL — lineage-incomplete (not statically traceable)`.
    Add the same line to `db info` ([`cli/commands/db.py`](../../src/sqlcg/cli/commands/db.py)).
@@ -164,6 +204,11 @@ Make the skipped site **visible in the graph** so the metric is derived graph-si
       **zero** COLUMN_LINEAGE edges for it; `collect_coverage(...).lineage_incomplete_dynamic == 1`.
 - [ ] Static-literal dynamic SQL (PR-6's recovered case, `parsing_mode='dynamic_sql'`) does **NOT**
       increment `lineage_incomplete_dynamic` (it is fully traced).
+- [ ] **(blocker 2)** `zero_edge_write_queries` is **unchanged** by the marker: compute coverage on the
+      same fixture before and after the marker emits — delta == 0. The two metrics are disjoint.
+- [ ] **(blocker 3)** BOTH a scripting-block fixture AND a structured var-form `EXECUTE IMMEDIATE`
+      (routed through `_inner_stmts_from_command`) each yield exactly one `dynamic_sql_unresolved` node;
+      the structured path is not undercounted.
 - [ ] A non-CREATE `EXECUTE IMMEDIATE` (e.g. `'SHOW TABLES'` / a CALL) does **NOT** emit a
       `dynamic_sql_unresolved` node and does **NOT** increment the count.
 - [ ] `gain --json` output contains key `lineage_incomplete_dynamic` with the integer value.
@@ -279,8 +324,12 @@ normalized id (collision policy), and to size the render-site sweep. **Architect
 the final A/B pick and the collision policy — route through `architect-reviewer` if the maintainer leans A
 or if the spike surfaces ambiguity.
 
-> **MAINTAINER DECISION (blocks PR-C implementation): choose Option A or Option B, and confirm the
-> schema-bump coordination with PR-A.** The developer agent must not start PR-C until this is recorded here.
+> **MAINTAINER DECISION — RESOLVED 2026-06-14: Option B confirmed.** The maintainer accepted the planner's
+> reversed recommendation (display_name field + quote-aware reverse resolver; `full_id` contract untouched,
+> no graph re-keying, golden suite preserved). Schema-bump coordination: PR-A takes **v10**, PR-C-Option-B's
+> new `display_name` column takes **v11** (PR-C ships last). PR-C still runs LAST and still requires the
+> half-day spike (collision policy for two quoted names folding to one `full_id`) + architect-review before
+> the developer is dispatched — those gate PR-C only, not PR-A/PR-B.
 
 ### Acceptance criteria (observable) — written against Option B; revise if A is chosen
 - [ ] A spaced quoted column `IA_SEMANTIC."omzet excl"` (ref `ddl/changelogs/IA-SEMANTIC/ARTIKEL.sql:18-19`)
@@ -356,12 +405,11 @@ Not marked `xfail`. This is the sprint-planner's compliance anchor.
 ---
 
 ### Blocking Questions
-1. **PR-C Option A vs B — MAINTAINER DECISION (blocks PR-C only).** Planner recommends **Option B**
-   (display_name + quote-aware resolver) over the DRAFT's Option A, because Option A breaks dot-split
-   parsing for embedded-dot quoted names (`"a.b"`) across ~9 sites and forces a rewrite of the entire
-   golden/anchor suite. Confirm B, or pick A with eyes open. (PR-A and PR-B are NOT blocked by this.)
+1. **PR-C Option A vs B — RESOLVED 2026-06-14: Option B confirmed by maintainer.** (display_name +
+   quote-aware resolver; `full_id` contract preserved.) No longer blocking. PR-C still gated on the spike
+   (Q2) + architect-review.
 2. **PR-C collision policy (needed only if B and the spike confirm ambiguity):** when two distinct quoted
    display names fold to the same normalized `full_id`, how should the reverse display→id lookup behave —
    first-wins, error, or disambiguate? Resolve in the spike/architect-review before PR-C implementation.
-3. **Schema-bump coordination:** PR-A takes v10; PR-C-Option-B's new column would take v11. Confirm this
-   ordering, or decide whether B folds its column into PR-A's v10 if they land together. Decide alongside Q1.
+3. **Schema-bump coordination — RESOLVED 2026-06-14:** PR-A takes **v10**, PR-C-Option-B's `display_name`
+   column takes **v11** (PR-C ships last; no folding into v10 since PR-C trails PR-A/PR-B). Confirmed alongside Q1.
