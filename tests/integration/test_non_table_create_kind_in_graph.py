@@ -10,11 +10,14 @@ Scope (RESCOPED, kind-only — plan §Scope):
   * AC3 — the ``analyze impact`` query (analyze.py:317 shape) renders the
     sequence's producing statement as ``kind=OTHER`` not ``CREATE_TABLE``.
 
-Explicitly OUT OF SCOPE (plan Follow-up §, blast-radius row #1b): the sequence
-name persists as a ``SqlTable`` source node via the kind-independent
-``referenced_tables`` → ``indexer.py`` source loop. This fix corrects only the
-stored kind; it does NOT remove that phantom node. No assertion here claims the
-node is absent.
+Originally OUT OF SCOPE for #159 (plan Follow-up §, blast-radius row #1b): the
+sequence name persisted as a ``SqlTable`` source node via the kind-independent
+``referenced_tables`` → ``indexer.py`` source loop. **That phantom node has since
+been removed by the PR-B source-gate (#161)**
+([plan doc](plan/sprints/sprint_snowflake_lineage_patterns.md)). The two tests
+below that previously asserted the phantom SELECTS_FROM edge / ``ba.s`` node
+*exists* have been flipped to assert its *absence* — the corrected post-#161
+graph shape. The kind-only assertions (AC1/AC2) are unchanged.
 """
 
 import pytest
@@ -87,13 +90,14 @@ def test_ctas_still_create_table(indexed, db):
     )
 
 
-def test_sequence_produces_selects_from_edge(indexed, db):
-    """The sequence statement carries a SELECTS_FROM edge to its name node.
+def test_sequence_produces_no_phantom_selects_from_edge(indexed, db):
+    """Post-#161: the sequence statement carries NO phantom SELECTS_FROM edge.
 
-    This is the live shape behind the bug — a non-table CREATE that has a
-    SELECTS_FROM edge yet was mislabeled CREATE_TABLE. Asserting the edge exists
-    proves the reclassified statement is exactly the kind that leaked into
-    ``analyze impact`` (NOT a statement with no edges).
+    Before PR-B (#161) the sequence's own name ``ba.s`` was scooped into
+    ``sources`` and emitted as a ``SELECTS_FROM`` edge from the producing
+    statement to a phantom ``ba.s`` SqlTable node. The source-gate suppresses
+    this, so no SELECTS_FROM edge points at ``ba.s`` any longer. (Flipped from the
+    pre-#161 assertion that the edge existed — see module docstring.)
     """
     rows = db.run_read(
         'SELECT q.id AS id, q.kind AS kind FROM "SqlQuery" q '
@@ -101,21 +105,28 @@ def test_sequence_produces_selects_from_edge(indexed, db):
         "WHERE sf.dst_key = ?",
         {"dst": "ba.s"},
     )
-    assert len(rows) == 1, f"expected one SELECTS_FROM producer for ba.s, got {rows}"
-    assert rows[0]["kind"] == "OTHER", (
-        f"the sequence statement with a SELECTS_FROM edge must be kind=OTHER, "
-        f"got {rows[0]['kind']!r}"
-    )
+    assert rows == [], f"phantom SELECTS_FROM edge to ba.s should be gone, got {rows}"
 
 
-def test_analyze_impact_renders_sequence_as_other(indexed, db, monkeypatch):
-    """AC3: ``analyze impact ba.s`` renders the producing statement kind=OTHER.
+def test_sequence_name_is_not_a_sqltable_node(indexed, db):
+    """Post-#161: the sequence object name is not emitted as a SqlTable node.
 
-    Runs the exact analyze.py:317 query shape against the indexed graph and the
-    CLI render path; asserts the kind column shows OTHER, never CREATE_TABLE.
-    No assertion is made about the ba.s SqlTable node's existence (out of scope).
+    The phantom ``ba.s`` SqlTable node previously created by the kind-independent
+    source loop is removed by the PR-B source-gate (#161).
     """
-    # Direct query (analyze.py:317 shape) — observable kind on the producer row.
+    rows = db.run_read('SELECT qualified FROM "SqlTable" WHERE qualified = ?', {"q": "ba.s"})
+    assert rows == [], f"phantom SqlTable node ba.s should be gone, got {rows}"
+
+
+def test_analyze_impact_sequence_node_absent(indexed, db, monkeypatch):
+    """Post-#161: ``analyze impact ba.s`` finds no phantom producer.
+
+    The phantom ``ba.s`` node and its SELECTS_FROM edge are removed, so the
+    analyze.py:317 query shape returns no rows for ``ba.s`` and the CLI never
+    renders a CREATE_TABLE (or any) producer for it. (Flipped from the pre-#161
+    assertion that the producer rendered as OTHER — see module docstring.)
+    """
+    # Direct query (analyze.py:317 shape) — no producer row for the phantom node.
     results = db.run_read(
         "SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target"
         ' FROM "SqlTable" t'
@@ -124,12 +135,9 @@ def test_analyze_impact_renders_sequence_as_other(indexed, db, monkeypatch):
         " WHERE t.qualified = ? LIMIT 100",
         {"t": "ba.s"},
     )
-    kinds = {r["kind"] for r in results}
-    assert kinds == {"OTHER"}, (
-        f"analyze impact on ba.s must render only kind=OTHER for the sequence producer; got {kinds}"
-    )
+    assert results == [], f"no producer should resolve via the removed phantom ba.s; got {results}"
 
-    # CLI render path: kind=OTHER appears, CREATE_TABLE does not.
+    # CLI render path: CREATE_TABLE must not be rendered for the sequence.
     from typer.testing import CliRunner
 
     from sqlcg.cli.commands.analyze import app
@@ -140,9 +148,6 @@ def test_analyze_impact_renders_sequence_as_other(indexed, db, monkeypatch):
     monkeypatch.setattr("sqlcg.cli.commands.analyze.run_read_routed", _route_to_db)
     result = CliRunner().invoke(app, ["impact", "ba.s", "--raw"])
     assert result.exit_code == 0, result.output
-    assert "OTHER" in result.output, (
-        f"analyze impact output must contain kind=OTHER for the sequence.\n{result.output}"
-    )
     assert "CREATE_TABLE" not in result.output, (
         f"analyze impact must NOT render CREATE_TABLE for the sequence.\n{result.output}"
     )
