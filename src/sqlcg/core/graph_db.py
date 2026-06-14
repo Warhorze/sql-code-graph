@@ -273,6 +273,16 @@ class GraphBackend(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support expand_star_sources")
 
+    def resolve_join_columns(self) -> int:
+        """Resolve JOIN_COL_RESOLVE markers into per-column COLUMN_LINEAGE edges.
+
+        Runs once per index after ingestion AND catalog apply, resolving bare
+        unqualified join columns against the full post-index HAS_COLUMN catalog
+        (including information_schema rows unavailable at parse time). Concrete
+        backends must override this; returns the total JOIN_COL_RESOLVED edge count.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support resolve_join_columns")
+
 
 def indexed_repo_root(db: "GraphBackend") -> Path | None:
     """Return the indexed root path stored on the first Repo node, or None.
