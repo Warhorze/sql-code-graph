@@ -51,6 +51,45 @@ _USE_SCHEMA_RE = re.compile(
     re.IGNORECASE,
 )
 
+# PR-6 (dynamic-SQL EXECUTE IMMEDIATE unwrap, Phase 1).
+#
+# Snowflake holds dynamic SQL either inline as a literal or in a STRING variable
+# that is later executed.  We recover ONLY the statically-knowable case: a single
+# string literal (possibly split by `|| <runtime> ||` concatenation OUTSIDE the
+# AS SELECT body — e.g. a WAREHOUSE clause).  Concatenation INSIDE the body, bind
+# variables (`:var`), and CONCAT(...) are runtime-dependent → NOT recoverable and
+# are skipped (see _unwrap_execute_immediate).
+#
+# Matches the two execution surfaces:
+#   EXECUTE IMMEDIATE (:var)    /  EXECUTE IMMEDIATE :var   → resolve `var := '...'`
+#   EXECUTE IMMEDIATE '<lit>'                                → inline literal
+_EXEC_IMMEDIATE_VAR_RE = re.compile(
+    r"EXECUTE\s+IMMEDIATE\s*\(?\s*:([A-Za-z_]\w*)\s*\)?",
+    re.IGNORECASE,
+)
+_EXEC_IMMEDIATE_LITERAL_RE = re.compile(
+    r"EXECUTE\s+IMMEDIATE\s*\(?\s*(?=')",
+    re.IGNORECASE,
+)
+
+# Placeholder substituted for a runtime `|| <fragment> ||` concatenation that sits
+# OUTSIDE the AS SELECT body (only the Snowflake WAREHOUSE clause in the corpus).
+# Lossless for lineage: it never appears inside a FROM/JOIN/SELECT clause.
+_DYNAMIC_RUNTIME_PLACEHOLDER = "__SQLCG_DYNAMIC_RUNTIME__"
+
+# Marks the start of a CREATE [...] AS <body>.  A runtime concatenation placeholder
+# at/after this point means the body itself is dynamic → the file is non-recoverable.
+_AS_BODY_START_RE = re.compile(r"\bAS\b\s*(?:WITH\b|SELECT\b|\()", re.IGNORECASE)
+
+# In-scope DDL prefix: only a CREATE [OR REPLACE] [TEMP|TEMPORARY|TRANSIENT|DYNAMIC|
+# ...] TABLE|VIEW is statically recoverable.  SHOW / DROP / bare SELECT / INSERT /
+# UPDATE / MERGE / CALL recovered from an EXECUTE IMMEDIATE are out of scope (the plan
+# limits Phase 1 to static-literal CREATE … AS SELECT DDL).
+_CREATE_DDL_PREFIX_RE = re.compile(
+    r"\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:\w+\s+)*?(?:TABLE|VIEW)\b",
+    re.IGNORECASE,
+)
+
 
 @register("snowflake")
 class SnowflakeParser(AnsiParser):
@@ -313,9 +352,35 @@ class SnowflakeParser(AnsiParser):
         current_schema: str | None = None
         result: list[Any] = []
 
+        # PR-6 Phase 1: pre-scan PropertyEQ assignments (`var := '<literal>'`) so an
+        # `EXECUTE IMMEDIATE (:var)` Command node below can resolve its inner literal.
+        # Only single-string-literal RHS values are captured (the statically-recoverable
+        # case); a concatenation / CONCAT / bind-var RHS is not a literal and is skipped.
+        var_literals: dict[str, str] = {}
+        for stmt in statements:
+            if isinstance(stmt, exp.PropertyEQ) and isinstance(stmt.expression, exp.Literal):
+                lit = stmt.expression
+                if lit.is_string and stmt.this is not None and stmt.this.name:
+                    var_literals[stmt.this.name.lower()] = str(lit.this)
+
         for stmt in statements:
             if stmt is None:
                 result.append(None)
+                continue
+
+            # PR-6 Phase 1: splice a static-literal EXECUTE IMMEDIATE inner DDL inline,
+            # in place of the EXECUTE IMMEDIATE Command node, so the inner statement(s)
+            # are processed by the SAME statement loop (inheriting the active USE SCHEMA
+            # context and registering inner temp targets as role="temp" BEFORE any later
+            # sink reads them and BEFORE the transitive temp-edge composition at :264).
+            inner_stmts = self._inner_stmts_from_command(stmt, var_literals)
+            if inner_stmts is not None:
+                for inner in inner_stmts:
+                    if inner is None:
+                        continue
+                    if current_schema:
+                        self._qualify_bare_tables(inner, current_schema)
+                    result.append(inner)
                 continue
 
             # Detect USE SCHEMA / USE DATABASE statements (Snowflake context setters).
@@ -349,6 +414,12 @@ class SnowflakeParser(AnsiParser):
                     if schema_table.name:
                         current_schema = schema_table.name.lower()
                 # Suppress the USE statement — it is not a real query node.
+                result.append(None)
+                continue
+
+            # PR-6 Phase 1: a `var := '<literal>'` assignment is a scripting-variable
+            # binding, not a query — suppress it (mirrors the USE-statement suppression).
+            if isinstance(stmt, exp.PropertyEQ):
                 result.append(None)
                 continue
 
@@ -402,6 +473,292 @@ class SnowflakeParser(AnsiParser):
                 continue
             # Apply the schema prefix in place.
             table.set("db", exp.Identifier(this=schema, quoted=False))
+
+    @staticmethod
+    def _scan_string_concat(text: str, start: int) -> tuple[str | None, list[int]]:
+        """Scan a Snowflake string-literal concatenation starting at index ``start``.
+
+        ``text[start]`` must be the opening ``'`` of a string literal.  Scans
+        ``'lit' [ || <runtime> || 'lit' ]*`` handling backslash escapes (``\\'``)
+        and doubled-quote escapes (``''``).  Each ``|| <runtime> ||`` bridge between
+        two literals is replaced by ``_DYNAMIC_RUNTIME_PLACEHOLDER``.
+
+        Args:
+            text: The raw SQL text.
+            start: Index of the opening quote of the first literal.
+
+        Returns:
+            ``(recovered_sql, placeholder_offsets)`` where ``placeholder_offsets`` are
+            the character offsets, WITHIN ``recovered_sql``, at which a runtime
+            placeholder was substituted (used by the caller to reject body-level
+            concatenation).  Returns ``(None, [])`` if ``start`` does not point at a
+            string literal.
+        """
+        n = len(text)
+        if start >= n or text[start] != "'":
+            return None, []
+        i = start
+        parts: list[str] = []
+        placeholder_offsets: list[int] = []
+        recovered_len = 0
+        while i < n:
+            if text[i] != "'":
+                break
+            i += 1  # consume opening quote
+            buf: list[str] = []
+            while i < n:
+                c = text[i]
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == "'":
+                    if i + 1 < n and text[i + 1] == "'":  # doubled '' → literal quote
+                        buf.append("'")
+                        i += 2
+                        continue
+                    i += 1  # closing quote
+                    break
+                buf.append(c)
+                i += 1
+            literal = "".join(buf)
+            parts.append(literal)
+            recovered_len += len(literal)
+            # Skip whitespace and look for a `||` concatenation continuation.
+            j = i
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j + 1 < n and text[j] == "|" and text[j + 1] == "|":
+                j += 2
+                # Consume the runtime fragment up to the next `||`.
+                while j < n and not (j + 1 < n and text[j] == "|" and text[j + 1] == "|"):
+                    j += 1
+                if j + 1 >= n or text[j] != "|":
+                    # Unterminated concatenation — bail out (non-recoverable).
+                    return None, []
+                j += 2  # skip the closing `||`
+                placeholder_offsets.append(recovered_len)
+                parts.append(_DYNAMIC_RUNTIME_PLACEHOLDER)
+                recovered_len += len(_DYNAMIC_RUNTIME_PLACEHOLDER)
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                i = j
+                continue
+            break
+        return "".join(parts), placeholder_offsets
+
+    @classmethod
+    def _unwrap_execute_immediate(cls, sql: str) -> list[str]:
+        """Recover static-literal inner SQL from ``EXECUTE IMMEDIATE`` sites.
+
+        PR-6 Phase 1.  Returns the list of recovered inner SQL strings (one per
+        recoverable EXECUTE IMMEDIATE).  ONLY static-literal DDL is recovered:
+
+        - ``EXECUTE IMMEDIATE (:var)`` / ``EXECUTE IMMEDIATE :var`` where ``var`` is
+          assigned a single string literal (``var := '<literal>'``).
+        - inline ``EXECUTE IMMEDIATE '<literal>'``.
+
+        A ``|| <runtime> ||`` concatenation is tolerated ONLY when it sits before the
+        ``AS <body>`` (e.g. the WAREHOUSE clause) — it is replaced by a placeholder.
+        A concatenation at/after the ``AS`` body marker, a CONCAT(...) call, a bind
+        variable inside the literal, or a non-resolvable var makes the site
+        non-recoverable and it is skipped (returns nothing for that site).
+
+        Args:
+            sql: The (preprocessed) full SQL text of the file.
+
+        Returns:
+            List of recovered inner SQL strings (may be empty).
+        """
+        recovered: list[str] = []
+        # Track which literal-start offsets we have already consumed so the inline
+        # and var-resolved passes do not double-count the same literal.
+        consumed_starts: set[int] = set()
+
+        def _try_literal_at(start: int) -> None:
+            inner, placeholder_offsets = cls._scan_string_concat(sql, start)
+            if inner is None:
+                return
+            # SCOPE GATE (plan Phase 1): only a static-literal `CREATE … AS SELECT`
+            # DDL is statically recoverable. Reject anything else — SHOW / DROP /
+            # bare SELECT / INSERT / UPDATE / MERGE / etc. (a SELECT/INSERT with a
+            # `|| :var ||` predicate is runtime-dependent and would inject a placeholder
+            # into a lineage-bearing clause). Locating the AS body anchors the
+            # placeholder guard below.
+            if not _CREATE_DDL_PREFIX_RE.match(inner):
+                return
+            body_match = _AS_BODY_START_RE.search(inner)
+            if body_match is None:
+                # A CREATE with no AS SELECT body carries no lineage to recover.
+                # If it also has a runtime placeholder we cannot prove it is in a
+                # non-lineage clause → reject. A static, body-less CREATE (e.g.
+                # CREATE TABLE … LIKE …) has no SELECT and is out of scope here.
+                return
+            body_start = body_match.start()
+            # Reject when a runtime placeholder landed at/after the AS SELECT body
+            # (the body must be fully static; only a pre-AS clause such as WAREHOUSE
+            # may carry a `|| <runtime> ||` placeholder — lossless for lineage).
+            if any(off >= body_start for off in placeholder_offsets):
+                return  # concatenation inside the body → non-recoverable
+            recovered.append(inner)
+            consumed_starts.add(start)
+
+        # Pass 1 — inline literal: EXECUTE IMMEDIATE '<literal>'.
+        for m in _EXEC_IMMEDIATE_LITERAL_RE.finditer(sql):
+            # The lookahead positioned the cursor; find the next quote at/after m.end().
+            q = sql.find("'", m.end() - 1)
+            if q != -1 and q not in consumed_starts:
+                _try_literal_at(q)
+
+        # Pass 2 — variable form: EXECUTE IMMEDIATE (:var), resolve `var := '<lit>'`.
+        for m in _EXEC_IMMEDIATE_VAR_RE.finditer(sql):
+            var = m.group(1)
+            # Find the variable's literal assignment: `var := '<literal>'`.
+            assign = re.search(rf"\b{re.escape(var)}\s*:=\s*", sql, re.IGNORECASE)
+            if not assign:
+                continue
+            q = assign.end()
+            while q < len(sql) and sql[q] in " \t\r\n":
+                q += 1
+            if q < len(sql) and sql[q] == "'" and q not in consumed_starts:
+                _try_literal_at(q)
+            # else: assigned from a non-literal (concatenation / bind var) → skip.
+
+        return recovered
+
+    def _inner_stmts_from_command(
+        self, stmt: Any, var_literals: dict[str, str]
+    ) -> list[Any] | None:
+        """If ``stmt`` is a static-literal EXECUTE IMMEDIATE, return its parsed inner AST.
+
+        PR-6 Phase 1 (structured / non-scripting path).  ``EXECUTE IMMEDIATE`` parses to
+        an ``exp.Command`` (``this='EXECUTE'``).  This recovers the inner SQL when it is a
+        static literal — either inline (``EXECUTE IMMEDIATE '<lit>'``) or via a variable
+        whose ``var := '<lit>'`` assignment was captured in ``var_literals`` — and parses
+        it through ``sqlglot.parse`` so the caller can splice the result into the main
+        statement loop.  Returns ``None`` when ``stmt`` is not a recoverable EXECUTE
+        IMMEDIATE (so the caller leaves the original statement untouched).
+
+        Non-recoverable cases return ``None`` (skipped, never mis-extracted):
+        concatenation inside the AS body, CONCAT(...), a bind variable inside the literal,
+        or a var with no captured literal assignment.
+
+        Args:
+            stmt: A parsed sqlglot AST node.
+            var_literals: ``var-name(lower) → literal RHS`` map pre-scanned from
+                ``PropertyEQ`` assignments in the same file.
+
+        Returns:
+            The parsed inner statement list, or ``None`` when not applicable.
+        """
+        if not isinstance(stmt, exp.Command):
+            return None
+        if (getattr(stmt, "name", "") or "").upper() != "EXECUTE":
+            return None
+        # The Command text round-trips the original `EXECUTE IMMEDIATE ...` source.
+        command_text = stmt.sql(dialect=self.DIALECT)
+        if "IMMEDIATE" not in command_text.upper():
+            return None
+
+        inner_sql: str | None = None
+        # Inline literal form: recover directly from the command text.
+        recovered = self._unwrap_execute_immediate(command_text)
+        if recovered:
+            inner_sql = recovered[0]
+        else:
+            # Variable form: EXECUTE IMMEDIATE (:var) — resolve the captured literal.
+            var_m = _EXEC_IMMEDIATE_VAR_RE.search(command_text)
+            if var_m is not None:
+                literal = var_literals.get(var_m.group(1).lower())
+                if literal is not None:
+                    # Re-run the literal scanner over the assignment's RHS so a
+                    # WAREHOUSE-clause concatenation placeholder / body-concat guard
+                    # applies identically to the variable form. The captured RHS is the
+                    # already-unescaped literal value, so wrap it back in quotes for the
+                    # scanner only when it still contains a `||` bridge; otherwise the
+                    # raw value IS the inner SQL.
+                    inner_sql = literal
+        if inner_sql is None:
+            return None
+
+        try:
+            return sqlglot.parse(inner_sql, dialect=self.DIALECT)
+        except Exception:
+            return None
+
+    def _emit_dynamic_sql_statements_scripting(
+        self,
+        sql: str,
+        path: Path,
+        out: ParsedFile,
+        sources_map: dict[str, Any],
+        active_schema: str | None,
+    ) -> None:
+        """Surface static-literal EXECUTE IMMEDIATE inner DDL on the SCRIPTING path.
+
+        PR-6 Phase 1.  A ``DECLARE/BEGIN`` block (e.g. the WTFA dynamic-table file)
+        cannot be parsed at the top level, so the structured ``_transform_statements``
+        splice never runs.  This raw-text recovery (see ``_unwrap_execute_immediate``)
+        parses each recovered inner statement through the normal
+        ``AnsiParser._parse_statement`` path — inner temp targets register
+        ``role="temp"`` and column lineage is extracted exactly as for a top-level
+        statement — and APPENDS the resulting QueryNode(s) into ``out.statements`` so the
+        transitive temp-edge composition (Phase 2) sees them.
+
+        Args:
+            sql: The (preprocessed) full SQL text of the file.
+            path: Path to the source file.
+            out: ParsedFile to append recovered inner QueryNodes to.
+            sources_map: Shared temp/CTAS body map.
+            active_schema: Schema active at the EXECUTE IMMEDIATE site (USE SCHEMA reuse).
+        """
+        inner_sqls = self._unwrap_execute_immediate(sql)
+        if not inner_sqls:
+            return
+
+        stmt_index = len(out.statements)
+        for inner_sql in inner_sqls:
+            try:
+                inner_statements = sqlglot.parse(inner_sql, dialect=self.DIALECT)
+            except Exception as exc:
+                out.errors.append(f"dynamic_sql_parse_error:{exc}")
+                continue
+            for stmt in inner_statements:
+                if stmt is None:
+                    continue
+                if active_schema:
+                    self._qualify_bare_tables(stmt, active_schema)
+                try:
+                    query_node: Any = AnsiParser._parse_statement(  # type: ignore[arg-type]
+                        self,
+                        stmt,
+                        path,
+                        stmt_index,
+                        out,
+                        sources_map,
+                    )
+                    query_node.parsing_mode = "dynamic_sql"
+                    out.statements.append(query_node)
+
+                    # Register CTAS/temp bodies so a later sink resolves the temp.
+                    if isinstance(stmt, exp.Create):
+                        _expr = stmt.expression
+                        if isinstance(_expr, exp.Subquery):
+                            _expr = _expr.this
+                        if isinstance(_expr, exp.Select) and query_node.target:
+                            target_name = (query_node.target.name or "").lower()
+                            if target_name:
+                                sources_map[target_name] = _expr
+
+                    if query_node.kind in ("CREATE_TABLE", "CREATE_VIEW"):
+                        if query_node.target:
+                            out.defined_tables.append(query_node.target)
+                    out.referenced_tables.extend(query_node.sources)
+                    if query_node.column_lineage:
+                        out.parse_quality = ParseQuality.FULL
+                    stmt_index += 1
+                except Exception as exc:
+                    out.errors.append(f"dynamic_sql_statement_error:{exc}")
 
     def _has_scripting_block(self, sql: str) -> bool:
         """Token-aware BEGIN detection — avoids false-positives on string literals and comments.
@@ -571,6 +928,18 @@ class SnowflakeParser(AnsiParser):
             except Exception as exc:
                 logger.debug("Failed to parse extracted DML from %s: %s", path, exc)
                 out.errors.append(f"dml_extraction_error:{exc}")
+
+        # PR-6 (dynamic-SQL EXECUTE IMMEDIATE unwrap, Phase 1): the scripting path is
+        # how a DECLARE/BEGIN block (the WTFA dynamic-table file) reaches the parser.
+        # Surface any static-literal EXECUTE IMMEDIATE inner DDL into out.statements so
+        # the recovered CREATE produces a SqlQuery + SELECTS_FROM edges and inner temp
+        # targets register role="temp".  Then compose transitive temp edges (Phase 2) —
+        # this is the ONLY _emit_transitive_temp_edges call on the scripting path, which
+        # otherwise never reaches the AnsiParser post-loop composition at :264.
+        self._emit_dynamic_sql_statements_scripting(
+            sql, path, out, sources_map, _active_schema(len(sql))
+        )
+        AnsiParser._emit_transitive_temp_edges(self, out)  # type: ignore[arg-type]
 
         # PR 3 — clear namespace after parsing
         self._current_file_namespace = None
