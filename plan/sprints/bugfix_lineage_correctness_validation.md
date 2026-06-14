@@ -1,9 +1,13 @@
 # Feature Plan: Bugfix — Lineage-Correctness Validation Findings (#2, #4, #5)
 
-**Status: REVIEWED** (plan-reviewer returned REWORK — 1 blocker + 1 warning; shepherd
-folded both 2026-06-14: PR-A narrowed to DDL+CLONE-catalogued disambiguation, the
-information_schema-only case moved to Non-Goals + a follow-up sprint; forbidden-path check
-PASSED, all anchors verified, four frozen perf suites pinned.)
+**Status: DRAFT** (REWORKED 2026-06-14 — maintainer DECISION: do NOT ship the
+narrowed DDL+CLONE-only qualify-schema merge for Bug #5; it does not fix the
+dominant LIVE shape, where the second join table is catalogued *only* via
+information_schema. Bug #5 is replaced by option (b): a **post-index
+re-resolution pass** that disambiguates unqualified join columns against the
+backend's `HAS_COLUMN(source='information_schema')` rows AFTER indexing — the
+information_schema case is now **IN scope**. PR-B (Bug #4 star-expansion) is
+KEPT AS-IS. A fresh plan-reviewer gate runs next.)
 
 ## Summary
 
@@ -15,7 +19,7 @@ the spaced/quoted-identifier work (#153 — **out of scope here**).
 
 | Bug | Severity | One-line | Verified |
 |-----|----------|----------|----------|
-| #5 | MAJOR | Unqualified columns in a 2-table join bind to the FIRST table (or drop entirely) | CONFIRMED (root cause = sqlglot `validate_qualify_columns=False` first-table fallback; catalog not reaching qualify) |
+| #5 | MAJOR | Unqualified columns in a 2-table join all bind to the FIRST table (or drop), because the SECOND table's columns are catalogued only via information_schema and never reach parse-time qualify | CONFIRMED (root cause = parse-time qualify cannot see information_schema columns; they enter post-index) |
 | #4 | MAJOR | `INSERT … SELECT *` `_TMP`→persisted produces no column edge | CONFIRMED, **but only in a narrower shape than reported** (see §Bug #4) |
 | #2 | MAJOR | Multi-column staging temp resolves as 1-of-14 columns → upstream of a payment fact points at a PHANTOM backup table | CONFIRMED as a *consequence* of #4 + #5 (see §Bug #2) — not an independent root cause |
 
@@ -27,12 +31,40 @@ the spaced/quoted-identifier work (#153 — **out of scope here**).
 
 ---
 
+## Why the narrowed PR-A was abandoned (maintainer decision, 2026-06-14)
+
+The prior REVIEWED draft narrowed PR-A to: merge `ddl_columns_by_bare` (parsed
+`CREATE TABLE`/`CREATE VIEW` DDL + CLONE-inherited columns) into the per-statement
+`qualify()` schema dict, so the second join table's columns are visible at qualify
+time. That fix is correct **only** when the second table's DDL is parsed in the
+indexed corpus.
+
+The dominant LIVE Bug #5 shape is the opposite: the second join table's columns
+live **only** in `HAS_COLUMN(source='information_schema')`, loaded **post-index**
+by `apply_catalog_to_backend`
+([`catalog.py:202-245`](src/sqlcg/cli/commands/catalog.py)) — they are NEVER in
+`ddl_columns_by_bare` ([`aggregator.py:91-103`](src/sqlcg/lineage/aggregator.py))
+and NEVER reach parse-time `qualify()`
+([`base.py:1162-1170`](src/sqlcg/parsers/base.py)). The maintainer's verdict:
+shipping the narrowed merge would pass CI on DDL-only fixtures while leaving the
+live failure intact (the v1.21.0-class green-on-toy-fixture trap). **Do not ship
+it.** Plan option (b) — a post-index re-resolution pass — instead.
+
+Feeding information_schema columns INTO parse-time `qualify()` is the **forbidden
+path** (CLAUDE.md "Schema resolution" + "Performance invariants"): the
+measured-zero, perf-regressing hot-loop cost class. Option (b) stays entirely in
+the **post-index world** the catalog already lives in.
+
+---
+
 ## Scope
 
 ### In Scope
-- Bug #5: disambiguate unqualified columns in multi-table joins using the DDL +
-  information_schema catalog already available to the parser, instead of letting
-  sqlglot silently bind them to the first FROM/JOIN table.
+- **Bug #5 (option b):** a post-index re-resolution pass that disambiguates
+  unqualified columns in multi-table joins against the **full** catalog — DDL +
+  **information_schema** + usage — available only AFTER indexing in `HAS_COLUMN`.
+  This fixes the dominant live shape (second table catalogued via
+  `sqlcg catalog load` / information_schema), which the narrowed PR-A could not.
 - Bug #4: emit a real `COLUMN_LINEAGE` edge for `INSERT … SELECT *` promotes out
   of a `_TMP` table **whose columns are derivable** (the temp has a column-list
   DDL, an explicit-projection CTAS, or a catalogued upstream).
@@ -47,68 +79,68 @@ the spaced/quoted-identifier work (#153 — **out of scope here**).
   join's or temp's source table has NO columns anywhere in the graph (no DDL, no
   information_schema), these fixes degrade gracefully (no wrong edge) but cannot
   conjure the missing columns. That gap is explicitly out of scope.
-- Any parse-time feeding of CTE/CTAS *bodies* into `exp.expand()` / `qualify()`
-  (CLAUDE.md hard prohibition — the zero-measured-win, perf-regressing path).
+- Any parse-time feeding of CTE/CTAS *bodies* — or information_schema columns — into
+  `exp.expand()` / `qualify()` (CLAUDE.md hard prohibition — the zero-measured-win,
+  perf-regressing path). Option (b) does NOT touch parse-time qualify.
+- **Disambiguation when a bare column name exists on BOTH source tables and the
+  catalog cannot break the tie** (e.g. both tables have a `status` column). Option
+  (b) resolves the *unambiguous* case (the bare name exists on exactly one of the
+  query's source tables) and OVER-ATTRIBUTES the genuinely-ambiguous case (one edge
+  per candidate table, low confidence) — the same safe failure mode the existing
+  `CTE_PROJECTION_AMBIGUOUS` path already uses
+  ([`base.py:1725-1740`](src/sqlcg/parsers/base.py)). It never silently picks one.
 - Changing the star-expansion SQL to iterate to a fixpoint across arbitrarily deep
   temp chains (the single-pass expansion already chains 2 levels when the leaf is
   catalogued; deeper chains are a separate measured question).
+
+> **NOTE — what moved IN scope vs. the prior draft.** The prior REVIEWED draft
+> listed "information_schema-only join-column disambiguation" as a Non-Goal /
+> follow-up. That follow-up is now THIS sprint's PR-5 (option b). The XML-DDL
+> coverage gap (source table absent from the graph entirely) remains out of scope.
 
 ---
 
 ## Root-Cause Analysis (verified against current source)
 
-### Bug #5 — unqualified columns in a 2-table join
+### Bug #5 — unqualified columns in a 2-table join (option b)
 
 **Symptom (live DWH):** in a join of two tables, unqualified column references all
 resolve to the FIRST table, so the second source table gets no edge.
 
 **Reproduced (current tree):**
 ```sql
-SELECT amount, status FROM orders o JOIN customers c ON o.cid = c.id
+INSERT INTO tgt SELECT amount, status
+FROM orders o JOIN customers c ON o.cid = c.id
+-- orders: parsed DDL.  customers: catalogued ONLY via `sqlcg catalog load`.
 ```
 - With **no catalog for `orders`/`customers`**: both columns hit
-  `col_lineage_skip:dynamic_source` → **zero edges emitted** (not even to the first
-  table). sqlglot's `qualify(..., validate_qualify_columns=False)` leaves the
-  columns unqualified (`amount AS amount`), so `build_scope`/`sg_lineage` cannot
-  attach them to any table.
-- With a **correct schema** passed to `qualify`, sqlglot binds them correctly
-  (`amount → orders`, `status → customers`) — verified directly against sqlglot.
-- The "all bind to the FIRST table" symptom is the live-DWH manifestation: when
-  the schema is *partial* (the column exists on the first table but the second
-  table's columns are absent from the catalog), `validate_qualify_columns=False`
-  greedily assigns every unqualified column to the first relation that plausibly
-  owns it — the first FROM table.
+  `col_lineage_skip:dynamic_source` → zero edges, or sqlglot binds both to the
+  first relation (`amount → orders`, `status → orders`).
+- With `customers` in **information_schema only**: parse-time `qualify()` cannot
+  see it (information_schema is post-index), so `status` is mis-bound to `orders`
+  (or dropped). The wrong edge is `orders.status → tgt.status`; the correct edge
+  `customers.status → tgt.status` is MISSING.
 
-**Root cause:**
+**Root cause (parse-time, unfixable at qualify):**
 [`base.py:1162-1170`](src/sqlcg/parsers/base.py) — the per-statement `qualify()`
-call already receives `schema=schema`, but `schema` is built ONLY from
-`SchemaResolver.as_dict()` ([`ansi_parser.py:184`](src/sqlcg/parsers/ansi_parser.py)),
-which is populated from parsed `CREATE TABLE` DDL bodies. The richer catalog —
-`ddl_columns_by_bare` — is threaded into `_extract_column_lineage`
-([`base.py:1029`](src/sqlcg/parsers/base.py)) but is **only consulted for
-positional-INSERT ordinal mapping** ([`base.py:1333-1336`](src/sqlcg/parsers/base.py)).
-It is **never merged into the `schema=` dict that `qualify` uses to disambiguate
-join columns.**
+receives `schema=schema`, built ONLY from `SchemaResolver.as_dict()`
+([`ansi_parser.py:184`](src/sqlcg/parsers/ansi_parser.py)) (parsed-DDL bodies).
+information_schema columns enter the graph only post-index via
+`apply_catalog_to_backend` ([`catalog.py:202-245`](src/sqlcg/cli/commands/catalog.py)),
+emitting `HAS_COLUMN(source='information_schema')` directly to the backend. **They
+are structurally unavailable at qualify time.** No parse-time merge can fix this
+case without reintroducing the forbidden information_schema-into-qualify path.
 
-> **CORRECTION (plan-review REWORK, folded by shepherd):** an earlier draft claimed
-> `ddl_columns_by_bare` contains "DDL **plus** information_schema **plus** CLONE". That
-> is FALSE against the current tree. `ddl_columns_by_bare` is populated ONLY from parsed
-> `CREATE TABLE`/`CREATE VIEW` DDL ([`aggregator.py:96-103`](src/sqlcg/lineage/aggregator.py))
-> plus CLONE resolution ([`aggregator.py:150-157`](src/sqlcg/lineage/aggregator.py)).
-> **information_schema columns NEVER reach qualify time** — they enter post-index via
-> `apply_catalog_to_backend` ([`catalog.py:202-243`](src/sqlcg/cli/commands/catalog.py)),
-> emitting `HAS_COLUMN(source='information_schema')` directly to the backend AFTER parsing.
-> **Consequence:** PR-A (merging `ddl_columns_by_bare` into the qualify schema) can
-> disambiguate joins ONLY for tables whose DDL is parsed in the indexed corpus (plus
-> CLONE-inherited columns). The information_schema-only case — likely the dominant LIVE
-> Bug #5 shape — is **NOT** fixed by PR-A and is now an explicit **Non-Goal** (see below);
-> full coverage needs a separate post-index re-qualify design (tracked as a follow-up).
+**The fix must therefore run post-index**, when the full catalog is present.
 
-**This is NOT the forbidden path.** CLAUDE.md prohibits passing CTE/CTAS *bodies*
-into `exp.expand()`/`qualify()`. Passing a column-NAME `schema` dict to `qualify`
-is the existing, sanctioned mechanism (the `schema=schema` arg already present).
-Merging catalogue column NAMES into that same dict is additive and stays
-once-per-statement.
+> **This is NOT the forbidden path.** CLAUDE.md prohibits feeding schema-CSV /
+> information_schema / CTE-CTAS bodies into `exp.expand()`/`qualify()` in the
+> parser hot loop. Option (b) adds NO parser-loop work: it (a) emits a lightweight
+> parse-time *marker* for ambiguous bare join columns (one row per such column,
+> built inside the existing once-per-statement projection loop with the same
+> cardinality as the existing `CTE_PROJECTION_AMBIGUOUS` emit), and (b) resolves
+> those markers in a **post-index SQL pass** against `HAS_COLUMN`, mirroring
+> `expand_star_sources` ([`duckdb_backend.py:843-869`](src/sqlcg/core/duckdb_backend.py)).
 
 ### Bug #4 — `INSERT … SELECT *` `_TMP`→persisted promote, no column edge
 
@@ -175,120 +207,235 @@ compound effect of #4 and #5 on a real payment-fact pipeline:
    IS catalogued — producing the phantom edge.
 
 **Verification approach for the fix:** a fixture that models a 14-column staging
-temp (explicit CTAS projection), a real source **whose columns are resolvable at the
-relevant stage**, AND a same-bare-named backup table with DDL, asserting (a) all 14 temp
-columns get `HAS_COLUMN`, (b) the payment-fact promote edges point at the real source's
-columns, and (c) **no** edge points at the backup table.
+temp (explicit CTAS projection), a real source **catalogued via the same route the
+live corpus uses** (information_schema via `sqlcg catalog load` — now resolvable
+through PR-5's post-index pass), AND a same-bare-named backup table with DDL,
+asserting (a) all 14 temp columns get `HAS_COLUMN`, (b) the payment-fact promote
+edges point at the real source's columns, and (c) **no** edge points at the backup
+table.
 
-> **REWORK gap #2 (folded):** the "real source" MUST be given **parsed `CREATE TABLE`
-> DDL** (so its columns are in `as_dict()`/`ddl_columns_by_bare` at qualify/derivation
-> time) — NOT an information_schema-only catalog entry, which would not resolve via this
-> sprint's mechanism and would make the fixture fail for a reason unrelated to the fix.
-> If the intent is to model the information_schema-cataloged source, that goes through
-> **PR-B's `sqlcg catalog load` path** and the fixture must state explicitly which
-> resolution route it exercises. Do not conflate the two catalog sources. This is the criterion the v1.21.0-class dual-write green-on-toy-fixture
-failure warns about — the fixture MUST contain the backup table so the phantom edge
-*can* appear if the fix is wrong.
+> The fixture MUST contain the backup table so the phantom edge *can* appear if the
+> fix is wrong — this is the criterion the v1.21.0-class dual-write
+> green-on-toy-fixture failure warns about. The real source is now catalogued via
+> **information_schema** (PR-5's resolution route), not parsed DDL, so the fixture
+> models the live configuration that produced the phantom.
 
 ---
 
-## Non-Goals (explicit — folded from plan-review REWORK)
+## PR Sequencing (REWORKED)
 
-- **information_schema-only join-column disambiguation.** PR-A enriches the qualify
-  schema from `ddl_columns_by_bare` (parsed DDL + CLONE only). Tables catalogued
-  *exclusively* via `sqlcg catalog load` (information_schema) are invisible at qualify
-  time and remain ambiguous → today's graceful first-table/`dynamic_source` behavior is
-  unchanged for them. **This likely leaves the dominant LIVE Bug #5 shape unfixed by this
-  sprint.** Closing it requires a separate, larger **post-index re-qualify** design
-  (reviewer's "option (b)") that re-resolves join columns against the backend's
-  information_schema `HAS_COLUMN` rows after indexing — out of scope here because it
-  changes the hot-loop contract and needs its own plan-review. **Tracked as a follow-up
-  (next sprint).**
-- **Star-from-star where the ROOT source has no columns anywhere** (no DDL, no
-  information_schema) — the XML-DDL coverage gap (Bug #4 residue), unchanged.
+Two code PRs. **PR-5** (Bug #5, option b — the post-index re-resolution pass) is now
+the larger, higher-blast-radius change: it adds a parse-time marker, a new edge
+table, a schema-version bump, and a post-index SQL pass. **PR-4** (Bug #4 — temp
+star-column derivation; KEPT AS-IS from the prior draft's PR-B) is unchanged.
+Bug #2's acceptance is the integration criterion verified after BOTH land.
 
-## PR Sequencing (by risk; combined where files overlap, split where they don't)
+Sequence: **PR-5 first** (it establishes the post-index resolution machinery and the
+full-catalog HAS_COLUMN read that Bug #2's correct-source attribution depends on),
+then **PR-4** (temp-column derivation + the star-expansion contract). Bug #2's
+compound acceptance is checked last.
 
-Two PRs. Bug #5 and Bug #2 both center on `base.py` qualify/schema handling and
-share the catalog-merge mechanism → **PR-A**. Bug #4 centers on temp-column
-derivation (`ansi_parser.py` + indexer/star-expansion) → **PR-B**. Bug #2's
-acceptance is the integration criterion verified after **both** land.
-
-Sequence: **PR-A first** (lowest blast radius — it only *enriches* the schema dict
-qualify already receives), then **PR-B** (touches column derivation + the
-star-expansion contract). Bug #2's compound acceptance is checked last.
+> **Why PR-5 before PR-4 (changed from the prior PR-A→PR-B order):** Bug #2's
+> phantom-backup misattribution is driven *primarily* by the join columns binding to
+> the wrong table (#5), and the correct-source resolution now depends on PR-5's
+> post-index pass reading information_schema. Landing PR-5 first lets the Bug #2
+> acceptance test exercise the real resolution route. The two PRs otherwise touch
+> disjoint code paths.
 
 ---
 
-### PR-A — Bug #5: catalog-aware join-column disambiguation
+### PR-5 — Bug #5: post-index re-resolution of unqualified join columns (option b)
 
-**Problem:** unqualified columns in multi-table joins bind to the first FROM table
-(or drop) because the per-statement `qualify()` schema omits the **CLONE-inherited
-DDL catalog columns** present in `ddl_columns_by_bare` but absent from
-`SchemaResolver.as_dict()`. (information_schema-only tables are out of scope — see
-Non-Goals; they never reach qualify time.)
+**Problem:** unqualified columns in a multi-table join bind to the FIRST table (or
+drop) because the second table's columns are catalogued ONLY via information_schema,
+which is unavailable at parse-time `qualify()`. The correct binding is only knowable
+AFTER indexing, when `HAS_COLUMN(source='information_schema')` rows exist.
 
-**Root-cause file:line:**
-- [`base.py:1162-1170`](src/sqlcg/parsers/base.py) — `qualify(..., schema=schema)`.
-- [`base.py:1333-1336`](src/sqlcg/parsers/base.py) — `ddl_columns_by_bare` consulted
-  only for positional-INSERT, never merged into `schema`.
-- [`ansi_parser.py:184`](src/sqlcg/parsers/ansi_parser.py) — `schema_dict` built from
-  `SchemaResolver.as_dict()` only.
+**Design — two cooperating pieces (parse-time marker + post-index resolver),
+mirroring the existing `STAR_SOURCE` → `expand_star_sources` pattern:**
 
-**Proposed fix (design):**
-- **Once per statement, before the column loop**, build the qualify `schema` dict by
-  merging the source tables' catalog column NAMES from `ddl_columns_by_bare` into the
-  existing `schema` dict, keyed by the bare table name as it appears in the FROM/JOIN.
-  - Build the merged dict ONCE per statement (not per column) — identical cardinality
-    to the existing once-per-statement `qualify` call.
-  - Only column NAMES are merged (sqlglot's qualify needs names, not types — produce
-    the name-list form `{table: [col, …]}` that `as_dict` already produces).
-  - Precedence: existing `as_dict()` parsed-DDL schema entries win over
-    `ddl_columns_by_bare` entries on collision. (Both are DDL-sourced; the only delta
-    `ddl_columns_by_bare` adds is CLONE-inherited columns + the bare-name keying.
-    information_schema is NOT in either source at qualify time.)
-- Pass the merged dict as `schema=` to the **first** `qualify` attempt
-  ([`base.py:1163`](src/sqlcg/parsers/base.py)). The existing schema-free retry on
-  failure ([`base.py:1177-1184`](src/sqlcg/parsers/base.py)) stays untouched.
-- **Constant alignment:** the bare-name key form MUST match `ddl_columns_by_bare`'s
-  key convention (lowercased bare name — confirm against `CrossFileAggregator`
-  before implementing) and the `SchemaResolver.as_dict()` nesting
-  (`{catalog: {db: {table: [cols]}}}` per [`schema_resolver.py:158`](src/sqlcg/lineage/schema_resolver.py)).
-  The developer must trace the exact `as_dict` shape and produce a merged dict in the
-  SAME shape — do not invent a flat shape qualify won't accept.
+#### Piece 1 — parse-time marker (no new hot-loop op)
 
-**Acceptance criteria (observable — assert real edges):**
-- [ ] `SELECT amount, status FROM orders o JOIN customers c ON o.cid=c.id`, with
-      `orders` catalogued via parsed DDL and `customers` catalogued via a CLONE-inherited
-      entry in `ddl_columns_by_bare` (NOT information_schema — that path never reaches
-      qualify), emits `orders.amount → tgt.amount` AND `customers.status → tgt.status`-style
-      edges — i.e. the SECOND table gets an edge. Assert BOTH edges exist and that NO edge
-      attributes `status` to `orders`.
-- [ ] A 3+-column unqualified-join projection where columns split across both tables
-      attributes each column to its correct owning table.
-- [ ] Regression: an already-qualified join (`a.x, b.y`) is unchanged (still emits
-      the same edges) — no double-counting, no new skip markers.
-- [ ] Degrade: when neither source table is catalogued, behavior is unchanged from
-      today (graceful `dynamic_source` skip; no wrong first-table edge fabricated).
+Today the top-level INSERT…SELECT projection loop calls `sg_lineage` per projection
+and emits an edge to whatever table sqlglot bound the bare column to
+([`base.py:1421-1440`](src/sqlcg/parsers/base.py) and the main column loop below
+it). The CTE branch already has the precedent we extend: when a CTE body has ≥2
+source tables and a bare column, it does NOT trust sqlglot's mis-bind — it emits one
+`CTE_PROJECTION_AMBIGUOUS` edge per candidate source table
+([`base.py:1701-1740`](src/sqlcg/parsers/base.py)).
 
-**Test strategy:**
-- Unit (parser): drive `SnowflakeParser.parse_file` (or `_extract_column_lineage`)
-  with a `ddl_columns_by_bare` modelling one parsed-DDL source and one CLONE-inherited
-  source (both are what `ddl_columns_by_bare` can actually hold at qualify time); assert
-  the emitted `LineageEdge` src tables.
-  Fixture MUST use realistic aliasing (`o`, `c`) and at least one column present on
-  BOTH tables to exercise the disambiguation (the failure mode cannot appear if every
-  column is unique to one table).
-- Integration (end-to-end via `sqlcg index`): index a fixture dir with a DDL file +
-  an information_schema catalog load + the join ETL; assert the `COLUMN_LINEAGE`
-  rows in DuckDB point at the correct source tables.
+PR-5 extends that *same* over-attribution-instead-of-mis-bind discipline to the
+TOP-LEVEL join projection, but **defers resolution to post-index** instead of
+emitting one edge per candidate immediately:
 
-**Version bump:** patch → **1.32.2** (bug fix only; no new surface).
+- When a top-level projection's expression contains a **bare** column (`exp.Column`
+  with no `.table` qualifier) AND the statement's source set has **≥2 tables**,
+  the parser records a marker row instead of the sqlglot edge for that column:
+  `JOIN_COL_RESOLVE(query_id, dst_col_id, bare_col)`.
+- This is built INSIDE the existing once-per-projection loop — the bare-column scan
+  (`expr.find_all(exp.Column)`) is the SAME scan the `CTE_PROJECTION_AMBIGUOUS` path
+  already runs ([`base.py:1720-1724`](src/sqlcg/parsers/base.py)), and the
+  source-table count is the SAME `query_sources` already computed once per statement.
+  **No new `qualify`/`build_scope`/`exp.expand`/`sg_lineage` call is added; no new
+  per-column op is added to the hot loop** — the marker is a dict-append, identical
+  in cardinality to the existing edge append.
+- **Marker storage:** a new edge table `JOIN_COL_RESOLVE`
+  (`src_key=query_id`, `dst_key=<dst_table>.<dst_col>` SqlColumn id, plus a `bare_col`
+  VARCHAR column) added to `_EDGE_DDLS`
+  ([`duckdb_backend.py:111-202`](src/sqlcg/core/duckdb_backend.py)) and to `RelType`
+  ([`schema.py:19-31`](src/sqlcg/core/schema.py)). Bump `SCHEMA_VERSION` from `"9"`
+  to `"10"` ([`schema.py:6`](src/sqlcg/core/schema.py)) — re-index is the migration
+  path (CLAUDE.md "No backward compatibility"). Add it to `clear_all_tables`
+  ([`duckdb_backend.py:894-907`](src/sqlcg/core/duckdb_backend.py)) and the
+  file-delete cascade ([`duckdb_backend.py:745-770`](src/sqlcg/core/duckdb_backend.py))
+  so reindex/incremental delete the temp markers like any other query-scoped edge.
+  Register its property list in the prop-name map next to the other edges
+  ([`duckdb_backend.py:301-303`](src/sqlcg/core/duckdb_backend.py)).
+
+> **Marker-vs-edge precedence (developer to confirm against the over-attribution
+> precedent):** the marker must SUPPRESS the sqlglot mis-bind edge for that
+> projection (otherwise the wrong `orders.status` edge survives alongside the
+> resolved one). The cleanest design mirrors the CTE branch: for an ambiguous bare
+> top-level projection, the parser emits NO COLUMN_LINEAGE edge for that column and
+> emits the marker instead — exactly as the CTE branch `continue`s past `sg_lineage`
+> after emitting `CTE_PROJECTION_AMBIGUOUS` ([`base.py:1740`](src/sqlcg/parsers/base.py)).
+> The post-index pass is then the SOLE producer of that column's edges. Qualified
+> projections (`o.amount`) are untouched: they have a `.table`, fail the bare test,
+> take the existing `sg_lineage` path unchanged.
+
+#### Piece 2 — post-index SQL resolver (mirrors `expand_star_sources`)
+
+A new backend method `resolve_join_columns()` on `DuckDBBackend`
+([`duckdb_backend.py`](src/sqlcg/core/duckdb_backend.py), next to
+`expand_star_sources` at line 843) and a query in
+[`queries.sql`](src/sqlcg/core/queries.sql) (next to `EXPAND_STAR_SOURCES_LINEAGE`).
+It resolves each `JOIN_COL_RESOLVE` marker against the full post-index catalog:
+
+```sql
+-- RESOLVE_JOIN_COLUMNS (sketch — developer writes the exact DML)
+-- For each marker (query_id, bare_col, dst): find which of the query's
+-- SELECTS_FROM source tables OWNS a column named bare_col (any HAS_COLUMN
+-- source: ddl | information_schema | star_expansion | usage).  Emit a
+-- COLUMN_LINEAGE edge src=<owning_table>.<bare_col> → dst.
+INSERT OR REPLACE INTO "COLUMN_LINEAGE"
+  (src_key, dst_key, transform, confidence, query_id, inferred_from_source_name)
+SELECT
+  hc.dst_key                AS src_key,   -- the owning table's SqlColumn id
+  m.dst_key                 AS dst_key,
+  'JOIN_COL_RESOLVED'       AS transform,
+  <conf>                    AS confidence,
+  m.src_key                 AS query_id,
+  FALSE                     AS inferred_from_source_name
+FROM "JOIN_COL_RESOLVE" m
+JOIN "SELECTS_FROM" sf  ON sf.src_key = m.src_key        -- query's source tables
+JOIN "HAS_COLUMN"   hc  ON hc.src_key = sf.dst_key       -- columns those tables own
+JOIN "SqlColumn"    c   ON c.id = hc.dst_key AND c.col_name = m.bare_col
+...
+```
+
+**Confidence / over-attribution rule (the disambiguation contract):**
+- **Exactly one** source table owns `bare_col` → high confidence (e.g. `0.9`); this
+  is the resolved, correct edge — the dominant live case (the second table is now
+  visible via information_schema).
+- **More than one** source table owns `bare_col` → genuinely ambiguous: emit ONE
+  edge per owning table at LOW confidence (e.g. `0.5`, mirroring
+  `CTE_PROJECTION_AMBIGUOUS`'s `confidence=0.5`
+  [`base.py:1737`](src/sqlcg/parsers/base.py)). Over-attribution is the documented
+  safe failure mode for impact analysis — never silently pick one.
+- **Zero** source tables own `bare_col` (no DDL, no information_schema anywhere) →
+  emit NOTHING (honest empty; the XML-DDL coverage gap, a Non-Goal). The marker
+  produces no fabricated first-table edge.
+
+> The high/low-confidence split can be done either in one SQL pass with a window
+> COUNT over owning tables, or in two passes; the developer chooses, but the
+> observable contract above is fixed by the acceptance criteria.
+
+**Pipeline hook (constant alignment — critical):** the resolver MUST run AFTER the
+catalog is applied, so information_schema columns are present in `HAS_COLUMN`. The
+index pipeline order is fixed at
+[`indexer.py:849-883`](src/sqlcg/indexer/indexer.py):
+`_expand_star_sources` (line 850) → external consumers → `set_indexed_sha` →
+`_reapply_catalog_if_configured` (line 881, `_t_catalog_end` at 883). PR-5 inserts
+the new call `self._resolve_join_columns(db)` **immediately after line 883**, before
+the error-classification block at line 885. Add a thin
+`_resolve_join_columns(self, db)` wrapper next to `_expand_star_sources`
+([`indexer.py:1922-1931`](src/sqlcg/indexer/indexer.py)) that calls
+`db.resolve_join_columns()` and returns the count, plus the `GraphBackend` ABC stub
+next to `expand_star_sources` ([`graph_db.py:257-263`](src/sqlcg/core/graph_db.py)).
+
+> **Constant-alignment notes for the developer (do not guess):**
+> - `SqlColumn.id` = `<table_qualified>.<col_name>`
+>   ([`queries.sql:97-104`](src/sqlcg/core/queries.sql)); `SELECTS_FROM.dst_key` =
+>   the source table's `qualified`. The resolver DML must use these exact key forms.
+> - The marker's `dst_key` must equal the SqlColumn id the original projection would
+>   have produced (`<dst_table>.<dst_col_name>`), using the SAME `ColumnRef`/`dst_table`
+>   resolution the existing projection loop uses
+>   ([`base.py:1730`](src/sqlcg/parsers/base.py)), so the resolved edge keys match the
+>   rest of the graph.
+> - The bare-name key for `JOIN_COL_RESOLVE.bare_col` must match the parsed bare name
+>   (`exp.Column.name`) and the `SqlColumn.col_name` stored by the catalog
+>   ([`catalog.py:184`](src/sqlcg/cli/commands/catalog.py)) — confirm casing
+>   (information_schema rows store `col_name` as exported; the ambiguous-bare key
+>   convention in the aggregator is lowercased
+>   [`aggregator.py:96`](src/sqlcg/lineage/aggregator.py)). Trace which casing
+>   `SqlColumn.col_name` actually carries before writing the equality join.
+> - `SCHEMA_VERSION` lives at [`schema.py:6`](src/sqlcg/core/schema.py); the schema
+>   gate rejects a stale DB on re-open, so the bump forces a clean re-index.
+
+**Acceptance criteria (observable — assert real edges; run against a DB indexed
+with an information_schema catalog loaded):**
+- [ ] **Dominant live case.** Fixture: `orders` parsed-DDL with column `amount`;
+      `customers` catalogued ONLY via `sqlcg catalog load` (information_schema) with
+      column `status`; ETL `INSERT INTO tgt SELECT amount, status FROM orders o JOIN
+      customers c ON o.cid=c.id`. After index + catalog load, the `COLUMN_LINEAGE`
+      rows include `orders.amount → tgt.amount` AND `customers.status → tgt.status`.
+      Assert BOTH edges exist, and that NO edge attributes `status` to `orders`. This
+      is the case the narrowed PR-A could NOT fix.
+- [ ] **Both sources get edges.** A 3+-column unqualified-join projection where
+      columns split across both tables attributes each column to its correct owning
+      table (`orders` columns → orders, `customers` columns → customers), with one
+      table catalogued via DDL and the other via information_schema.
+- [ ] **Genuine ambiguity → over-attribute, never mis-pick.** When `bare_col` exists
+      on BOTH source tables, the pass emits one `JOIN_COL_RESOLVED` edge per owning
+      table at the documented low confidence — never a single confident wrong edge.
+- [ ] **Safe-identifier regression.** An already-qualified join (`o.amount, c.status`)
+      is unchanged: no marker emitted, no `JOIN_COL_RESOLVED` edge, the existing
+      `sg_lineage` edges are byte-identical to today (same src/dst/transform). Assert
+      the qualified case produces ZERO `JOIN_COL_RESOLVE` markers.
+- [ ] **Degrade (XML-DDL gap).** When neither source table is catalogued anywhere
+      (no DDL, no information_schema), the pass emits NO edge for the bare column and
+      NO fabricated first-table edge — honest empty, matching today's graceful skip.
+- [ ] **No mis-bind survivor.** For the dominant-case fixture, assert there is NO
+      stray `orders.status → tgt.status` edge left over from the suppressed sqlglot
+      bind (the marker must replace, not augment, the mis-bind).
+
+**Test strategy (describe by behavior; developer names tests
+`test_<unit>_<scenario>_<expected>` and links this plan in the docstring):**
+- Integration (end-to-end, the load-bearing tier): index a fixture dir containing a
+  DDL file for `orders`, an information_schema catalog CSV cataloguing `customers`,
+  and the join ETL; run `sqlcg catalog load` (or configure `[sqlcg.catalog]` so the
+  index reapplies it); assert the `COLUMN_LINEAGE` rows in DuckDB. The fixture MUST
+  catalogue the second table via the information_schema CSV route — NOT parsed DDL —
+  so it exercises the exact path the narrowed PR-A could not, and models the live
+  configuration (USE SCHEMA context / schema aliases as the live corpus has them).
+  Fixtures MUST use realistic aliasing (`o`, `c`).
+- Unit (parser): assert that a ≥2-table top-level join projection with a bare column
+  emits a `JOIN_COL_RESOLVE` marker (and suppresses the sqlglot edge), while a
+  qualified projection emits none. Verify the marker carries the correct
+  `query_id` / `bare_col` / `dst` keys.
+- Unit (resolver SQL): seed `JOIN_COL_RESOLVE` + `SELECTS_FROM` + `HAS_COLUMN`
+  (one row `source='information_schema'`) directly and assert `resolve_join_columns()`
+  emits the right `COLUMN_LINEAGE` rows for the one-owner, two-owner, and zero-owner
+  cases.
+
+**Version bump:** minor → **1.33.0** (new edge table + new post-index pass +
+SCHEMA_VERSION bump = new surface/capability; SemVer per CLAUDE.md "Releasing").
 Update [`pyproject.toml`](pyproject.toml), [`src/sqlcg/__init__.py`](src/sqlcg/__init__.py),
 `uv lock`.
 
 **Live-DWH index slot:** YES (recommended for final acceptance) — re-run the live
-validation join case and confirm second-table edges appear. Not required for CI.
+validation join case and confirm second-table (information_schema-catalogued) edges
+appear. Not required for CI.
 
 **Perf-invariant constraint (CLAUDE.md):**
 - The four frozen suites — [`test_T09_01_qualify_once.py`](tests/unit/test_T09_01_qualify_once.py),
@@ -296,16 +443,25 @@ validation join case and confirm second-table edges appear. Not required for CI.
   [`test_upsert_batch_invariant.py`](tests/unit/test_upsert_batch_invariant.py),
   [`test_perf_scaling_guard.py`](tests/unit/test_perf_scaling_guard.py) — MUST pass
   UNMODIFIED.
-- The schema-merge MUST be built **once per statement, before the column loop** — NO
-  new per-column op in the `base.py` hot loop. No new `qualify`/`build_scope`/
-  `exp.expand`/`sg_lineage` call is added; the existing single `qualify` call simply
-  receives a richer (already-constructed) dict.
-- Add a behavioural assertion to the scaling guard if a new per-statement op-count
-  axis is warranted (merge built once, not N_cols times).
+- **No new per-column op in `base.py`'s hot loop.** The marker emit reuses the
+  existing once-per-projection bare-column scan and the once-per-statement
+  source-table set; it adds NO `qualify`/`build_scope`/`exp.expand`/`sg_lineage`
+  call. If a new per-statement op-count axis is warranted, add a behavioural
+  assertion to the scaling guard (marker emit is once-per-ambiguous-projection, never
+  re-qualifies).
+- The post-index resolver is a constant number of `execute()` calls (mirrors
+  `expand_star_sources`'s three-step DML) — it does NOT scale per column or per file.
+  It runs ONCE per index_repo call, after the catalog reapply, like the star pass.
+  It MUST use set-based SQL (one INSERT … SELECT), never a Python row loop calling
+  `upsert_*` per marker (bulk-upsert invariant).
 
 ---
 
-### PR-B — Bug #4: derive temp columns for `SELECT *` CTAS so the promote star expands
+### PR-4 — Bug #4: derive temp columns for `SELECT *` CTAS so the promote star expands
+
+> **KEPT AS-IS from the prior draft's PR-B.** Renamed PR-B → PR-4 only for
+> sequencing clarity; design, root cause, acceptance, and perf constraints are
+> unchanged.
 
 **Problem:** `INSERT … SELECT *` out of a `_TMP` produces no edge when the temp was
 built as `CREATE TEMP … AS SELECT *` from a source — the temp has no `HAS_COLUMN`
@@ -330,7 +486,7 @@ rows, so the promote's `STAR_SOURCE` expansion finds nothing to expand.
   repro showed a `STAR_SOURCE(query0 → raw_src)` row already exists for the CTAS.
   **Developer must first re-confirm whether Option 1 is already satisfied** (i.e. the
   only residual break is when `src` itself has no columns anywhere — a Non-Goal). If
-  so, narrow PR-B to the information_schema-catalogued-source guarantee + the Bug #2
+  so, narrow PR-4 to the information_schema-catalogued-source guarantee + the Bug #2
   phantom guard, and pin the working chains as regression guards.
 - **Option 2 (if Option 1 insufficient):** when `defined_columns` is empty for a
   CTAS whose body is `SELECT *` and the single source IS catalogued
@@ -360,7 +516,7 @@ rows, so the promote's `STAR_SOURCE` expansion finds nothing to expand.
 - Unit (parser): assert `defined_columns` / `star_sources` for the `SELECT *` CTAS
   temp shape.
 
-**Version bump:** patch → **1.32.3** (after PR-A merges; bug fix only).
+**Version bump:** patch → **1.33.1** (after PR-5 merges; bug fix only, no new surface).
 
 **Live-DWH index slot:** YES (recommended) — confirm the payment-fact promote chain
 appears against the real corpus.
@@ -372,23 +528,26 @@ star-expansion SQL stays single-pass (no fixpoint loop added in this PR).
 
 ---
 
-### Bug #2 compound acceptance (verified after PR-A + PR-B)
+### Bug #2 compound acceptance (verified after PR-5 + PR-4)
 
-Bug #2 has no standalone code PR — it is fixed by PR-A (correct join binding so all
-temp columns resolve) + PR-B (full temp-column population for star promotes). It
-gets a dedicated **integration acceptance test** that models the live failure:
+Bug #2 has no standalone code PR — it is fixed by PR-5 (correct join binding so all
+temp columns resolve to the right source, including the information_schema-catalogued
+real source) + PR-4 (full temp-column population for star promotes). It gets a
+dedicated **integration acceptance test** that models the live failure:
 
 **Acceptance criteria:**
 - [ ] A fixture with: a 14-column staging temp (`pay_stg_TMP`), a real source
-      (`payments` with 14 catalogued columns), a same-bare-named backup table
-      (`payment_fact_BACKUP` with DDL), and the promote
+      (`payments` with 14 columns **catalogued via information_schema**), a
+      same-bare-named backup table (`payment_fact_BACKUP` with DDL), and the promote
       `INSERT INTO payment_fact SELECT * FROM pay_stg_TMP`, produces:
   - all 14 `pay_stg_TMP` columns with `HAS_COLUMN`;
   - 14 `payment_fact.<col>` edges sourced from `payments.<col>` (via the temp);
   - **ZERO** `COLUMN_LINEAGE` edges attributing any `payment_fact` column to the
     backup table.
 - [ ] The fixture MUST contain the backup table with DDL so the phantom edge *can*
-      appear if the fix is incomplete (no green-on-toy-fixture).
+      appear if the fix is incomplete (no green-on-toy-fixture). The real source is
+      catalogued via information_schema (PR-5's resolution route), so the fixture
+      exercises the live configuration.
 
 **Live-DWH index slot:** YES — final acceptance re-runs the payment-fact validation
 case and confirms (a) 14-of-14 columns, (b) no phantom backup edge.
@@ -397,9 +556,11 @@ case and confirms (a) 14-of-14 columns, (b) no phantom backup edge.
 
 ## Cross-cutting constraints (apply to every PR)
 
-- **No backward compatibility** — re-index is the migration path (CLAUDE.md).
+- **No backward compatibility** — re-index is the migration path (CLAUDE.md). The
+  PR-5 SCHEMA_VERSION bump forces a clean re-index; that is the intended migration.
 - **No TODO in the happy path** of any fix.
-- **Every new method must have a grep-confirmed call site** before the PR opens.
+- **Every new method must have a grep-confirmed call site** before the PR opens
+  (`resolve_join_columns`, `_resolve_join_columns`).
 - **Path/constant fallbacks must match `KuzuConfig`** — never hardcode the DB path
   in fixtures; drive via `SQLCG_DB_PATH` or config.
 - **Tests assert observable output** (real edges in DuckDB / real `LineageEdge`
@@ -410,9 +571,13 @@ case and confirms (a) 14-of-14 columns, (b) no phantom backup edge.
 
 | Risk | Mitigation |
 |------|-----------|
-| PR-A schema merge accidentally feeds CTE/CTAS *bodies* into qualify (forbidden path) | Merge ONLY column NAME lists from the catalog, never `exp.Query` bodies. Plan-reviewer to confirm the merged dict contains no AST nodes. |
-| Per-column cost creep in `base.py` hot loop | Schema merge built once per statement before the loop; behavioural scaling-guard assertion. |
-| Bug #4 "fix" is a no-op because Option 1 is already satisfied | Developer re-confirms repro FIRST; if the catalogued-source chain already works, narrow PR-B to the information_schema variant + Bug #2 phantom guard. |
-| Green on a toy fixture that cannot exhibit the phantom (v1.21.0-class) | Bug #2 fixture mandates the backup table with DDL + a column shared across source and backup. |
-| qualify regresses on a corpus where a catalog entry is wrong | DDL precedence over information_schema; the schema-free retry path is the existing safety net. |
+| PR-5 marker emit accidentally reintroduces parse-time schema feeding (forbidden path) | The marker carries only NAMES (query_id, bare_col, dst keys) — never an AST node or schema dict; resolution is post-index SQL against HAS_COLUMN. Plan-reviewer to confirm no `schema=`/`sources=` change to the `qualify`/`expand` calls. |
+| Per-column cost creep in `base.py` hot loop | Marker emitted inside the existing once-per-projection bare-column scan; no new qualify/scope/expand/lineage call. Behavioural scaling-guard assertion: marker emit scales with ambiguous projections, NOT with re-qualify calls. |
+| Resolver scales per marker (Python row loop) | Resolver is a single set-based INSERT … SELECT (mirrors `expand_star_sources`), constant execute() count per index run; never a per-marker upsert. |
+| Resolver runs before catalog applied → information_schema columns missing | Hook the call AFTER `_reapply_catalog_if_configured` (indexer.py:881-883), verified pipeline order. Acceptance test indexes WITH a catalog load to prove the information_schema path. |
+| Green on a DDL-only fixture that can't exhibit the information_schema case (the v1.21.0 / narrowed-PR-A trap) | The dominant-case acceptance fixture catalogues the second table ONLY via the information_schema CSV route — NOT parsed DDL. A PASS requires the post-index pass to read information_schema. |
+| Mis-bind survivor: the suppressed sqlglot edge leaks alongside the resolved one | Explicit acceptance criterion asserting NO stray first-table edge; parser must replace (not augment) the mis-bind, mirroring the CTE branch `continue`. |
+| Genuine ambiguity (bare name on both tables) silently picks one | Over-attribute (one edge per owning table, low confidence) — documented safe failure mode; never a single confident wrong edge. |
+| Bug #4 "fix" is a no-op because Option 1 is already satisfied | Developer re-confirms repro FIRST; if the catalogued-source chain already works, narrow PR-4 to the information_schema variant + Bug #2 phantom guard. |
+| SCHEMA_VERSION bump breaks existing DBs | Intended — re-index is the migration path; the schema gate rejects stale DBs on re-open with a clear message. |
 | Uncatalogued source tables (XML-DDL gap) make some live cases still fail | Explicit Non-Goal; degrade is honest-empty, not wrong. Tracked separately. |
