@@ -1,6 +1,7 @@
 """End-to-end tests for git hook installation and execution."""
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -86,8 +87,10 @@ def test_hook_runs_sqlcg_reindex_on_branch_checkout(temp_git_repo):
 
     hook_content = hook_path.read_text()
 
-    # post-checkout must call sqlcg reindex --from $1 --to $2 (incremental resync)
-    assert "sqlcg reindex" in hook_content
+    # post-checkout must call reindex via the run-time-resolved $SQLCG_BIN (#126/#1):
+    # preferred path -> command -v sqlcg -> loud error.
+    assert '"$SQLCG_BIN" reindex' in hook_content
+    assert "command -v sqlcg" in hook_content
     assert '--from "$1"' in hook_content
     assert '--to "$2"' in hook_content
     assert "--dialect auto" in hook_content
@@ -112,8 +115,8 @@ def test_idempotency_no_duplicate_hook_lines(temp_git_repo):
     assert sentinel_count == 1, f"Expected 1 sentinel, found {sentinel_count}"
 
     # All three installs should report success/idempotency
-    hook_lines = content.count("sqlcg reindex")
-    assert hook_lines == 1, f"Expected 1 sqlcg reindex line, found {hook_lines}"
+    hook_lines = content.count('"$SQLCG_BIN" reindex')
+    assert hook_lines == 1, f"Expected 1 reindex line, found {hook_lines}"
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +150,7 @@ def test_post_merge_hook_content_orig_head_guard(temp_git_repo):
     # The else branch must contain a reindex call without --from
     else_idx = content.index("else")
     fallback_section = content[else_idx:]
-    assert "sqlcg reindex" in fallback_section
+    assert '"$SQLCG_BIN" reindex' in fallback_section
 
 
 def test_post_merge_hook_idempotent(temp_git_repo):
@@ -292,3 +295,127 @@ def test_post_merge_hook_orig_head_set_routes_with_shas(temp_git_repo):
     )
     assert "--to HEAD" in argv_recorded, f"Expected --to HEAD in argv; got: {argv_recorded!r}"
     assert "--notify" in argv_recorded
+
+
+# ---------------------------------------------------------------------------
+# #126 + #1 — run-time binary resolution survives a stale preferred path
+# ---------------------------------------------------------------------------
+
+
+def _install_hook_with_preferred_bin(repo: Path, preferred_bin: Path) -> Path:
+    """Install the post-checkout hook with ``preferred_bin`` rendered as the entry."""
+    import sqlcg.cli.commands.git as _git_mod
+
+    original = _git_mod._resolve_sqlcg_bin
+    _git_mod._resolve_sqlcg_bin = lambda: str(preferred_bin)
+    try:
+        runner.invoke(app, ["git", "install-hooks", "--repo", str(repo)])
+    finally:
+        _git_mod._resolve_sqlcg_bin = original
+    return repo / ".git" / "hooks" / "post-checkout"
+
+
+def test_hook_resolves_path_binary_after_preferred_path_deleted(temp_git_repo):
+    """venv-rebuild sim: preferred path gone -> hook resolves a $PATH sqlcg, exit 0.
+
+    Models an editable .venv install whose embedded path is deleted by a venv
+    rebuild. The run-time preamble must fall back to `command -v sqlcg` and invoke
+    the working $PATH binary. Guards the git-hook binary-resolution plan
+    ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+    """
+    venv_dir = temp_git_repo / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    preferred = venv_dir / "sqlcg"
+    preferred.write_text("#!/bin/sh\nexit 0\n")
+    preferred.chmod(0o755)
+
+    hook_path = _install_hook_with_preferred_bin(temp_git_repo, preferred)
+    assert f'if [ -x "{preferred}"' in hook_path.read_text()
+
+    # Simulate the venv rebuild: the preferred path no longer exists.
+    preferred.unlink()
+
+    # Provide a working sqlcg on $PATH that records its invocation.
+    path_dir = temp_git_repo / "pathbin"
+    path_dir.mkdir()
+    argv_file = temp_git_repo / "argv.txt"
+    path_bin = path_dir / "sqlcg"
+    path_bin.write_text(f'#!/bin/sh\necho "$@" >> {argv_file}\nexit 0\n')
+    path_bin.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{path_dir}:{env['PATH']}"
+    result = subprocess.run(
+        ["sh", str(hook_path), "abc123", "def456", "1"],
+        cwd=str(temp_git_repo),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert argv_file.exists(), "the $PATH sqlcg binary was never invoked"
+    assert "reindex" in argv_file.read_text()
+
+
+def test_hook_loud_error_when_no_binary_resolvable_anywhere(temp_git_repo):
+    """No sqlcg anywhere -> hook exits NON-ZERO with a stderr message, never silent 0.
+
+    The exact #1 failure inversion at the hook-script layer. Guards the git-hook
+    binary-resolution plan
+    ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+    """
+    missing = temp_git_repo / "gone" / "sqlcg"  # never created
+    hook_path = _install_hook_with_preferred_bin(temp_git_repo, missing)
+
+    # Run with a PATH that has the system shell dirs (so `sh`/`command` resolve)
+    # but no sqlcg anywhere — i.e. drop the test runner's venv/user-base dirs.
+    sh_bin = shutil.which("sh") or "/bin/sh"
+    sh_dir = str(Path(sh_bin).parent)
+    empty_path_dir = temp_git_repo / "emptybin"
+    empty_path_dir.mkdir()
+    env = os.environ.copy()
+    env["PATH"] = f"{empty_path_dir}:{sh_dir}:/usr/bin:/bin"
+    assert shutil.which("sqlcg", path=env["PATH"]) is None, "test setup: sqlcg still on PATH"
+    result = subprocess.run(
+        [sh_bin, str(hook_path), "abc123", "def456", "1"],
+        cwd=str(temp_git_repo),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0, f"hook must exit non-zero when no binary resolves: {result!r}"
+    assert "cannot find the sqlcg binary" in result.stderr
+    assert "sqlcg git install-hooks" in result.stderr
+
+
+def test_reinstall_upgrades_stale_template_hook(temp_git_repo):
+    """A pre-#126 fixed-path hook is auto-upgraded to the run-time-resilient template.
+
+    The self-upgrade branch (sentinel present, body differs -> overwrite) rewrites a
+    stale v1.33.1-era hook and prints 'Upgraded git hook:'. Guards the git-hook
+    binary-resolution plan
+    ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+    """
+    hooks_dir = temp_git_repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    stale = hooks_dir / "post-checkout"
+    # Old v1.33.1-era template: fixed embedded literal, no run-time preamble.
+    stale.write_text(
+        "#!/bin/sh\n"
+        "# sqlcg post-checkout hook — incremental resync after branch switch\n"
+        '[ "$3" = "1" ] || exit 0\n'
+        '/old/path/sqlcg reindex --from "$1" --to "$2" "$(git rev-parse --show-toplevel)"'
+        " --dialect auto --quiet --notify\n"
+    )
+    stale.chmod(0o755)
+
+    result = runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
+
+    assert result.exit_code == 0
+    assert "Upgraded git hook:" in result.output
+    upgraded = stale.read_text()
+    assert "command -v sqlcg" in upgraded
+    assert '"$SQLCG_BIN" reindex' in upgraded
+    assert "/old/path/sqlcg reindex" not in upgraded

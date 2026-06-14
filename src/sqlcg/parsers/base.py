@@ -591,7 +591,8 @@ class SqlParser(ABC):
                     case "PROCEDURE" | "FUNCTION":
                         return QueryKind.CREATE_PROC
                     case _:
-                        return QueryKind.CREATE_TABLE  # Default to table
+                        # non-table CREATE (sequence/stage/file format/schema/index/etc.)
+                        return QueryKind.OTHER
             case exp.Merge():
                 return QueryKind.MERGE
             case _:

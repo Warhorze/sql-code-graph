@@ -129,6 +129,11 @@ def reindex_cmd(  # noqa: B008
     # below) and return to git immediately. The respawn guard env var prevents
     # the detached child from detaching again.
     if _is_hook_path and os.environ.get(_HOOK_DETACHED_ENV) != "1":
+        # #1 — loud foreground preflight BEFORE detaching. The detached child's
+        # schema gate (below) writes its Exit(1) to the hook-resync log, invisible
+        # to the user, so a stale-binary schema skew dies silently (exit 0 to git).
+        # Surface a real mismatch in the foreground, where git's terminal can see it.
+        _hook_preflight_schema_check()
         _spawn_detached_hook_resync(path)
         return
 
@@ -289,6 +294,66 @@ def _spawn_detached_hook_resync(path: Path) -> None:
         )
 
     console.print(f"sqlcg: resyncing graph in background (log: {log_path})")
+
+
+def _hook_preflight_schema_check() -> None:
+    """Surface a stale-binary schema/version skew in the FOREGROUND hook process (#1).
+
+    On the hook path the resync is detached (#77), so the existing schema gate
+    (``reindex_cmd`` at ~:150) runs in the detached child whose stdout/stderr go to
+    ``hook-resync.log`` — its ``Exit(1)`` never reaches the user's terminal and the
+    graph silently never refreshes. This preflight runs *before* the detach and, on a
+    REAL mismatch, prints a visible, actionable stderr message and exits non-zero
+    without detaching.
+
+    Git runs post-checkout/post-merge AFTER the operation and ignores the hook exit
+    status, so the **stderr message** is the load-bearing part (not the exit code).
+
+    BOUNDED, FAIL-SOFT open (plan-review B1 — MANDATED). DuckDB takes an exclusive
+    file lock: per ``config.py`` ``get_backend`` docstring, a second process cannot
+    open the DB at all (even read-only) while another holds it — it raises
+    ``duckdb.IOException`` (#63). On rapid successive checkouts a prior detached
+    resync still holds the lock, so this open WILL contend. We therefore do a SINGLE
+    open attempt (NOT ``_open_backend_with_lock_retry``'s ~31 s retry, which would
+    stall ``git checkout`` — a #77-class regression) and, on ``IOException`` (lock
+    held ⇒ a resync is already in flight), treat it as "cannot determine — fall
+    through to the existing detach path unchanged": never block, never emit a
+    schema-mismatch error. Only a SUCCESSFUL read showing a real mismatch triggers
+    the loud exit. The backend is opened read-only and released before returning so
+    the detached child can still acquire the lock.
+    """
+    import duckdb
+
+    from sqlcg.core.config import get_backend
+    from sqlcg.core.schema import SCHEMA_VERSION
+
+    try:
+        backend = get_backend(read_only=True)
+    except duckdb.IOException:
+        # Lock held by an in-flight resync — cannot determine; fall through to detach.
+        return
+
+    try:
+        with backend:
+            stored_version = backend.get_schema_version()
+            if stored_version is None or stored_version == SCHEMA_VERSION:
+                # Matches (or no stored version yet on a fresh graph) — detach as today.
+                return
+            indexed_tool_version = backend.get_indexed_version()
+    except duckdb.IOException:
+        # Lock raced after the open (e.g. closed-then-reopened by the writer);
+        # fail soft exactly as the open-time IOException path.
+        return
+
+    skew = f" (graph last indexed by sqlcg {indexed_tool_version})" if indexed_tool_version else ""
+    print(
+        f"sqlcg: graph schema is v{stored_version} but this tool needs "
+        f"v{SCHEMA_VERSION}{skew} — the hook binary is stale. "
+        "Run 'sqlcg git install-hooks' to repoint the hook, then "
+        "'sqlcg db reset && sqlcg index <root>'.",
+        file=sys.stderr,
+    )
+    raise typer.Exit(1)
 
 
 def _open_backend_with_lock_retry() -> "GraphBackend":

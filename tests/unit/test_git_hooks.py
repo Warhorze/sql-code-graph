@@ -55,7 +55,11 @@ def test_post_checkout_contains_reindex_with_sha_args(temp_git_repo):
     runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
 
     content = hook_path.read_text()
-    assert "sqlcg reindex" in content
+    # Run-time resolution (#126/#1): the binary is invoked via $SQLCG_BIN, resolved
+    # by the preamble (preferred path -> command -v sqlcg -> loud error), not a fixed
+    # embedded literal.
+    assert '"$SQLCG_BIN" reindex' in content
+    assert "command -v sqlcg" in content
     assert '--from "$1"' in content
     assert '--to "$2"' in content
     assert "--dialect auto" in content
@@ -101,7 +105,8 @@ def test_post_merge_contains_orig_head_guard(temp_git_repo):
     runner.invoke(app, ["git", "install-hooks", "--repo", str(temp_git_repo)])
 
     content = hook_path.read_text()
-    assert "sqlcg reindex" in content
+    assert '"$SQLCG_BIN" reindex' in content
+    assert "command -v sqlcg" in content
     # ORIG_HEAD guard — reads pre-merge HEAD via git rev-parse
     assert "git rev-parse --verify --quiet ORIG_HEAD" in content
     # If-branch: passes explicit SHAs to enable server routing
@@ -444,11 +449,14 @@ def test_install_hooks_fails_outside_git_repo():
 
 
 def test_install_hooks_embeds_absolute_binary_path(temp_git_repo, monkeypatch):
-    """Scenario E: when shutil.which returns an absolute path, hooks use it.
+    """Scenario E: the resolved absolute path is the PREFERRED run-time entry.
 
-    Asserts:
-    - post-checkout and post-merge command lines start with the resolved absolute path
-    - NOT bare 'sqlcg' (which would cause version skew if the installed binary differs)
+    Run-time resolution (#126/#1): the absolute path is no longer the literal that
+    invokes reindex. It is rendered into the preamble's preferred branch
+    (`if [ -x "<abs>" ]`); the body invokes `$SQLCG_BIN`, with `command -v sqlcg`
+    as the run-time fallback. Asserts:
+    - the resolved absolute path appears as the preferred preamble entry
+    - the body invokes "$SQLCG_BIN" reindex (not a fixed literal that can go stale)
     - sentinel comments are present (R9 idempotency preserved)
     """
     import sqlcg.cli.commands.git as _git_mod
@@ -464,18 +472,19 @@ def test_install_hooks_embeds_absolute_binary_path(temp_git_repo, monkeypatch):
     co_content = co_hook.read_text()
     pm_content = pm_hook.read_text()
 
-    # Command lines must use the absolute path
-    assert f"{abs_bin} reindex" in co_content, (
-        f"post-checkout must use absolute path. Got:\n{co_content}"
+    # The absolute path is the preferred run-time entry in the resolution preamble.
+    assert f'if [ -x "{abs_bin}" ]' in co_content, (
+        f"post-checkout must prefer the absolute path. Got:\n{co_content}"
     )
-    assert f"{abs_bin} reindex" in pm_content, (
-        f"post-merge must use absolute path. Got:\n{pm_content}"
+    assert f'if [ -x "{abs_bin}" ]' in pm_content, (
+        f"post-merge must prefer the absolute path. Got:\n{pm_content}"
     )
 
-    # Bare 'sqlcg reindex' (without the leading abs path prefix) must NOT appear
-    # as a standalone command (i.e. not preceded by a different path component)
-    assert "\nsqlcg reindex" not in co_content, "post-checkout must not use bare 'sqlcg reindex'"
-    assert "\nsqlcg reindex" not in pm_content, "post-merge must not use bare 'sqlcg reindex'"
+    # The body invokes the resolved $SQLCG_BIN, with command -v sqlcg as the fallback.
+    assert '"$SQLCG_BIN" reindex' in co_content
+    assert '"$SQLCG_BIN" reindex' in pm_content
+    assert "command -v sqlcg" in co_content
+    assert "command -v sqlcg" in pm_content
 
     # Sentinels must be unchanged (R9 idempotency)
     assert "# sqlcg post-checkout hook" in co_content
@@ -516,11 +525,15 @@ def test_install_hooks_idempotent_with_absolute_path(temp_git_repo, monkeypatch)
 
 
 def test_install_hooks_bare_fallback_when_no_binary_resolvable(temp_git_repo, monkeypatch):
-    """Scenario G: when no sqlcg binary is resolvable, falls back to bare 'sqlcg' + warning.
+    """Scenario G: no resolvable binary at install -> bare 'sqlcg' preferred entry + warning.
 
-    Asserts:
+    Run-time resolution (#126/#1): even when install-time resolution returns the bare
+    'sqlcg' literal, the rendered hook still relies on the run-time preamble — the bare
+    'sqlcg' is the preferred entry and `command -v sqlcg` is the run-time fallback, with
+    a loud error branch if neither resolves. Asserts:
     - install-hooks does NOT hard-fail
-    - the generated hooks use bare 'sqlcg reindex'
+    - the preamble renders the bare 'sqlcg' preferred entry + command -v fallback
+    - the body invokes "$SQLCG_BIN" reindex
     - a one-line warning is printed to output
     """
     import sqlcg.cli.commands.git as _git_mod
@@ -540,9 +553,13 @@ def test_install_hooks_bare_fallback_when_no_binary_resolvable(temp_git_repo, mo
     co_content = (temp_git_repo / ".git" / "hooks" / "post-checkout").read_text()
     pm_content = (temp_git_repo / ".git" / "hooks" / "post-merge").read_text()
 
-    # Must fall back to bare 'sqlcg'
-    assert "sqlcg reindex" in co_content
-    assert "sqlcg reindex" in pm_content
+    # Bare 'sqlcg' is rendered as the preferred preamble entry; run-time fallback is PATH.
+    assert 'if [ -x "sqlcg" ]' in co_content
+    assert 'if [ -x "sqlcg" ]' in pm_content
+    assert "command -v sqlcg" in co_content
+    assert "command -v sqlcg" in pm_content
+    assert '"$SQLCG_BIN" reindex' in co_content
+    assert '"$SQLCG_BIN" reindex' in pm_content
 
     # Warning must be printed
     assert "warning" in result.output.lower() or "warn" in result.output.lower(), (
