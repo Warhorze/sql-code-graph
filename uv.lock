@@ -2844,7 +2844,7 @@ wheels = [
 
 [[package]]
 name = "sql-code-graph"
-version = "1.29.1"
+version = "1.30.0"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
