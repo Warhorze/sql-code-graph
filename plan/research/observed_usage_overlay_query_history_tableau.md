@@ -303,12 +303,27 @@ Define the **indexed table universe** `T_indexed = { t.qualified | t in SqlTable
 >
 > Let `E_oracle_scoped` be as defined in §3.3 (oracle edges with **both** endpoints in `T_indexed`).
 >
-> **Recall denominator (i) — the headline number:**
+> **Recall denominator (i) — a MIXED lower bound, NOT the parser grade:**
 > ```
 > oracle_recall_pct = | E_ours ∩ E_oracle_scoped |  /  | E_oracle_scoped |   × 100
 > ```
-> The denominator is **external** (Snowflake-resolved), so this is the first metric that measures
-> what fraction of *real, observed* in-corpus lineage our parser actually captured.
+> The denominator is **external** (Snowflake-resolved), so this measures what fraction of *real,
+> observed* in-corpus lineage our graph contains. But `E_oracle_scoped` mixes two kinds of edge
+> (see the **provenance partition** below): edges a parser *could* recover from the corpus, and
+> edges produced only by external BI/ad-hoc SQL that **is not in the repo at all** and that the
+> parser can *never* recover. So `oracle_recall_pct` is a **mixed lower bound on parser recall** —
+> it is depressed by un-parseable external lineage and therefore **does not grade the parser**.
+> Report it, but do not call it "parser recall."
+>
+> **Parser recall (the honest parser grade) — restricted to the parser-recoverable partition:**
+> ```
+> parser_recall_pct = | E_ours ∩ E_oracle_scoped |
+>                     / | E_oracle_scoped restricted to in-corpus-attributable edges |   × 100
+> ```
+> The denominator **excludes overlay-only edges** (those whose every producing query is external —
+> see the provenance partition). This is the number that actually grades the parser: every edge in
+> its denominator is one the parser *could* have produced from the indexed corpus, so a miss is a
+> real parser defect rather than lineage that lives only in history.
 >
 > **Coverage ceiling (denominator ii) — reported, never conflated:**
 > ```
@@ -316,12 +331,55 @@ Define the **indexed table universe** `T_indexed = { t.qualified | t in SqlTable
 > ```
 > How much of all observed lineage even falls inside the corpus we indexed.
 
-**Residual buckets** (the actionable output, not just a percentage):
+#### The provenance partition — why "oracle-has / we-miss" is two different things
 
-- **oracle-has / we-miss** = `E_oracle_scoped \ E_ours` — **TRUE recall gaps.** Both tables are
-  indexed, Snowflake observed the flow, we produced no edge. This is the **ranked worklist** that
-  drives parser fixes (group by dst table → the analogue of the existing blindspot ranking, but
-  externally grounded). Every item here is a falsifiable "we should have this edge."
+`oracle_recall_pct` treats **all** of `E_oracle_scoped \ E_ours` as "TRUE recall gaps / parser
+fixes." That is **wrong**, and it conflates two fundamentally different things. An oracle
+table→table edge between two indexed tables can be produced by a query whose SQL **is not in the
+repo at all** — a Tableau/BI custom-SQL query or an ad-hoc analyst query (exactly the queries
+[Tier 2](#tier-2--tableau--bi-impact-the-genuinely-strong-part) is about: visible in history,
+invisible in the repo). The parser can **never** recover that edge from the corpus, because the
+producing statement was never indexed. It is **not a parser gap** — it is a **Tier-2 overlay
+candidate**. `ACCESS_HISTORY`/`QUERY_HISTORY` is **one ingest**; the bridge between the recall tier
+and the Tableau tier is partitioning each miss by **query provenance**.
+
+**Query provenance / in-corpus attribution.** For each oracle edge, look at the **producing
+query/queries** — the `QUERY_ID`s whose `BASE_OBJECTS_ACCESSED × OBJECTS_MODIFIED` cross product
+(§3.1) yielded the edge. An edge is **in-corpus-attributable** iff **≥1 producing query corresponds
+to an indexed repo definition**. Concretely, a producing query is in-corpus iff **both**:
+
+1. its write target is in our `defined_tables` (`T_indexed` physical tables — §3.3); **and**
+2. it is a **scheduled / ETL execution**, not an interactive BI session — classified using the
+   Tier-2 levers **already in this doc**
+   ([Tier 2 isolation](#tier-2--tableau--bi-impact-the-genuinely-strong-part)):
+   - **`SESSIONS.client_environment`** — a batch/ETL client (the scheduler/orchestrator driver,
+     `snowsql`, the Python/JDBC connector used by the pipeline) ⇒ in-corpus candidate; a Tableau /
+     BI driver ⇒ external.
+   - **`QUERY_TAG`** — an ETL/job tag ⇒ in-corpus candidate; a Tableau workbook/view band (or no
+     tag on a BI-driver session) ⇒ external.
+
+If **every** producing query for an edge is external (BI / ad-hoc — a BI-driver
+`client_environment` and/or no repo definition for the write target), the edge is **overlay-only**.
+
+**Residual buckets** (the actionable output, not just a percentage) — the "oracle-has / we-miss"
+set `E_oracle_scoped \ E_ours` now **splits by provenance into two**:
+
+- **parser-recoverable misses** = `(E_oracle_scoped \ E_ours)` ∩ in-corpus-attributable — the
+  **TRUE parser recall gaps.** Both tables are indexed, Snowflake observed the flow, ≥1 producing
+  query is a scheduled/ETL execution against a repo-defined target, and we produced no edge. This is
+  the **ranked parser worklist** that drives parser fixes (group by dst table → the analogue of the
+  existing blindspot ranking, but externally grounded). Every item here is a falsifiable "we should
+  have this edge." This — and only this — is the denominator-relevant miss set for
+  `parser_recall_pct`.
+- **external / overlay-only misses** = `(E_oracle_scoped \ E_ours)` with **all** producing queries
+  external — **NOT parser bugs.** These are real lineage that exists *only in history* (Tableau / BI
+  / ad-hoc), extending the graph **past the warehouse boundary** into consumption. They are the
+  **Tier-2 overlay candidates**: the same `ACCESS_HISTORY`/`QUERY_HISTORY` data sliced by
+  provenance, and they are precisely
+  [Tier 2](#tier-2--tableau--bi-impact-the-genuinely-strong-part)'s definition of "done" — every
+  edge here is a flow Tier 2 should ingest as an overlay (source-tagged, never a parser input).
+  Chasing these as "parser bugs" is wasted effort: no parser change can produce them, because the
+  producing SQL is not in the corpus.
 - **we-have / oracle-lacks** = `E_ours \ E_oracle_scoped` — **ambiguous, cannot be fully
   disambiguated.** An edge here is *either* a real edge that simply **did not run in the window**
   (committed code that is correct but cold — recall the liveness asymmetry: absence ≠ wrong) *or* a
@@ -335,18 +393,36 @@ Define the **indexed table universe** `T_indexed = { t.qualified | t in SqlTable
   oracle-lacking but catalog-confirmed is most likely real-but-cold.
 - **both have** = `E_ours ∩ E_oracle_scoped` — agreement, the numerator.
 
+**The measurement trap (state it explicitly).** Once an `access_history` overlay **ingests the
+external / overlay-only edges into our graph** (which is exactly what Tier 2 is *supposed* to do —
+those edges are real lineage), `parser_recall_pct` **must** continue to be computed on the
+**parser-attributable partition only** — i.e. its denominator stays `E_oracle_scoped` restricted to
+in-corpus-attributable edges, and its numerator counts only parser-produced edges, never
+overlay-ingested ones. Otherwise parser recall jumps toward 100% **trivially**, by copying the
+oracle into our own graph: the overlay writes the missing external edges into `E_ours`, they then
+appear in the intersection, and the parser looks like it improved when nothing about the parser
+changed. **Overlay coverage** (how many external / overlay-only edges we ingested, out of the
+overlay-only bucket) is reported **separately** as a Tier-2 progress number — it is **never folded
+into parser recall**. Two distinct questions, two distinct denominators: "is the parser getting
+better?" (parser-attributable only) vs. "how much external lineage have we overlaid?" (overlay-only
+bucket).
+
 **As a `gain`-style metric.** Surface in `sqlcg gain` Section G (next to the existing coverage
 lines) as an **optional, overlay-gated** block — present only when an `access_history` overlay is
 loaded (mirroring the `catalog load` precedent; never computed from the parser path):
 ```
 Oracle recall (90d window, overlay loaded 2026-06-14):
-  recall:           E_ours ∩ E_oracle_scoped / E_oracle_scoped   (N / D, P%)
-  corpus coverage:  E_oracle_scoped / E_oracle                   (N / D, P%)
-  TRUE recall gaps (oracle-has/we-miss): K   [top dst tables by gap count]
-  oracle-lacking (ambiguous):            M   (of which catalog-contradicted: X = likely false positive)
+  parser recall:    E_ours ∩ E_oracle_scoped / E_oracle_scoped[in-corpus-attributable]  (N / D, P%)  <- grades the parser
+  oracle recall:    E_ours ∩ E_oracle_scoped / E_oracle_scoped                          (N / D, P%)  <- mixed lower bound (incl. un-parseable external)
+  corpus coverage:  E_oracle_scoped / E_oracle                                          (N / D, P%)
+  oracle-has/we-miss, by provenance:
+    parser-recoverable (TRUE parser gaps): K   [top dst tables by gap count]  <- parser worklist
+    external / overlay-only (Tier-2 candidates): J   (overlay-ingested so far: I)  <- NOT parser bugs; reported separate from parser recall
+  oracle-lacking (ambiguous):              M   (of which catalog-contradicted: X = likely false positive)
 ```
-Recall is a **ratio with an external denominator** (unlike the monotone-up
-`resolvable_write_col_edges` count), so it has a real ceiling (100%) and regressions are visible.
+`parser_recall_pct` is a **ratio with an external denominator** restricted to the parser-recoverable
+partition (unlike the monotone-up `resolvable_write_col_edges` count), so it has a real ceiling
+(100%) and regressions are visible — and it cannot be gamed by the overlay (the trap above).
 
 ### 3.5 Reframing the E8 / `cte_source_gap` gates in recall terms
 
@@ -355,10 +431,16 @@ the overlay exists:
 
 - **E8 revival gate** is currently "`resolvable_write_col_edges` rises by ≥ +1,000 on the same
   corpus" ([`coverage.py:340-365`](../../src/sqlcg/cli/coverage.py)). That proves *more edges*, not
-  *more correct coverage*. Recall reframing:
-  > **E8 closed _X%_ of the measured recall gap** = `(gaps_before − gaps_after) / gaps_before` over
-  > the **same `E_oracle_scoped`** (same window, same corpus). A +1,000-edge change that does not
-  > move `oracle-has/we-miss` is adding edges the oracle never asked for; a change that closes the
+  *more correct coverage*. Recall reframing — measured over the **parser-recoverable** miss set
+  only (E8 is a **parser change**; it can only close parser-attributable gaps, never overlay-only
+  ones — measuring it over the raw miss set would credit/penalize it for external lineage it cannot
+  touch):
+  > **E8 closed _X%_ of the measured recall gap** =
+  > `(parser_recoverable_gaps_before − parser_recoverable_gaps_after) / parser_recoverable_gaps_before`
+  > over the **same `E_oracle_scoped` restricted to in-corpus-attributable edges** (same window,
+  > same corpus, same provenance partition). A +1,000-edge change that does not move the
+  > **parser-recoverable** `oracle-has/we-miss` set is adding edges the oracle never asked for (or
+  > edges that belong to the overlay-only bucket); a change that closes the **parser-recoverable**
   > gap is real recall.
 - **`cte_source_gap_writes`** ([`coverage.py:327-338`](../../src/sqlcg/cli/coverage.py)) becomes
   "_Y_ of the CTE-source-gap writes correspond to a TRUE recall gap in `E_oracle_scoped`" — i.e. the
