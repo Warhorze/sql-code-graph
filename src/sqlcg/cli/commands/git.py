@@ -23,6 +23,29 @@ class _HookSpec(NamedTuple):
 # Hook script templates — use {sqlcg_bin} as the placeholder for the resolved binary.
 # The sentinel comments (e.g. "# sqlcg post-checkout hook") must stay byte-for-byte
 # unchanged so R9 idempotency is preserved: _install_single_hook matches them verbatim.
+#
+# Run-time binary resolution (#126 + #1): the hook no longer trusts the single embedded
+# absolute literal to stay valid forever (a venv rebuild or tool upgrade makes the
+# install-time path stale and the resync would then run a wrong/missing binary). Instead
+# the shared _RESOLVE_PREAMBLE resolves the binary at *run time* with a hybrid order:
+#   1. the preferred path rendered in at install time ({sqlcg_bin}, normally the stable
+#      user-base binary from _resolve_sqlcg_bin) — the fast path, used if still executable;
+#   2. `command -v sqlcg` on $PATH — covers uv-tool, user-base-on-PATH, and active-venv;
+#   3. neither resolves → print a loud stderr error and exit non-zero (never silent).
+# The shell never recomputes getuserbase() — the preferred path is rendered in by Python.
+# It exports SQLCG_BIN for the hook body to invoke.
+_RESOLVE_PREAMBLE = (
+    'if [ -x "{sqlcg_bin}" ]; then\n'
+    '  SQLCG_BIN="{sqlcg_bin}"\n'
+    "elif command -v sqlcg >/dev/null 2>&1; then\n"
+    '  SQLCG_BIN="$(command -v sqlcg)"\n'
+    "else\n"
+    "  echo \"sqlcg: cannot find the sqlcg binary (tried '{sqlcg_bin}' and \\$PATH)"
+    " -- run 'sqlcg git install-hooks' to repoint this hook\" >&2\n"
+    "  exit 1\n"
+    "fi\n"
+)
+
 _HOOKS: list[_HookSpec] = [
     _HookSpec(
         filename="post-checkout",
@@ -32,7 +55,8 @@ _HOOKS: list[_HookSpec] = [
             "# sqlcg post-checkout hook — incremental resync after branch switch\n"
             "# $3 == 1 means branch checkout (not file checkout); skip file checkouts\n"
             '[ "$3" = "1" ] || exit 0\n'
-            '{sqlcg_bin} reindex --from "$1" --to "$2"'
+            + _RESOLVE_PREAMBLE
+            + '"$SQLCG_BIN" reindex --from "$1" --to "$2"'
             ' "$(git rev-parse --show-toplevel)" --dialect auto --quiet --notify'
             ' || echo "sqlcg: graph not updated (reindex failed)'
             " -- run 'sqlcg mcp status'\" >&2\n"
@@ -41,22 +65,27 @@ _HOOKS: list[_HookSpec] = [
     _HookSpec(
         filename="post-merge",
         sentinel="# sqlcg post-merge hook",
-        script_template="""\
-#!/bin/sh
-# sqlcg post-merge hook — incremental resync after pull/merge
-# git sets ORIG_HEAD to the pre-merge HEAD; pass it as --from so --notify can route
-# through a running server (same path as post-checkout). If ORIG_HEAD is unset (e.g.
-# first-ever merge / gc'd), fall back to the standalone stored-SHA delta (direct write).
-PREV=$(git rev-parse --verify --quiet ORIG_HEAD)
-TOP=$(git rev-parse --show-toplevel)
-if [ -n "$PREV" ]; then
-  {sqlcg_bin} reindex --from "$PREV" --to HEAD "$TOP" --dialect auto --quiet --notify \\
-    || echo "sqlcg: graph not updated (reindex failed) -- run 'sqlcg mcp status'" >&2
-else
-  {sqlcg_bin} reindex "$TOP" --dialect auto --quiet --notify \\
-    || echo "sqlcg: graph not updated (reindex failed) -- run 'sqlcg mcp status'" >&2
-fi
-""",
+        script_template=(
+            "#!/bin/sh\n"
+            "# sqlcg post-merge hook — incremental resync after pull/merge\n"
+            "# git sets ORIG_HEAD to the pre-merge HEAD; pass it as --from so --notify\n"
+            "# can route through a running server (same path as post-checkout). If\n"
+            "# ORIG_HEAD is unset (e.g. first-ever merge / gc'd), fall back to the\n"
+            "# standalone stored-SHA delta (direct write).\n"
+            + _RESOLVE_PREAMBLE
+            + "PREV=$(git rev-parse --verify --quiet ORIG_HEAD)\n"
+            "TOP=$(git rev-parse --show-toplevel)\n"
+            'if [ -n "$PREV" ]; then\n'
+            '  "$SQLCG_BIN" reindex --from "$PREV" --to HEAD "$TOP" --dialect auto'
+            " --quiet --notify \\\n"
+            '    || echo "sqlcg: graph not updated (reindex failed)'
+            " -- run 'sqlcg mcp status'\" >&2\n"
+            "else\n"
+            '  "$SQLCG_BIN" reindex "$TOP" --dialect auto --quiet --notify \\\n'
+            '    || echo "sqlcg: graph not updated (reindex failed)'
+            " -- run 'sqlcg mcp status'\" >&2\n"
+            "fi\n"
+        ),
     ),
 ]
 
