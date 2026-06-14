@@ -1,13 +1,22 @@
 # Feature Plan: Bugfix — Lineage-Correctness Validation Findings (#2, #4, #5)
 
-**Status: DRAFT** (REWORKED 2026-06-14 — maintainer DECISION: do NOT ship the
-narrowed DDL+CLONE-only qualify-schema merge for Bug #5; it does not fix the
-dominant LIVE shape, where the second join table is catalogued *only* via
-information_schema. Bug #5 is replaced by option (b): a **post-index
-re-resolution pass** that disambiguates unqualified join columns against the
-backend's `HAS_COLUMN(source='information_schema')` rows AFTER indexing — the
-information_schema case is now **IN scope**. PR-B (Bug #4 star-expansion) is
-KEPT AS-IS. A fresh plan-reviewer gate runs next.)
+**Status: REVIEWED** (option-b design gated by plan-reviewer 2026-06-14 — forbidden
+parse-time-schema check PASSED, all key-forms + the four frozen perf suites verified.
+Returned REWORK on ONE blocker: the resolver was wired only into the full-index path,
+not the two incremental paths (`resync_changed` @indexer.py:1330, `reindex_file`
+@indexer.py:1383) — an incremental reindex of a join file would have permanently
+dropped its join-column edges. Shepherd FOLDED 2026-06-14: resolver now wired into all
+three call sites (no catalog reapply in the incremental paths — they resolve against
+persisted HAS_COLUMN); added an incremental-reindex regression acceptance test; pinned
+the one-owner high-confidence value and a case-mismatched-CSV fixture (notes 3+4) into
+acceptance criteria; reconciled version 1.33.0→**1.34.0** and SCHEMA_VERSION "9"→"10"
+to **"10"→"11"** (PR #154 took v1.33.0/v10 on master first). PR-4 Option-1-vs-2 stays
+deferred to the developer's repro re-confirmation as the plan directs — dev reports the
+choice before opening PR-4. READY FOR INDEX-HEAVY DISPATCH.
+
+> *(Superseded prior status — DRAFT/REWORKED 2026-06-14: maintainer decision to replace
+> Bug #5's narrowed DDL+CLONE qualify-schema merge with option (b), the post-index
+> re-resolution pass; information_schema case now IN scope; PR-4 star-expansion kept.)*
 
 ## Summary
 
@@ -283,8 +292,8 @@ emitting one edge per candidate immediately:
   (`src_key=query_id`, `dst_key=<dst_table>.<dst_col>` SqlColumn id, plus a `bare_col`
   VARCHAR column) added to `_EDGE_DDLS`
   ([`duckdb_backend.py:111-202`](src/sqlcg/core/duckdb_backend.py)) and to `RelType`
-  ([`schema.py:19-31`](src/sqlcg/core/schema.py)). Bump `SCHEMA_VERSION` from `"9"`
-  to `"10"` ([`schema.py:6`](src/sqlcg/core/schema.py)) — re-index is the migration
+  ([`schema.py:19-31`](src/sqlcg/core/schema.py)). Bump `SCHEMA_VERSION` from `"10"`
+  to `"11"` ([`schema.py:6`](src/sqlcg/core/schema.py)) — re-index is the migration
   path (CLAUDE.md "No backward compatibility"). Add it to `clear_all_tables`
   ([`duckdb_backend.py:894-907`](src/sqlcg/core/duckdb_backend.py)) and the
   file-delete cascade ([`duckdb_backend.py:745-770`](src/sqlcg/core/duckdb_backend.py))
@@ -363,6 +372,35 @@ the error-classification block at line 885. Add a thin
 `db.resolve_join_columns()` and returns the count, plus the `GraphBackend` ABC stub
 next to `expand_star_sources` ([`graph_db.py:257-263`](src/sqlcg/core/graph_db.py)).
 
+> **BLOCKING (plan-review 2026-06-14 — incremental/resync paths MUST also resolve):**
+> `_expand_star_sources` has **three** call sites, not one. The full-index path is
+> [`indexer.py:850`](src/sqlcg/indexer/indexer.py) (hooked above). The two incremental
+> paths also run star expansion but the prior draft left them unhooked:
+> - `resync_changed` (the `sqlcg reindex` delta path) — star expansion at
+>   [`indexer.py:1330`](src/sqlcg/indexer/indexer.py) (Step 8).
+> - `reindex_file` (single-file incremental) — star expansion at
+>   [`indexer.py:1383`](src/sqlcg/indexer/indexer.py).
+>
+> Because the marker design SUPPRESSES the sqlglot mis-bind edge (`continue` past
+> `sg_lineage`) and the file-delete cascade ([`duckdb_backend.py:745-770`](src/sqlcg/core/duckdb_backend.py))
+> deletes both the old `JOIN_COL_RESOLVE` markers AND the old resolved `COLUMN_LINEAGE`
+> edges (via `query_id`), an incremental `reindex_file`/`resync_changed` on a join file
+> re-creates the markers but never resolves them → **the file's join-column edges vanish
+> until the next full `sqlcg index`. That is a correctness REGRESSION this feature
+> introduces, not a mere omission.** Fix: add `self._resolve_join_columns(db)` to BOTH
+> incremental paths, immediately after their `_expand_star_sources` call —
+> [`indexer.py:1330`](src/sqlcg/indexer/indexer.py) (after Step 8) and
+> [`indexer.py:1383`](src/sqlcg/indexer/indexer.py) (after the star re-run in
+> `reindex_file`).
+>
+> **Do NOT add a catalog reapply to these paths.** `resync_changed`/`reindex_file` do
+> not call `_reapply_catalog_if_configured` (it lives only at line 881, full-index
+> path) — and they should not. The information_schema `HAS_COLUMN` rows from the prior
+> full index PERSIST in the DB across a single-file reindex, so the resolver in these
+> paths correctly resolves against the already-persisted catalog. The grep-confirmed
+> call sites for the new `_resolve_join_columns` are therefore THREE: `indexer.py` 883,
+> 1330, 1383.
+
 > **Constant-alignment notes for the developer (do not guess):**
 > - `SqlColumn.id` = `<table_qualified>.<col_name>`
 >   ([`queries.sql:97-104`](src/sqlcg/core/queries.sql)); `SELECTS_FROM.dst_key` =
@@ -390,7 +428,24 @@ with an information_schema catalog loaded):**
       customers c ON o.cid=c.id`. After index + catalog load, the `COLUMN_LINEAGE`
       rows include `orders.amount → tgt.amount` AND `customers.status → tgt.status`.
       Assert BOTH edges exist, and that NO edge attributes `status` to `orders`. This
-      is the case the narrowed PR-A could NOT fix.
+      is the case the narrowed PR-A could NOT fix. **Also assert the resolved
+      one-owner edges carry the HIGH confidence value** (e.g. `0.9`) — not merely that
+      the edge exists (plan-review note 3: the high/low split is part of the contract,
+      so pin the value).
+- [ ] **Case-insensitive owner match (plan-review note 4).** The dominant-case fixture
+      MUST use a catalog CSV whose column casing DIFFERS from the SQL — e.g. CSV column
+      `STATUS` (information_schema-exported casing) vs SQL `status`. A naive
+      case-sensitive equality join (`c.col_name = m.bare_col`) MUST fail this test;
+      the resolver normalizes casing on both sides. This guards against shipping
+      green-on-toy-fixture and breaking live (the live IA_* corpus has exported-case ids).
+- [ ] **Incremental reindex preserves join edges (plan-review BLOCKER — regression
+      guard).** Full-index the join fixture WITH the information_schema catalog loaded,
+      assert `customers.status → tgt.status` exists; then `reindex_file` the join file
+      (single-file incremental, no catalog reapply); assert the
+      `customers.status → tgt.status` edge STILL exists afterward (the resolver ran in
+      the incremental path against the persisted `HAS_COLUMN` rows). A `resync_changed`
+      variant of the same assertion is recommended. Without this, the incremental path
+      silently drops the edge until the next full index.
 - [ ] **Both sources get edges.** A 3+-column unqualified-join projection where
       columns split across both tables attributes each column to its correct owning
       table (`orders` columns → orders, `customers` columns → customers), with one
@@ -428,10 +483,17 @@ with an information_schema catalog loaded):**
   emits the right `COLUMN_LINEAGE` rows for the one-owner, two-owner, and zero-owner
   cases.
 
-**Version bump:** minor → **1.33.0** (new edge table + new post-index pass +
+**Version bump:** minor → **1.34.0** (new edge table + new post-index pass +
 SCHEMA_VERSION bump = new surface/capability; SemVer per CLAUDE.md "Releasing").
 Update [`pyproject.toml`](pyproject.toml), [`src/sqlcg/__init__.py`](src/sqlcg/__init__.py),
 `uv lock`.
+
+> **VERSION/SCHEMA RECONCILED 2026-06-14:** the prior draft targeted 1.33.0 + SCHEMA_VERSION
+> `"9"→"10"`, but PR #154 (tool-version stamp) landed first and CLAIMED both `v1.33.0`
+> AND `SCHEMA_VERSION "10"` on master. PR-5 therefore shifts up: version **1.34.0** and
+> SCHEMA_VERSION bump **`"10"→"11"`** ([`schema.py:6`](src/sqlcg/core/schema.py)) — master
+> is now at `"10"`. Re-confirm the on-master `SCHEMA_VERSION` value at dispatch (it is `"10"`
+> after #154 merged) and bump to the next integer.
 
 **Live-DWH index slot:** YES (recommended for final acceptance) — re-run the live
 validation join case and confirm second-table (information_schema-catalogued) edges
