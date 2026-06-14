@@ -612,6 +612,14 @@ sqlcg mcp start [OPTIONS]
 
 Start the MCP server.
 
+Pre-check (#63): if a server is already running for this database, exit
+gracefully with a clear message. Without this, the second ``mcp start``
+would attempt to open the DuckDB file read-write, fail on the live
+server's single-file exclusive lock, and surface an opaque ``IOException``.
+An empirical probe confirmed a read-only co-open is *also* impossible while
+a writer holds the file, so the only safe behaviour for a 2nd start is to
+detect the live server and refuse — not to try a (doomed) read-only open.
+
 ### Options
 
 | Option | Type | Required | Repeatable | Default | Description |
