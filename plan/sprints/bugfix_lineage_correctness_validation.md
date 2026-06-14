@@ -1,6 +1,9 @@
 # Feature Plan: Bugfix — Lineage-Correctness Validation Findings (#2, #4, #5)
 
-**Status: DRAFT** (plan-reviewer gate runs next — do NOT mark REVIEWED)
+**Status: REVIEWED** (plan-reviewer returned REWORK — 1 blocker + 1 warning; shepherd
+folded both 2026-06-14: PR-A narrowed to DDL+CLONE-catalogued disambiguation, the
+information_schema-only case moved to Non-Goals + a follow-up sprint; forbidden-path check
+PASSED, all anchors verified, four frozen perf suites pinned.)
 
 ## Summary
 
@@ -81,13 +84,25 @@ SELECT amount, status FROM orders o JOIN customers c ON o.cid = c.id
 call already receives `schema=schema`, but `schema` is built ONLY from
 `SchemaResolver.as_dict()` ([`ansi_parser.py:184`](src/sqlcg/parsers/ansi_parser.py)),
 which is populated from parsed `CREATE TABLE` DDL bodies. The richer catalog —
-`ddl_columns_by_bare` (DDL **plus** information_schema **plus** CLONE-inherited
-columns) — is threaded into `_extract_column_lineage`
+`ddl_columns_by_bare` — is threaded into `_extract_column_lineage`
 ([`base.py:1029`](src/sqlcg/parsers/base.py)) but is **only consulted for
 positional-INSERT ordinal mapping** ([`base.py:1333-1336`](src/sqlcg/parsers/base.py)).
 It is **never merged into the `schema=` dict that `qualify` uses to disambiguate
-join columns.** So a column whose owning table is catalogued only via
-information_schema (the live-DWH case) stays ambiguous → first-table fallback.
+join columns.**
+
+> **CORRECTION (plan-review REWORK, folded by shepherd):** an earlier draft claimed
+> `ddl_columns_by_bare` contains "DDL **plus** information_schema **plus** CLONE". That
+> is FALSE against the current tree. `ddl_columns_by_bare` is populated ONLY from parsed
+> `CREATE TABLE`/`CREATE VIEW` DDL ([`aggregator.py:96-103`](src/sqlcg/lineage/aggregator.py))
+> plus CLONE resolution ([`aggregator.py:150-157`](src/sqlcg/lineage/aggregator.py)).
+> **information_schema columns NEVER reach qualify time** — they enter post-index via
+> `apply_catalog_to_backend` ([`catalog.py:202-243`](src/sqlcg/cli/commands/catalog.py)),
+> emitting `HAS_COLUMN(source='information_schema')` directly to the backend AFTER parsing.
+> **Consequence:** PR-A (merging `ddl_columns_by_bare` into the qualify schema) can
+> disambiguate joins ONLY for tables whose DDL is parsed in the indexed corpus (plus
+> CLONE-inherited columns). The information_schema-only case — likely the dominant LIVE
+> Bug #5 shape — is **NOT** fixed by PR-A and is now an explicit **Non-Goal** (see below);
+> full coverage needs a separate post-index re-qualify design (tracked as a follow-up).
 
 **This is NOT the forbidden path.** CLAUDE.md prohibits passing CTE/CTAS *bodies*
 into `exp.expand()`/`qualify()`. Passing a column-NAME `schema` dict to `qualify`
@@ -160,14 +175,37 @@ compound effect of #4 and #5 on a real payment-fact pipeline:
    IS catalogued — producing the phantom edge.
 
 **Verification approach for the fix:** a fixture that models a 14-column staging
-temp (explicit CTAS projection), a real source, AND a same-bare-named backup table
-with DDL, asserting (a) all 14 temp columns get `HAS_COLUMN`, (b) the payment-fact
-promote edges point at the real source's columns, and (c) **no** edge points at the
-backup table. This is the criterion the v1.21.0-class dual-write green-on-toy-fixture
+temp (explicit CTAS projection), a real source **whose columns are resolvable at the
+relevant stage**, AND a same-bare-named backup table with DDL, asserting (a) all 14 temp
+columns get `HAS_COLUMN`, (b) the payment-fact promote edges point at the real source's
+columns, and (c) **no** edge points at the backup table.
+
+> **REWORK gap #2 (folded):** the "real source" MUST be given **parsed `CREATE TABLE`
+> DDL** (so its columns are in `as_dict()`/`ddl_columns_by_bare` at qualify/derivation
+> time) — NOT an information_schema-only catalog entry, which would not resolve via this
+> sprint's mechanism and would make the fixture fail for a reason unrelated to the fix.
+> If the intent is to model the information_schema-cataloged source, that goes through
+> **PR-B's `sqlcg catalog load` path** and the fixture must state explicitly which
+> resolution route it exercises. Do not conflate the two catalog sources. This is the criterion the v1.21.0-class dual-write green-on-toy-fixture
 failure warns about — the fixture MUST contain the backup table so the phantom edge
 *can* appear if the fix is wrong.
 
 ---
+
+## Non-Goals (explicit — folded from plan-review REWORK)
+
+- **information_schema-only join-column disambiguation.** PR-A enriches the qualify
+  schema from `ddl_columns_by_bare` (parsed DDL + CLONE only). Tables catalogued
+  *exclusively* via `sqlcg catalog load` (information_schema) are invisible at qualify
+  time and remain ambiguous → today's graceful first-table/`dynamic_source` behavior is
+  unchanged for them. **This likely leaves the dominant LIVE Bug #5 shape unfixed by this
+  sprint.** Closing it requires a separate, larger **post-index re-qualify** design
+  (reviewer's "option (b)") that re-resolves join columns against the backend's
+  information_schema `HAS_COLUMN` rows after indexing — out of scope here because it
+  changes the hot-loop contract and needs its own plan-review. **Tracked as a follow-up
+  (next sprint).**
+- **Star-from-star where the ROOT source has no columns anywhere** (no DDL, no
+  information_schema) — the XML-DDL coverage gap (Bug #4 residue), unchanged.
 
 ## PR Sequencing (by risk; combined where files overlap, split where they don't)
 
@@ -185,8 +223,10 @@ star-expansion contract). Bug #2's compound acceptance is checked last.
 ### PR-A — Bug #5: catalog-aware join-column disambiguation
 
 **Problem:** unqualified columns in multi-table joins bind to the first FROM table
-(or drop) because the per-statement `qualify()` schema omits information_schema /
-CLONE-inherited catalog columns.
+(or drop) because the per-statement `qualify()` schema omits the **CLONE-inherited
+DDL catalog columns** present in `ddl_columns_by_bare` but absent from
+`SchemaResolver.as_dict()`. (information_schema-only tables are out of scope — see
+Non-Goals; they never reach qualify time.)
 
 **Root-cause file:line:**
 - [`base.py:1162-1170`](src/sqlcg/parsers/base.py) — `qualify(..., schema=schema)`.
@@ -203,8 +243,10 @@ CLONE-inherited catalog columns.
     to the existing once-per-statement `qualify` call.
   - Only column NAMES are merged (sqlglot's qualify needs names, not types — produce
     the name-list form `{table: [col, …]}` that `as_dict` already produces).
-  - Precedence: existing parsed-DDL schema entries win over catalog entries on
-    collision (DDL > information_schema, matching the backend's documented precedence).
+  - Precedence: existing `as_dict()` parsed-DDL schema entries win over
+    `ddl_columns_by_bare` entries on collision. (Both are DDL-sourced; the only delta
+    `ddl_columns_by_bare` adds is CLONE-inherited columns + the bare-name keying.
+    information_schema is NOT in either source at qualify time.)
 - Pass the merged dict as `schema=` to the **first** `qualify` attempt
   ([`base.py:1163`](src/sqlcg/parsers/base.py)). The existing schema-free retry on
   failure ([`base.py:1177-1184`](src/sqlcg/parsers/base.py)) stays untouched.
@@ -217,10 +259,11 @@ CLONE-inherited catalog columns.
 
 **Acceptance criteria (observable — assert real edges):**
 - [ ] `SELECT amount, status FROM orders o JOIN customers c ON o.cid=c.id`, with
-      `orders` and `customers` catalogued (one via DDL, one via information_schema
-      `ddl_columns_by_bare`), emits `orders.amount → tgt.amount` AND
-      `customers.status → tgt.status`-style edges — i.e. the SECOND table gets an
-      edge. Assert BOTH edges exist and that NO edge attributes `status` to `orders`.
+      `orders` catalogued via parsed DDL and `customers` catalogued via a CLONE-inherited
+      entry in `ddl_columns_by_bare` (NOT information_schema — that path never reaches
+      qualify), emits `orders.amount → tgt.amount` AND `customers.status → tgt.status`-style
+      edges — i.e. the SECOND table gets an edge. Assert BOTH edges exist and that NO edge
+      attributes `status` to `orders`.
 - [ ] A 3+-column unqualified-join projection where columns split across both tables
       attributes each column to its correct owning table.
 - [ ] Regression: an already-qualified join (`a.x, b.y`) is unchanged (still emits
@@ -230,8 +273,9 @@ CLONE-inherited catalog columns.
 
 **Test strategy:**
 - Unit (parser): drive `SnowflakeParser.parse_file` (or `_extract_column_lineage`)
-  with a `ddl_columns_by_bare` modelling one DDL-catalogued and one
-  information_schema-catalogued source; assert the emitted `LineageEdge` src tables.
+  with a `ddl_columns_by_bare` modelling one parsed-DDL source and one CLONE-inherited
+  source (both are what `ddl_columns_by_bare` can actually hold at qualify time); assert
+  the emitted `LineageEdge` src tables.
   Fixture MUST use realistic aliasing (`o`, `c`) and at least one column present on
   BOTH tables to exercise the disambiguation (the failure mode cannot appear if every
   column is unique to one table).
