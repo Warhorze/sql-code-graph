@@ -17,6 +17,7 @@ bash scripts/generate_cli_docs.sh
 | `watch` | Watch a directory and re-index on SQL file changes. |
 | `gain` | Show metrics and feedback analytics. |
 | `report` | Generate a metrics report with FP clusters and parse error patterns. |
+| `viz` | Generate a self-contained graph-explorer HTML from the live graph. |
 | `install` | Register sqlcg as an MCP server in Claude Code. |
 | `uninstall` | Uninstall sqlcg from Claude Code and optionally clean up resources. |
 | `version` | Show version. |
@@ -186,6 +187,33 @@ If no metrics database exists, prints a message and exits 0.
 | --- | --- | --- | --- | --- | --- |
 | --stdout | BOOLEAN | No | No | False | Print to stdout instead of file |
 | --output, -o | PATH | No | No |  | Output file path |
+
+## `sqlcg viz`
+
+```bash
+sqlcg viz [OPTIONS]
+```
+
+Generate a self-contained graph-explorer HTML from the live graph.
+
+Reads the graph via the server-aware routed-read path (never a direct DB
+open). The emitted file inlines the force-graph library plus the baked node/
+edge/adjacency data and the tag/job facets — no external resources — so it
+opens by double-click on Windows.
+
+The client-side filter composes schema ∩ kind ∩ tag (multi-select per facet,
+union within a facet, intersection across) plus a job dropdown; an edge
+renders only when both endpoints are visible. Node kinds table/view/temp are
+ON by default, cte/derived OFF (switchable).
+
+### Options
+
+| Option | Type | Required | Repeatable | Default | Description |
+| --- | --- | --- | --- | --- | --- |
+| --tags | PATH | No | No |  | BYO tags CSV (pattern,label[,color]; header required). The 'tag' facet drives the legend swatches (color + filter). Patterns are fnmatch globs (*, ?, [seq]) matched case-insensitively against the qualified table name. Many-to-many. Omit to hide the tag legend. |
+| --jobs | PATH | No | No |  | BYO jobs CSV, same shape as --tags. The 'job' facet drives the job dropdown (filter only). Omit to leave the dropdown empty. |
+| --out | PATH | No | No |  | Output HTML path (default: table_graph.html in the current directory). |
+| --config-dir | PATH | No | No | . | Directory searched for .sqlcg.toml ([sqlcg.viz] schemas). |
 
 ## `sqlcg install`
 

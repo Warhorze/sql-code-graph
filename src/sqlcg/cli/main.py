@@ -16,6 +16,7 @@ from sqlcg.cli.commands import (
     reindex,
     report,
     uninstall,
+    viz,
     watch,
 )
 
@@ -84,6 +85,7 @@ app.command("reindex")(reindex.reindex_cmd)
 app.command("watch")(watch.watch_cmd)
 app.command("gain")(gain.gain_cmd)
 app.command("report")(report.report_cmd)
+app.command("viz")(viz.viz_cmd)
 app.command("install")(install.install_cmd)
 app.command("uninstall")(uninstall.uninstall_cmd)
 
