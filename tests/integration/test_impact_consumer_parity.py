@@ -1,27 +1,31 @@
-"""Bug #6 gate: does `analyze impact <T>` under-report consumers that
-`downstream` / `empty-impact` surface?
+"""Bug #6 gate: ``analyze impact <T>`` must not under-report consumers that
+``downstream`` / ``empty-impact`` surface.
 
-Governing plan: PR-B of the impact-analysis validation sprint
-([plan doc](plan/sprints/bugfix_impact_analysis_validation.md), branch
-``plan/bugfix-impact-analysis``).
+Governing plan: [bugfix_impact_consumer_union]
+([plan doc](plan/sprints/bugfix_impact_consumer_union.md), branch
+``plan/impact-consumer-union``).
 
-GATE OUTCOME: NOT REPRODUCED. The bug did not reproduce in standalone fixtures
-during planning, and a bounded developer-side capture effort (this file) could
-not reproduce it either. These tests pin the *parity invariant* that actually
-holds for every shape the plan named, so a future regression that breaks it
-would turn the ``parametrize`` cases red — and the live shape, if ever isolated,
-can be dropped straight into ``IMPACT_PARITY_CASES``.
+GATE OUTCOME: REPRODUCED at DWH scale. The bug is real: the live DWH node
+``ba.all_rows_in_selection`` is a *cross-file qualified-name-promoted* inner-CTE
+intermediate — ``kind='table'``, **non-namespaced** (no ``::``), **0
+SELECTS_FROM in-edges**, **55 COLUMN_LINEAGE out-edges**. ``analyze impact``
+joined only SELECTS_FROM, so it returned "No results" for that node while
+``empty-impact`` / ``downstream`` (which follow COLUMN_LINEAGE) found the real
+consumer.
 
-Structural reason it cannot reproduce (verified, see the sprint plan §"Structural
-root cause" and ``_real_tables`` in src/sqlcg/parsers/base.py): the SELECTS_FROM
-source set that ``analyze impact`` joins on is extracted from the SAME sqlglot
-scope tree (top-level FROM + every CTE body + every subscope via
-``traverse_scope``) that COLUMN_LINEAGE is derived from. STAR_SOURCE reads are by
-construction a subset of those FROM tables. So for any *physical* table, the
-SELECTS_FROM edge set is a superset of, or equal to, the COLUMN_LINEAGE/STAR
-consumer set. The only tables that have a COLUMN_LINEAGE/STAR read with no
-SELECTS_FROM edge are namespaced CTE intermediates (kind='cte'), which are never
-valid ``analyze impact`` targets.
+Why the earlier "NOT REPRODUCED" claim was wrong (PR #156): the disproven
+hypothesis was that *only namespaced CTE intermediates* (``kind='cte'``) ever
+have a COLUMN_LINEAGE/STAR read without a SELECTS_FROM edge. A from-scratch
+in-memory index of a nested-CTE INSERT…SELECT does indeed only emit a namespaced
+``kind='cte'`` gap node — but the live divergence arises from a **cross-file**
+promotion effect (a source-ref node defaults to ``kind='table'`` and is only
+upgraded to ``kind='cte'`` when the *same* qualified name is later confirmed a
+CTE destination in the same pass; the single-file case namespaces+confirms →
+``cte``). A unit/indexer fixture cannot reproduce the non-namespaced
+``kind='table'`` shape, so the authoritative repro below is **graph-layer
+seeded**: it writes the exact divergence shape directly, with no indexer. The
+nested-CTE indexer fixture is kept only as a *no-regression* case (it proves
+``impact`` on a physical source is unchanged), NOT as the bug repro.
 """
 
 from __future__ import annotations
@@ -29,10 +33,12 @@ from __future__ import annotations
 import pytest
 
 from sqlcg.core.duckdb_backend import DuckDBBackend
+from sqlcg.core.queries import IMPACT_CONSUMERS_VIA_LINEAGE_QUERY
 from sqlcg.indexer.indexer import Indexer
 
-# The exact query `analyze impact <table>` runs (analyze.py:316-323): a single
-# hop SqlTable -> SELECTS_FROM -> SqlQuery.
+# The exact query the OLD `analyze impact <table>` ran (SELECTS_FROM only): a
+# single hop SqlTable -> SELECTS_FROM -> SqlQuery. Kept here as the negative
+# control — the seeded repro asserts this returns ∅ for the promoted node.
 _IMPACT_SQL = (
     "SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target"
     ' FROM "SqlTable" t'
@@ -50,8 +56,8 @@ _DDL = (
     "CREATE TABLE ba.filt (id INT);\n"
 )
 
-# (case-id, consumer-SQL, physical-target-table) — every shape PR-B named, plus
-# subquery / CTE / view / star variants probed during the capture effort.
+# (case-id, consumer-SQL, physical-target-table) — every shape the validation
+# sprint named, plus subquery / CTE / view / star variants.
 IMPACT_PARITY_CASES = [
     ("plain_insert_select", "INSERT INTO ba.tgt SELECT col1, col2 FROM ba.src;\n", "ba.src"),
     ("insert_select_star", "INSERT INTO ba.tgt SELECT * FROM ba.src;\n", "ba.src"),
@@ -99,13 +105,14 @@ def _index(tmp_path, files: dict[str, str]) -> DuckDBBackend:
 
 
 def _impact_consumers(db: DuckDBBackend, table: str) -> set[str]:
+    """OLD `impact`: direct SELECTS_FROM consumers only (the under-reporting query)."""
     return {r["id"] for r in db.run_read(_IMPACT_SQL, {"t": table})}
 
 
 def _union_consumers(db: DuckDBBackend, table: str) -> set[str]:
     """The full consumer set across SELECTS_FROM ∪ STAR_SOURCE ∪ COLUMN_LINEAGE.
 
-    This is the parity yardstick PR-B proposes ``impact`` should reach.
+    This is the parity yardstick the fixed ``impact`` reaches.
     """
     sf = db.run_read(
         'SELECT DISTINCT src_key AS q FROM "SELECTS_FROM" WHERE dst_key = ?', {"t": table}
@@ -121,6 +128,87 @@ def _union_consumers(db: DuckDBBackend, table: str) -> set[str]:
     return {r["q"] for r in sf} | {r["q"] for r in ss} | {r["q"] for r in cl}
 
 
+def _merged_impact_consumers(db: DuckDBBackend, table: str) -> list[dict]:
+    """The NEW `impact` consumer set: direct (SELECTS_FROM) merged with via-lineage
+    (COLUMN_LINEAGE ∪ STAR_SOURCE), deduped on q.id — exactly what
+    ``analyze.py:impact()`` builds. Two ``?`` both bound to the qualified name via
+    an ordered 2-entry dict (``_params_list`` returns ``list(values())``).
+    """
+    direct = db.run_read(_IMPACT_SQL, {"t": table})
+    via = db.run_read(IMPACT_CONSUMERS_VIA_LINEAGE_QUERY, {"t": table, "t2": table})
+    seen = {r["id"] for r in direct}
+    return (direct + [r for r in via if r["id"] not in seen])[:100]
+
+
+def _seed_promoted_intermediate(db: DuckDBBackend) -> tuple[str, str]:
+    """Seed the live DWH divergence shape DIRECTLY (no indexer).
+
+    Writes:
+      * a non-namespaced ``kind='table'`` SqlTable (``ba.promoted_intermediate``);
+      * a SqlColumn whose ``table_qualified`` is that table;
+      * a consumer SqlQuery (INSERT INTO ba.consumer);
+      * a COLUMN_LINEAGE edge column -> consumer-column with ``query_id`` = consumer;
+      * NO SELECTS_FROM in-edge to the seeded table.
+
+    Returns ``(table_qualified, consumer_query_id)``. This is the only shape that
+    reproduces Bug #6 (cross-file promotion); an indexer cannot emit it.
+    """
+    table = "ba.promoted_intermediate"
+    consumer_qid = "q:ba.consumer:0"
+    src_col = f"{table}.dn_functie_naam"
+    dst_col = "ba.consumer.dn_functie_naam"
+
+    db.upsert_node(
+        "SqlTable",
+        table,
+        {"catalog": None, "db": "ba", "name": "promoted_intermediate", "kind": "table"},
+    )
+    db.upsert_node(
+        "SqlColumn",
+        src_col,
+        {
+            "catalog": None,
+            "db": "ba",
+            "table_name": "promoted_intermediate",
+            "col_name": "dn_functie_naam",
+            "table_qualified": table,
+        },
+    )
+    db.upsert_node(
+        "SqlColumn",
+        dst_col,
+        {
+            "catalog": None,
+            "db": "ba",
+            "table_name": "consumer",
+            "col_name": "dn_functie_naam",
+            "table_qualified": "ba.consumer",
+        },
+    )
+    db.upsert_node(
+        "SqlQuery",
+        consumer_qid,
+        {
+            "file_path": "consumer.sql",
+            "statement_index": 0,
+            "sql": "INSERT INTO ba.consumer SELECT dn_functie_naam FROM ba.promoted_intermediate",
+            "kind": "INSERT_SELECT",
+            "target_table": "ba.consumer",
+            "parse_failed": False,
+            "start_line": 1,
+        },
+    )
+    db.upsert_edge(
+        "SqlColumn",
+        src_col,
+        "SqlColumn",
+        dst_col,
+        "COLUMN_LINEAGE",
+        {"transform": "CTE_PROJECTION", "confidence": 1.0, "query_id": consumer_qid},
+    )
+    return table, consumer_qid
+
+
 @pytest.mark.parametrize(
     ("case_id", "consumer_sql", "target"),
     IMPACT_PARITY_CASES,
@@ -129,102 +217,134 @@ def _union_consumers(db: DuckDBBackend, table: str) -> set[str]:
 def test_impact_matches_full_consumer_set_for_physical_target(
     tmp_path, case_id, consumer_sql, target
 ):
-    """`analyze impact <physical table>` lists the same consumer as the full
-    SELECTS_FROM union.
+    """`analyze impact <physical table>` covers the full SELECTS_FROM ∪ STAR ∪
+    COLUMN_LINEAGE consumer union (the union is a superset, never drops the
+    physical consumer).
 
-    Guards PR-B's B2 parity criterion. NOT-REPRODUCED gate evidence: for every
-    shape the plan named, ``impact`` already covers the full
-    SELECTS_FROM ∪ STAR_SOURCE ∪ COLUMN_LINEAGE union (it is never a strict
-    subset), so the under-report does not occur on physical tables.
+    Guards the union fix's superset property
+    ([plan doc](plan/sprints/bugfix_impact_consumer_union.md), A3): for a physical
+    table the merged ``impact`` set equals the full union — it neither under-reports
+    nor adds spurious rows.
     """
     db = _index(tmp_path, {"ddl.sql": _DDL, "etl.sql": consumer_sql})
     try:
-        impact = _impact_consumers(db, target)
+        merged = {r["id"] for r in _merged_impact_consumers(db, target)}
         union = _union_consumers(db, target)
-        assert impact, f"[{case_id}] impact found no consumer for {target}"
-        # The bug would manifest as `union - impact` being non-empty (impact a
-        # strict subset). It is empty for every reproducible shape.
-        assert not (union - impact), (
-            f"[{case_id}] impact UNDER-reports for {target}: "
-            f"union has {sorted(union)}, impact has {sorted(impact)}, "
-            f"missed {sorted(union - impact)}"
+        assert merged, f"[{case_id}] impact found no consumer for {target}"
+        # Merged impact must equal the full union for a physical target.
+        assert union - merged == set(), (
+            f"[{case_id}] merged impact UNDER-reports for {target}: "
+            f"union has {sorted(union)}, merged has {sorted(merged)}, "
+            f"missed {sorted(union - merged)}"
+        )
+        assert merged - union == set(), (
+            f"[{case_id}] merged impact OVER-reports for {target}: extra {sorted(merged - union)}"
         )
     finally:
         db.close()
 
 
-def test_only_cte_intermediates_have_lineage_read_without_selects_from(tmp_path):
-    """The sole tables with a COLUMN_LINEAGE/STAR read but no SELECTS_FROM edge
-    are namespaced CTE intermediates (kind='cte') — never valid impact targets.
+def test_impact_surfaces_lineage_only_consumer_of_promoted_intermediate(tmp_path):
+    """The fixed ``impact`` surfaces a consumer reachable ONLY via COLUMN_LINEAGE
+    (no SELECTS_FROM edge) — the live ``ba.all_rows_in_selection`` shape.
 
-    This pins WHY Bug #6 cannot reproduce on physical tables: the recursive-CTE
-    known gap in ``_real_tables`` only leaks the CTE alias node, not the real
-    physical source. Uses the documented recursive-CTE gap shape from the plan.
+    Authoritative Bug #6 repro, GRAPH-LAYER SEEDED
+    ([plan doc](plan/sprints/bugfix_impact_consumer_union.md), A1). FAILS pre-fix
+    (the OLD SELECTS_FROM-only query returns ∅), PASSES post-fix (the union
+    surfaces the consumer). The negative control (``_impact_consumers`` == ∅) is
+    asserted in the same test so the repro cannot silently pass for the wrong
+    reason.
+    """
+    db = DuckDBBackend(":memory:")
+    db.init_schema()
+    try:
+        table, consumer_qid = _seed_promoted_intermediate(db)
+
+        # Negative control: the OLD SELECTS_FROM-only query finds nothing (the bug).
+        old = _impact_consumers(db, table)
+        assert old == set(), (
+            f"negative control broken: the SELECTS_FROM-only impact query should "
+            f"return ∅ for a promoted intermediate with no SELECTS_FROM in-edge, "
+            f"got {sorted(old)}"
+        )
+
+        # The fix: the merged (direct ∪ via-lineage) impact surfaces the consumer.
+        merged = {r["id"] for r in _merged_impact_consumers(db, table)}
+        assert consumer_qid in merged, (
+            f"fixed impact must surface the lineage-only consumer {consumer_qid}; "
+            f"got {sorted(merged)}"
+        )
+    finally:
+        db.close()
+
+
+def test_impact_physical_source_unchanged_by_union(tmp_path):
+    """``impact`` on a physical source of a nested-CTE INSERT…SELECT is UNCHANGED
+    by the union (direct == merged).
+
+    No-regression case ([plan doc](plan/sprints/bugfix_impact_consumer_union.md),
+    A2). This nested-CTE indexer fixture does NOT reproduce Bug #6 (it emits only a
+    namespaced ``kind='cte'`` gap node, and ``ba.src`` already has a SELECTS_FROM
+    edge) — the live divergence needs cross-file promotion, covered by the seeded
+    test above. Here it proves the union adds/drops nothing for a physical source.
     """
     db = _index(
         tmp_path,
         {
-            "ddl.sql": "CREATE TABLE ba.emp (id INT, mgr INT, name STRING);\n"
-            "CREATE TABLE ba.tgt (id INT, name STRING);\n",
-            "etl.sql": "INSERT INTO ba.tgt WITH RECURSIVE r(id, mgr, name) AS ("
-            "SELECT id, mgr, name FROM ba.emp WHERE mgr IS NULL "
-            "UNION ALL SELECT e.id, e.mgr, e.name FROM ba.emp e JOIN r ON e.mgr = r.id) "
-            "SELECT id, name FROM r;\n",
+            "ddl.sql": "CREATE TABLE ba.src (col1 INT, col2 INT);\n"
+            "CREATE TABLE ba.tgt (col1 INT, col2 INT);\n",
+            "etl.sql": "INSERT INTO ba.tgt WITH outer_c AS ("
+            "  WITH all_rows AS (SELECT col1, col2 FROM ba.src) SELECT col1, col2 FROM all_rows"
+            ") SELECT col1, col2 FROM outer_c;\n",
         },
     )
     try:
-        cl = {
-            r["tq"]
-            for r in db.run_read(
-                'SELECT DISTINCT s.table_qualified AS tq FROM "COLUMN_LINEAGE" cl '
-                'JOIN "SqlColumn" s ON s.id = cl.src_key '
-                "WHERE s.table_qualified IS NOT NULL AND s.table_qualified <> ''",
-                {},
-            )
-        }
-        star = {
-            r["tq"] for r in db.run_read('SELECT DISTINCT dst_key AS tq FROM "STAR_SOURCE"', {})
-        }
-        sf = {r["tq"] for r in db.run_read('SELECT DISTINCT dst_key AS tq FROM "SELECTS_FROM"', {})}
-        gap = (cl | star) - sf
-        # The real physical source ba.emp IS covered by SELECTS_FROM.
-        assert "ba.emp" in sf, "physical recursive-CTE source must have a SELECTS_FROM edge"
-        assert "ba.emp" not in gap
-        # Every leaked-read-only table is a namespaced CTE alias (contains '::').
-        assert all("::" in g for g in gap), (
-            f"a non-CTE table leaked a lineage read without SELECTS_FROM: {sorted(gap)} "
-            "— this would be a genuine Bug #6 reproduction; capture it as a fixture."
+        direct = _impact_consumers(db, "ba.src")
+        merged = {r["id"] for r in _merged_impact_consumers(db, "ba.src")}
+        assert direct, "physical source ba.src must have a direct SELECTS_FROM consumer"
+        assert direct == merged, (
+            f"union changed the consumer set for physical source ba.src: "
+            f"direct {sorted(direct)} != merged {sorted(merged)}"
         )
     finally:
         db.close()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Bug #6 capture gate: no standalone fixture reproduces a physical table "
-        "whose consumer is reachable via COLUMN_LINEAGE/STAR_SOURCE but NOT "
-        "SELECTS_FROM. If the live DWH shape is ever isolated, replace this body "
-        "with that fixture and remove the xfail — the assertion then fails on "
-        "current `impact` (proving the under-report) and passes once the PR-B "
-        "UNION fix lands. See plan/sprints/bugfix_impact_analysis_validation.md PR-B."
-    ),
-    strict=True,
-)
-def test_impact_under_reports_lineage_only_consumer_placeholder(tmp_path):
-    """Placeholder for the live-derived reproducing fixture (PR-B B1).
+def test_impact_dedups_consumer_reachable_via_both_edges(tmp_path):
+    """A consumer reachable via BOTH SELECTS_FROM and COLUMN_LINEAGE is listed
+    exactly once (dedup on q.id).
 
-    Intentionally xfail-strict: it asserts a condition (physical table with a
-    lineage/star-only consumer that impact misses) that NO known fixture
-    produces. The harness above is ready — fill in the captured SQL here.
+    Guards A4 ([plan doc](plan/sprints/bugfix_impact_consumer_union.md)): the merge
+    must not double-count. A plain ``INSERT … SELECT … FROM ba.src`` yields a
+    consumer reachable both ways; assert it appears once.
     """
     db = _index(
         tmp_path,
         {"ddl.sql": _DDL, "etl.sql": "INSERT INTO ba.tgt SELECT col1 FROM ba.src;\n"},
     )
     try:
-        impact = _impact_consumers(db, "ba.src")
-        union = _union_consumers(db, "ba.src")
-        # XFAIL: this difference is empty for every known shape.
-        assert union - impact, "no known fixture makes impact a strict subset"
+        rows = _merged_impact_consumers(db, "ba.src")
+        ids = [r["id"] for r in rows]
+        assert ids, "expected at least one consumer for ba.src"
+        assert len(ids) == len(set(ids)), f"duplicate consumer rows in impact: {ids}"
+    finally:
+        db.close()
+
+
+def test_impact_result_schema_has_id_and_kind(tmp_path):
+    """The merged ``impact`` rows still expose ``id`` and ``kind`` keys (output
+    schema unchanged).
+
+    Guards A5 ([plan doc](plan/sprints/bugfix_impact_consumer_union.md)).
+    """
+    db = _index(
+        tmp_path,
+        {"ddl.sql": _DDL, "etl.sql": "INSERT INTO ba.tgt SELECT col1 FROM ba.src;\n"},
+    )
+    try:
+        rows = _merged_impact_consumers(db, "ba.src")
+        assert rows, "expected at least one consumer row"
+        for r in rows:
+            assert "id" in r and "kind" in r, f"missing id/kind in row keys: {sorted(r)}"
     finally:
         db.close()
