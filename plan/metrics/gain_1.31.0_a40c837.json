@@ -1,0 +1,30 @@
+{"total_calls": 951, "last_7d_calls": 951, "index_runs": 5, "feedback_tp": 0, 
+"feedback_total": 0, "top_tools": [{"name": "execute_sql", "count": 316}, 
+{"name": "trace_column_lineage", "count": 254}, {"name": 
+"list_dialects_and_repos", "count": 82}], "execute_sql_ratio": 0.33, 
+"parse_quality": {"sqlglot": 5166, "scripting": 20, "dynamic_sql": 3}, 
+"coverage": {"catalogued_tables": 5796, "total_tables": 6581, "good_edges": 
+51590, "total_edges": 59749, "phantom_edges": 12433, "blindspot_tables": 628, 
+"good_edges_strict": 46374, "edge_health_strict_pct": 77.61, 
+"good_edges_scoped": 36811, "total_edges_scoped": 37585, 
+"edge_health_scoped_pct": 97.94, "phantom_confirmed": 11893, 
+"phantom_contradicted": 352, "phantom_unverified": 188, "top_blindspot_tables": 
+[{"table": "ia_analytics.ba_wtfa_artikel_formule_dagomzet", "bad_edges": 218}, 
+{"table": "ba.wtfa_kpi_datum_klant", "bad_edges": 70}, {"table": 
+"ba.wtfs_voorraad_dagstand", "bad_edges": 55}, {"table": 
+"ba.wtfs_voorraad_zondagstand", "bad_edges": 55}, {"table": 
+"da.rtgmd_postnl_customer_usage", "bad_edges": 43}, {"table": 
+"da.rtgmd_postnl_athome_3s", "bad_edges": 33}, {"table": 
+"wtfe_kpi_voorraad_artikel_voorraadlocatie", "bad_edges": 32}, {"table": 
+"da.rtgmd_postnl_facturen", "bad_edges": 30}, {"table": "da.hthyb_pages", 
+"bad_edges": 23}, {"table": "da.rtgmd_dhb_extra_kosten", "bad_edges": 19}], 
+"blindspot_tables_for_80pct": 15, "files_indexed": 1335, "indexed_sha": 
+"fdf1b551a34601a6cf3ce1c8b9f76e27ce2753e6", "db_path": 
+"/tmp/sqlcg_pr6_after.db", "index_timestamp": 1781437141.6080067, 
+"degraded_parse_total": 5189, "degraded_parse_queries": 20, 
+"degraded_parse_by_dir": {"etl": {"degraded": 1, "total": 2776}, "ddl": 
+{"degraded": 19, "total": 2413}}, "zero_edge_write_queries": 1077, 
+"total_write_queries": 2352, "cte_key_collisions": 0, 
+"rescuable_unqualified_edges": 131, "info_schema_has_column_rows": 110257, 
+"cte_source_gap_writes": 0, "resolvable_write_col_edges": 35660, 
+"transitive_col_edges": 4567, "qualify_failed_statements": 9}}
