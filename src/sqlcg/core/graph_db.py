@@ -178,6 +178,17 @@ class GraphBackend(ABC):
             feature, or the DB was freshly initialised).
         """
 
+    def get_indexed_version(self) -> str | None:
+        """Retrieve the sqlcg version that wrote the last successful index.
+
+        Returns:
+            The version string (e.g. "1.33.0"), or None for legacy graphs or
+            backends that do not persist the tool version.  The default
+            implementation returns None so subclasses that don't override it
+            degrade gracefully without claiming false staleness.
+        """
+        return None
+
     @abstractmethod
     def close(self) -> None:
         """Close the database connection."""

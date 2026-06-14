@@ -37,6 +37,19 @@ class Freshness:
     branch: str | None
     """Current branch name (``git rev-parse --abbrev-ref HEAD``), or None."""
 
+    indexed_version: str | None = None
+    """The sqlcg version that wrote the last successful index, or None for legacy graphs."""
+
+    running_version: str | None = None
+    """The currently running sqlcg version, passed by the caller."""
+
+    tool_version_stale: bool = False
+    """True when *indexed_version* is known and differs from the running version.
+
+    False when *indexed_version* is None (pre-v1.33.0 graph or never indexed) so
+    we never claim staleness we cannot prove.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Internal git helper
@@ -65,7 +78,12 @@ def _git(root: Path, *args: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def compute_freshness(root: Path, indexed_sha: str | None) -> Freshness:
+def compute_freshness(
+    root: Path,
+    indexed_sha: str | None,
+    indexed_version: str | None = None,
+    running_version: str | None = None,
+) -> Freshness:
     """Compute freshness relative to the git repo at *root*.
 
     Returns a :class:`Freshness` with all-None/False fields when *root* is not
@@ -77,6 +95,12 @@ def compute_freshness(root: Path, indexed_sha: str | None) -> Freshness:
         indexed_sha: The SHA recorded by ``DuckDBBackend.get_indexed_sha()``.
             May be ``None`` when the graph was never indexed, or a sentinel
             like ``"<head>+dirty"`` written by ``index --include-working-tree``.
+        indexed_version: The sqlcg version that wrote the last index, from
+            ``DuckDBBackend.get_indexed_version()``.  None for legacy graphs —
+            treated as unknown (no false-positive staleness claim).
+        running_version: The currently running sqlcg version string (e.g.
+            ``sqlcg.__version__``).  When None, tool-version staleness is not
+            computed.
     """
     head = _git(root, "rev-parse", "HEAD")
     branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
@@ -96,12 +120,23 @@ def compute_freshness(root: Path, indexed_sha: str | None) -> Freshness:
                     stale = None
             # If indexed_sha is unknown (rebased/shallow), raw is None → stale stays None
 
+    # Tool-version staleness: only claim stale when we have proof (both versions known
+    # and they differ).  Null indexed_version → False, no false positive.
+    tool_version_stale = (
+        indexed_version is not None
+        and running_version is not None
+        and indexed_version != running_version
+    )
+
     return Freshness(
         indexed_sha=indexed_sha,
         head_sha=head,
         stale_by_commits=stale,
         dirty=dirty,
         branch=branch,
+        indexed_version=indexed_version,
+        running_version=running_version,
+        tool_version_stale=tool_version_stale,
     )
 
 
@@ -131,4 +166,13 @@ def render_freshness_line(f: Freshness) -> str:
 
     summary = ", ".join(parts)
     sha8 = f.indexed_sha[:8]
-    return f"indexed at {sha8} ({summary})"
+    line = f"indexed at {sha8} ({summary})"
+
+    if f.tool_version_stale:
+        line += (
+            f"; indexed with sqlcg {f.indexed_version},"
+            f" running {f.running_version}"
+            f" — reindex to pick up parser improvements"
+        )
+
+    return line

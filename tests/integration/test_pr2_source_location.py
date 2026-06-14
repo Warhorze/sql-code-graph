@@ -228,10 +228,10 @@ def test_scenario_d_schema_version_mismatch_exits(tmp_path):
         assert stored == "4"
         assert stored != SCHEMA_VERSION, "SCHEMA_VERSION must differ from '4' after the PR-2 bump"
         # Confirm the version gate would fire (matches the check in index.py).
-        # SCHEMA_VERSION has since moved to '9' (SqlQuery.qualify_failed column,
-        # plan/sprints/sprint_backlog_q2_bugfix.md §PR-C) — the gate
+        # SCHEMA_VERSION has since moved to '10' (SchemaVersion.sqlcg_version column,
+        # plan/sprints/bugfix_audit_findings_151_153.md §PR-A) — the gate
         # logic this test pins (any mismatch triggers re-index) is unaffected.
-        assert SCHEMA_VERSION == "9", f"Expected SCHEMA_VERSION='9', got {SCHEMA_VERSION!r}"
+        assert SCHEMA_VERSION == "10", f"Expected SCHEMA_VERSION='10', got {SCHEMA_VERSION!r}"
 
 
 # ---------------------------------------------------------------------------
