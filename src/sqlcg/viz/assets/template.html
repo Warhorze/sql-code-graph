@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>sqlcg graph explorer</title>
+<script>
+/*__FORCE_GRAPH_LIB__*/
+</script>
+<style>
+ body{margin:0;font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;overflow:hidden}
+ #bar{position:fixed;top:0;left:0;right:0;z-index:10;background:#161b22;padding:8px 14px;
+      display:flex;gap:10px;align-items:center;border-bottom:1px solid #30363d;flex-wrap:wrap}
+ #bar input,#bar select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;
+      border-radius:6px;padding:4px 8px;font-size:13px}
+ #meta{font-size:11px;color:#8b949e;margin-left:auto;white-space:nowrap}
+ #info{position:fixed;bottom:0;left:0;z-index:10;background:#161b22cc;padding:6px 14px;
+      font-size:12px;max-width:60vw;border-top-right-radius:8px;line-height:1.6}
+ label{font-size:12px;color:#8b949e}
+ .facet{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:11px;
+        border:1px solid #30363d;border-radius:6px;padding:3px 6px;max-width:46vw}
+ .facet > b{color:#8b949e;font-weight:600;margin-right:2px;font-size:10px;text-transform:uppercase}
+ .chip{display:inline-flex;align-items:center;gap:3px;white-space:nowrap;cursor:pointer;
+       padding:1px 4px;border-radius:4px;user-select:none}
+ .chip.off{opacity:.4}
+ .dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+ #legend{display:flex;gap:8px;flex-wrap:wrap;font-size:11px;align-items:center}
+</style></head><body>
+<div id="bar">
+ <b style="white-space:nowrap">sqlcg graph explorer</b>
+ <input id="search" placeholder="search table… (Enter focuses)" size="22">
+ <div class="facet" id="schema-facet"><b>schema</b></div>
+ <div class="facet" id="kind-facet"><b>kind</b></div>
+ <div class="facet" id="tag-facet"><b>tag</b></div>
+ <select id="jobsel"><option value="">all jobs</option></select>
+ <label>min deg <input id="mindeg" type="number" value="0" min="0" style="width:3.2em"></label>
+ <label><input id="egomode" type="checkbox"> ego</label>
+ <label><input id="labelmode" type="checkbox" checked> labels</label>
+ <label><input id="tagcolor" type="checkbox"> color by tag</label>
+ <span id="meta"></span>
+</div>
+<div id="graph"></div>
+<div id="info">click a node · scroll to zoom · drag to pan · click a chip to toggle, alt/right-click to solo</div>
+<script>
+const DATA = /*__DATA__*/;
+const TAGS = /*__TAGS__*/;
+const JOBS = /*__JOBS__*/;
+const SCHEMA_CONFIG = /*__SCHEMA_CONFIG__*/;
+
+const nodeById = new Map(DATA.nodes.map(n => [n.id, n]));
+
+// ── Adjacency (undirected, for ego-mode). The baked DATA.adj is the same set;
+//    we rebuild here so ego works even on partial future re-bakes, and assert
+//    agreement with the bake below. ─────────────────────────────────────────
+const adj = new Map();
+for (const l of DATA.links) {
+  const s = l.source.id ?? l.source;
+  const t = l.target.id ?? l.target;
+  if (!adj.has(s)) adj.set(s, new Set());
+  if (!adj.has(t)) adj.set(t, new Set());
+  adj.get(s).add(t); adj.get(t).add(s);
+}
+
+// ── Schema palette + colors ──────────────────────────────────────────────
+const SCHEMA_PALETTE = SCHEMA_CONFIG.palette;
+const SCHEMA_OTHER_COLOR = SCHEMA_CONFIG.other;
+const dataSchemas = [...new Set(DATA.nodes.map(n => n.schema))].sort();
+const curatedSchemas = (SCHEMA_CONFIG.schemas && SCHEMA_CONFIG.schemas.length)
+  ? SCHEMA_CONFIG.schemas
+  : dataSchemas;
+const schemaColour = new Map();
+curatedSchemas.forEach((s, i) => schemaColour.set(s, SCHEMA_PALETTE[i % SCHEMA_PALETTE.length]));
+dataSchemas.forEach(s => { if (!schemaColour.has(s)) schemaColour.set(s, SCHEMA_OTHER_COLOR); });
+function schemaFill(n) { return schemaColour.get(n.schema) || SCHEMA_OTHER_COLOR; }
+
+// ── Kind vocabulary (B2): table/view/temp default ON; cte/derived default OFF.
+//    "external" is never emitted. Unknown kinds bucket into "table". ─────────
+const KNOWN_KINDS = ['table', 'view', 'temp', 'cte', 'derived'];
+const KIND_DEFAULT_ON = new Set(['table', 'view', 'temp']);
+function kindBucket(k) { return KNOWN_KINDS.includes(k) ? k : 'table'; }
+
+// ── Facet selection state. Empty selected-set for a facet = "do not filter". ─
+const sel = {
+  schema: new Set(),         // empty = all schemas
+  kind: new Set([...KIND_DEFAULT_ON]),  // checked kinds; cte/derived start off
+  tag: new Set(),            // empty = all (no tag filter)
+};
+const soloBackup = { schema: null, kind: null, tag: null };
+
+let focusNode = null;
+let hoveredNode = null;
+
+function buildFacet(facetId, key, items, colorOf, defaultOn) {
+  const root = document.getElementById(facetId);
+  for (const item of items) {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    const on = defaultOn(item);
+    if (!on) chip.classList.add('off');
+    const col = colorOf ? colorOf(item) : null;
+    chip.innerHTML = (col ? `<span class="dot" style="background:${col}"></span>` : '') + item;
+    // Toggle on click; solo on alt/right-click.
+    chip.addEventListener('click', (e) => {
+      if (e.altKey) { soloFacet(key, item, items, defaultOn); }
+      else { toggleChip(key, item, chip); }
+      refresh();
+    });
+    chip.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      soloFacet(key, item, items, defaultOn);
+      refresh();
+    });
+    chip._item = item;
+    root.appendChild(chip);
+  }
+}
+
+function toggleChip(key, item, chip) {
+  if (sel[key].has(item)) { sel[key].delete(item); chip.classList.add('off'); }
+  else { sel[key].add(item); chip.classList.remove('off'); }
+  soloBackup[key] = null;
+}
+
+function soloFacet(key, item, items, defaultOn) {
+  const isSolo = sel[key].size === 1 && sel[key].has(item);
+  if (isSolo && soloBackup[key]) {
+    // Restore the previous multi-select state.
+    sel[key] = soloBackup[key];
+    soloBackup[key] = null;
+  } else {
+    soloBackup[key] = new Set(sel[key]);
+    sel[key] = new Set([item]);
+  }
+  syncChips(key, items);
+}
+
+function syncChips(key, items) {
+  const root = document.getElementById(
+    key === 'schema' ? 'schema-facet' : key === 'kind' ? 'kind-facet' : 'tag-facet'
+  );
+  for (const chip of root.querySelectorAll('.chip')) {
+    if (sel[key].has(chip._item)) chip.classList.remove('off');
+    else chip.classList.add('off');
+  }
+}
+
+// schema facet: chip = configured/derived schemas; empty selection = all.
+buildFacet('schema-facet', 'schema', curatedSchemas,
+  s => schemaColour.get(s) || SCHEMA_OTHER_COLOR, () => false);
+// kind facet
+buildFacet('kind-facet', 'kind', KNOWN_KINDS, null, k => KIND_DEFAULT_ON.has(k));
+// tag facet (legend swatches double as filter controls)
+buildFacet('tag-facet', 'tag', TAGS.labels || [],
+  t => (TAGS.colors || {})[t] || SCHEMA_OTHER_COLOR, () => false);
+
+// ── Job facet → dropdown (filter only). ──────────────────────────────────
+const jobSel = document.getElementById('jobsel');
+for (const j of (JOBS.labels || [])) {
+  const o = document.createElement('option'); o.value = o.textContent = j; jobSel.appendChild(o);
+}
+
+// ── Facet predicates ──────────────────────────────────────────────────────
+function schemaPass(n) { return sel.schema.size === 0 || sel.schema.has(n.schema); }
+function kindPass(n)   { return sel.kind.has(kindBucket(n.kind)); }
+function tagPass(n)    {
+  if (sel.tag.size === 0) return true;
+  return (n.tags || []).some(t => sel.tag.has(t));
+}
+function jobPass(n, job) {
+  if (!job) return true;
+  return (n.jobs || []).includes(job);
+}
+
+function currentData() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const md = +document.getElementById('mindeg').value || 0;
+  const ego = document.getElementById('egomode').checked && focusNode;
+  const job = jobSel.value;
+
+  let keep = new Set();
+  if (ego) {
+    // Ego mode: focus node + its neighbours, still subject to facet filters.
+    const candidate = new Set([focusNode, ...(adj.get(focusNode) || [])]);
+    for (const id of candidate) {
+      const n = nodeById.get(id);
+      if (!n) continue;
+      if (schemaPass(n) && kindPass(n) && tagPass(n) && jobPass(n, job)) keep.add(id);
+    }
+  } else {
+    for (const n of DATA.nodes) {
+      if (n.deg < md) continue;
+      // Composition: schemaPass ∧ kindPass ∧ tagPass ∧ jobPass.
+      if (schemaPass(n) && kindPass(n) && tagPass(n) && jobPass(n, job)) keep.add(n.id);
+    }
+  }
+
+  let nodes = DATA.nodes.filter(n => keep.has(n.id))
+    .map(n => ({...n, _hit: q && n.id.toLowerCase().includes(q)}));
+  const ids = new Set(nodes.map(n => n.id));
+  // Edge visible iff BOTH endpoints visible.
+  const links = DATA.links
+    .filter(l => ids.has(l.source.id ?? l.source) && ids.has(l.target.id ?? l.target))
+    .map(l => ({source: l.source.id ?? l.source, target: l.target.id ?? l.target, n: l.n}));
+
+  const metaEl = document.getElementById('meta');
+  metaEl.textContent = `${nodes.length} / ${DATA.nodes.length} tables · ${links.length} links`;
+  return {nodes, links};
+}
+
+// ── Node coloring ─────────────────────────────────────────────────────────
+// Default fill = schema color. "color by tag" mode = first-checked-tag (legend
+// order) wins the fill; a thin secondary ring signals the node has more tags.
+function nodeFill(n) {
+  if (n._hit) return '#ffffff';
+  if (document.getElementById('tagcolor').checked && (n.tags || []).length) {
+    const order = TAGS.labels || [];
+    const checked = sel.tag.size ? order.filter(t => sel.tag.has(t)) : order;
+    const first = checked.find(t => n.tags.includes(t)) || n.tags[0];
+    return (TAGS.colors || {})[first] || schemaFill(n);
+  }
+  return schemaFill(n);
+}
+function tagRing(n) {
+  // Secondary ring: present when the node carries any tag (the tag color in
+  // schema-fill mode, or "has more tags" in tag-color mode).
+  if (!(n.tags || []).length) return null;
+  const order = TAGS.labels || [];
+  const first = order.find(t => n.tags.includes(t)) || n.tags[0];
+  return (TAGS.colors || {})[first] || null;
+}
+
+function drawNodeCanvas(node, ctx, globalScale) {
+  const r = Math.max(1, Math.sqrt(node.deg || 1));
+  ctx.beginPath();
+  ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+  ctx.fillStyle = nodeFill(node);
+  ctx.fill();
+  const ring = tagRing(node);
+  if (ring && !node._hit) {
+    ctx.lineWidth = 1.5 / globalScale;
+    ctx.strokeStyle = ring;
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, r + 1.5 / globalScale, 0, 2 * Math.PI);
+    ctx.stroke();
+  }
+  const showLabels = document.getElementById('labelmode').checked;
+  if (showLabels && (r * globalScale > 6 || node._hit || node.id === hoveredNode)) {
+    ctx.font = `${10 / globalScale}px system-ui`;
+    ctx.fillStyle = '#c9d1d9';
+    ctx.fillText(node.id, node.x + r + 1, node.y + 3 / globalScale);
+  }
+}
+
+// ── Graph init ────────────────────────────────────────────────────────────
+const Graph = ForceGraph()(document.getElementById('graph'))
+  .graphData(currentData())
+  .nodeId('id')
+  .nodeCanvasObject(drawNodeCanvas)
+  .nodeLabel(n => `${n.id}\nschema: ${n.schema} · kind: ${n.kind} · degree: ${n.deg}`
+    + ((n.tags || []).length ? `\ntags: ${n.tags.join(', ')}` : '')
+    + ((n.jobs || []).length ? `\njobs: ${n.jobs.join(', ')}` : ''))
+  .onNodeClick(n => { focusNode = n.id; refresh(); })
+  .onNodeHover(n => { hoveredNode = n ? n.id : null; });
+
+function refresh() { Graph.graphData(currentData()); }
+
+for (const id of ['search', 'mindeg', 'egomode', 'labelmode', 'tagcolor']) {
+  document.getElementById(id).addEventListener('input', refresh);
+}
+jobSel.addEventListener('change', refresh);
+document.getElementById('search').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const hit = DATA.nodes.find(n => n.id.toLowerCase().includes(e.target.value.toLowerCase()));
+    if (hit) { focusNode = hit.id; refresh(); }
+  }
+});
+</script>
+</body></html>

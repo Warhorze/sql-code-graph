@@ -151,6 +151,44 @@ def get_noise_filter_patterns(path: Path) -> list[str]:
     return default_patterns
 
 
+def get_viz_schemas(path: Path) -> list[str]:
+    """Get the curated viz schema list from .sqlcg.toml.
+
+    Reads [sqlcg.viz] -> schemas (a list of schema-name strings) from
+    .sqlcg.toml. Used by ``sqlcg viz`` to decide which schemas get a distinct
+    hue / appear as multi-select facets. When the block/key is absent or not a
+    list, returns ``[]`` and the generator falls back to **data-derived**
+    schemas (every distinct schema present in the graph), preserving the
+    zero-config small-repo path::
+
+        [sqlcg.viz]
+        schemas = ["ba", "da", "ia_analytics"]
+
+    This reader mirrors ``get_schema_aliases`` / ``get_noise_filter_patterns``
+    exactly (same .sqlcg.toml open, same ``except Exception: pass`` guard, same
+    fallback shape). It is presentation-only config; it never touches indexing
+    or lineage.
+
+    Args:
+        path: Root directory to search for .sqlcg.toml
+
+    Returns:
+        List of configured schema names. ``[]`` when the key is absent or
+        malformed (caller derives schemas from the data).
+    """
+    config_file = Path(path) / ".sqlcg.toml"
+    if config_file.exists():
+        try:
+            with open(config_file, "rb") as f:
+                config = tomllib.load(f)
+            raw = config.get("sqlcg", {}).get("viz", {}).get("schemas")
+            if isinstance(raw, list):
+                return [s for s in raw if isinstance(s, str)]
+        except Exception:
+            pass
+    return []
+
+
 def get_ignored_tables(path: Path) -> list[str]:
     """Get explicitly-ignored qualified table names from .sqlcg.toml.
 
