@@ -1,6 +1,14 @@
 # Fix Plan: `analyze impact` under-reports consumers (Bug #6)
 
-**Status:** DRAFT (a plan-reviewer gates this before any implementation)
+**Status:** REVIEWED (plan-reviewer 2026-06-14 returned REWORK; shepherd folded. FORK-1 RESOLVED
+— union is correct, `impact` single-hop preserved, not intentional semantics (the divergence is an
+incomplete impl predating the lineage rollup `find_table_usages` already has). FORK-2 RESOLVED — the
+reviewer EMPIRICALLY PROVED the nested-CTE indexer fixture cannot fail pre-fix (it yields a namespaced
+`kind='cte'` gap node, not the live non-namespaced `kind='table'` from cross-file promotion). The 3
+blockers (all one root cause) are folded: the authoritative repro is now **graph-layer seeded** (A1);
+the indexer fixture is demoted to no-regression only (A2); PR #156 docstring + disproven-invariant test
+rewrites are reconciled to the seeded repro. The fix QUERY itself was proven correct against the live
+shape by the reviewer. Version PATCH, reconcile at merge (master now v1.34.1). READY FOR DISPATCH.)
 **Branch (plan):** `plan/impact-consumer-union` (off `master` @ v1.34.0, commit `2047bc0`)
 **Implementation branch (developer creates):** `fix/impact-consumer-union`
 **Version:** PATCH → `1.34.1` (reconcile at merge; CLI-output completeness fix, no surface break)
@@ -203,59 +211,63 @@ the real root cause: a nested-CTE INSERT…SELECT whose inner CTE is promoted to
 bare `kind='table'` node yields COLUMN_LINEAGE out-edges with **no** SELECTS_FROM
 in-edge, so the SELECTS_FROM-only `impact` query under-reports.
 
-### (b) Convert the xfail slot into a real failing-then-passing repro
-The file currently has no live fixture in `IMPACT_PARITY_CASES` that exhibits the
-gap (every listed shape resolves to a *physical* source that DOES have a
-SELECTS_FROM edge). Add the **verifier's fixture recipe** — a nested-CTE
-INSERT…SELECT where an inner CTE is promoted to a bare `kind='table'` node:
+### (b) Convert the xfail slot into a real failing-then-passing repro — **GRAPH-LAYER SEEDED (mandated, plan-review FORK-2 resolved)**
+
+**MEASURED FACT (plan-review, empirical):** the nested-CTE INSERT…SELECT fixture
+below does **NOT** reproduce the gap in a from-scratch in-memory index — the inner
+CTE is **not** promoted to a non-namespaced `kind='table'` node; the only gap node
+it produces is `etl.sql::outer_c` (namespaced `kind='cte'`), and `ba.src` (the sole
+physical source) already has a SELECTS_FROM edge so `impact('ba.src')` already
+passes. The live `ba.all_rows_in_selection` is non-namespaced `kind='table'` only
+because of a **cross-file / qualified-name promotion effect** (indexer.py:240-256:
+a source-ref node defaults to `kind='table'` and is upgraded to `kind='cte'` ONLY
+when the same qualified name is later confirmed a CTE destination in the same pass;
+the single-file alias namespaces+confirms → `cte`). A unit fixture cannot reproduce
+it. **Do NOT use an indexer fixture as the bug repro** — that is the v1.21.0
+ship-green-on-toy-fixture trap.
+
+**MANDATED authoritative repro = graph-layer seeded** (the developer SEEDS the rows
+directly, no indexer):
+- a `SqlTable` with a **non-namespaced** qualified name (e.g. `ba.promoted_intermediate`), `kind='table'`;
+- a `SqlColumn` whose `table_qualified` = that name;
+- a `COLUMN_LINEAGE` edge from that column to a consumer `SqlQuery` (e.g. an INSERT into `ba.consumer`);
+- **zero** `SELECTS_FROM` in-edges to the seeded table.
+Then assert: the OLD `_IMPACT_SQL` (`analyze.py:316-323`) returns **∅** for the seeded
+node (the bug), and the NEW union (`IMPACT_CONSUMERS_VIA_LINEAGE` ∪ direct) returns
+the consumer (the fix). This test FAILS pre-fix, PASSES post-fix. Param binding for
+the two-`?` query: a 2-entry ordered dict (`{"t": name, "t2": name}`) — `_params_list`
+([`duckdb_backend.py:650`](src/sqlcg/core/duckdb_backend.py)) returns `list(values())`
+in insertion order.
+
+The nested-CTE INSERT…SELECT fixture (below) is **demoted to a NO-REGRESSION case
+only** — it proves `impact('ba.src')` is unchanged (direct == merged for a physical
+source), NOT that the bug reproduces:
 
 ```sql
--- DDL
 CREATE TABLE ba.src (col1 INT, col2 INT);
 CREATE TABLE ba.tgt (col1 INT, col2 INT);
--- ETL (inner CTE all_rows promoted to a bare kind='table' node ba.all_rows)
-INSERT INTO ba.tgt
-WITH outer_c AS (
-  WITH all_rows AS (SELECT col1, col2 FROM ba.src)
-  SELECT col1, col2 FROM all_rows
-)
-SELECT col1, col2 FROM outer_c;
+INSERT INTO ba.tgt WITH outer_c AS (
+  WITH all_rows AS (SELECT col1, col2 FROM ba.src) SELECT col1, col2 FROM all_rows
+) SELECT col1, col2 FROM outer_c;
 ```
-target node: **`ba.all_rows`** (the promoted intermediate — verify with the
-indexer that it materializes as `kind='table'`, non-namespaced, with
-COLUMN_LINEAGE out-edges and 0 SELECTS_FROM in-edges; if the indexer namespaces
-it as `ba.all_rows::...`, the developer must capture the **actual** promoted key
-the indexer emits and assert on that — the fixture's value is that it reproduces
-the *gap*, not the exact string).
 
-The repro test must, **on the pre-fix code, FAIL** (old `impact` query returns
-empty for the promoted node while the union/`downstream`/`empty-impact` set is
-non-empty) and **on the post-fix code, PASS** (impact matches the union). The
-developer adds it as a standalone test (not an `xfail` — the
-gate is now REPRODUCED, so it is a normal failing→passing test) and removes any
-`xfail(strict=True)` slot tied to the disproven gate.
+Remove the `xfail(strict=True)` slot; the seeded test is a normal failing→passing test.
 
-> If the indexer does **not** reproduce a non-namespaced `kind='table'` promoted
-> node in a from-scratch in-memory index of this fixture (i.e. the promotion only
-> happens at DWH scale / cross-file), this becomes **FORK-2**: the repro must be
-> pinned at a lower layer — assert directly on the graph that a `kind='table'`
-> non-namespaced node with COLUMN_LINEAGE out-edges and 0 SELECTS_FROM in-edges
-> makes the old query return ∅ and the new union return the consumer. The
-> developer must report which path reproduces and the plan-reviewer confirms the
-> fixture genuinely exhibits the failure mode before sign-off (do not ship a
-> fixture that cannot exhibit it — that is how the v1.21.0 dual-write shipped
-> green).
-
-### (c) Keep the parity assertions that genuinely hold
-`test_impact_matches_full_consumer_set_for_physical_target` (the parametrized
-physical-table parity) genuinely holds and must stay green **after** the fix too
-(the union is a superset, never drops the physical consumer). Keep it; update its
-docstring only where it references the NOT-REPRODUCED gate. The
-`test_only_cte_intermediates_have_lineage_read_without_selects_from` test asserts
-the **disproven** invariant (`all("::" in g for g in gap)`) — it must be
-**rewritten** to assert the *correct* invariant: a promoted non-namespaced
-`kind='table'` node CAN appear in the gap, and `analyze impact` (post-fix) still
-surfaces its consumer. Do not delete the coverage; re-aim it at the true behaviour.
+### (c) Reconcile the PR #156 docstring + invariant test (plan-review B2/B3)
+- **Docstring (a):** rewrite to state the bug reproduces **at DWH scale via cross-file
+  qualified-name promotion** (cite the live `ba.all_rows_in_selection`), and is pinned
+  in tests by a **graph-layer seeded** fixture — NOT by an indexer fixture (which the
+  measurement shows produces only a namespaced `kind='cte'` gap node).
+- **`test_impact_matches_full_consumer_set_for_physical_target`** genuinely holds (union
+  is a superset, never drops the physical consumer) — keep green.
+- **`test_only_cte_intermediates_have_lineage_read_without_selects_from`** asserts the
+  **disproven** `all("::" in g)` invariant. Rewrite to ONE of: (i) assert the corrected
+  positive behaviour on the **seeded** graph (post-fix `impact` surfaces the consumer of
+  a seeded non-namespaced `kind='table'` gap node); OR (ii) keep an indexer-level
+  invariant scoped to what indexers actually emit (`all("::" in g)` holds for
+  *indexer-produced* gaps) and document that the DWH cross-file case is covered by the
+  seeded test. **Do NOT assert that an indexer produces a non-namespaced `kind='table'`
+  gap node — it does not.** Recommended: (i).
 
 ---
 
@@ -292,16 +304,19 @@ green (c).
 
 ## Acceptance Criteria (observable)
 
-- [ ] **A1 — Promoted-intermediate parity:** an integration test indexes the
-  nested-CTE fixture and asserts `impact`'s consumer set on the promoted node
-  equals the `SELECTS_FROM ∪ STAR_SOURCE ∪ COLUMN_LINEAGE` union set **and is
-  non-empty** (the same set `downstream`/`empty-impact` reach). FAILS on pre-fix
-  code, PASSES on post-fix.
-- [ ] **A2 — Live-case guard:** a test (or the A1 fixture, documented as the
-  reduction of the live case) demonstrates that a `kind='table'`, non-namespaced
-  node with COLUMN_LINEAGE out-edges and 0 SELECTS_FROM in-edges — the
-  `ba.all_rows_in_selection` shape — now surfaces its consumer via `impact`. The
-  docstring cites the live case.
+- [ ] **A1 — Promoted-intermediate parity (GRAPH-LAYER SEEDED, plan-review FORK-2):**
+  a test SEEDS the graph directly — a non-namespaced `kind='table'` `SqlTable`, a
+  `SqlColumn` with `table_qualified` = that name, a `COLUMN_LINEAGE` edge to a consumer
+  `SqlQuery`, and ZERO `SELECTS_FROM` in-edges — then asserts the OLD `_IMPACT_SQL`
+  returns **∅** (bug) and the NEW union returns the consumer (fix). **FAILS on pre-fix,
+  PASSES on post-fix.** This is the authoritative repro. **Do NOT use an indexer fixture
+  here — measurement proved it produces only a namespaced `kind='cte'` gap node and
+  cannot fail pre-fix.**
+- [ ] **A2 — No-regression via the nested-CTE indexer fixture:** index the nested-CTE
+  fixture and assert `impact('ba.src')` (the physical source) is UNCHANGED before/after
+  (direct == merged). This fixture is a no-regression case ONLY, NOT the bug repro
+  (the bug needs the cross-file promotion the fixture doesn't produce). The live
+  `ba.all_rows_in_selection` is cited in the docstring as the field case.
 - [ ] **A3 — No regression on normal tables:** a physical table read via a
   top-level `FROM` returns the **exact same** consumer set from `impact` before
   and after the fix (the parametrized `test_impact_matches_full_consumer_set_for_physical_target`
