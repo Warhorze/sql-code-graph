@@ -548,6 +548,53 @@ class SnowflakeParser(AnsiParser):
         return "".join(parts), placeholder_offsets
 
     @classmethod
+    def _recover_literal_at(cls, sql: str, start: int) -> str | None:
+        """Apply the Phase-1 scope gate to a string literal starting at ``sql[start]``.
+
+        Shared gate for BOTH execution surfaces (inline literal and resolved variable
+        form).  Scans the literal (tolerating a pre-AS-body ``|| <runtime> ||``
+        concatenation placeholder), then enforces:
+
+        - ``_CREATE_DDL_PREFIX_RE`` — only a static ``CREATE … TABLE|VIEW`` is in scope
+          (SHOW / DROP / bare SELECT / INSERT / UPDATE / MERGE → rejected);
+        - an ``AS <body>`` marker must exist (a body-less CREATE carries no lineage);
+        - no runtime placeholder may land at/after the AS body (the body must be static).
+
+        Returns the recovered inner SQL, or ``None`` when the site is non-recoverable.
+
+        Args:
+            sql: Text containing the literal.
+            start: Index of the opening quote of the literal.
+
+        Returns:
+            Recovered inner SQL string, or ``None``.
+        """
+        inner, placeholder_offsets = cls._scan_string_concat(sql, start)
+        if inner is None:
+            return None
+        # SCOPE GATE (plan Phase 1): only a static-literal `CREATE … AS SELECT` DDL is
+        # statically recoverable. Reject anything else — SHOW / DROP / bare SELECT /
+        # INSERT / UPDATE / MERGE / etc. (a SELECT/INSERT with a `|| :var ||` predicate
+        # is runtime-dependent and would inject a placeholder into a lineage-bearing
+        # clause). Locating the AS body anchors the placeholder guard below.
+        if not _CREATE_DDL_PREFIX_RE.match(inner):
+            return None
+        body_match = _AS_BODY_START_RE.search(inner)
+        if body_match is None:
+            # A CREATE with no AS SELECT body carries no lineage to recover.
+            # If it also has a runtime placeholder we cannot prove it is in a
+            # non-lineage clause → reject. A static, body-less CREATE (e.g.
+            # CREATE TABLE … LIKE …) has no SELECT and is out of scope here.
+            return None
+        body_start = body_match.start()
+        # Reject when a runtime placeholder landed at/after the AS SELECT body
+        # (the body must be fully static; only a pre-AS clause such as WAREHOUSE
+        # may carry a `|| <runtime> ||` placeholder — lossless for lineage).
+        if any(off >= body_start for off in placeholder_offsets):
+            return None  # concatenation inside the body → non-recoverable
+        return inner
+
+    @classmethod
     def _unwrap_execute_immediate(cls, sql: str) -> list[str]:
         """Recover static-literal inner SQL from ``EXECUTE IMMEDIATE`` sites.
 
@@ -576,30 +623,9 @@ class SnowflakeParser(AnsiParser):
         consumed_starts: set[int] = set()
 
         def _try_literal_at(start: int) -> None:
-            inner, placeholder_offsets = cls._scan_string_concat(sql, start)
+            inner = cls._recover_literal_at(sql, start)
             if inner is None:
                 return
-            # SCOPE GATE (plan Phase 1): only a static-literal `CREATE … AS SELECT`
-            # DDL is statically recoverable. Reject anything else — SHOW / DROP /
-            # bare SELECT / INSERT / UPDATE / MERGE / etc. (a SELECT/INSERT with a
-            # `|| :var ||` predicate is runtime-dependent and would inject a placeholder
-            # into a lineage-bearing clause). Locating the AS body anchors the
-            # placeholder guard below.
-            if not _CREATE_DDL_PREFIX_RE.match(inner):
-                return
-            body_match = _AS_BODY_START_RE.search(inner)
-            if body_match is None:
-                # A CREATE with no AS SELECT body carries no lineage to recover.
-                # If it also has a runtime placeholder we cannot prove it is in a
-                # non-lineage clause → reject. A static, body-less CREATE (e.g.
-                # CREATE TABLE … LIKE …) has no SELECT and is out of scope here.
-                return
-            body_start = body_match.start()
-            # Reject when a runtime placeholder landed at/after the AS SELECT body
-            # (the body must be fully static; only a pre-AS clause such as WAREHOUSE
-            # may carry a `|| <runtime> ||` placeholder — lossless for lineage).
-            if any(off >= body_start for off in placeholder_offsets):
-                return  # concatenation inside the body → non-recoverable
             recovered.append(inner)
             consumed_starts.add(start)
 
@@ -671,13 +697,15 @@ class SnowflakeParser(AnsiParser):
             if var_m is not None:
                 literal = var_literals.get(var_m.group(1).lower())
                 if literal is not None:
-                    # Re-run the literal scanner over the assignment's RHS so a
-                    # WAREHOUSE-clause concatenation placeholder / body-concat guard
-                    # applies identically to the variable form. The captured RHS is the
-                    # already-unescaped literal value, so wrap it back in quotes for the
-                    # scanner only when it still contains a `||` bridge; otherwise the
-                    # raw value IS the inner SQL.
-                    inner_sql = literal
+                    # Route the resolved literal through the SAME Phase-1 scope gate the
+                    # inline form uses (only a static `CREATE … TABLE|VIEW AS <body>` is
+                    # recoverable; DROP / SELECT / etc. → rejected). var_literals holds
+                    # only pure single string literals (a concat RHS is not exp.Literal),
+                    # so wrapping the unescaped value back in quotes (doubling embedded
+                    # `'` per Snowflake escaping) round-trips it losslessly through the
+                    # _scan_string_concat-based gate.
+                    quoted = "'" + literal.replace("'", "''") + "'"
+                    inner_sql = self._recover_literal_at(quoted, 0)
         if inner_sql is None:
             return None
 

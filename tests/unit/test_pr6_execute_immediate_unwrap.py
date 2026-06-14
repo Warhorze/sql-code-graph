@@ -119,6 +119,36 @@ class TestPhase1Negative:
         result = _snow().parse_file(tmp_path / "ext.sql", sql, rel_path="ext.sql")
         assert [s for s in result.statements if s.kind == "CREATE_TABLE"] == []
 
+    def test_var_form_non_create_drop_literal_not_recovered(self, tmp_path):
+        """Var-form `var := 'DROP TABLE foo'; EXECUTE IMMEDIATE(:var)` is out of scope.
+
+        Structured (non-scripting) path: the resolved literal must pass through the SAME
+        scope gate as the inline form. A non-CREATE literal (DROP) is rejected — no
+        statement/node is spliced, even though the literal parses cleanly.
+        """
+        sql = "var := 'DROP TABLE foo';\nEXECUTE IMMEDIATE(:var);\n"
+        result = _snow().parse_file(tmp_path / "drop.sql", sql, rel_path="drop.sql")
+        # No recovered statement of any kind from the DROP literal (no spurious target
+        # and no source refs to `foo`).
+        all_names = {
+            n.name.lower()
+            for st in result.statements
+            for n in [*st.sources, *([st.target] if st.target else [])]
+        }
+        assert "foo" not in all_names, result.statements
+        assert [s for s in result.statements if s.kind in ("CREATE_TABLE", "CREATE_VIEW")] == []
+
+    def test_var_form_bare_select_literal_not_recovered(self, tmp_path):
+        """Var-form `var := 'SELECT …'; EXECUTE IMMEDIATE(:var)` is out of scope.
+
+        A bare SELECT recovered from a variable would otherwise be parsed and spliced,
+        injecting source edges out of Phase-1 scope ("skip, not guess").
+        """
+        sql = "var := 'SELECT a, b FROM secret_src';\nEXECUTE IMMEDIATE(:var);\n"
+        result = _snow().parse_file(tmp_path / "sel.sql", sql, rel_path="sel.sql")
+        all_source_names = {s.name.lower() for st in result.statements for s in st.sources}
+        assert "secret_src" not in all_source_names, result.statements
+
 
 class TestPhase2TempComposition:
     """Phase 2 — a static-literal EXECUTE IMMEDIATE of a TEMP CREATE composes a TEMP_INLINE edge."""
