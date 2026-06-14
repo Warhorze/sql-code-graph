@@ -5,8 +5,9 @@
 table), COLUMN_LINEAGE is SqlColumn→SqlColumn (collapse both ends); none were table-to-table.
 **B2**: `kind` vocabulary = `{table,view,cte,temp,derived}` — `external` is NEVER emitted; dropped
 from toggles (table/view/temp ON, cte/derived OFF). **B3**: `link.n` is NEW/additive (artifact has
-none) — e2e asserts as new, not parity. **B4**: `jobs:[]` baked → job dropdown goes INERT = KNOWN
-REGRESSION, flagged in Risks + follow-up, maintainer-consented. Forks resolved: A bake jobs:[]; B
+none) — e2e asserts as new, not parity. **B4 DISSOLVED (maintainer 2026-06-14):** jobs are NOT
+graph/external-sourced — `job` is a named FACET of the same per-table CSV lever as tags (no inert
+dropdown, no regression). Forks resolved: A jobs=tag-facet (per-table CSV); B
 factual kind set; C multi-tag = schema-color default + tag secondary ring, first-checked-tag wins
 fill in tag-color mode; D `[sqlcg.viz] schemas`. Priority checks PASS: self-containment e2e gate
 (no external src/fetch/CDN, lib+DATA inlined, node --check) + config-fallback can't break index/gain
@@ -176,12 +177,15 @@ curates*, never a *requirement*. The fallback default `[]` matches the `get_*` c
     must assert `n` as new behavior, NOT parity.
 - Degree `deg`: count of distinct neighbors per node over the collapsed edge set
   (computed in Python from the edge rows; do not add a graph query for it).
-- `jobs[]`: **bake `jobs: []` (Decision A — there is NO `jobs` column on `SqlTable` and no
-  graph relation produces it; the current artifact's non-empty `jobs` come from an external
-  `ej_*`/`semtex_*` source outside the repo). ⚠ KNOWN REGRESSION (plan-review B4): the shipped
-  generator's job dropdown becomes INERT until that external source is wired — a feature the
-  user's hand-maintained artifact has today is temporarily lost. Documented in §Risks; filed as
-  a follow-up. Maintainer consents to this trade.**
+- `jobs[]`: **MAINTAINER DECISION (2026-06-14, supersedes B4) — jobs are NOT graph-derived; they
+  are a per-table mapping supplied via THE SAME CSV LEVER AS TAGS.** No external source, no inert
+  dropdown, NO regression. `job` is simply a named facet of the generic per-table label mechanism
+  (see Tags CSV §). Generalize the design: the BYO mapping is a set of named FACETS, each a
+  per-table CSV mapping; `tag` and `job` are both facets (impl: either a `facet` column in one CSV
+  — `pattern,facet,label[,color]` — or separate `--tags`/`--jobs` files of identical shape; dev
+  picks, reviewer confirms). The job dropdown wires to the `job` facet exactly as the tag legend
+  wires to the `tag` facet. `jobs[]` on a node = the labels from the `job` facet for that table
+  (empty if the user supplies no job mapping — graceful, not a regression).
 
 **Baked `DATA` shape (extends the current artifact, additive — never drops a field):**
 
@@ -468,14 +472,14 @@ control panel needed.
 
 These do not block writing the plan but should be resolved before/at plan review:
 
-**Decision A — `jobs[]` provenance.** The current `table_graph.html` bakes a per-node
-`jobs` array (used by the job dropdown), but `SqlTable` has no obvious `jobs` column and no
-generator is committed. *Where did `jobs` come from?* Options: (a) it was hand-injected /
-external (the `viz_color_by_schema` note says `ej_*` job names come from "an external job
-source outside this repo"), so the generator bakes `jobs: []` and the job dropdown becomes
-inert unless a future source is wired; (b) there is a graph relation we should query.
-**Recommended:** (a) — bake `jobs: []`, keep the dropdown code dormant, file a follow-up to
-wire a real job source. Confirm.
+**Decision A — `jobs[]` provenance — RESOLVED by maintainer (2026-06-14).** Jobs are a
+**per-table mapping supplied via the same CSV lever as tags** — NOT graph-derived, NOT an
+external `ej_*` source the generator must wire. `job` is a named FACET of the generic per-table
+label mechanism (alongside `tag`). The job dropdown is driven by the user-supplied `job` facet,
+identical plumbing to the tag legend. No regression (B4 dissolved): if the user supplies no job
+mapping, `jobs[]` is empty and the dropdown is simply empty — same graceful behaviour as an empty
+tags CSV. Impl choice (dev → reviewer): a `facet` column in one mapping CSV vs separate
+`--tags`/`--jobs` files of identical shape; the renderer treats each facet as its own filter group.
 
 **Decision B — `kind` string vocabulary.** Confirm the exact strings the indexer writes to
 `SqlTable.kind` (`table`, `view`, and whether `temp`/`temporary` and `external` are emitted,
