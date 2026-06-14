@@ -183,9 +183,34 @@ def run_read_routed(
     if rows is not None:
         return rows
 
+    # query_via_server returned None. Normally this means no server is live and
+    # we can open the file directly. But there is a race/edge (#63): a server
+    # PID may still be alive while its control socket is momentarily
+    # unavailable (e.g. self-heal re-exec window, stale/refused socket). In that
+    # case a direct open would hit the live writer's single-file exclusive lock
+    # and surface an opaque IOException — read_only=True does NOT help, because
+    # an empirical probe confirmed a read-only co-open is impossible while a
+    # writer holds the file. So if a live server is detected, surface a clear
+    # message instead of the doomed open.
+    from sqlcg.server.control import is_pid_alive, read_pid
+
+    record = read_pid(db_path)
+    live_pid = record.get("pid") if record else None
+    if isinstance(live_pid, int) and is_pid_alive(live_pid):
+        from rich.console import Console
+
+        Console(stderr=True).print(
+            f"[red]An MCP server is running (PID {live_pid}) but its control "
+            "socket is currently unavailable, so this read cannot reach it. "
+            "It holds the DuckDB file's exclusive lock, so a direct read is not "
+            "possible. Retry in a moment, or check 'sqlcg mcp status'.[/red]"
+        )
+        raise typer.Exit(1)
+
     # No server live — fall back to a direct read-only open.
-    # read_only=True is required: without it the fallback opens read-write
-    # and any concurrent writer will produce "Database is locked" (BLOCKER 1).
+    # read_only is accepted for API compatibility but ignored: DuckDB's lock is
+    # single-file exclusive, so there is no read-only co-open (#63). With no
+    # live writer the lock is free, so a plain open succeeds here.
     from sqlcg.core.config import get_backend
 
     with get_backend(read_only=True) as backend:
