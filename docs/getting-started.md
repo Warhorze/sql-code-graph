@@ -7,96 +7,138 @@ questions against it: where a column comes from, what breaks downstream if a
 table changes, whether a PR deletes a table's sole producer, and which
 pipelines go dark if a table was not loaded last night.
 
-**Three audiences this guide is written for:**
-
-- **Impact-analysis engineer** — you are on-call or doing a pre-deploy review
-  and need to know the blast radius of a change before it ships.
-- **LLM-assisted developer** — you have Claude Code open and want lineage facts
-  available to your agent via MCP tools without running queries by hand.
-- **Onboarding engineer** — you are new to the warehouse and need a fast way to
-  understand which tables are load-bearing and how data flows between schemas.
-
-All three personas share the same setup. The four questions in section 3 are the
-daily interface; workflows by persona follow in section 4.
+This guide starts at the start: prerequisites (§2), then **one linear smoke
+test** that takes you from a fresh machine to a real lineage answer (§3). Only
+after you have a working graph do we break things down by persona (§4) and the
+four daily questions (§5).
 
 ---
 
-## 2. Setup (zero-friction)
+## 2. Step 0 — prerequisites
 
-### Install
+Read this before you run anything. The smoke test below assumes all of it.
 
-The PyPI package is currently at 1.5.1 (publish pipeline fix is in flight).
-Install from source until that lands:
+- **Install `uv` first.** Everything in this project runs via `uv` — there is
+  no `pip install` path. Follow the
+  [astral uv install docs](https://docs.astral.sh/uv/getting-started/installation/),
+  then confirm with `uv --version`.
+- **Only git-tracked `.sql` files are indexed.** Build artefacts, `.venv`,
+  `node_modules`, and anything not committed to git are ignored automatically.
+  If a file is missing from the graph, check it is tracked by git first.
+- **Point `sqlcg index` at the repo ROOT, not a subfolder.** DDL
+  (`CREATE TABLE` / `CREATE VIEW`) and ETL must be indexed together so `SELECT *`
+  expansion and cross-file resolution work. Indexing only `etl/` while the DDL
+  lives in `ddl/` will leave wildcards unresolved.
+- **Run the CLI via `uv run sqlcg …` from the tool checkout, or
+  `uv tool install` it globally.** Do *not* rely on a repo-local `.venv` — a
+  stale repo-local `.venv/bin/sqlcg` can throw in `get_backend`. When in doubt,
+  `uv tool install sql-code-graph` and call the global `sqlcg`.
+
+---
+
+## 3. Smoke test — fresh machine to a real answer
+
+One linear path. Do these in order; each line is verified against the current
+CLI. By the end you have an indexed graph and a real lineage answer.
+
+### 3.1 Install
 
 ```bash
-# Option A — install as a global tool from GitHub (recommended)
+# Option A — install as a global tool from PyPI (recommended)
+uv tool install sql-code-graph
+
+# Option A' — global tool, latest from GitHub
 uv tool install git+https://github.com/Warhorze/sql-code-graph@master
 
-# Option B — clone and sync
+# Option B — clone and sync, then run via `uv run sqlcg …`
 git clone https://github.com/Warhorze/sql-code-graph
 cd sql-code-graph
 uv sync
 ```
 
-Verify:
+Verify the install (your exact version may differ — anything **1.32.0 or
+newer** is current):
 
 ```bash
 sqlcg version
-# sqlcg version 1.25.x
+# sqlcg version 1.32.0
 ```
 
-### Initialise the graph database
+### 3.2 Initialise the graph database
 
 The graph lives in `~/.sqlcg/graph.db` by default — a single global file, not
 a per-repo directory. Running `sqlcg db init` inside your repo does not change
 where the graph file lives.
 
 ```bash
-cd /path/to/your/sql-repo
 sqlcg db init
-# Database initialised at /home/<you>/.sqlcg/graph.db (schema v8)
+# Database initialised at /home/<you>/.sqlcg/graph.db (schema v9)
 ```
 
-### Index your SQL files
+### 3.3 Index your repo (point at the ROOT)
 
 ```bash
+cd /path/to/your/sql-repo
 sqlcg index . --dialect snowflake
 ```
 
-Use `--dialect ansi` for standard SQL. Omit `--dialect` if you have a
-`.sqlcg.toml` in the repo root that declares the dialect (the `auto` default
-reads from there). Indexing 1,335 files on a laptop takes roughly 2–3 minutes.
+Index the repo **root** (`.`), not a subfolder — DDL and ETL need to be seen
+together (see §2). Use `--dialect ansi` for standard SQL. Omit `--dialect` if
+you have a `.sqlcg.toml` in the repo root that declares the dialect (the `auto`
+default reads from there). Indexing ~1,300 files on a laptop takes roughly
+2–3 minutes.
 
-### Check graph health
+### 3.4 Ask one real question
+
+```bash
+sqlcg find table ba.wtfe_verkoopinfo          # confirm a table is indexed
+sqlcg analyze upstream ba.wtfe_verkoopinfo.da_transactie_id   # trace its sources
+```
+
+```
+da.ttint_verkooptransactie.dekasnr
+da.ttint_verkooptransactie.detranr
+da.ttint_verkooptransactie.da_filiaalnr
+```
+
+If you see source columns like the above, the graph is live and working.
+Substitute a table name from your own warehouse. The full set of daily
+questions is in §5.
+
+### 3.5 (Optional) Check graph health
 
 ```bash
 sqlcg gain
 ```
 
-Real output from the live DWH acceptance run (1,335 files, Snowflake dialect):
+Illustrative output (1,335 files, Snowflake dialect) — **your exact numbers
+will differ by corpus and version; treat the shape, not the digits, as the
+signal:**
 
 ```
 G. Coverage
   Tables with catalog: 5785 / 6571 (88%)
-  Edge health (strict, column-level): 43807 / 52514 (83%)
-  Edge health (table-level, legacy): 44344 / 52514 (84%)
-  Edge health (scoped, excl. CTE/derived/temp): 35092 / 35688 (98%)
-  Phantom edges: 12603 / 52514 (24%)
-    confirmed: 12002  contradicted: 413 (0.8% of all edges)  unverified: 188
+  Edge health (strict, column-level): 43807 / 56000 (78%)
+  Edge health (table-level, legacy): 44344 / 56000 (79%)
+  Edge health (scoped, excl. CTE/derived/temp): 35400 / 35688 (99%)
+  Phantom edges: 11800 / 56000 (21%)
+    confirmed: 11200  contradicted: 410 (~0.7% of all edges)  unverified: 190
   Blindspot tables: 637
     15 table(s) cover 80% of bad-edge volume
-  Corpus: 1335 files, db_path=/home/ignwrad/.sqlcg/graph.db
-  Write queries with zero outgoing lineage: 1090 / 2349
+  Corpus: ~1335 files, db_path=/home/<you>/.sqlcg/graph.db
+  Write queries with zero outgoing lineage: ~1000 / 2349
   Rescuable unqualified edges: 86
 ```
 
-The **scoped edge health** (98% here) is the most meaningful number: it
-measures edges that exclude CTEs, derived tables, and temp tables — the ones
-whose source can actually be verified against the catalog.
+The **scoped edge health** is the most meaningful number: it measures edges
+that exclude CTEs, derived tables, and temp tables — the ones whose source can
+actually be verified against the catalog. The strict and table-level numbers
+include unverifiable scaffolding, so they read lower by design. Low scoped
+health on a specific table usually means its DDL is not indexed yet.
 
 ---
 
-## 3. The four questions, increasing in power
+## 4. The four questions, increasing in power
 
 ### Question 1 — Where is this column defined?
 
@@ -265,7 +307,17 @@ scripts to avoid races.
 
 ---
 
-## 4. Three workflows by persona
+## 5. Three workflows by persona
+
+Now that you have a working graph (§3), here is how each audience uses it day to
+day. All three personas share the same setup and the four questions in §4.
+
+- **Impact-analysis engineer** — you are on-call or doing a pre-deploy review
+  and need to know the blast radius of a change before it ships.
+- **LLM-assisted developer** — you have Claude Code open and want lineage facts
+  available to your agent via MCP tools without running queries by hand.
+- **Onboarding engineer** — you are new to the warehouse and need a fast way to
+  understand which tables are load-bearing and how data flows between schemas.
 
 ### Impact-analysis engineer
 
@@ -329,7 +381,7 @@ unknown territory.
 
 ---
 
-## 5. Where to go next
+## 6. Where to go next
 
 | Resource | Purpose |
 |---|---|

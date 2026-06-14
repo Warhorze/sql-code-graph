@@ -54,8 +54,11 @@ for that project.
 ## Full setup (recommended)
 
 ```bash
-# 1. Install
-pip install sql-code-graph
+# 1. Install (this project uses uv — never pip)
+uv tool install sql-code-graph          # global tool (recommended)
+# — or, from a source checkout:
+#   git clone https://github.com/Warhorze/sql-code-graph
+#   cd sql-code-graph && uv sync        # then run via `uv run sqlcg …`
 
 # 2. Register with Claude Code (writes ~/.claude.json)
 sqlcg install
