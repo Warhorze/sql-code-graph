@@ -1,6 +1,8 @@
 # Backlog — Confirmed Q2-B Sprint Plan
 
-**Status:** REVIEWED (plan-reviewer gate cleared 2026-06-14; amendments folded in below).
+**Status:** PR-1..PR-4 **REVIEWED** (plan-reviewer gate cleared 2026-06-14; amendments folded
+in below). PR-5 and PR-6 are **DRAFT (needs plan-review)** — added 2026-06-14 from a fresh full
+DWH reindex; they have **not** cleared the gate and do **not** ride the REVIEWED status.
 Two items remain explicit **maintainer design decisions** (PR-1 shared-predicate placement;
 PR-3 read-only-open viability) — flagged, not blocking; the developer must surface them, not
 silently pick.
@@ -9,7 +11,13 @@ silently pick.
 **current master `292da6a`** (PR #141 self-heal merge; `__version__ = "1.28.4"`). All four PR
 gaps **still exist** on `292da6a` — nothing already shipped. See the *Plan-reviewer verdict*
 block and *Anchor reconciliation* below; several cited line numbers drifted and are corrected.
-**Scope:** four confirmed, evidence-backed PRs + one pending-verification stub.
+**Scope:** four confirmed, evidence-backed PRs (PR-1..PR-4, **REVIEWED — frozen**) + two
+DRAFT additions folded in 2026-06-14 from a fresh full DWH reindex (schema v9; SELECTS_FROM
+6094; islands 147→43): **PR-5** (IA-DATAPRODUCTS coverage gap — now real, decision-gated) and
+**PR-6** (EXECUTE IMMEDIATE dynamic-SQL string-literal blindspot). PR-5/PR-6 are
+**Status: DRAFT (needs plan-review)** — they have NOT cleared the plan-reviewer gate and do
+**not** inherit PR-1..PR-4's REVIEWED status. PR-2 carries one clarifying annotation
+(viz-cleanliness, not lineage-island reduction) but stays REVIEWED.
 
 ---
 
@@ -63,7 +71,13 @@ recommendations; left to the maintainer/developer to settle, not gating the gate
   `:476`; the catalog re-apply stage is not an instrumented bucket. Bulk target
   `upsert_edges_bulk` exists at [`duckdb_backend.py:574`](../../src/sqlcg/core/duckdb_backend.py)
   (grep-confirmed call site for the developer).
-- **PR-5 - placeholder, correctly marked not-ready.** No change.
+- **PR-5 - placeholder REPLACED (2026-06-14, DRAFT).** The fresh index resolved the verdict:
+  the IA-DATAPRODUCTS gap is a **deliberate `.sqlcgignore` exclusion with a false rationale**,
+  not an indexer-wiring gap. Now planned as 5a (correct the stale comment — ship) + 5b (restore
+  coverage — gated on subprocess isolation, maintainer decision). **DRAFT, not yet reviewer-gated.**
+- **PR-6 - NEW (2026-06-14, DRAFT).** EXECUTE IMMEDIATE dynamic-SQL string-literal blindspot
+  (distinct from PR-5: file IS indexed, literal-wrapping defeats extraction). **DRAFT, not yet
+  reviewer-gated.**
 
 ---
 
@@ -220,6 +234,16 @@ walked and indexed, creating orphan "island" nodes that inflate the graph and di
 island-noise metrics. The existing backup-table machinery is a *table-name* noise filter
 applied (if at all) at a different layer than file discovery — and crucially has **no
 indexer call site**, so nothing currently excludes these at discovery time.
+
+> **Impact clarification (fresh-index annotation, 2026-06-14 — REVIEWED PR, annotation only):**
+> The fresh full reindex shows the 123 backup/snapshot nodes (`_eenmalig_`/`_bck`) inflate the
+> **deg-0 SINGLETON visualization mass**, **not** the lineage-island *count*: only 4 of them sit
+> in lineage islands, and **0 remain after the `_bck` filter**. So PR-2's true impact is
+> **VIZ-CLEANLINESS** — shrinking the ~3,700 deg-0 singleton "sea" the maintainer eyeballs — not
+> lineage-island reduction. **Acceptance should therefore measure deg-0 singleton-node reduction
+> in the viz, not island-count delta** (the island-count line in the criteria below reads against
+> the singleton mass, not the 43-island lineage set). Status stays REVIEWED; this is a scope-of-
+> impact clarification, not a plan change.
 
 ## Root cause (file:line — verified)
 - Walker discovers files via `git ls-files` (tracked `*.sql`) with an `rglob("*.sql")`
@@ -427,18 +451,180 @@ Three coupled perf sub-items in the post-rebuild index path:
 
 ---
 
-# PR-5 (pending verification) — IA-DATAPRODUCTS dynamic-table data-products possibly orphaned
+# PR-5 (#NEW) — IA-DATAPRODUCTS coverage gap: deliberate `.sqlcgignore` exclusion with a stale/incorrect rationale
 
-**Status: PLACEHOLDER — do NOT plan a fix yet.**
+**Status: DRAFT (needs plan-review).** Does **not** inherit PR-1..PR-4's REVIEWED status.
+**Rank: deferred (decision-gated). Two parts: 5a ships now, 5b is gated.**
+**Version bump:** 5a → **patch** (config-comment correction, effectively docs-only);
+5b → deferred, not shippable now (see gate).
 
-A separate reindex is confirming whether the 112-file dynamic-table (`IA-DATAPRODUCTS`)
-layer connects on a **fresh** index or is genuinely orphaned. The parser **does** extract
-their sources, so if the layer is orphaned the gap is **indexer-side** (wiring), not a parse
-gap. Once the reindex verdict lands, this section will be filled with problem / root cause
-(file:line) / fix / acceptance / version bump. Until then: **no fix, no sequence commitment.**
+## Problem
+The 113 tracked dynamic-table files under `ddl/changelogs/IA-DATAPRODUCTS/` are dropped at
+**file discovery — before parsing** — by a `.sqlcgignore` rule. Result on the fresh index:
+**124 `ia_dataproducts.*` catalog-only orphan nodes** (empty `defined_in_file`, 0 producing
+query, 0 edges). The exclusion is **deliberate** (a perf workaround), but its rationale comment
+is **factually wrong** and actively misleading.
 
-Relevant scratch evidence (do not commit; `git checkout -- plan/measurements/`):
-`plan/measurements/pr5_extraction_recall_taxonomy.json`.
+## Root cause (file:line — verified, fresh index schema v9)
+- **The exclusion rule:** [`/home/ignwrad/Projects/dwh/.sqlcgignore`](file:///home/ignwrad/Projects/dwh/.sqlcgignore)
+  contains `ddl/changelogs/IA-DATAPRODUCTS/` (line 5). Its comment (lines 1-4) claims the
+  source tables are *"absent from schema (E5), so zero lineage edges are produced anyway."*
+- **Honored at discovery, before any parse:** `load_ignore_spec`
+  ([`indexer.py:461`](../../src/sqlcg/indexer/indexer.py)) → `walk_sql_files`
+  ([`indexer.py:469`](../../src/sqlcg/indexer/indexer.py)) → `is_ignored`
+  ([`walker.py:50`](../../src/sqlcg/indexer/walker.py)) → `spec.match_file`
+  ([`utils/ignore.py:26-38`](../../src/sqlcg/utils/ignore.py)). All 113 files are excluded
+  **before parsing** → the parser never sees them; the 124 nodes exist only as catalog refs
+  from downstream consumers.
+- **The rationale is FALSE.** The IA-DATAPRODUCTS files read `FROM IA_SEMANTIC."..."`, and
+  **`ia_semantic` IS fully indexed (187 files)** on the fresh index. So the sources are
+  **present**, not "absent from schema" — un-ignoring would connect at least at table level
+  (table-grain SELECTS_FROM), contradicting "zero edges produced anyway." The real reason for
+  the exclusion is **indexing cost** (the COMBI/AGG dynamic tables are 100+ cols × 10+ FULL
+  OUTER JOINs; sqlglot lineage is O(cols × joins) per file) — a **PERF workaround pending
+  subprocess isolation** (`ARCHITECTURE_REVIEW.md` §14.5), **not** an extraction failure.
+
+## Plan — two-part, decision-gated
+
+### 5a — CHEAP NOW (ship): correct the stale/incorrect `.sqlcgignore` rationale
+The comment misleads any future reader into believing coverage is impossible ("absent from
+schema"). It is a perf gate, not a correctness gate. **Patch the comment** in
+`/home/ignwrad/Projects/dwh/.sqlcgignore` to state the accurate reason:
+- sources (`ia_semantic`, 187 files) **are** indexed; un-ignoring **would** produce ≥ table-grain
+  edges;
+- the exclusion exists purely as a **perf workaround** for the O(cols × joins) cost on the
+  COMBI/AGG dynamic tables, **pending subprocess isolation** (`ARCHITECTURE_REVIEW.md` §14.5);
+- cross-reference 5b below as the revisit trigger.
+
+This is effectively docs-only (a corpus config file in the `dwh` repo, not `sqlcg` source).
+**No `sqlcg` code, no version bump on `sqlcg` for 5a** beyond recording the corrected rationale.
+No metric moves (still ignored → 124 orphans unchanged).
+
+### 5b — GATED (do NOT plan as shippable now): restore coverage by un-ignoring the 113 files
+Un-ignoring is **blocked on the subprocess-isolation perf work** (`ARCHITECTURE_REVIEW.md`
+§14.5). These files were excluded for indexing cost; restoring them re-introduces the
+O(cols × joins) blow-up the workaround was created to avoid. **Frame as "revisit after
+subprocess isolation lands."** Do not plan the un-ignore as shippable in this sprint.
+
+**Estimated connectivity gain (for the decision, fresh index):** un-ignoring closes the
+**124 `ia_dataproducts.*` catalog-only orphan nodes** (empty `defined_in_file`, 0 edges today)
+by giving them producing queries + ≥ table-grain SELECTS_FROM into `ia_semantic` — pulling them
+(and their downstream consumers) **into the giant component**. This is the headline gain to
+weigh against the perf cost.
+
+> **MAINTAINER DECISION (priority, gates 5b):** after subprocess isolation lands, do we
+> **restore IA-DATAPRODUCTS coverage** (recover the 124 orphan nodes into the giant, accepting
+> the dynamic-table indexing cost now bounded by isolation) **or keep the perf workaround**
+> (leave them ignored)? This is a priority/cost trade-off the maintainer owns; 5b is not
+> actionable until subprocess isolation exists. 5a (the comment fix) is independent of this
+> decision and ships regardless.
+
+## Acceptance criteria
+- **5a:** the `.sqlcgignore` comment no longer claims "absent from schema"; it states the
+  accurate perf-workaround rationale + the `ia_semantic`-is-indexed fact + the §14.5 revisit
+  trigger. No `sqlcg` source change; no metric delta (124 orphans intentionally unchanged).
+- **5b:** **not in scope this sprint** — blocked on subprocess isolation. When revisited:
+  un-ignoring drops the 124 orphan nodes to 0 and produces ≥ table-grain edges into
+  `ia_semantic`; `gain --json` snapshot to [`plan/metrics/`](../metrics/) showing the orphan
+  delta; **all four perf-invariant suites pass unmodified AND the per-file dynamic-table index
+  cost stays within the isolation-bounded budget** (the gate's whole point).
+
+## Dependency / sequence
+- **5a:** independent, shippable immediately (corpus-config patch). Not metric-moving.
+- **5b:** **blocked** on subprocess isolation (`ARCHITECTURE_REVIEW.md` §14.5); maintainer
+  priority decision required before it is scheduled. Metric-moving when it lands.
+
+---
+
+# PR-6 (#NEW) — EXECUTE IMMEDIATE / dynamic-SQL string-literal blindspot: indexed-but-unextracted DDL
+
+**Status: DRAFT (needs plan-review).** Does **not** inherit PR-1..PR-4's REVIEWED status.
+**Rank: TBD (set by plan-reviewer). Version bump: MINOR (new extraction surface).**
+
+## Problem
+A `CREATE ... DYNAMIC TABLE ... AS WITH ... FROM ...` wrapped inside a PL/SQL block as
+`ddl_statement := '<the whole CREATE...AS...SELECT>'; EXECUTE IMMEDIATE (:ddl_statement);`
+is **invisible to the parser** — the actual SQL lives in a **string literal**, so the parser
+sees only a variable assignment + an EXECUTE IMMEDIATE call, never the CREATE/SELECT. The file
+**is indexed** (`parse_failed=False`) but yields **0 `SqlQuery` rows and 0 edges**. This is a
+genuine **parser-extraction** lever, **distinct from PR-5**: PR-5's files are *excluded* before
+parsing (`.sqlcgignore`); this file *is* parsed but the literal-wrapping defeats extraction.
+
+## Root cause (file:line — verified, fresh index)
+- Confirmed on `ba.wtfa_artikel_formule_dagomzet`, file
+  [`/home/ignwrad/Projects/dwh/ddl/changelogs/BA-DYNAMIC-TABLES/WTFA_ARTIKEL_FORMULE_DAGOMZET.sql`](file:///home/ignwrad/Projects/dwh/ddl/changelogs/BA-DYNAMIC-TABLES/WTFA_ARTIKEL_FORMULE_DAGOMZET.sql).
+  The `CREATE OR REPLACE DYNAMIC TABLE BA.WTFA_ARTIKEL_FORMULE_DAGOMZET ... AS WITH ... SELECT`
+  lives inside the `ddl_statement := '...'` string literal (~lines 12-46), executed at
+  `EXECUTE IMMEDIATE (:ddl_statement);` (line 48). Index result: indexed, `parse_failed=False`,
+  **0 SqlQuery / 0 edges**. Extracting it pulls a **4-node island (the table + its 3 IA views)**
+  into the giant.
+
+## (a) Prevalence — MEASURED FIRST (sizes the lever)
+Grep over the corpus [`/home/ignwrad/Projects/dwh`](file:///home/ignwrad/Projects/dwh):
+- **21 files** total use `EXECUTE IMMEDIATE`.
+- **Recoverable by PR-6 = exactly 1 file today.** Only the WTFA dynamic table matches the
+  in-scope pattern `var := '<static CREATE...AS...SELECT>'; EXECUTE IMMEDIATE` (a static literal
+  CREATE-DDL string). Grep: `:= 'CREATE ...` → 1 hit; that hit contains `DYNAMIC TABLE`.
+- **Out of scope (the other 20):**
+  - 1 file (`MA-PROCEDURES/MSSPR_COMPARE_DATA.sql`) does `EXECUTE IMMEDIATE 'CREATE OR REPLACE
+    TEMP TABLE ... AS SELECT * FROM (' || :sql_source || ')'` — **concatenated with bind
+    variables** (`||`, `:sql_source`) and targeting transient diagnostic `TEMP` tables, **not**
+    static and **not** lineage targets.
+  - The rest assign via `CONCAT(...)` / `||` concatenation or are non-CREATE statements (ALTER
+    external-table refresh, INFORMATION_SCHEMA selects, MERGE/UPDATE plumbing).
+- **Conclusion:** the immediate lever is **small (1 file, 1 table, a 4-node island)**, but the
+  pattern is a **structural class** (Snowflake dynamic-table-via-EXECUTE-IMMEDIATE) likely to
+  recur as more dynamic tables are authored this way. Plan-reviewer should weigh "1 island now"
+  against "new extraction surface for a growing authoring pattern" when ranking.
+
+## (b) Design
+Detect an `EXECUTE IMMEDIATE` of a **literal** (or a **simply-assigned literal** — a `var :=
+'<string literal>'` immediately preceding/feeding the `EXECUTE IMMEDIATE (:var)`) DDL string,
+extract the inner SQL from the literal, and **re-parse it as a nested statement** in the same
+file context.
+- **In scope:** static literal DDL only — a single string literal, or a single
+  `var := '<literal>'` assignment with no concatenation, fed to `EXECUTE IMMEDIATE`.
+- **Out of scope (explicit, do not attempt):** non-literal / concatenated dynamic SQL
+  (`|| $WAREHOUSENAME ||`, `CONCAT(...)`, bind-variable interpolation `:sql_source`) — only
+  **static-literal** DDL is recoverable; anything assembled at runtime cannot be statically
+  parsed and must be skipped, not guessed.
+  - Note: the WTFA literal itself contains one `|| $WAREHOUSENAME ||` concatenation **in the
+    WAREHOUSE clause only**; the `AS WITH ... SELECT` body is fully static. The design must
+    tolerate a concatenation in non-lineage-bearing clauses (warehouse/options) while still
+    extracting the static `AS SELECT` body — e.g. parse the literal segment, accept partial
+    reconstruction of the body, or substitute a placeholder for the runtime fragment. This
+    nuance is a plan-reviewer design point.
+- **Session context inheritance:** the inner SQL must inherit the file's `USE SCHEMA` / session
+  context (the WTFA file sets `USE SCHEMA BA;` at line 5) so the extracted CREATE resolves to
+  `BA.WTFA_ARTIKEL_FORMULE_DAGOMZET` and its `FROM ba.wtfe_verkoopinfo` / `ba.wtda_datum`
+  sources resolve correctly. Reuse the existing session-context mechanism; do not invent a
+  parallel one.
+
+## Acceptance criteria
+- The **artikel-formule-dagomzet 4-node island closes** (table + its 3 IA views join the
+  giant): observable before/after island membership for `ba.wtfa_artikel_formule_dagomzet`.
+- The extracted inner CREATE produces a `SqlQuery` row + SELECTS_FROM edges into
+  `ba.wtfe_verkoopinfo` and `ba.wtda_datum` (assert the edges, not "no exception").
+- Concatenated / bind-variable dynamic SQL (e.g. `MSSPR_COMPARE_DATA.sql`) is **skipped**, not
+  mis-extracted — a negative test asserts no spurious nodes/edges from a concatenated
+  EXECUTE IMMEDIATE.
+- The inner SQL inherits the file's `USE SCHEMA` context (resolution lands in `BA`, not unqualified).
+- **All four perf-invariant suites pass UNMODIFIED** (nested re-parse must not regress the
+  qualify-once / bulk-upsert invariants).
+- `gain --json` snapshot committed to [`plan/metrics/`](../metrics/) showing the island delta
+  (metric-moving PR).
+- `pyright` + `ruff` clean.
+
+## Risk
+- Over-eager literal extraction could pick up non-DDL or concatenated strings → spurious
+  nodes. Mitigate by restricting to static literals and DDL-shaped inner SQL (CREATE/INSERT),
+  plus the concatenation negative test.
+- Nested re-parse on the hot path could trip a perf invariant if not bounded — the inner parse
+  must reuse the existing parse path, not add a per-column re-entry; re-confirm the four suites.
+
+## Dependency / sequence
+- Independent of PR-1..PR-4 and PR-5. Distinct mechanism from PR-5 (extraction, not exclusion).
+  Metric-moving → `gain --json` required. Rank set by plan-reviewer.
 
 ---
 
@@ -472,7 +658,13 @@ against #142's edge set before either merges.**
 | 2 | PR-2 #27a | Small, independent, reduces island noise | minor | **Yes** |
 | 3 | PR-3 #63 | Independent bug; precedes PR-4's profiling | patch | No |
 | 4 | PR-4 #94 | Perf; benefits from stable server start | patch | **Yes** |
-| — | PR-5 | Pending reindex verdict | TBD | TBD |
+| 5a | PR-5 (DRAFT) | Correct stale `.sqlcgignore` rationale — cheap, ship anytime | patch (docs-ish) | No |
+| 5b | PR-5 (DRAFT) | **Gated** on subprocess isolation + maintainer priority decision | deferred | Yes (when it lands) |
+| — | PR-6 (DRAFT) | Dynamic-SQL literal extraction; rank set by plan-reviewer | minor | **Yes** |
+
+> **PR-5 / PR-6 are Status: DRAFT (needs plan-review)** — folded in 2026-06-14 from the fresh
+> index; they have **not** cleared the plan-reviewer gate and are sequenced provisionally.
+> PR-1..PR-4 remain **REVIEWED** and frozen.
 
 ---
 
@@ -491,3 +683,12 @@ against #142's edge set before either merges.**
    before committing to `access_mode='READ_ONLY'`.
 5. **PR-4:** whether to rewrite the catalog insert path now or only instrument + characterize
    it this PR and defer the bulk-catalog rewrite to a follow-up.
+6. **PR-5 (DRAFT):** after subprocess isolation lands — **restore IA-DATAPRODUCTS coverage**
+   (recover 124 orphan nodes into the giant, accept the dynamic-table indexing cost) **or keep
+   the perf workaround** (leave ignored)? Maintainer priority decision; gates 5b. 5a (the
+   stale-comment fix) ships regardless of this decision.
+7. **PR-6 (DRAFT):** how to handle a literal that mixes a static `AS SELECT` body with a
+   runtime concatenation in a non-lineage clause (the WTFA `|| $WAREHOUSENAME ||` in the
+   WAREHOUSE option) — extract the static body with a placeholder for the runtime fragment, or
+   skip the whole literal? Planner leans extract-the-body; plan-reviewer to settle. Also: rank
+   PR-6 given the lever is 1 file / 1 island *today* vs. a recurring structural authoring pattern.
