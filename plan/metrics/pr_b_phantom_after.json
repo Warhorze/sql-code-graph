@@ -1,0 +1,32 @@
+{"total_calls": 1476, "last_7d_calls": 1476, "index_runs": 5, "feedback_tp": 0, 
+"feedback_total": 0, "top_tools": [{"name": "execute_sql", "count": 496}, 
+{"name": "trace_column_lineage", "count": 389}, {"name": 
+"list_dialects_and_repos", "count": 127}], "execute_sql_ratio": 0.34, 
+"parse_quality": {"sqlglot": 5166, "scripting": 20, "dynamic_sql": 3}, 
+"coverage": {"catalogued_tables": 5800, "total_tables": 6552, "good_edges": 
+52657, "total_edges": 60805, "phantom_edges": 12241, "blindspot_tables": 628, 
+"good_edges_strict": 48140, "edge_health_strict_pct": 79.17, 
+"good_edges_scoped": 37460, "total_edges_scoped": 38009, 
+"edge_health_scoped_pct": 98.56, "phantom_confirmed": 11701, 
+"phantom_contradicted": 352, "phantom_unverified": 188, "top_blindspot_tables": 
+[{"table": "ba.wtfa_kpi_datum_klant", "bad_edges": 70}, {"table": 
+"ba.wtfs_voorraad_dagstand", "bad_edges": 55}, {"table": 
+"ba.wtfs_voorraad_zondagstand", "bad_edges": 55}, {"table": 
+"da.rtgmd_postnl_customer_usage", "bad_edges": 43}, {"table": 
+"da.rtgmd_postnl_athome_3s", "bad_edges": 33}, {"table": 
+"wtfe_kpi_voorraad_artikel_voorraadlocatie", "bad_edges": 32}, {"table": 
+"da.rtgmd_postnl_facturen", "bad_edges": 30}, {"table": "da.hthyb_pages", 
+"bad_edges": 23}, {"table": "da.rtgmd_dhb_extra_kosten", "bad_edges": 19}, 
+{"table": "da.hthyb_page_brandplacement", "bad_edges": 17}], 
+"blindspot_tables_for_80pct": 17, "files_indexed": 1335, "indexed_sha": 
+"fdf1b551a34601a6cf3ce1c8b9f76e27ce2753e6", "db_path": 
+"/tmp/sqlcg-gain-after.db", "index_timestamp": 1781466521.041257, 
+"degraded_parse_total": 5189, "degraded_parse_queries": 20, 
+"degraded_parse_by_dir": {"etl": {"degraded": 1, "total": 2776}, "ddl": 
+{"degraded": 19, "total": 2413}}, "zero_edge_write_queries": 1034, 
+"total_write_queries": 2323, "cte_key_collisions": 0, 
+"rescuable_unqualified_edges": 125, "info_schema_has_column_rows": 100193, 
+"cte_source_gap_writes": 0, "resolvable_write_col_edges": 36936, 
+"transitive_col_edges": 4168, "qualify_failed_statements": 9, 
+"tool_version_stale": false, "indexed_tool_version": "1.34.5", 
+"running_tool_version": "1.34.5"}}

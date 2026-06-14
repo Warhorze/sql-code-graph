@@ -551,25 +551,44 @@ class AnsiParser(SqlParser):
         # measurement artifact (96.1%/4,544 of 4,727 on the DWH corpus).
         can_have_lineage = self._can_have_column_lineage(stmt)
 
+        # Phantom source-node gate (#161): a non-table/non-view CREATE
+        # (SEQUENCE / STAGE / FILE FORMAT / SCHEMA / INDEX / PROCEDURE / ...) has
+        # target=None and no data-flow source. Its only Table node is its own
+        # object name, which _fallback_table_scan below would otherwise scoop into
+        # `sources`, leaking a phantom SqlTable SOURCE node + SELECTS_FROM edge
+        # into the graph. #159 fixed the kind LABEL (-> OTHER); this closes the
+        # source-node half. Keying off stmt.kind (the sqlglot AST value, e.g.
+        # 'SEQUENCE') keeps the gate independent of the _classify/QueryKind path.
+        # CREATE TABLE/VIEW ... AS SELECT keep kind in (TABLE, VIEW) and so retain
+        # their real sources. Real procedure lineage comes from the spliced inner
+        # DML (a separate node the gate never touches), so gating PROCEDURE is
+        # edge-neutral. This single gate feeds all three
+        # `referenced_tables.extend(query_node.sources)` sites
+        # (ansi_parser.py:246, snowflake_parser.py:784 / :944).
+        is_non_table_create = isinstance(stmt, exp.Create) and stmt.kind not in ("TABLE", "VIEW")
+
         # Try to extract table references using scope analysis
         try:
-            # Use pre-built scope if provided, otherwise build it here (fallback)
-            root_scope = scope
-            if root_scope is None:
-                from sqlglot.optimizer.scope import build_scope
-
-                root_scope = build_scope(stmt)
-
-            if root_scope:
-                sources = self._real_tables(root_scope)
+            if is_non_table_create:
+                sources = []
             else:
-                # Fallback to basic table extraction
-                sources = [
-                    r
-                    for s in self._fallback_table_scan(stmt)
-                    if (r := self._apply_table_alias(s)) is not None
-                ]
-                parse_failed = can_have_lineage
+                # Use pre-built scope if provided, otherwise build it here (fallback)
+                root_scope = scope
+                if root_scope is None:
+                    from sqlglot.optimizer.scope import build_scope
+
+                    root_scope = build_scope(stmt)
+
+                if root_scope:
+                    sources = self._real_tables(root_scope)
+                else:
+                    # Fallback to basic table extraction
+                    sources = [
+                        r
+                        for s in self._fallback_table_scan(stmt)
+                        if (r := self._apply_table_alias(s)) is not None
+                    ]
+                    parse_failed = can_have_lineage
         except Exception as exc:
             logger.debug("Failed to build scope for statement %d in %s: %s", stmt_index, path, exc)
             sources = [
