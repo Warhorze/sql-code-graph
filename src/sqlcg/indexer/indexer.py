@@ -47,6 +47,7 @@ class FileRowSet:
     selects_from_edges: list[dict] = field(default_factory=list)
     column_lineage_edges: list[dict] = field(default_factory=list)
     star_source_edges: list[dict] = field(default_factory=list)
+    join_col_resolve_edges: list[dict] = field(default_factory=list)
     counts: dict = field(
         default_factory=lambda: {"tables": 0, "edges": 0, "columns_defined": 0, "star_sources": 0}
     )
@@ -71,6 +72,7 @@ class BatchRowBuffer:
     selects_from_edges: list[dict] = field(default_factory=list)
     column_lineage_edges: list[dict] = field(default_factory=list)
     star_source_edges: list[dict] = field(default_factory=list)
+    join_col_resolve_edges: list[dict] = field(default_factory=list)
 
     def extend(self, rows: FileRowSet) -> None:
         """Accumulate one file's row sets into this buffer."""
@@ -84,6 +86,7 @@ class BatchRowBuffer:
         self.selects_from_edges.extend(rows.selects_from_edges)
         self.column_lineage_edges.extend(rows.column_lineage_edges)
         self.star_source_edges.extend(rows.star_source_edges)
+        self.join_col_resolve_edges.extend(rows.join_col_resolve_edges)
 
     @classmethod
     def from_single(cls, rows: FileRowSet) -> "BatchRowBuffer":
@@ -292,6 +295,9 @@ def _flush_row_batch(
     star_source_edges = list(
         {(r["src_key"], r["dst_key"]): r for r in buf.star_source_edges}.values()
     )
+    join_col_resolve_edges = list(
+        {(r["src_key"], r["dst_key"]): r for r in buf.join_col_resolve_edges}.values()
+    )
 
     # --- Phase B2: usage-derived catalog harvest ---
     # Post-dedup: for each COLUMN_LINEAGE src endpoint whose table is a physical
@@ -345,6 +351,11 @@ def _flush_row_batch(
             star_source_edges = [
                 r for r in star_source_edges if r["dst_key"] not in excluded_tables
             ]
+            join_col_resolve_edges = [
+                r
+                for r in join_col_resolve_edges
+                if _table_of_column_id(r["dst_key"]) not in excluded_tables
+            ]
             column_lineage_edges = [
                 r
                 for r in column_lineage_edges
@@ -372,6 +383,9 @@ def _flush_row_batch(
         NodeLabel.COLUMN, NodeLabel.COLUMN, RelType.COLUMN_LINEAGE, column_lineage_edges
     )
     db.upsert_edges_bulk(NodeLabel.QUERY, NodeLabel.TABLE, RelType.STAR_SOURCE, star_source_edges)
+    db.upsert_edges_bulk(
+        NodeLabel.QUERY, NodeLabel.COLUMN, RelType.JOIN_COL_RESOLVE, join_col_resolve_edges
+    )
 
 
 def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
@@ -882,6 +896,12 @@ class Indexer:
         if profile:
             _t_catalog_end = time.perf_counter()
 
+        # Post-catalog: resolve JOIN_COL_RESOLVE markers against the full HAS_COLUMN
+        # catalog (Bug #5, PR-5 option b). MUST run after the catalog is applied so
+        # information_schema columns are present; the suppressed sqlglot mis-bind
+        # edge is never emitted, so this is the sole producer of the resolved edges.
+        join_cols_resolved = self._resolve_join_columns(db)
+
         # Classify all errors into buckets for measurement and reporting
         error_summary: dict[str, int] = {
             "E1": 0,
@@ -931,6 +951,7 @@ class Indexer:
             "columns_defined": nonlocal_counts["columns_defined"],
             "star_sources": nonlocal_counts["star_sources"],
             "star_edges_expanded": star_edges_expanded,
+            "join_cols_resolved": join_cols_resolved,
             "quality": nonlocal_counts["quality"],
             "error_summary": error_summary,
             "degraded_files": degraded_files,
@@ -1329,6 +1350,14 @@ class Indexer:
         # ---- Step 8: Single star expansion (same as index_repo) ------------------
         self._expand_star_sources(db)
 
+        # ---- Step 8b: Resolve JOIN_COL_RESOLVE markers (Bug #5, PR-5 option b) ----
+        # The incremental path does NOT reapply the catalog — it resolves against the
+        # information_schema HAS_COLUMN rows persisted by the prior full index. Without
+        # this, a delta touching a join file would re-create the markers but never
+        # resolve them, silently dropping the join-column edges until the next full
+        # index (plan-review BLOCKER).
+        self._resolve_join_columns(db)
+
         # ---- Step 9: Persist new SHA on success ----------------------------------
         db.set_indexed_sha(new_sha)
 
@@ -1381,6 +1410,13 @@ class Indexer:
 
         # Re-run star expansion after re-indexing
         self._expand_star_sources(db)
+
+        # Resolve JOIN_COL_RESOLVE markers (Bug #5, PR-5 option b) against the
+        # information_schema HAS_COLUMN rows persisted by the prior full index. The
+        # single-file path does NOT reapply the catalog; without re-resolving here a
+        # reindex of a join file would re-create the markers but drop the resolved
+        # join-column edges until the next full index (plan-review BLOCKER).
+        self._resolve_join_columns(db)
 
     def _index_single_file(self, parser, path: Path, sql: str, timeout: int) -> ParsedFile:
         """Parse one file, with optional timeout via subprocess isolation.
@@ -1706,6 +1742,21 @@ class Indexer:
                 )
                 rows.counts["star_sources"] += 1
 
+            # JOIN_COL_RESOLVE markers (Bug #5, PR-5 option b): bare unqualified
+            # join-projection columns whose owning source table is only knowable
+            # post-index (e.g. catalogued via information_schema). The sqlglot
+            # mis-bind edge was suppressed at parse time; the post-index resolver
+            # (DuckDBBackend.resolve_join_columns) is the SOLE producer of these
+            # columns' COLUMN_LINEAGE edges. src_key=query_id, dst_key=<dst>.<col>.
+            for jcr in stmt.join_col_resolves:
+                rows.join_col_resolve_edges.append(
+                    {
+                        "src_key": query_id,
+                        "dst_key": jcr.dst.full_id,
+                        "bare_col": jcr.bare_col,
+                    }
+                )
+
             # Upsert target table node (if not already a defined_table)
             # so that star expansion can create destination columns.
             # #44: when a canonical_by_bare index is available, attempt to resolve
@@ -1929,6 +1980,22 @@ class Indexer:
             Number of COLUMN_LINEAGE STAR_EXPANSION edges after expansion.
         """
         return db.expand_star_sources()
+
+    def _resolve_join_columns(self, db: GraphBackend) -> int:
+        """Run the post-index join-column resolution (Bug #5, PR-5 option b).
+
+        Calls DuckDBBackend.resolve_join_columns(), which resolves JOIN_COL_RESOLVE
+        markers (bare unqualified join columns) against the full post-index
+        HAS_COLUMN catalog — including information_schema rows unavailable at parse
+        time. MUST run AFTER the catalog is applied (full-index path) and AFTER star
+        expansion in every path that re-creates the markers; the suppressed sqlglot
+        mis-bind edge is never emitted, so this pass is the SOLE producer of these
+        columns' edges.
+
+        Returns:
+            Number of COLUMN_LINEAGE JOIN_COL_RESOLVED edges after resolution.
+        """
+        return db.resolve_join_columns()
 
     def _ingest_external_consumers(self, db: GraphBackend, path: Path) -> dict:
         """Ingest declared external downstream consumers from .sqlcg.toml.

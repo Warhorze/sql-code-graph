@@ -622,6 +622,7 @@ class AnsiParser(SqlParser):
             )
         column_lineage = extraction.edges
         star_sources = extraction.star_sources
+        join_col_resolves = extraction.join_col_resolves
         stmt_qualify_failed = extraction.qualify_failed
 
         # Extract defined columns for CREATE TABLE statements
@@ -666,6 +667,7 @@ class AnsiParser(SqlParser):
             parsing_mode="sqlglot",
             defined_columns=defined_columns,
             star_sources=star_sources,
+            join_col_resolves=join_col_resolves,
             defined_body=defined_body,
             clone_source=clone_source,
         )
