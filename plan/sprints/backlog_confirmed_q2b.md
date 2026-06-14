@@ -1,8 +1,9 @@
 # Backlog — Confirmed Q2-B Sprint Plan
 
-**Status:** PR-1..PR-4 **REVIEWED** (plan-reviewer gate cleared 2026-06-14; amendments folded
-in below). PR-5 and PR-6 are **DRAFT (needs plan-review)** — added 2026-06-14 from a fresh full
-DWH reindex; they have **not** cleared the gate and do **not** ride the REVIEWED status.
+**Status:** PR-1..PR-6 **REVIEWED**. PR-1..PR-4 cleared the plan-reviewer gate 2026-06-14
+(amendments folded in below). **PR-5 and PR-6 cleared the plan-reviewer gate 2026-06-14
+(second pass, amendments folded in)** — they were added the same day from a fresh full DWH
+reindex and have now been verified against the live corpus and `feat/e8-dual-emission`.
 Two items remain explicit **maintainer design decisions** (PR-1 shared-predicate placement;
 PR-3 read-only-open viability) — flagged, not blocking; the developer must surface them, not
 silently pick.
@@ -12,12 +13,13 @@ silently pick.
 gaps **still exist** on `292da6a` — nothing already shipped. See the *Plan-reviewer verdict*
 block and *Anchor reconciliation* below; several cited line numbers drifted and are corrected.
 **Scope:** four confirmed, evidence-backed PRs (PR-1..PR-4, **REVIEWED — frozen**) + two
-DRAFT additions folded in 2026-06-14 from a fresh full DWH reindex (schema v9; SELECTS_FROM
-6094; islands 147→43): **PR-5** (IA-DATAPRODUCTS coverage gap — now real, decision-gated) and
-**PR-6** (EXECUTE IMMEDIATE dynamic-SQL string-literal blindspot). PR-5/PR-6 are
-**Status: DRAFT (needs plan-review)** — they have NOT cleared the plan-reviewer gate and do
-**not** inherit PR-1..PR-4's REVIEWED status. PR-2 carries one clarifying annotation
-(viz-cleanliness, not lineage-island reduction) but stays REVIEWED.
+additions folded in 2026-06-14 from a fresh full DWH reindex (schema v9; SELECTS_FROM
+6094; islands 147→43): **PR-5** (IA-DATAPRODUCTS coverage gap — real, decision-gated) and
+**PR-6** (EXECUTE IMMEDIATE dynamic-SQL string-literal blindspot). PR-5/PR-6 are now
+**Status: REVIEWED** (gate cleared 2026-06-14, second pass; amendments folded in — the
+"Phase 2 is FREE" claim verified on `feat/e8-dual-emission`, PR-5a scoped as a `dwh`-repo
+maintainer edit). PR-2 carries one clarifying annotation (viz-cleanliness, not lineage-island
+reduction) but stays REVIEWED.
 
 ---
 
@@ -71,13 +73,19 @@ recommendations; left to the maintainer/developer to settle, not gating the gate
   `:476`; the catalog re-apply stage is not an instrumented bucket. Bulk target
   `upsert_edges_bulk` exists at [`duckdb_backend.py:574`](../../src/sqlcg/core/duckdb_backend.py)
   (grep-confirmed call site for the developer).
-- **PR-5 - placeholder REPLACED (2026-06-14, DRAFT).** The fresh index resolved the verdict:
+- **PR-5 - REVIEWED (2026-06-14, second pass).** The fresh index resolved the verdict:
   the IA-DATAPRODUCTS gap is a **deliberate `.sqlcgignore` exclusion with a false rationale**,
-  not an indexer-wiring gap. Now planned as 5a (correct the stale comment — ship) + 5b (restore
-  coverage — gated on subprocess isolation, maintainer decision). **DRAFT, not yet reviewer-gated.**
-- **PR-6 - NEW (2026-06-14, DRAFT).** EXECUTE IMMEDIATE dynamic-SQL string-literal blindspot
-  (distinct from PR-5: file IS indexed, literal-wrapping defeats extraction). **DRAFT, not yet
-  reviewer-gated.**
+  not an indexer-wiring gap. Planned as 5a (correct the stale comment — a **maintainer edit in
+  the `dwh` repo**, not a `sqlcg` code PR) + 5b (restore coverage — gated on subprocess isolation,
+  maintainer decision). Verified live: `dwh/.sqlcgignore:3` carries the false "absent from schema
+  (E5)" claim; IA-SEMANTIC is in-corpus (not ignored). **Gate cleared; amendments folded into PR-5.**
+- **PR-6 - REVIEWED (2026-06-14, second pass).** EXECUTE IMMEDIATE dynamic-SQL string-literal
+  blindspot (distinct from PR-5: file IS indexed, literal-wrapping defeats extraction). The
+  load-bearing "Phase 2 is FREE" claim was **CONFIRMED on `feat/e8-dual-emission`**
+  (`_emit_transitive_temp_edges` def `:273`, unconditional post-loop call `:264`, pure O(edges)
+  `role=='temp'` composition `:326-329`); #142 hard-gate confirmed (e8 not on master); corpus ROI
+  honest (1 file / 1 island today). Ranked LAST of the post-#142 tail. **Gate cleared; amendments
+  folded into PR-6.**
 
 ---
 
@@ -453,10 +461,32 @@ Three coupled perf sub-items in the post-rebuild index path:
 
 # PR-5 (#NEW) — IA-DATAPRODUCTS coverage gap: deliberate `.sqlcgignore` exclusion with a stale/incorrect rationale
 
-**Status: DRAFT (needs plan-review).** Does **not** inherit PR-1..PR-4's REVIEWED status.
+**Status: REVIEWED (plan-reviewer gate cleared 2026-06-14, second pass).**
 **Rank: deferred (decision-gated). Two parts: 5a ships now, 5b is gated.**
-**Version bump:** 5a → **patch** (config-comment correction, effectively docs-only);
-5b → deferred, not shippable now (see gate).
+**Version bump:** 5a → **no `sqlcg` bump** (the fix lands in the *dwh* corpus repo, not this
+codebase — see scope amendment below); 5b → deferred, not shippable now (see gate).
+
+> **Plan-reviewer amendment (5a SCOPE — maintainer action in the dwh repo, NOT a code PR here):**
+> Verified against the live corpus: the stale comment lives in
+> [`/home/ignwrad/Projects/dwh/.sqlcgignore`](file:///home/ignwrad/Projects/dwh/.sqlcgignore)
+> lines 1-4 (the false claim is on **line 3** — *"all source tables are absent from schema (E5),
+> so zero lineage edges are produced anyway"*); the exclusion rule is line 5
+> (`ddl/changelogs/IA-DATAPRODUCTS/`). This file is **not in the `sqlcg` repo** — there is **no
+> `sqlcg` source change, no test, no version bump, no PR in this codebase for 5a**. 5a is a
+> **maintainer/corpus-config edit in the `dwh` repo**, correctly scoped that way in the plan
+> text. Recording it as a numbered "PR" line in the sequence table is a tracking convenience
+> only; the deliverable is a one-line comment correction in another repo. Confirmed independent
+> of 5b and of every PR in this codebase.
+>
+> **Plan-reviewer amendment (the "187 files" figure):** the plan's PR-5 root-cause cites
+> "`ia_semantic` IS fully indexed (187 files)." A live check finds the `IA-SEMANTIC` changelog
+> dir present (not ignored) but only **7 changelog files** under it; the IA-DATAPRODUCTS dir
+> holds exactly **113 files** (matches). The 187 figure is the *fresh-index `ia_semantic`-schema
+> object/file count*, not the changelog-dir file count — a provenance-of-number nuance, **not**
+> load-bearing. The load-bearing claim — *the IA_SEMANTIC sources ARE in-corpus and indexed, so
+> the "absent from schema" rationale is false and un-ignoring would produce ≥ table-grain edges*
+> — is **CONFIRMED** independently (IA-SEMANTIC is not ignored; the corpus references resolve to
+> indexed `ia_semantic` objects). Treat "187" as an indexed-object count, not a file count.
 
 ## Problem
 The 113 tracked dynamic-table files under `ddl/changelogs/IA-DATAPRODUCTS/` are dropped at
@@ -538,10 +568,58 @@ weigh against the perf cost.
 
 # PR-6 (#NEW) — Dynamic-SQL lineage recovery: unwrap static-literal EXECUTE IMMEDIATE, then compose the intermediate via #142
 
-**Status: DRAFT (needs plan-review).** Does **not** inherit PR-1..PR-4's REVIEWED status.
-**Rank: TBD (set by plan-reviewer). Version bump: MINOR (new extraction surface).**
+**Status: REVIEWED (plan-reviewer gate cleared 2026-06-14, second pass).**
+**Rank: LAST of the post-#142 tail (set by plan-reviewer — see execution-order amendment
+below). Version bump: MINOR (new extraction surface).**
 **Shape: ONE PR, two phases (re-scoped 2026-06-14).** **Depends on #142 (E8 dual-emission,
 `feat/e8-dual-emission`) — sequence PR-6 AFTER #142 merges.**
+
+> **Plan-reviewer amendment — "Phase 2 is FREE" VERIFIED ON `feat/e8-dual-emission` (CONFIRM):**
+> Read against the branch, every load-bearing line checks out:
+> - `_emit_transitive_temp_edges` is **defined at** `ansi_parser.py:273` and **invoked
+>   unconditionally at `ansi_parser.py:264`** — i.e. after the per-statement loop (loop body
+>   `:206-254`, with each `query_node` appended to `out.statements` at **`:227`**) and before the
+>   namespace reset (`:266-270`). **CONFIRMED (a):** the helper runs over the whole file's
+>   `out.statements` post-loop (`statements = out.statements` at `:315`).
+> - The pass is **pure O(edges) in-memory composition**: it builds
+>   `incoming_to_temp[(temp_full_id, col)]` by scanning each `stmt.column_lineage` for
+>   `e.dst.table.role == "temp"` at **`:326-329`**, then composes out-of-temp edges
+>   (`e.src.table.role == "temp"`, `:348`) to a bounded fixpoint (`_TEMP_INLINE_MAX_DEPTH = 8`,
+>   `:33`/`:343`). **No `exp.expand`/`qualify`/`build_scope`/`sg_lineage`** in the body — off the
+>   per-column hot path, so **CONFIRMED (c):** the *composition* pass adds no perf-invariant risk.
+> - **CONFIRMED (b):** because the scan is over `out.statements`, Phase 1's only obligation is to
+>   land the unwrapped inner CREATE (and any inner `CREATE TEMP TABLE`, marked `role=='temp'`)
+>   into the **same** `out.statements` (via the normal `_parse_statement` path so `column_lineage`
+>   is populated) **before** the `:264` call — not into a discarded sub-`out`. With that, the
+>   `transform='TEMP_INLINE'` composition fires automatically; **no engine change**.
+> - **Residual risk is in Phase 1, not Phase 2** (the plan already flags this): the *unwrap /
+>   re-parse entry point* must reuse the existing `_parse_statement` path (no per-column
+>   re-entry, no nested `parse_file` that re-runs expand/qualify on the hot path). The four
+>   perf-invariant suites gate this. The plan's caveat permitting a Phase-1/acceptance split *if*
+>   the re-parse entry point turns non-trivial stands.
+> - **#142 HARD-GATE CONFIRMED:** `feat/e8-dual-emission` is **not** an ancestor of `master`
+>   (verified) — #142 is still open, and PR-6 is correctly sequenced to NOT open until it lands.
+> - **Corpus claims CONFIRMED:** 21 files use `EXECUTE IMMEDIATE`; exactly **1** matches the
+>   static-literal `:= 'CREATE…` pattern (WTFA, contains `DYNAMIC TABLE`); WTFA's
+>   `|| $WAREHOUSENAME ||` is **only** in the WAREHOUSE clause (a non-lineage clause —
+>   placeholder substitution is lossless), with `USE SCHEMA BA;` and a fully static
+>   `AS WITH … FROM ba.wtfe_verkoopinfo … from ba.wtda_datum … SELECT` body;
+>   `MA-PROCEDURES/MSSPR_COMPARE_DATA.sql` uses `|| :sql_source ||` bind-variable concatenation
+>   into `TEMP` tables → **Phase-1-unrecoverable, correctly out of scope (skip-not-guess).**
+>
+> **Plan-reviewer amendment — recommended post-#142 execution order (value ranking, requested):**
+> Of the metric-moving levers that can run *after* #142 lands, rank by value/cost:
+> 1. **PR-2 (#27a)** — highest immediate value: shrinks the ~3,700 deg-0 singleton viz-mass
+>    (123 backup/snapshot nodes), low cost, independent of #142. **Run first.**
+> 2. **PR-4 (#94)** — perf/profiling lever; bulk BELONGS_TO + catalog-stage instrumentation.
+>    Higher engineering surface than PR-2 but characterizes the slowest index stage. **Second.**
+> 3. **PR-6** — **last**. It is **structural / future-proofing, NOT a volume lever**: it closes
+>    exactly **1 file / 1 table / a 4-node island today** (WTFA), and Phase 2 adds **0 islands
+>    today** (the only temp-inside-dynamic-SQL file is concatenated → out of scope). Its value is
+>    the new static-literal-EXECUTE-IMMEDIATE extraction surface (a growing Snowflake authoring
+>    class) plus near-free temp-composition future-proofing — explicitly low-immediate-yield.
+>    **Stated plainly: PR-6 is the lowest-volume of the three and is justified structurally, not
+>    by node/island count.**
 
 ## Framing — same shape, reuse #142's machinery
 The maintainer's design call: dynamic-SQL extraction and "pick up the intermediate" are the
@@ -707,7 +785,6 @@ reading the engine and the parse pipeline on `feat/e8-dual-emission`:
 - `gain --json` snapshot committed to [`plan/metrics/`](../metrics/) showing the island delta
   (metric-moving PR).
 - `pyright` + `ruff` clean.
-- **Status stays DRAFT (needs plan-review).**
 
 ## Risk
 - Over-eager literal extraction could pick up non-DDL or concatenated strings → spurious nodes.
@@ -753,13 +830,17 @@ against #142's edge set before either merges.**
 | 2 | PR-2 #27a | Small, independent, reduces island noise | minor | **Yes** |
 | 3 | PR-3 #63 | Independent bug; precedes PR-4's profiling | patch | No |
 | 4 | PR-4 #94 | Perf; benefits from stable server start | patch | **Yes** |
-| 5a | PR-5 (DRAFT) | Correct stale `.sqlcgignore` rationale — cheap, ship anytime | patch (docs-ish) | No |
-| 5b | PR-5 (DRAFT) | **Gated** on subprocess isolation + maintainer priority decision | deferred | Yes (when it lands) |
-| — | PR-6 (DRAFT) | Dynamic-SQL unwrap (Phase 1) + #142 temp composition (Phase 2); **after #142**; rank set by plan-reviewer | minor | **Yes** |
+| 5a | PR-5 (REVIEWED) | Correct stale `.sqlcgignore` rationale — **maintainer edit in the `dwh` repo, not a `sqlcg` PR**; cheap, ship anytime | none (dwh-repo config) | No |
+| 5b | PR-5 (REVIEWED) | **Gated** on subprocess isolation + maintainer priority decision | deferred | Yes (when it lands) |
+| 6 | PR-6 (REVIEWED) | Dynamic-SQL unwrap (Phase 1) + #142 temp composition (Phase 2); **after #142**; ranked **LAST** of the post-#142 tail (structural, not a volume lever) | minor | **Yes** |
 
-> **PR-5 / PR-6 are Status: DRAFT (needs plan-review)** — folded in 2026-06-14 from the fresh
-> index; they have **not** cleared the plan-reviewer gate and are sequenced provisionally.
-> PR-1..PR-4 remain **REVIEWED** and frozen.
+> **Post-#142 execution order (plan-reviewer, 2026-06-14):** of the metric-moving levers,
+> run **PR-2 (#27a) → PR-4 (#94) → PR-6** by value/cost. PR-6 is last: it is structural
+> future-proofing (1 file / 1 table / 4-node island today, 0 islands from Phase 2 today),
+> not a volume lever. See the PR-6 execution-order amendment for the rationale.
+>
+> **PR-5 / PR-6 are now Status: REVIEWED** (gate cleared 2026-06-14, second pass; amendments
+> folded in). PR-1..PR-4 remain **REVIEWED** and frozen — unchanged by this pass.
 
 ---
 
@@ -778,12 +859,12 @@ against #142's edge set before either merges.**
    before committing to `access_mode='READ_ONLY'`.
 5. **PR-4:** whether to rewrite the catalog insert path now or only instrument + characterize
    it this PR and defer the bulk-catalog rewrite to a follow-up.
-6. **PR-5 (DRAFT):** after subprocess isolation lands — **restore IA-DATAPRODUCTS coverage**
+6. **PR-5 (REVIEWED):** after subprocess isolation lands — **restore IA-DATAPRODUCTS coverage**
    (recover 124 orphan nodes into the giant, accept the dynamic-table indexing cost) **or keep
    the perf workaround** (leave ignored)? Maintainer priority decision; gates 5b. 5a (the
    stale-comment fix) ships regardless of this decision.
-7. **PR-6 (DRAFT) — re-scoped 2026-06-14 to ONE PR, two phases, reusing #142.** Resolved
-   design points (planner positions, plan-reviewer to confirm):
+7. **PR-6 (REVIEWED) — ONE PR, two phases, reusing #142.** Design points
+   (planner positions, **plan-reviewer CONFIRMED 2026-06-14**):
    - **One PR, two phases** (Phase 1 unwrap static-literal EXECUTE IMMEDIATE; Phase 2 compose the
      intermediate via #142's existing `_emit_transitive_temp_edges`). Confirms the maintainer's
      single-PR instinct — Phase 2 is the existing engine, not new code, so there is nothing to
