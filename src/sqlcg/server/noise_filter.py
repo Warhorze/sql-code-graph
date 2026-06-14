@@ -1,7 +1,5 @@
 """Noise filter for backup tables and schema-alias mirrors."""
 
-import fnmatch
-import re
 from pathlib import Path
 
 from sqlcg.core.config import (
@@ -10,25 +8,18 @@ from sqlcg.core.config import (
     get_noise_filter_patterns,
     get_schema_aliases,
 )
+from sqlcg.core.noise_match import TableNameMatcher, table_short_name
 
 
 def _table_short_name(table_qualified: str) -> str:
     """Extract the bare table name from a qualified key, handling CTE namespacing.
 
-    PR 3 (sprint_lineage_identity_and_session_context.md §PR 3) introduced
-    namespaced CTE keys of the form ``path/file.sql::cte_name``.  A naive
-    ``split(".")[-1]`` would yield ``sql::cte_name`` instead of ``cte_name``.
-
-    Resolution order:
-    1. If ``::`` is present, return the segment after the last ``::``.
-    2. Otherwise, return the segment after the last ``.``.
-    3. If neither delimiter is present, return the whole string.
+    Thin delegate to :func:`sqlcg.core.noise_match.table_short_name` (the single
+    core-resident implementation shared by the read-time filter and the
+    index-time exclusion).  Kept as a module-level name because tests and
+    callers reference it.
     """
-    if "::" in table_qualified:
-        return table_qualified.rsplit("::", 1)[-1]
-    if "." in table_qualified:
-        return table_qualified.rsplit(".", 1)[-1]
-    return table_qualified
+    return table_short_name(table_qualified)
 
 
 class NoiseFilter:
@@ -62,22 +53,23 @@ class NoiseFilter:
         """
         self.patterns = patterns
         self.schema_aliases = schema_aliases
-        self.ignored_tables = {t.lower() for t in (ignored_tables or [])}
-        self.ignore_regexes: list[re.Pattern[str]] = []
-        for pattern in ignore_regexes or []:
-            try:
-                self.ignore_regexes.append(re.compile(pattern, re.IGNORECASE))
-            except re.error:
-                # A malformed user regex must not break filtering for every table.
-                continue
+        # The match logic is owned by the core-resident TableNameMatcher so the
+        # read-time hide (here) and the index-time exclusion (PR-2b) never drift.
+        self._matcher = TableNameMatcher(
+            patterns=patterns,
+            ignored_tables=ignored_tables,
+            ignore_regexes=ignore_regexes,
+        )
+        # Preserved attributes for back-compat with callers/tests that inspect them.
+        self.ignored_tables = self._matcher.ignored_tables
+        self.ignore_regexes = self._matcher.ignore_regexes
 
     def is_noise(self, table_qualified: str) -> bool:
         """Return True if table_qualified is noise.
 
-        A node is noise when any of the three layers matches:
-        1. its qualified name is in the ``ignored_tables`` exact list (case-insensitive);
-        2. its table-name part matches a backup glob pattern (fnmatch);
-        3. its full qualified name matches an ``ignore_regexes`` pattern (re.search).
+        Delegates to the core-resident :class:`TableNameMatcher`, which applies
+        the three ignore layers (exact name / glob / regex).  A node is noise
+        when any layer matches.
 
         Args:
             table_qualified: A qualified table name (schema.table).
@@ -85,25 +77,7 @@ class NoiseFilter:
         Returns:
             True if the table matches any ignore layer.
         """
-        # Exact qualified-name match against the explicit ignore list.
-        if table_qualified.lower() in self.ignored_tables:
-            return True
-
-        # Extract just the table part for glob matching.
-        # PR 3: use _table_short_name to handle namespaced CTE keys
-        # (e.g. "a/b.sql::final" → "final"; "schema.table" → "table").
-        table_name = _table_short_name(table_qualified)
-
-        for pattern in self.patterns:
-            if fnmatch.fnmatch(table_name, pattern):
-                return True
-
-        # Regex layer: match against the full qualified name (unanchored).
-        for regex in self.ignore_regexes:
-            if regex.search(table_qualified):
-                return True
-
-        return False
+        return self._matcher.matches(table_qualified)
 
     def canonical(self, table_qualified: str) -> str:
         """Return the canonical form of a table_qualified, resolving alias mirrors.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ def _sniff_delimiter(header_line: str) -> str:
 def load_catalog_csv(
     csv_path: Path,
     schema_aliases: dict[str, str] | None = None,
+    exclude: Callable[[str], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int, int, int]:
     """Parse a INFORMATION_SCHEMA.COLUMNS CSV export into bulk-upsert row lists.
 
@@ -51,6 +53,11 @@ def load_catalog_csv(
     - Quoted fields with embedded commas/dots handled via Python's csv module.
     - Single catalog component (``table_catalog``) dropped from graph keys —
       graph keys are ``schema.table`` (two-part, lower-cased).
+
+    ``exclude`` (PR-2b, #27a) is an optional predicate ``(qualified) -> bool``;
+    when it returns True for a row's two-part ``schema.table`` name, that row is
+    skipped (no SqlTable / SqlColumn / HAS_COLUMN emitted) so an index-time
+    backup-table exclusion is honoured by the catalog re-apply too.
 
     ``schema_aliases`` (e.g. ``{"ba_tmp": "ba"}``, from
     ``[sqlcg.schema_aliases]`` in ``.sqlcg.toml``) folds staging-schema rows
@@ -140,6 +147,15 @@ def load_catalog_csv(
 
         # Two-part qualified name: schema.table (catalog component dropped).
         table_qualified = f"{schema}.{table}"
+
+        # PR-2b (#27a): the DWH INFORMATION_SCHEMA lists every physical table,
+        # including backup clones.  When the index-time exclusion is on, drop
+        # excluded names here too — otherwise the catalog re-apply RE-CREATES
+        # every *_bck* SqlTable / HAS_COLUMN the flush already excluded.  Same
+        # core predicate as the flush, so the two never drift.
+        if exclude is not None and exclude(table_qualified):
+            continue
+
         col_id = f"{table_qualified}.{col}"
 
         # SqlTable row (bare — kind='table', defined_in_file='').
@@ -187,6 +203,7 @@ def apply_catalog_to_backend(
     csv_path: Path,
     backend: Any,
     schema_aliases: dict[str, str] | None = None,
+    exclude: Callable[[str], bool] | None = None,
 ) -> dict[str, int]:
     """Load catalog CSV rows into the graph backend.
 
@@ -201,13 +218,17 @@ def apply_catalog_to_backend(
         schema_aliases: Optional staging-schema -> canonical-schema map (from
             ``[sqlcg.schema_aliases]``); folds rows like ``ba_tmp.*`` onto
             ``ba.*`` before upsert. Defaults to no folding.
+        exclude: Optional PR-2b (#27a) predicate ``(qualified) -> bool``.  When
+            provided, catalog rows for excluded names are dropped before upsert
+            so the catalog re-apply cannot re-create tables the index-time
+            filter already excluded.  None = no exclusion (today's behaviour).
 
     Returns:
         Dict with keys: rows_read, malformed_skipped, tables_loaded, columns_loaded,
         folded_rows.
     """
     table_rows, column_rows, has_column_edges, rows_read, malformed_skipped, folded_rows = (
-        load_catalog_csv(csv_path, schema_aliases=schema_aliases)
+        load_catalog_csv(csv_path, schema_aliases=schema_aliases, exclude=exclude)
     )
 
     # SqlTable: INSERT OR IGNORE — never overwrite existing rows with real kind/
