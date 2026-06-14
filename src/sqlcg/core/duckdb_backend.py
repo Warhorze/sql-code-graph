@@ -30,6 +30,7 @@ from typing import Any
 
 import duckdb
 
+from sqlcg import __version__ as _SQLCG_VERSION
 from sqlcg.core.graph_db import GraphBackend
 from sqlcg.core.schema import SCHEMA_VERSION, NodeLabel, RelType
 from sqlcg.utils.logging import getLogger
@@ -97,7 +98,8 @@ _NODE_DDLS = [
     """
     CREATE TABLE IF NOT EXISTS "SchemaVersion" (
         version VARCHAR PRIMARY KEY,
-        indexed_sha VARCHAR
+        indexed_sha VARCHAR,
+        sqlcg_version VARCHAR
     )
     """,
     """
@@ -257,7 +259,7 @@ _NODE_COLUMNS: dict[str, list[str]] = {
         "parsing_mode",
         "start_line",
     ],
-    NodeLabel.SCHEMA_VERSION: ["version", "indexed_sha"],
+    NodeLabel.SCHEMA_VERSION: ["version", "indexed_sha", "sqlcg_version"],
     NodeLabel.EXTERNAL_CONSUMER: ["name", "consumer_type"],
 }
 
@@ -365,11 +367,13 @@ class DuckDBBackend(GraphBackend):
                 self._conn.execute(ddl)
             # Upsert the schema version row.
             self._conn.execute(
-                'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha) '
+                'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha, sqlcg_version) '
                 "VALUES (?, COALESCE("
                 '  (SELECT indexed_sha FROM "SchemaVersion" WHERE version = ?), NULL'
+                "), COALESCE("
+                '  (SELECT sqlcg_version FROM "SchemaVersion" WHERE version = ?), NULL'
                 "))",
-                [SCHEMA_VERSION, SCHEMA_VERSION],
+                [SCHEMA_VERSION, SCHEMA_VERSION, SCHEMA_VERSION],
             )
         logger.debug("DuckDB schema initialized (version %s)", SCHEMA_VERSION)
 
@@ -809,11 +813,12 @@ class DuckDBBackend(GraphBackend):
             return None
 
     def set_indexed_sha(self, sha: str) -> None:
-        """Persist the git SHA of the last successful index."""
+        """Persist the git SHA of the last successful index and the running sqlcg version."""
         try:
             self._conn.execute(
-                'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha) VALUES (?, ?)',
-                [SCHEMA_VERSION, sha],
+                'INSERT OR REPLACE INTO "SchemaVersion" (version, indexed_sha, sqlcg_version)'
+                " VALUES (?, ?, ?)",
+                [SCHEMA_VERSION, sha, _SQLCG_VERSION],
             )
         except Exception as exc:
             logger.warning("Failed to write indexed_sha: %s", exc)
@@ -834,6 +839,24 @@ class DuckDBBackend(GraphBackend):
             return row[0] if row else None
         except Exception as exc:
             logger.warning("Failed to read indexed_sha: %s", exc)
+            return None
+
+    def get_indexed_version(self) -> str | None:
+        """Return the sqlcg version that wrote the last successful index, or None.
+
+        Returns None when the graph was indexed by a pre-v1.33.0 tool (column
+        did not exist) or when the graph has never been indexed.  Callers treat
+        None as "unknown" and must not claim staleness without proof.
+        """
+        try:
+            result = self._conn.execute(
+                'SELECT sqlcg_version FROM "SchemaVersion" WHERE version = ?',
+                [SCHEMA_VERSION],
+            )
+            row = result.fetchone()
+            return row[0] if row else None
+        except Exception as exc:
+            logger.warning("Failed to read indexed sqlcg_version: %s", exc)
             return None
 
     # ------------------------------------------------------------------
