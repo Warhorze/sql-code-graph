@@ -1,10 +1,69 @@
 # Backlog — Confirmed Q2-B Sprint Plan
 
-**Status:** DRAFT (awaiting `plan-reviewer` gate before any implementation)
+**Status:** REVIEWED (plan-reviewer gate cleared 2026-06-14; amendments folded in below).
+Two items remain explicit **maintainer design decisions** (PR-1 shared-predicate placement;
+PR-3 read-only-open viability) — flagged, not blocking; the developer must surface them, not
+silently pick.
 **Owner role:** architect-planner
-**Baseline:** triaged against master `HEAD ~v1.28.4`; anchors re-verified by direct
-read in the working tree (see *Anchor reconciliation* below — some paths drifted).
+**Baseline:** triaged against master `HEAD ~v1.28.4`; re-verified by plan-reviewer against
+**current master `292da6a`** (PR #141 self-heal merge; `__version__ = "1.28.4"`). All four PR
+gaps **still exist** on `292da6a` — nothing already shipped. See the *Plan-reviewer verdict*
+block and *Anchor reconciliation* below; several cited line numbers drifted and are corrected.
 **Scope:** four confirmed, evidence-backed PRs + one pending-verification stub.
+
+---
+
+## Plan-reviewer verdict (2026-06-14, current master `292da6a`)
+
+**VERDICT: REVIEWED.** The plan is sound: every PR's gap was confirmed to **still exist** on
+current master; no item is already-shipped. Path/line drift from the stale baseline is corrected
+inline below. Acceptance criteria already encode the house rules. Two maintainer design decisions
+remain (PR-1 predicate placement, PR-3 RO-open viability) — both already flagged with planner
+recommendations; left to the maintainer/developer to settle, not gating the gate.
+
+**Per-PR gap reconfirmation (file:line on `292da6a`):**
+
+- **PR-1 (#40) - GAP EXISTS.** The golden BFS helpers query **raw `COLUMN_LINEAGE` with no
+  `kind` predicate and no `SqlTable` join**: `_reachable_physical_leaves`
+  [`tests/e2e/test_golden_lineage.py:97-98`](../../tests/e2e/test_golden_lineage.py),
+  `_direct_sources` `:112-113`, `_table_blast_radius` `:154-155`, `_upstream_tables` `:182-183`.
+  They filter only on **backup-name** globs via `_table_is_noise` (`:124-127`,
+  `_DEFAULT_BACKUP_PATTERNS` `:121`) - that is *not* the `kind IN ('table','external')` CLI
+  filter. `test_downstream_count_exact` asserts `== 2` at `:652`. The CLI predicate to mirror is
+  the `kind_filter` string in [`analyze.py:30-37`](../../src/sqlcg/cli/commands/analyze.py)
+  (`_upstream_sql`) and `:82-89` (`_downstream_sql`). **Note:** the brief's `_leaf_sources`
+  function name no longer exists - it is `_reachable_physical_leaves`.
+- **#142 coupling - CONFIRMED + DE-RISKED.** `transform` is **already a column on
+  `COLUMN_LINEAGE` on current master** ([`duckdb_backend.py:170,:301`](../../src/sqlcg/core/duckdb_backend.py)),
+  so PR-1's synthetic-`TEMP_INLINE` regression test is **insertable on master today** - it does
+  **not** depend on #142 landing first. `feat/e8-dual-emission` is the branch that *emits*
+  `transform='TEMP_INLINE'` edges (`coverage.py:380`, transform-aware upsert at `indexer.py:170-178`).
+  Sequencing in *#40 dpos #142* stands: PR-1 must be green both on `292da6a` **and** on a local
+  merge with `feat/e8-dual-emission`, and must merge with-or-before #142 so master never has an
+  armed-and-red window.
+- **PR-2 (#27a) - GAP EXISTS, premise CONFIRMED EXACTLY.** `get_noise_filter_patterns`
+  ([`config.py:117-151`](../../src/sqlcg/core/config.py)) defaults exist and ARE wired - but
+  **only at the read surface** ([`server/noise_filter.py:175`](../../src/sqlcg/server/noise_filter.py),
+  table-NAME layer). Grep finds **no call in `indexer/` or `lineage/`** at file discovery. The
+  walker globs `*.sql` (via `git ls-files`, rglob fallback at
+  [`walker.py:50-52`](../../src/sqlcg/indexer/walker.py)) and applies only the `.sqlcgignore`
+  spec; `load_ignore_spec` ([`utils/ignore.py:8-23`](../../src/sqlcg/utils/ignore.py)) has **no
+  default patterns**. `load_ignore_spec` is called from [`indexer.py:461`](../../src/sqlcg/indexer/indexer.py),
+  not the walker. So the missing piece is precisely a **file-discovery default-ignore**. Correct.
+- **PR-3 (#63) - GAP EXISTS.** `get_backend(read_only=...)` still ignores the flag
+  ([`config.py:351-366`](../../src/sqlcg/core/config.py), docstring says "Ignored for DuckDB").
+  `duckdb.connect(db_path)` has **no `access_mode`** ([`duckdb_backend.py:332`](../../src/sqlcg/core/duckdb_backend.py));
+  `IOException` re-raised `:333-347`. **Live failure path confirmed:** the no-server fallback at
+  [`read_client.py:191`](../../src/sqlcg/server/read_client.py) calls `get_backend(read_only=True)`
+  - which, because the flag is ignored, opens **read-write** and fails on a locked file. DuckDB
+  pin is `>=1.0.0,<2.0` (`pyproject.toml:25`). The empirical-probe gate (below) stands.
+- **PR-4 (#94) - GAP EXISTS.** Per-row BELONGS_TO loop confirmed at
+  [`index.py:407-415`](../../src/sqlcg/cli/commands/index.py) (`for row in file_rows:
+  backend.upsert_edge(... RelType.BELONGS_TO ...)`). `--profile` flag at `:62-63`; summary at
+  `:476`; the catalog re-apply stage is not an instrumented bucket. Bulk target
+  `upsert_edges_bulk` exists at [`duckdb_backend.py:574`](../../src/sqlcg/core/duckdb_backend.py)
+  (grep-confirmed call site for the developer).
+- **PR-5 - placeholder, correctly marked not-ready.** No change.
 
 ---
 
@@ -75,10 +134,12 @@ the filtered surface real users query → the exact-count and floor guards flip 
 moment #142 merges. The guards are an armed regression against unmerged work.
 
 ## Root cause (file:line — verified)
-- Raw, unfiltered BFS over `COLUMN_LINEAGE`:
+- Raw, unfiltered BFS over `COLUMN_LINEAGE` (reviewer-verified on `292da6a`):
   [`tests/e2e/test_golden_lineage.py:97-98`](../../tests/e2e/test_golden_lineage.py)
-  (`_leaf_sources`), `:113-116` (`_direct_sources`), `:154-155` (`_table_blast_radius`
-  downstream), `:182-183` (`_upstream_tables`). None join `SqlTable` / apply a `kind` predicate.
+  (`_reachable_physical_leaves` - the brief's `_leaf_sources` was **renamed**), `:112-113`
+  (`_direct_sources`), `:154-155` (`_table_blast_radius` downstream), `:182-183`
+  (`_upstream_tables`). None join `SqlTable` / apply a `kind` predicate; they filter ONLY on
+  backup-name globs via `_table_is_noise` (`:124-127`), which is orthogonal to the kind-filter.
 - Exact-count anchors: `:338` and `:360` (per-statement `precision=1.0 if match`),
   and `test_downstream_count_exact` at [`:643-652`](../../tests/e2e/test_golden_lineage.py)
   asserting `count == 2` ("etl, mart").
@@ -126,8 +187,12 @@ This keeps the guards *meaningful* (counts not loosened — they still assert `=
 - Guards remain meaningful: `test_downstream_count_exact` still asserts `== 2`;
   `PRECISION_FLOOR`/`RECALL_FLOOR` stay `0.8` (not loosened).
 - New regression test: with a synthetic `transform='TEMP_INLINE'` edge inserted, the
-  filtered traversal **excludes** it and the count/floor assertions still pass — proving the
+  filtered traversal **excludes** it and the count/floor assertions still pass - proving the
   guard now exercises the filter layer (assert observable output, not "no exception").
+  **Reviewer note:** `transform` is already a `COLUMN_LINEAGE` column on master
+  (`duckdb_backend.py:170,:301`), so this regression test is writable **against `292da6a`
+  alone** - it does NOT block on #142 merging. (#142 is only needed for the *local-merge*
+  green check below.)
 - The four perf-invariant suites pass **unmodified**.
 - `rtk uv run pytest tests/e2e/test_golden_lineage.py tests/integration/test_live_anchors.py`
   green both with and without a simulated #142 edge set.
@@ -157,9 +222,13 @@ applied (if at all) at a different layer than file discovery — and crucially h
 indexer call site**, so nothing currently excludes these at discovery time.
 
 ## Root cause (file:line — verified)
-- Walker globs only `*.sql` and applies only the `.sqlcgignore` spec:
-  [`src/sqlcg/indexer/walker.py:54`](../../src/sqlcg/indexer/walker.py) (`root.rglob("*.sql")`),
-  `:50,:55` (`is_ignored(path, root, spec)`).
+- Walker discovers files via `git ls-files` (tracked `*.sql`) with an `rglob("*.sql")`
+  **fallback at [`walker.py:50-52`](../../src/sqlcg/indexer/walker.py)**, applying only the
+  `.sqlcgignore` spec (`is_ignored` at `:46,:51`). **Reviewer correction:** the brief's
+  `:54 root.rglob` / `:55` lines drifted - the walker was rewritten to a git-first path; the
+  `spec` it receives comes from `load_ignore_spec(path)` called in
+  **[`indexer.py:461`](../../src/sqlcg/indexer/indexer.py)** (not inside the walker). The
+  file-discovery default-ignore must seed that `spec` (option A) or filter in the walker.
 - `load_ignore_spec` has **no default patterns** — it reads `.sqlcgignore` or returns an
   empty spec: [`src/sqlcg/utils/ignore.py:8-23`](../../src/sqlcg/utils/ignore.py).
 - `get_noise_filter_patterns` (backup globs) lives at
@@ -262,8 +331,16 @@ openers go read-only or are short-circuited by the pre-check.
 ## Acceptance criteria
 - A 2nd connection / health-probe either **succeeds** (read-only) or **fails gracefully with
   a clear, actionable message** (not a raw `IOException` stack).
-- `get_backend(read_only=True)` actually passes `access_mode='READ_ONLY'` (docstring no
-  longer claims the flag is ignored), with a test asserting the connect kwarg.
+- **Conditional on the empirical probe (reviewer gate):** *only if* the probe (open a live
+  R/W writer, then attempt a 2nd R/O open of the same file under DuckDB `>=1.0,<2.0`) shows a
+  2nd R/O open **succeeds**, then `get_backend(read_only=True)` passes
+  `access_mode='READ_ONLY'` (docstring no longer claims the flag is ignored), with a test
+  asserting the connect kwarg. **If the probe shows the writer's lock blocks a 2nd open**
+  (the likely DuckDB single-file outcome), drop option (1) and ship **only** option (2) - the
+  graceful "server already running" pre-check - as the real fix; do not commit a dead
+  `access_mode` path. Capture the probe result in `plan/measurements/` (scratch, not committed).
+  **Live failure site:** [`read_client.py:191`](../../src/sqlcg/server/read_client.py)
+  already requests `read_only=True` in the no-server fallback and silently gets R/W today.
 - No regression to the single-writer drain model: the writer server still opens R/W and the
   socket-routed CLI read path still works (existing `read_client` tests stay green).
 - Integration test simulating a 2nd `mcp start` against a live server asserts the graceful
@@ -321,8 +398,14 @@ Three coupled perf sub-items in the post-rebuild index path:
 ## Acceptance criteria
 - `--profile` output includes the **catalog re-apply stage** as its own bucket (observable in
   the rendered summary at `index.py:476-488`).
-- BELONGS_TO uses a **bulk upsert** (no per-row `upsert_edge` loop); grep-confirmed bulk call
-  site.
+- BELONGS_TO uses a **bulk upsert** (`upsert_edges_bulk`, confirmed at
+  [`duckdb_backend.py:574`](../../src/sqlcg/core/duckdb_backend.py)) replacing the per-row
+  `upsert_edge` loop at [`index.py:407-415`](../../src/sqlcg/cli/commands/index.py); grep-confirmed
+  call site before the PR opens.
+- **Bump tripwire (reviewer):** extending the *existing* `--profile` flag to add a catalog
+  bucket stays **patch**. If the PR instead adds a **new** `--profile-catalog` flag (a new
+  user-facing surface), the bump becomes **minor** per CLAUDE.md SemVer - pick one and bump
+  accordingly; do not ship a new flag under a patch bump.
 - The 3-minute full-corpus budget is **measured via the profile breakdown**, not raw
   wall-clock seconds — *this box is a 3.8GB-RAM machine; judge by stage breakdown +
   `test_perf_scaling_guard`, not absolute seconds.*
