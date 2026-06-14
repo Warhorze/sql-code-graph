@@ -438,6 +438,13 @@ sqlcg analyze impact [OPTIONS] TABLE
 
 Show all queries impacted by a table.
 
+One-hop "who reads this table" — the union of direct SELECTS_FROM consumers
+and consumers that read the table only via COLUMN_LINEAGE / STAR_SOURCE
+(CTE-wrapped / promoted-intermediate reads, e.g. the live DWH node
+``ba.all_rows_in_selection``). Bug #6 fix: brings ``impact`` to the same
+one-hop consumer completeness ``find_table_usages`` already has. Stays
+one-hop (NOT transitive — that is ``downstream``'s job).
+
 ### Options
 
 | Option | Type | Required | Repeatable | Default | Description |

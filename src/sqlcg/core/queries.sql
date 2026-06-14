@@ -413,3 +413,26 @@ WHERE t.name = ?
 SELECT DISTINCT target_table AS producer_table
 FROM "SqlQuery"
 WHERE target_table <> '' AND target_table IS NOT NULL
+
+-- IMPACT_CONSUMERS_VIA_LINEAGE
+-- Bug #6: consumers that read a table only via COLUMN_LINEAGE or STAR_SOURCE
+-- (CTE-wrapped / promoted-intermediate reads that emit no top-level SELECTS_FROM
+-- edge, e.g. the live DWH cross-file-promoted node ba.all_rows_in_selection:
+-- kind='table', non-namespaced, 0 SELECTS_FROM in-edges, 55 COLUMN_LINEAGE
+-- out-edges). Returns the same (id, kind, target) shape as the SELECTS_FROM-only
+-- impact query in analyze.py:impact() so the two result sets merge + dedup on q.id.
+-- Both branches key on the QUALIFIED table name (impact() keys on t.qualified):
+-- COLUMN_LINEAGE branch -> src.table_qualified; STAR_SOURCE branch -> ss.dst_key.
+-- The STAR_SOURCE branch closes the STAR-only-consumer gap (FIND_TABLE_USAGES
+-- itself still lacks it — out of scope, separate follow-up).
+-- params: [table_qualified, table_qualified]  (same value bound to BOTH ?)
+SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target
+FROM "SqlColumn" src
+JOIN "COLUMN_LINEAGE" cl ON cl.src_key = src.id
+JOIN "SqlQuery" q ON q.id = cl.query_id
+WHERE src.table_qualified = ?
+UNION
+SELECT DISTINCT q.id AS id, q.kind AS kind, q.target_table AS target
+FROM "STAR_SOURCE" ss
+JOIN "SqlQuery" q ON q.id = ss.src_key
+WHERE ss.dst_key = ?
