@@ -55,9 +55,47 @@ def mcp_setup(print_only: bool = typer.Option(True, "--print/--write")) -> None:
     console.print("Note: Binary is `sqlcg`; PyPI package is `sql-code-graph`.")
 
 
+def _live_server_pid() -> int | None:
+    """Return the PID of a live MCP server holding the DuckDB lock, else None.
+
+    A server is "live" when the PID file exists, parses, and names a process
+    that is currently alive (``is_pid_alive``). A stale PID file (process gone)
+    returns ``None`` so a fresh start is allowed — its DuckDB lock has been
+    released. This mirrors the liveness check ``mcp status`` uses (#63).
+    """
+    from sqlcg.server.control import is_pid_alive, read_pid
+
+    record = read_pid()
+    if record is None:
+        return None
+    pid = record.get("pid")
+    if not isinstance(pid, int):
+        return None
+    return pid if is_pid_alive(pid) else None
+
+
 @app.command("start")
 def mcp_start() -> None:
-    """Start the MCP server."""
+    """Start the MCP server.
+
+    Pre-check (#63): if a server is already running for this database, exit
+    gracefully with a clear message. Without this, the second ``mcp start``
+    would attempt to open the DuckDB file read-write, fail on the live
+    server's single-file exclusive lock, and surface an opaque ``IOException``.
+    An empirical probe confirmed a read-only co-open is *also* impossible while
+    a writer holds the file, so the only safe behaviour for a 2nd start is to
+    detect the live server and refuse — not to try a (doomed) read-only open.
+    """
+    pid = _live_server_pid()
+    if pid is not None:
+        console.print(
+            f"[yellow]An MCP server is already running for this database "
+            f"(PID {pid}).[/yellow]\n"
+            "Only one server may hold the DuckDB file at a time. "
+            "Use the running server, or stop it first with: [bold]sqlcg mcp stop[/bold]"
+        )
+        raise typer.Exit(code=0)
+
     from sqlcg.server.server import main as server_main
 
     server_main()

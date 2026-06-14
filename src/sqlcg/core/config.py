@@ -352,9 +352,14 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
     """Get a DuckDBBackend instance.
 
     The ``read_only`` parameter is accepted for API compatibility but is
-    ignored — DuckDB uses a single R/W handle for the process lifetime.
-    Concurrent read safety is provided by DuckDB's MVCC (readers see a
-    consistent snapshot during an in-flight write transaction).
+    ignored — DuckDB takes a **single-file exclusive lock** on the database
+    file, so ``access_mode='READ_ONLY'`` does **not** let a second process
+    co-open the file while a live writer (the MCP server) holds it. This was
+    settled by an empirical probe (#63): both ``read_only=True`` and
+    ``config={'access_mode': 'READ_ONLY'}`` raise ``IOException`` ("Conflicting
+    lock is held") against a live R/W writer on DuckDB 1.x. Concurrent read
+    safety is instead provided by DuckDB's MVCC *within* the server process
+    (readers see a consistent snapshot during an in-flight write transaction).
 
     Cross-process access: whichever process opens the DuckDB file first holds
     an exclusive lock; other processes cannot open it at all (even read-only).
@@ -363,7 +368,8 @@ def get_backend(read_only: bool = False) -> "GraphBackend":
     the file directly only when no server is running.
 
     Args:
-        read_only: Ignored for DuckDB. Accepted for API compatibility.
+        read_only: Ignored for DuckDB — the exclusive lock makes a read-only
+            co-open impossible (#63). Accepted for API compatibility.
 
     Returns:
         A DuckDBBackend instance.
