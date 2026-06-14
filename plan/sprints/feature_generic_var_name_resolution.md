@@ -1,6 +1,16 @@
 # Feature Plan: Generic variable-name resolution for dynamic table names
 
-**Status:** DRAFT (a plan-reviewer gates this before implementation)
+**Status:** REVIEWED (plan-reviewer gate 2026-06-14 — VERDICT REVIEWED, no blockers. Both load-bearing
+checks PROVEN empirically: (1) fold-core catalog rule correct — `to_table('DHB.KOSTEN')`→cat='' (wildcard
+opaque catalog), `to_table('PRD_DB.DHB.KOSTEN')`→cat='PRD_DB' (KEEP literal catalog), bare `KOSTEN`→give-up;
+(2) flow-gate structurally enforced — `ALTER WAREHOUSE`/`CALL` parse to `exp.Command`, never `exp.Table`, so
+the demand-driven resolver auto-excludes them. Forks: F1 accept (env-param + keep-literal-catalog + PR-3
+zero-collision assert), F2 absorb PR-A scaffolding into PR-2, F3 chain-depth=1, F4 two pre-scan maps.
+**3 corrections to FOLD AT PR-2:** (a) master is v1.35.1 → next MINOR = **v1.36.0** (not 1.35.0); (b) sink
+predicate must match `IDENTIFIER` CASE-INSENSITIVELY (`table.this.name == 'IDENTIFIER'` is UPPERCASE — else
+matches nothing and PR-2 tests silently pass-as-noop); (c) PR-1 bind-param→OPAQUE fixture asserts via
+`exp.Placeholder`. Anchors verified on master: pre-scan snowflake_parser.py:355-364, wiring :428,
+EXEC-IMMEDIATE var :640/655 (file now 976 lines, re-grep at impl). READY — PR-1 → PR-2 → PR-3.)
 **Source study:** `git show research/generic-var-name-resolution:plan/research/generic_variable_name_resolution.md` (commit `60635c7`, VERDICT **HOLDS**)
 **Foundation (dropped):** [`fix/identifier-var-indirection`](src/sqlcg/parsers/snowflake_parser.py) commit `0f655d0` — handles the LITERAL case only; this feature extends "is the RHS a literal?" → "FOLD the RHS".
 **Branch:** `plan/generic-var-name-resolution`
