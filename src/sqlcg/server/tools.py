@@ -753,7 +753,9 @@ def _empty_closure_hint(db: GraphBackend, table_id: str, cols: list[dict] | None
 
 @mcp.tool()
 @_timed_tool("trace_column_lineage")
-def trace_column_lineage(table_col: str, max_depth: int | None = None) -> LineageResult:
+def trace_column_lineage(
+    table_col: str, max_depth: int | None = None, view: str = "structural"
+) -> LineageResult:
     """Trace upstream lineage of a column.
 
     Traverses COLUMN_LINEAGE edges backward. When max_depth is None, computes
@@ -768,6 +770,14 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
         max_depth: Maximum number of hops to traverse. If None, computes full closure.
                    Safety cap: stops at 50,000 nodes to prevent pathological graphs from
                    hanging the server.
+        view: Lineage view selector (E8 dual-emission, plan/research/
+              e8_dual_emission_feasibility.md §6.3).
+              - "structural" (default): the real per-hop graph; filters OUT the derived
+                transform='TEMP_INLINE' shortcut edges. The BFS still reaches every leaf
+                via the structural temp hops, so the shortcut adds no reachability — only
+                diagram clutter — and is elided.
+              - "source_to_sink": the temps-elided view; keeps ONLY the TEMP_INLINE edges,
+                answering "what real source table feeds this column?" in one hop.
 
     Returns:
         LineageResult with list of upstream column nodes
@@ -776,6 +786,15 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
         NotIndexedError: If no repos have been indexed
         InvalidColumnRefError: If column reference format is invalid
     """
+    if view not in ("structural", "source_to_sink"):
+        raise ValueError(f"invalid view {view!r}; expected 'structural' or 'source_to_sink'")
+
+    def _select_rows(rows: list) -> list:
+        """E8 dual-emission view selector: keep structural OR TEMP_INLINE rows."""
+        if view == "source_to_sink":
+            return [r for r in rows if (r.get("transform") or "") == "TEMP_INLINE"]
+        return [r for r in rows if (r.get("transform") or "") != "TEMP_INLINE"]
+
     with _open_backend() as db:
         _assert_indexed(db)
 
@@ -807,9 +826,11 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
             visited.add(current_id)
 
             # Query for upstream columns (reverse direction)
-            rows = db.run_read(
-                TRACE_COLUMN_LINEAGE_QUERY,
-                {"id": current_id},
+            rows = _select_rows(
+                db.run_read(
+                    TRACE_COLUMN_LINEAGE_QUERY,
+                    {"id": current_id},
+                )
             )
 
             for row in rows:
@@ -855,7 +876,7 @@ def trace_column_lineage(table_col: str, max_depth: int | None = None) -> Lineag
                 if len(bare_visited) >= max_nodes:
                     break
                 bare_visited.add(current_id)
-                rows = db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": current_id})
+                rows = _select_rows(db.run_read(TRACE_COLUMN_LINEAGE_QUERY, {"id": current_id}))
                 for row in rows:
                     node_id = row["id"]
                     edges.append((node_id, current_id, row.get("transform") or "SELECT"))

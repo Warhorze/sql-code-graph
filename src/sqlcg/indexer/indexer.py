@@ -164,6 +164,38 @@ def _harvest_usage_catalog(
     return usage_column_rows, usage_has_column_edges
 
 
+def _dedup_column_lineage_edges(rows: list[dict]) -> list[dict]:
+    """Dedup COLUMN_LINEAGE rows by (src_key, dst_key) with structural precedence.
+
+    Matches MERGE (src)-[r]->(dst) cardinality (KuzuDB cannot hold two edges of the
+    same type between the same pair). E8 dual-emission gap-A (structural precedence,
+    plan/sprints/e8_dual_emission.md §gap-A): the dedup key does NOT include
+    ``transform``, so a derived ``transform='TEMP_INLINE'`` edge and a real structural
+    edge that happen to share ``(src_key, dst_key)`` — e.g. a sink that both reads a
+    source directly (``PASS_THROUGH leaf→sink``) AND reads it via a temp
+    (``TEMP_INLINE leaf→sink``) — collide. The STRUCTURAL/real edge MUST win: dropping
+    it in favour of the derived shortcut would silently lose real provenance. This dedup
+    is therefore transform-aware: an existing non-``TEMP_INLINE`` row is NEVER replaced
+    by a ``TEMP_INLINE`` row for the same key (deterministic structural precedence). All
+    other collisions keep prior last-wins behaviour.
+    """
+    deduped: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["src_key"], r["dst_key"])
+        existing = deduped.get(key)
+        if existing is not None:
+            existing_struct = existing.get("transform") != "TEMP_INLINE"
+            incoming_struct = r.get("transform") != "TEMP_INLINE"
+            # Incoming TEMP_INLINE must not shadow an existing structural edge.
+            if existing_struct and not incoming_struct:
+                continue
+            # else: both structural (last wins) OR existing TEMP_INLINE + incoming
+            # structural (structural takes over) OR both TEMP_INLINE (last wins) —
+            # in all three the incoming row is kept.
+        deduped[key] = r
+    return list(deduped.values())
+
+
 def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     """Dedup accumulated rows across the batch, then issue the 10 bulk calls ONCE.
 
@@ -237,9 +269,7 @@ def _flush_row_batch(db: GraphBackend, buf: BatchRowBuffer) -> None:
     selects_from_edges = list(
         {(r["src_key"], r["dst_key"]): r for r in buf.selects_from_edges}.values()
     )
-    column_lineage_edges = list(
-        {(r["src_key"], r["dst_key"]): r for r in buf.column_lineage_edges}.values()
-    )
+    column_lineage_edges = _dedup_column_lineage_edges(buf.column_lineage_edges)
     star_source_edges = list(
         {(r["src_key"], r["dst_key"]): r for r in buf.star_source_edges}.values()
     )

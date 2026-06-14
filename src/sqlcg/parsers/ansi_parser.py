@@ -25,6 +25,13 @@ class AnsiParser(SqlParser):
 
     DIALECT: str | None = None
 
+    # E8 dual-emission: bounded fixpoint depth for transitive temp-edge composition
+    # (gap B — multi-temp chains). depth=1 covers single-level src→temp→sink; higher
+    # composes leaf→temp1→temp2→sink. 8 comfortably exceeds any observed real chain
+    # depth while keeping the pass O(edges · depth) and guaranteeing termination even
+    # if the per-(src,sink,col) dedup ledger were somehow defeated.
+    _TEMP_INLINE_MAX_DEPTH: int = 8
+
     def __init__(
         self,
         schema_resolver: SchemaResolver,
@@ -246,12 +253,134 @@ class AnsiParser(SqlParser):
                 logger.warning("Failed to process statement %d in %s: %s", stmt_index, path, exc)
                 out.errors.append(f"statement_error:{stmt_index}:{exc}")
 
+        # E8 dual-emission (plan/research/e8_dual_emission_feasibility.md §1.2): after
+        # the per-statement loop, compose the already-extracted structural temp hops
+        # (src→temp, temp→sink) into an additive, transform='TEMP_INLINE'-tagged
+        # transitive src→sink edge so consumers can pick the view (the structural hops
+        # stay untouched → namespacing intent preserved; the transitive edge satisfies
+        # E8 recall). Pure in-memory O(edges) composition — NO exp.expand/qualify/
+        # build_scope/sg_lineage (off the per-column hot path). Must run BEFORE the
+        # namespace reset below.
+        self._emit_transitive_temp_edges(out)
+
         # PR 3 — clear namespace after parsing to avoid stale state on reuse
         self._current_file_namespace = None
         # temp_table_namespacing (Step 1.1 / W4): also clear the temp-key set at
         # file-end so a pool-reused parser instance carries no stale temp identity.
         self._current_file_temp_keys = set()
         return out
+
+    def _emit_transitive_temp_edges(self, out: ParsedFile) -> None:
+        """Additively emit transitive ``source→sink`` edges across temp tables.
+
+        E8 dual-emission (plan/research/e8_dual_emission_feasibility.md §1.2/§8.1).
+        The structural temp hops are left intact (``sources_map`` registration stays
+        bare-key-only, so ``exp.expand`` does NOT inline the temp body and the temp
+        node keeps COLUMN_LINEAGE edges on both sides — namespacing intent preserved).
+        This pass *composes* those hops into a derived, ``transform='TEMP_INLINE'``
+        edge ``F.src → E.dst`` for every out-of-temp edge ``E`` (``E.src.table.role ==
+        'temp'``) matched by column name to a temp's incoming edge ``F`` (``F.dst`` is
+        the same temp column). Consumers pick the view via the ``transform`` tag.
+
+        Mechanism / cost: pure in-memory edge composition over the file's already
+        alias-normalized edges (refs are alias-remapped at construction via
+        ``_apply_table_alias``). It builds one ``dict[(temp_full_id, col) → [incoming
+        edges]]`` then a single pass over out-of-temp edges — O(sum over temp-columns
+        of fan_in × fan_out). NO ``exp.expand``/``qualify``/``build_scope``/
+        ``sg_lineage`` — off the per-column hot path (CLAUDE.md perf invariants), runs
+        once per file after the statement loop.
+
+        Gaps handled:
+        - Self-loop trap (§4): a transitive edge whose ``F.src`` identity equals
+          ``E.dst`` (post-alias ``full_id`` + column name) is dropped — no spurious
+          ``da.t.col → da.t.col`` on a temp self-reload.
+        - Multi-temp chains (gap B): the composition is iterated to a fixpoint with a
+          bounded depth (``_TEMP_INLINE_MAX_DEPTH``) so ``leaf→temp1→temp2→sink`` yields
+          a ``leaf→sink`` TEMP_INLINE edge. Each iteration re-feeds the prior round's
+          TEMP_INLINE edges as candidate incoming edges. Bounded depth keeps it
+          O(edges · depth); chains deeper than the cap degrade to partial transitivity
+          (documented limitation) rather than looping.
+        - Per-(src,sink,col) cap (§7d, gap-A dedup precedence): at most one TEMP_INLINE
+          edge is emitted per distinct ``(src_full_id, dst_full_id, col)`` — this both
+          bounds the fan_in × fan_out multiplication and, combined with the dedup
+          precedence in the indexer (structural wins on ``(src_key,dst_key)``
+          collision), prevents a derived edge from shadowing a real-provenance edge.
+
+        Args:
+            out: the ParsedFile whose statements' ``column_lineage`` lists are mutated
+                in place (additive only — existing structural edges are never removed).
+        """
+        from sqlcg.parsers.base import LineageEdge
+
+        statements = out.statements
+        if not statements:
+            return
+
+        def _col_key(ref: Any) -> tuple[str, str]:
+            return (ref.table.full_id, ref.name)
+
+        # Index every temp column's incoming structural edges:
+        #   (temp_full_id, col_name) -> [edges F where F.dst is that temp column]
+        # A temp column is the *destination* of a hop INTO the temp.
+        incoming_to_temp: dict[tuple[str, str], list[Any]] = {}
+        for stmt in statements:
+            for e in stmt.column_lineage:
+                if e.dst.table.role == "temp":
+                    incoming_to_temp.setdefault(_col_key(e.dst), []).append(e)
+
+        if not incoming_to_temp:
+            return
+
+        # Dedup ledger across all iterations: (src_full_id, dst_full_id, col) already
+        # emitted as TEMP_INLINE. Caps the fan_in × fan_out multiplication (§7d) and
+        # makes the fixpoint terminate.
+        emitted: set[tuple[str, str, str]] = set()
+
+        # Iterate to a bounded fixpoint so multi-temp chains compose (gap B). Each
+        # round composes against incoming_to_temp; newly emitted TEMP_INLINE edges
+        # whose dst is itself a temp are folded into incoming_to_temp for the next
+        # round so leaf→temp1→temp2→sink reaches leaf→sink.
+        for _depth in range(self._TEMP_INLINE_MAX_DEPTH):
+            new_edges_by_stmt: list[tuple[int, Any]] = []
+            for stmt_idx, stmt in enumerate(statements):
+                for e in list(stmt.column_lineage):
+                    # Only compose edges whose SOURCE is a temp (out-of-temp hop E).
+                    if e.src.table.role != "temp":
+                        continue
+                    incoming = incoming_to_temp.get(_col_key(e.src))
+                    if not incoming:
+                        continue
+                    for f in incoming:
+                        # Self-loop guard on post-alias identity (§4): drop F.src→E.dst
+                        # when they are the same column on the same table.
+                        if f.src.table.full_id == e.dst.table.full_id and f.src.name == e.dst.name:
+                            continue
+                        key = (f.src.table.full_id, e.dst.table.full_id, e.dst.name)
+                        if key in emitted:
+                            continue
+                        emitted.add(key)
+                        new_edges_by_stmt.append(
+                            (
+                                stmt_idx,
+                                LineageEdge(
+                                    src=f.src,
+                                    dst=e.dst,
+                                    transform="TEMP_INLINE",
+                                    confidence=min(f.confidence, e.confidence),
+                                    query_id=e.query_id,
+                                ),
+                            )
+                        )
+
+            if not new_edges_by_stmt:
+                break
+
+            # Append new edges and feed any that land on a temp column back into the
+            # incoming index for the next fixpoint round (multi-temp chains).
+            for stmt_idx, edge in new_edges_by_stmt:
+                statements[stmt_idx].column_lineage.append(edge)
+                if edge.dst.table.role == "temp":
+                    incoming_to_temp.setdefault(_col_key(edge.dst), []).append(edge)
 
     def _do_parse(self, sql: str) -> tuple[list[Any], list[str]]:
         """Parse SQL text into statements, returning both statements and any parse errors.
