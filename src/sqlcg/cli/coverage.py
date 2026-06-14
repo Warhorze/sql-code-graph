@@ -65,6 +65,7 @@ SELECT SUM(CASE WHEN EXISTS (
        ) THEN 1 ELSE 0 END) AS good_edges_strict,
        COUNT(*) AS total_edges
 FROM "COLUMN_LINEAGE" cl
+WHERE cl.transform IS DISTINCT FROM 'TEMP_INLINE'
 """
 
 # ---------------------------------------------------------------------------
@@ -78,7 +79,8 @@ SELECT
         ) THEN 1 ELSE 0 END) AS good_edges_scoped,
     COUNT(*) AS total_edges_scoped
 FROM "COLUMN_LINEAGE" cl
-WHERE NOT EXISTS (
+WHERE cl.transform IS DISTINCT FROM 'TEMP_INLINE'
+  AND NOT EXISTS (
     SELECT 1 FROM "SqlTable" t
     WHERE t.qualified = {_DST_TABLE.replace("dst_key", "cl.dst_key")}
       AND t.kind IN ('cte', 'derived', 'temp')
@@ -361,7 +363,21 @@ FROM "COLUMN_LINEAGE" cl
 JOIN "SqlQuery" q ON q.id = cl.query_id
 WHERE q.kind IN ({_WRITE_KINDS_SQL})
   AND q.target_table <> ''
+  AND cl.transform IS DISTINCT FROM 'TEMP_INLINE'
   AND EXISTS (SELECT 1 FROM "SELECTS_FROM" sf WHERE sf.src_key = q.id)
+"""
+
+# ---------------------------------------------------------------------------
+# E8 dual-emission (plan/research/e8_dual_emission_feasibility.md §6.1): the
+# derived transitive source→sink edges carry transform='TEMP_INLINE'. They are
+# EXCLUDED from the recall/health counters above (they double-count provenance
+# already captured by the two structural hops). This SEPARATE counter surfaces
+# the transitive-reach volume in `gain` WITHOUT folding it into recall/health.
+# ---------------------------------------------------------------------------
+_Q_TRANSITIVE_COL_EDGES = """
+SELECT COUNT(*) AS transitive_col_edges
+FROM "COLUMN_LINEAGE" cl
+WHERE cl.transform = 'TEMP_INLINE'
 """
 
 # ---------------------------------------------------------------------------
@@ -467,6 +483,13 @@ class CoverageStats:
     # closed PR #111). Baseline (master 1.26.0, /tmp/e8_without.duckdb proxy): 25,246.
     resolvable_write_col_edges: int = 0
 
+    # --- transitive temp-edge counter (E8 dual-emission §6.1) ---
+    # COLUMN_LINEAGE edges with transform='TEMP_INLINE' — derived source→sink edges
+    # composed across temp tables. Reported SEPARATELY; deliberately NOT folded into
+    # resolvable_write_col_edges / good_edges_* (those count STRUCTURAL edges only, to
+    # avoid double-counting provenance already captured by the two structural hops).
+    transitive_col_edges: int = 0
+
     # --- qualify_failed per-statement counter (PR-C, #118) ---
     # SqlQuery rows where qualify_failed = TRUE — statements where the qualify()
     # step raised during column-lineage extraction.  Graph-queryable A/B baseline.
@@ -555,6 +578,7 @@ def collect_coverage() -> CoverageStats | None:
         q_info_schema = run_read_routed(_Q_INFO_SCHEMA_ROWS, {})
         q_cte_source_gap = run_read_routed(_Q_CTE_SOURCE_GAP_WRITES, {})
         q_rwce = run_read_routed(_Q_RESOLVABLE_WRITE_COL_EDGES, {})
+        q_transitive = run_read_routed(_Q_TRANSITIVE_COL_EDGES, {})
         q_qualify_failed = run_read_routed(_Q_QUALIFY_FAILED_STATEMENTS, {})
 
         row1 = q1[0] if q1 else {}
@@ -572,6 +596,7 @@ def collect_coverage() -> CoverageStats | None:
         row_info_schema = q_info_schema[0] if q_info_schema else {}
         row_cte_source_gap = q_cte_source_gap[0] if q_cte_source_gap else {}
         row_rwce = q_rwce[0] if q_rwce else {}
+        row_transitive = q_transitive[0] if q_transitive else {}
         row_qualify_failed = q_qualify_failed[0] if q_qualify_failed else {}
 
         top_blindspot = [
@@ -648,6 +673,7 @@ def collect_coverage() -> CoverageStats | None:
             indexed_repo_root=indexed_root_str if catalog_configured else None,
             cte_source_gap_writes=int(row_cte_source_gap.get("cte_source_gap_writes") or 0),
             resolvable_write_col_edges=int(row_rwce.get("resolvable_write_col_edges") or 0),
+            transitive_col_edges=int(row_transitive.get("transitive_col_edges") or 0),
             qualify_failed_statements=int(row_qualify_failed.get("qualify_failed_statements") or 0),
         )
     except Exception:
@@ -812,6 +838,10 @@ def render_coverage_lines(coverage: CoverageStats, indent: str = "  ") -> list[s
         f"{indent}Column-lineage edges on resolvable-source writes: "
         f"{coverage.resolvable_write_col_edges}"
     )
+    lines.append(
+        f"{indent}Transitive temp edges (TEMP_INLINE, derived; not in recall/health): "
+        f"{coverage.transitive_col_edges}"
+    )
     lines.append(f"{indent}Qualify-failed statements: {coverage.qualify_failed_statements}")
 
     # Identity health (PR 4, sprint_lineage_identity_and_session_context.md §PR 4).
@@ -893,6 +923,8 @@ def coverage_to_json(coverage: CoverageStats) -> dict:
         "cte_source_gap_writes": coverage.cte_source_gap_writes,
         # column-lineage recall (column_lineage_recall_metric.md — issue #38, E8 revival gate)
         "resolvable_write_col_edges": coverage.resolvable_write_col_edges,
+        # transitive temp edges (E8 dual-emission §6.1) — derived, reported separately
+        "transitive_col_edges": coverage.transitive_col_edges,
         # qualify_failed per-statement counter (PR-C, #118)
         "qualify_failed_statements": coverage.qualify_failed_statements,
     }
