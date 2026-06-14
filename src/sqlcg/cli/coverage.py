@@ -296,7 +296,7 @@ WHERE source = 'information_schema'
 
 # ---------------------------------------------------------------------------
 # Query §G-4 (PR-1, issue-38-selects-from-island-lever.md §PR-1 Step 1.1;
-# floor-filter added #116):
+# inference-only filter added #116):
 # CTE-source gap — write-kind queries that have ≥1 REAL (non-inferred)
 # COLUMN_LINEAGE edge but zero SELECTS_FROM source rows.  These are
 # CTE-wrapped writes whose column path resolved correctly but whose table path
@@ -309,13 +309,20 @@ WHERE source = 'information_schema'
 # zero_edge_write_queries (writes with zero COLUMN_LINEAGE); kept distinct by
 # field name and rendered label.
 #
-# Floor filter (#116): no-FROM literal inserts (INSERT … SELECT NULL AS x)
-# carry only inferred_from_source_name=TRUE COLUMN_LINEAGE edges because the
-# column names are taken from the INSERT column list with no real source table.
-# They can never gain a SELECTS_FROM row by construction, so they are not an
-# addressable CTE gap.  The EXISTS … inferred_from_source_name=FALSE clause
-# excludes them: a write must have at least one scope-derived (real) edge to be
-# counted.  This removes the permanent ~48-unit floor measured on DWH v1.27.1.
+# Inference-only filter (#116): genuine no-FROM literal inserts
+# (INSERT … SELECT NULL AS x) carry only inferred_from_source_name=TRUE
+# COLUMN_LINEAGE edges because the column names are taken from the INSERT column
+# list with no real source table.  Their zero SELECTS_FROM edges are
+# correct-by-design, so they are not an addressable CTE gap.  The EXISTS …
+# inferred_from_source_name=FALSE clause excludes them: a write must have at
+# least one scope-derived (real) edge to be counted.
+#
+# NOTE: this filter does NOT remove a ~48-unit floor.  PR-3 (#134,
+# traverse_scope subscope descent) proved the live residual is 1, not ~48: the
+# writes once thought to be a permanent "~48 sourceless literal-insert floor"
+# were not sourceless — their real sources lived in FROM / WHERE … IN (SELECT …)
+# subqueries hidden by the 500-char SqlQuery.sql truncation, which PR-3 now
+# recovers.  Evidence: plan/reports/issue38_pr3_live_acceptance.md.
 # ---------------------------------------------------------------------------
 _Q_CTE_SOURCE_GAP_WRITES = f"""
 SELECT COUNT(*) AS cte_source_gap_writes
@@ -339,8 +346,8 @@ WHERE q.kind IN ({_WRITE_KINDS_SQL})
 # Monotone-up productivity counter: a recall improvement (e.g. E8 temp-chain
 # fix) can only add COLUMN_LINEAGE rows → this counter is non-decreasing in
 # the improvement direction by construction.  The EXISTS … SELECTS_FROM clause
-# scopes the count to exactly the write queries E8 can help, excluding
-# literal-only / source-less writes whose zero edges are correct-by-design.
+# scopes the count to exactly the write queries E8 can help, excluding genuine
+# no-FROM literal inserts whose zero edges are correct-by-design.
 #
 # Baseline (master 1.26.0 proxy, /tmp/e8_without.duckdb, 1,335 files): 25,246.
 # Predicted post-E8: ≈27,036 (+1,790).  Gate rule: revive E8 only if the
@@ -440,15 +447,18 @@ class CoverageStats:
     info_schema_has_column_rows: int = 0
 
     # --- CTE-source gap (PR-1, issue-38-selects-from-island-lever.md §PR-1;
-    #     floor-filter #116) ---
+    #     inference-only filter #116) ---
     # Write-kind queries with ≥1 REAL (non-inferred) COLUMN_LINEAGE edge but
-    # zero SELECTS_FROM rows.  Excludes no-FROM literal inserts (INSERT …
-    # SELECT NULL AS x) which carry only inferred_from_source_name=TRUE edges
-    # and can never gain a SELECTS_FROM row by construction — they are not an
-    # addressable CTE gap.  Inverse complement of zero_edge_write_queries;
-    # distinct field + label.
+    # zero SELECTS_FROM rows.  Excludes genuine no-FROM literal inserts (INSERT …
+    # SELECT NULL AS x) which carry only inferred_from_source_name=TRUE edges:
+    # their zero SELECTS_FROM edges are correct-by-design, not an addressable CTE
+    # gap.  Inverse complement of zero_edge_write_queries; distinct field + label.
     # Pre-filter baseline on DWH (schema v8, sha fdf1b551): 168 graph-wide.
-    # Post-filter baseline (v1.27.1): ~120 (permanent ~48-unit floor removed).
+    # PR-3 (#134, traverse_scope subscope descent) drove the live residual to 1,
+    # not the once-projected "~48 permanent literal-insert floor": those writes
+    # were not sourceless — their sources lived in FROM / WHERE … IN (SELECT …)
+    # subqueries hidden by the 500-char SqlQuery.sql truncation, now recovered.
+    # Evidence: plan/reports/issue38_pr3_live_acceptance.md.
     cte_source_gap_writes: int = 0
 
     # --- column-lineage recall (column_lineage_recall_metric.md) ---
