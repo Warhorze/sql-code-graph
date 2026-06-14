@@ -1,6 +1,18 @@
 # Feature Plan: `sqlcg viz` — committed graph-visualization generator
 
-**Status:** DRAFT (plan-reviewer gates before any implementation)
+**Status:** REVIEWED (plan-reviewer 2026-06-14 returned REWORK; shepherd folded all 4 blockers.
+**B1**: edge model CORRECTED — SELECTS_FROM/STAR_SOURCE are SqlQuery→SqlTable (resolve query→target
+table), COLUMN_LINEAGE is SqlColumn→SqlColumn (collapse both ends); none were table-to-table.
+**B2**: `kind` vocabulary = `{table,view,cte,temp,derived}` — `external` is NEVER emitted; dropped
+from toggles (table/view/temp ON, cte/derived OFF). **B3**: `link.n` is NEW/additive (artifact has
+none) — e2e asserts as new, not parity. **B4**: `jobs:[]` baked → job dropdown goes INERT = KNOWN
+REGRESSION, flagged in Risks + follow-up, maintainer-consented. Forks resolved: A bake jobs:[]; B
+factual kind set; C multi-tag = schema-color default + tag secondary ring, first-checked-tag wins
+fill in tag-color mode; D `[sqlcg.viz] schemas`. Priority checks PASS: self-containment e2e gate
+(no external src/fetch/CDN, lib+DATA inlined, node --check) + config-fallback can't break index/gain
+(new reader/new key, mirrors get_schema_aliases, `.sqlcg.toml`). NOTES to honor at impl: extend
+`currentData()` in BOTH branches (job-closure + plain, table_graph.html:211/217); `schema = SqlTable.db`.
+READY FOR DISPATCH.)
 **Branch:** `plan/graph-viz` (off `master` @ v1.34.3)
 **Version target:** MINOR bump (new CLI surface, nothing breaks) — `1.34.3 → 1.35.0`
 **Owner (compliance):** architect-planner owns this file.
@@ -146,20 +158,30 @@ curates*, never a *requirement*. The fallback default `[]` matches the `get_*` c
   [`schema.cypher`](../../src/sqlcg/core/schema.cypher)).
 - "Catalogued" flag: `EXISTS` in `"HAS_COLUMN"` keyed on `src_key = qualified`
   (same join `coverage.py` uses).
-- Edges: union of `"SELECTS_FROM"`, `"COLUMN_LINEAGE"` (collapsed to table level), and
-  `"STAR_SOURCE"` — the three table-level lineage relations the prompt named.
-  - `COLUMN_LINEAGE` keys are `<table>.<col>`; collapse to table by stripping the trailing
-    `.<col>` using the established `_DST_TABLE` expression pattern in
-    [`coverage.py`](../../src/sqlcg/cli/coverage.py)
-    (`left(k, len(k) - instr(reverse(k), '.'))`). Verify against `base.py` `full_id` join,
-    as coverage.py already documents.
-  - Self-loops dropped; duplicate (src,dst) collapsed with a count `n` (matches existing
-    `link.n` seen in the current artifact's link objects).
+- Edges → **table→table links (CORRECTED per plan-review B1).** The three relations are NOT
+  table-to-table in the graph ([`schema.cypher`](../../src/sqlcg/core/schema.cypher)):
+  `SELECTS_FROM (SqlQuery→SqlTable)`, `STAR_SOURCE (SqlQuery→SqlTable)`,
+  `COLUMN_LINEAGE (SqlColumn→SqlColumn)`. Each must be resolved to a table→table link:
+  - **`SELECTS_FROM` / `STAR_SOURCE`** are query-anchored: the `SqlTable` end is the **source**
+    table; the **target** table is the query's write target — resolve each `SqlQuery` to its
+    target via `SqlQuery.target_table` (or the `INSERTS_INTO`/`DECLARES` relation if present;
+    the developer confirms which the indexer populates). Emit `source_table → target_table`,
+    skipping queries with no resolvable target (read-only SELECTs contribute no link).
+  - **`COLUMN_LINEAGE`** is column→column: collapse BOTH endpoint keys `<table>.<col>` to their
+    table by stripping the trailing `.<col>` via the established `_DST_TABLE` pattern in
+    [`coverage.py`](../../src/sqlcg/cli/coverage.py) (`left(k, len(k) - instr(reverse(k), '.'))`),
+    then emit `src_table → dst_table`.
+  - Self-loops dropped; duplicate (src,dst) collapsed with a count `n`. **`n` is NEW/additive**
+    — the current artifact's links are bare `{source,target}` with **no `n` field**; the e2e
+    must assert `n` as new behavior, NOT parity.
 - Degree `deg`: count of distinct neighbors per node over the collapsed edge set
   (computed in Python from the edge rows; do not add a graph query for it).
-- `jobs[]`: preserve the existing field. **DECISION/fork for reviewer:** the current
-  `table_graph.html` bakes a `jobs` array per node, but it is unclear which graph relation
-  produces it (no obvious `jobs` column on `SqlTable`). See §Blocking/Decision A.
+- `jobs[]`: **bake `jobs: []` (Decision A — there is NO `jobs` column on `SqlTable` and no
+  graph relation produces it; the current artifact's non-empty `jobs` come from an external
+  `ej_*`/`semtex_*` source outside the repo). ⚠ KNOWN REGRESSION (plan-review B4): the shipped
+  generator's job dropdown becomes INERT until that external source is wired — a feature the
+  user's hand-maintained artifact has today is temporarily lost. Documented in §Risks; filed as
+  a follow-up. Maintainer consents to this trade.**
 
 **Baked `DATA` shape (extends the current artifact, additive — never drops a field):**
 
@@ -169,7 +191,7 @@ curates*, never a *requirement*. The fallback default `[]` matches the `get_*` c
     {
       "id": "ba.wtda_webshop_order",   // = SqlTable.qualified (the graph key)
       "schema": "ba",                   // SqlTable.db (the schema part) — same as today
-      "kind": "table",                  // SqlTable.kind: table|view|temp|external|cte|derived
+      "kind": "table",                  // SqlTable.kind: table|view|cte|temp|derived (NO external — B2)
       "deg": 12,                        // neighbor count in collapsed edge set
       "cat": true,                      // catalogued (HAS_COLUMN exists)
       "jobs": [],                       // preserved as-is (see Decision A)
@@ -192,10 +214,14 @@ Baking it server-side means the future neighborhood UI reads it directly. The ex
 rebuilding — the plan keeps the runtime rebuild for ego-mode (no behavior change) AND bakes
 `adj` for the future feature; the two are derived from the same edge set so they agree.
 
-**`kind` values:** tie node-kind toggles to the existing `SqlTable.kind`. The toggle set is
-`table / view / temp / external` (ON by default) and `cte / derived` (OFF by default, but
-present in DATA and switchable). The renderer must not invent kinds — it reads the distinct
-`kind` values present and maps the known six to toggles; any unexpected `kind` value falls
+**`kind` values (CORRECTED per plan-review B2):** the indexer writes EXACTLY
+`{table, view, cte, temp, derived}` to `SqlTable.kind` (`base.py` `role=` literals;
+`indexer.py:1813` `target_kind="derived"`). **`external` is NEVER emitted as a node kind** —
+it exists only in `analyze.py`'s read-filter tuple, with no node-write site. Toggle set:
+`table / view` ON by default, `temp` ON by default (a real physical-ish kind), `cte / derived`
+OFF by default (present + switchable). **No `external` toggle.** The renderer must not invent
+kinds — it reads the distinct `kind` values present and maps the known five to toggles; any
+unexpected `kind` value falls
 into a catch-all "table" toggle bucket (documented inline) so the view never silently drops
 nodes. **Decision/fork B:** confirm the exact `kind` string vocabulary the indexer emits
 (`temp` vs `temporary`, `external` presence) — see §Blocking/Decision B.
@@ -245,8 +271,9 @@ function that today drops nodes via `sc && n.schema !== sc` at ~lines 211/217).
 **Facets (three independent multi-selects, union within a facet, intersection across):**
 - **Schema** — checkboxes for each configured/derived schema. A node passes iff its
   `schema` is in the checked set (or the set is empty = "all").
-- **Kind** — checkboxes `table/view/temp/external/cte/derived`; `cte`+`derived` start
-  unchecked. A node passes iff its `kind` is in the checked set.
+- **Kind** — checkboxes `table/view/temp/cte/derived` (NO `external` — not emitted, per B2);
+  `cte`+`derived` start unchecked, `table/view/temp` checked. A node passes iff its `kind` is in
+  the checked set.
 - **Tag** — a swatch per tag in the legend; checking tags isolates nodes carrying any
   checked tag. Empty tag selection = "do not filter by tag" (all pass).
 
