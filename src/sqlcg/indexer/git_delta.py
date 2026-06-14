@@ -34,6 +34,24 @@ def _is_sql_not_ignored(path: Path, root: Path, spec: pathspec.PathSpec) -> bool
     return path.suffix == ".sql" and not is_ignored(path, root, spec)
 
 
+def _get_current_head(root: Path) -> str | None:
+    """Return ``git rev-parse HEAD`` for *root*, or None on any failure.
+
+    Never raises — on any subprocess error or non-zero exit code, returns None.
+    Mirrors ``freshness._git`` to avoid a core-layer import here.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def git_name_status_delta(root: Path, old_sha: str, new_sha: str) -> Delta | None:
     """Compute added/modified/deleted .sql file sets between two git SHAs.
 
