@@ -1,6 +1,14 @@
 # Bugfix Plan: Git-hook binary resolution + loud resync failure (#126 + #1)
 
-**Status**: DRAFT
+**Status**: REVIEWED (plan-reviewer gate 2026-06-14 returned REWORK — 1 blocker + 2 reference
+drifts; shepherd folded all and resolved both forks. **B1**: the foreground schema preflight
+must be a SINGLE bounded sub-second fail-soft open — on `IOException` (DuckDB exclusive lock
+held ⇒ concurrent resync) it falls through to detach, never blocking 31 s and never emitting a
+false stale-schema error (mandated in Design (b) + Step 2.2 + an acceptance criterion). **B2**:
+`test_git_hook_install.py` is under `tests/e2e/` not `tests/unit/` — corrected. Anchor drifts
+corrected (CLI gate read at reindex.py:150; server raise at tools.py:219). Both forks DECIDED:
+user-base-path + `command -v` sole shell fallback; `Exit(1)` with a load-bearing stderr message.
+Headline root cause CONFIRMED; four frozen perf suites untouched. READY FOR DISPATCH.)
 **Branch**: `plan/githook-binary-resolution` (cut off `master` @ v1.33.1)
 **Author**: architect-planner (Opus 4.8)
 **Plan date**: 2026-06-14
@@ -39,8 +47,8 @@ PR-D's anchors predate this session (master moved v1.27→v1.33.1, schema v9→v
 | `_resolve_sqlcg_bin` at `git.py:63-88`, `which` first | **STALE — already fixed.** The install-time half of #126 is **already merged.** `_resolve_sqlcg_bin` now puts `site.getuserbase()/bin/sqlcg` at **step 0**, demotes `shutil.which` to step 1, and emits a `.venv` warning. | [`git.py:64-107`](../../src/sqlcg/cli/commands/git.py) |
 | Hook templates embed `{sqlcg_bin}` | Confirmed. Both `post-checkout` and `post-merge` `_HookSpec.script_template` format an absolute `{sqlcg_bin}` at install time. | [`git.py:26-61`](../../src/sqlcg/cli/commands/git.py) |
 | `_install_single_hook` writes the rendered template | Confirmed; also now self-upgrades a stale sqlcg-owned hook (sentinel present, body differs → overwrite). | [`git.py:110-148`](../../src/sqlcg/cli/commands/git.py) |
-| Schema gate on resync | Present and **loud at the CLI layer** (`typer.Exit(1)`). | [`reindex.py:149-158`](../../src/sqlcg/cli/commands/reindex.py) |
-| Server-routed resync schema gate | Present, raises `RuntimeError` in the server path. | [`server/tools.py:208-216`](../../src/sqlcg/server/tools.py) |
+| Schema gate on resync | Present and **loud at the CLI layer** (`typer.Exit(1)`). | [`reindex.py:150-158`](../../src/sqlcg/cli/commands/reindex.py) (read at 150, gate 151-158) |
+| Server-routed resync schema gate | Present, raises `RuntimeError` in the server path (`_assert_schema_current` 197-219, raise at 219). | [`server/tools.py:213-219`](../../src/sqlcg/server/tools.py) |
 
 ### Why the install-time half being merged changes the scope
 
@@ -133,7 +141,9 @@ script.** Rationale:
 - Option (ii) `uv run` is rejected as the default: it adds cold-start latency to every
   branch switch and assumes a uv-managed repo, violating the zero-friction small-repo rule.
 
-> **OPEN DESIGN FORK — needs a maintainer decision** (see Blocking Questions): whether the
+> **DESIGN DECISION (closed by plan-review — see Resolved decisions): render the resolved
+> user-base absolute path as the preferred entry + `command -v sqlcg` as the sole shell
+> fallback; the shell never recomputes `getuserbase()`.** Original framing kept for context: whether the
 > hook preamble's run-time `$PATH` fallback should *also* attempt `site.getuserbase()/bin`
 > in shell (mirroring the Python resolver), or rely solely on `command -v`. The Python
 > resolver knows `getuserbase()`; the shell does not without re-deriving it. Recommended:
@@ -171,9 +181,21 @@ in the **detached child** whose output goes to a log file. Two coordinated chang
      If the planner/developer extracts it as a helper (e.g. `_hook_preflight_schema_check`),
      its only caller is `reindex_cmd`; that call site must be named and grep-confirmed in the
      PR (`grep -n "_hook_preflight_schema_check" src/sqlcg/cli/commands/reindex.py`).
-   - It must open the backend **read-only and release it** before detaching, so the
-     detached child can still acquire the lock (reuse `_open_backend_with_lock_retry` or a
-     read-only open; the developer picks the least-contended path and documents it).
+   - **BOUNDED, FAIL-SOFT open (plan-review B1 — MANDATED, not developer's choice).**
+     DuckDB takes an **exclusive** file lock: per [`config.py:470-490`](../../src/sqlcg/core/config.py),
+     a second process **cannot open the DB at all, even read-only** (`read_only=True` still
+     raises `IOException`; settled empirically in #63). On rapid successive checkouts a prior
+     detached resync still holds the lock, so the preflight's open WILL contend. The two naive
+     options both regress the hot path: `_open_backend_with_lock_retry()`
+     ([`reindex.py:294-325`](../../src/sqlcg/cli/commands/reindex.py)) **blocks ~31 s** →
+     a #77-class `git checkout` stall; a plain `get_backend(read_only=True)` raises
+     `IOException` immediately → a **false "schema stale" error on a healthy graph**.
+     Therefore the preflight MUST do a **single bounded open (1 attempt, hard cap well under
+     1 s — NOT the 31 s lock-retry)** and, on `IOException` (lock held ⇒ a resync is already
+     in flight), treat it as **"cannot determine — fall through to detach exactly as today"**:
+     never block, never emit a schema-mismatch error. It opens read-only and releases before
+     detaching so the child can still acquire the lock. Only a *successful* read that shows a
+     real mismatch triggers the loud non-zero exit.
 
 2. **Surface the detached child's terminal failure on the *next* hook run.** The detached
    child's `Exit(1)` writes to `~/.sqlcg/hook-resync.log`. On the next branch switch, the
@@ -240,11 +262,23 @@ hook path, gating before `_spawn_detached_hook_resync`.
 - Acceptance: a v8/v10 mismatch on the hook path produces a non-zero exit and a terminal
   message; a matching schema detaches and exits 0 exactly as today.
 
-**Step 2.2**: Ensure the preflight's read-only backend open is released before the detach
-path runs, so the detached child does not hit a self-inflicted lock.
+**Step 2.2**: The preflight open MUST be **single-attempt, sub-second, fail-soft** (plan-review
+B1), and released before the detach path runs so the detached child does not hit a
+self-inflicted lock.
 - Files: [`reindex.py`](../../src/sqlcg/cli/commands/reindex.py) (preflight block).
-- Acceptance: with a matching schema, the detached child still acquires the lock and
-  completes (existing `test_hook_reindex_detach.py` scenarios stay green).
+- Use a bounded open (1 attempt / hard cap ≪ 1 s); **do NOT** call `_open_backend_with_lock_retry`
+  ([`reindex.py:294-325`](../../src/sqlcg/cli/commands/reindex.py)) here — its ~31 s retry would
+  stall `git checkout` (a #77-class regression).
+- On `IOException` (DB exclusively locked ⇒ a resync is already in flight): **fall through to
+  the existing detach path unchanged** — no block, no error. Only a successful read showing a
+  real mismatch raises the loud exit.
+- Acceptance:
+  - matching schema → detached child still acquires the lock and completes (existing
+    `test_hook_reindex_detach.py` scenarios stay green);
+  - **lock held (concurrent resync in flight) → preflight does NOT block and does NOT emit a
+    schema-mismatch error; it falls through to detach** (the B1 hot-path-safety criterion —
+    assert via a test that holds the DB lock then runs the hook-path preflight and observes
+    fall-through, not a 31 s stall and not a false stale-schema message).
 
 ---
 
@@ -265,7 +299,8 @@ Describe tests by behaviour; the developer names them `test_<unit>_<scenario>_<e
 - **No binary anywhere → loud error**: render the hook, remove every `sqlcg` from the
   preferred path and `$PATH`, run the script; assert non-zero exit and a stderr message —
   never a silent exit 0. (Extends [`test_git_hooks.py`](../../tests/unit/test_git_hooks.py)
-  / [`test_git_hook_install.py`](../../tests/unit/test_git_hook_install.py).)
+  / [`test_git_hook_install.py`](../../tests/e2e/test_git_hook_install.py) — the install test
+  is an **e2e** test, not unit; corrected per plan-review B2.)
 - **Re-install upgrades a stale-template hook**: write an old-template sqlcg hook, run
   `install-hooks`, assert it is rewritten to the run-time-resilient template and
   `Upgraded git hook:` is printed. (Extends
@@ -325,18 +360,18 @@ Describe tests by behaviour; the developer names them `test_<unit>_<scenario>_<e
 
 ---
 
-### Blocking Questions (resolve before implementation)
+### Resolved decisions (both forks closed by plan-review 2026-06-14)
 
-1. **Shell fallback scope (OPEN FORK).** Should the hook preamble's run-time fallback try
-   only `command -v sqlcg`, or also a shell-derived user-base path? Recommended: render the
-   resolved user-base absolute path as the preferred entry and use `command -v sqlcg` as the
-   sole shell fallback (the shell should not recompute `getuserbase()`). **Maintainer
-   decision needed** only if they want the shell to additionally probe a hardcoded
-   `~/.local/bin` — which the house rule forbids, so default recommendation stands.
-2. **Exit-code convention for the loud preflight failure.** `typer.Exit(1)` matches the
-   existing CLI gate; confirm no caller treats a non-zero hook exit as fatal to the git
-   operation in a way that would block `git checkout` (it should not — the message is
-   advisory and the checkout already completed). Recommended: `Exit(1)`, advisory message.
+1. **Shell fallback scope — DECIDED.** Render the resolved **user-base absolute path** as the
+   preferred entry; use **`command -v sqlcg` as the sole shell fallback**. The shell does NOT
+   recompute `getuserbase()` (that would reimplement `_resolve_sqlcg_bin` fragilely) and does
+   NOT hardcode `~/.local/bin` (house rule). `command -v` covers `uv tool`, user-base-on-PATH,
+   and active-venv cases. No maintainer input required.
+2. **Exit-code convention — DECIDED: `typer.Exit(1)` with an advisory stderr message.** Git
+   runs `post-checkout`/`post-merge` **after** the operation and ignores the hook's exit
+   status — a non-zero exit cannot abort/block `git checkout`. So the **stderr message is the
+   load-bearing part**, not the code; the acceptance test asserts the message substring (it
+   already does). `Exit(1)` matches the existing CLI gate at [`reindex.py:158`](../../src/sqlcg/cli/commands/reindex.py).
 
 ---
 
