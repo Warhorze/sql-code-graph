@@ -890,7 +890,8 @@ against #142's edge set before either merges.**
 
 # PR-2b (#27a follow-up) — Option B: backup table-NAME exclusion at NODE CREATION
 
-**Status: DRAFT — awaiting plan-reviewer gate.**
+**Status: REVIEWED (plan-reviewer gate cleared 2026-06-14 — REWORK amendments folded in below:
+two post-flush re-introduction paths, core/-resident shared predicate, separate config block).**
 **Rank: after PR-6 (last of the post-#142 tail). Version bump: MINOR** (new opt-in
 index-time config surface). **Metric-moving → `gain --json` required.**
 
@@ -926,59 +927,112 @@ This PR is that follow-up. **The user has explicitly requested it.**
 Wire the **existing** table-name exclusion into the indexer's Phase-C flush, **before**
 `indexer.py:306`, behind a **new opt-in flag** (default OFF):
 
-1. **Reuse, do not duplicate.** Build the predicate from the existing config readers
-   (`get_noise_filter_patterns` + `get_ignored_tables` + `get_ignore_table_regexes`) — ideally
-   factor the match logic `NoiseFilter` already implements into a shared module-private
-   predicate so index-time and query-time exclusion stay byte-identical (DRY; mirrors PR-1's
-   shared-predicate decision). Do NOT re-implement the glob/regex matching.
+1. **Reuse via a `core/`-resident shared predicate — NOT `server/`.** Build the predicate from
+   the existing config readers (`get_noise_filter_patterns` + `get_ignored_tables` +
+   `get_ignore_table_regexes`). **AMENDMENT (layering — required):** the shared match predicate
+   MUST live in `core/` (e.g. a new `core/noise_match.py`, or a function in `core/config.py`),
+   NOT in `server/noise_filter.py`. Verified: `noise_filter.py` lives under `server/` and already
+   imports downward into `core.config` (`noise_filter.py:7-12`); `core/config.py` imports nothing
+   from `server/`; nothing in `indexer/`/`lineage/` imports `server`. An `indexer → server.noise_filter`
+   import would be a NEW layering violation (and a cycle risk as the matcher grows). Refactor
+   `NoiseFilter.is_noise` (`server/noise_filter.py:74-106`) and `_table_short_name` (`:15-31`) to
+   delegate to the core predicate, so BOTH `server` (read-time) and `indexer` (index-time) import
+   downward into `core`. **Forbid `indexer → server`.** Do NOT re-implement the glob/regex matching.
 2. **Filter `table_rows`** by qualified name before the `upsert_nodes_bulk(TABLE, …)` call,
-   collecting the set of excluded qualified ids.
-3. **Cascade (correctness-critical).** Dropping a TABLE node must also drop everything keyed to
-   it, or orphan columns/edges remain:
-   - `column_rows` whose owning table is excluded;
-   - `has_column_edges` and `defined_in_edges` referencing an excluded table;
-   - any `selects_from_edges`, `column_lineage_edges`, `star_source_edges` whose src or dst
-     resolves to an excluded table.
-   Because the targets are inline-backup **deg-0 singletons** (no real downstream lineage —
-   that is *why* they island), the cascade should drop only self-contained rows; the plan must
-   nonetheless **assert zero orphan columns/edges** post-exclusion, not assume it.
-4. **Config — new opt-in flag, default OFF.** Today the noise filter is **non-destructive**
-   (query-time hide; the data stays in the graph). Index-time exclusion is **destructive** (the
-   table is never indexed → gone from graph, viz, AND every query). That is the desired effect
-   for backup clones, but it is a behavior change, so it must be **explicitly opt-in**: add
-   e.g. `[sqlcg.noise_filter] exclude_at_index = false` (default). When false, behavior is
-   exactly as today. The `_eenmalig` legitimate-production-table safety is **already** encoded
-   in the existing defaults (bare `_eenmalig` is deliberately NOT a default pattern — see
-   `config.py:234` comment), so reusing the existing pattern set inherits that safety.
+   collecting the set of excluded qualified ids. **The filter must run at/after `indexer.py:302`,
+   immediately before the flush at `:306`** — `_harvest_usage_catalog` (`:282`) merges usage rows
+   into `column_rows`/`has_column_edges` *after* dedup (`:288-302`), so a naive filter placed at
+   row-assembly (`:240`/`:253`) would miss usage-catalog rows. Filtering the final
+   `column_rows`/`has_column_edges` collections at `:302` covers them.
+3. **Cascade (correctness-critical) — the pre-`:306` filter is NECESSARY BUT NOT SUFFICIENT.**
+   Dropping a TABLE node must also drop everything keyed to it across BOTH the Phase-C flush AND
+   two post-flush re-introduction passes, or orphan columns / resurrected tables remain:
+   - **At the Phase-C flush (`indexer.py:305-319`):** `column_rows` whose owning table is excluded;
+     `has_column_edges` and `defined_in_edges` referencing an excluded table; any
+     `selects_from_edges`, `column_lineage_edges`, `star_source_edges` whose src or dst resolves to
+     an excluded table.
+   - **Cite-check (verified, state so no reviewer re-adds redundant filtering):** `query_defined_in_edges`
+     (`:313`) is correctly OUT — it is keyed QUERY→FILE, not TABLE. `EXTERNAL_CONSUMER`/`CONSUMED_BY`
+     (`:1911-1918`) needs NO special handling — `_ingest_external_consumers` only emits an edge if
+     the target table already exists as a node (`indexer.py:1878-1893`, `target not in existing_tables`
+     → skip), so an excluded table silently gets no consumer edge.
+   - **POST-FLUSH EMITTER 1 — clone inheritance (REQUIRED, was the missing gap).**
+     `_emit_clone_inherited_rows` (called at `indexer.py:745`, body at `:1659`/`:1722-1747`) runs
+     AFTER the batch loop and emits `SqlColumn` nodes + `HAS_COLUMN(source='clone_inherited')` edges
+     keyed to each CLONE TARGET. **The backup singletons ARE clone targets** (`CREATE TABLE …_BCK_<date> … CLONE`),
+     so their inherited columns are re-emitted here regardless of the pre-`:306` filter → exactly the
+     orphan columns the "zero orphans" criterion forbids. Skip CLONE targets whose
+     `target_ref.full_id` is excluded before appending the inherited column_rows/has_column_edges
+     (`indexer.py:1722-1747`), reusing the same `core/` predicate. (The draft's "deg-0 singleton →
+     minimal cascade" reasoning is WRONG for clone targets specifically — clone inheritance gives
+     them columns after the flush.)
+   - The plan must **assert zero orphan columns/edges** post-exclusion across all of the above, not assume it.
+4. **POST-FLUSH EMITTER 2 — catalog re-apply (REQUIRED, was the biggest gap).** The destructive
+   exclusion MUST also filter the catalog re-apply path or it is a NO-OP on any corpus with a
+   configured catalog. `_reapply_catalog_if_configured` runs AFTER the flush and the batch loop;
+   it calls `apply_catalog_to_backend` (`cli/commands/catalog.py:186`), which **independently** emits
+   `SqlTable` nodes via `backend.insert_table_nodes_if_absent(table_rows)` (`catalog.py:217`) and
+   `HAS_COLUMN(source='information_schema')` edges (`catalog.py:218-219`) straight from the CSV
+   (`catalog.py:142-160`) with **no noise filtering**. The DWH's INFORMATION_SCHEMA lists every
+   physical table including backup clones, so without this the catalog re-apply RE-CREATES every
+   excluded `*_bck*` table and `MATCH … *_bck* RETURNS 0` fails. **Fix:** thread the same `core/`
+   predicate into `apply_catalog_to_backend` / `load_catalog_csv` (`catalog.py:186`, `:55`) so
+   catalog `table_rows`/`column_rows`/`has_column_edges` for excluded names are dropped before
+   `insert_table_nodes_if_absent`/`upsert_*_bulk` at `catalog.py:217-219`.
+5. **Config — new opt-in flag in a SEPARATE block, default OFF.** Today the noise filter is
+   **non-destructive** (query-time hide; data stays in the graph, reversible). Index-time exclusion
+   is **destructive and irreversible without re-index** (the table is never indexed → gone from
+   graph, viz, AND every query). Because a reader scanning `[sqlcg.noise_filter]` reasonably assumes
+   everything there is reversible, the destructive switch goes in a **distinct block**:
+   `[sqlcg.index_filter] enabled = false` (default), **reusing the same pattern/name/regex readers**
+   as the query-time filter. When false (and even when patterns ARE defined), no index-time
+   filtering runs. The `_eenmalig` legitimate-production-table safety is **already** encoded — bare
+   `_eenmalig` is deliberately ABSENT from the default *table* patterns (`config.py:133-140`), so
+   reusing the existing pattern set inherits that safety. (Cite fix: the prior draft pointed at
+   `config.py:234`, which is the *file*-discovery default comment — the relevant table-pattern fact
+   is at `config.py:133-140`.)
 
 ## Acceptance criteria
-- With `exclude_at_index = true` on the DWH corpus: the ~106 inline backup-clone singletons are
-  **absent from the graph** — report deg-0 singleton count before→after (expect a material drop
-  toward ~3666) and confirm the specific `*_bck*` qualified names are gone (`MATCH` returns 0).
-- **Islands UNCHANGED** (these are deg-0 singletons, not lineage islands): assert the small-island
+- With `[sqlcg.index_filter] enabled = true` on the DWH corpus: the ~106 inline backup-clone
+  singletons are **absent from the graph** — report deg-0 singleton count before→after (expect a
+  material drop toward ~3666) and confirm the specific `*_bck*` qualified names are gone
+  (`MATCH` returns 0) **after `_reapply_catalog_if_configured` AND `_emit_clone_inherited_rows` have run.**
+- **Catalog parity (post-flush emitter 2):** with the flag on AND a catalog CSV that contains a
+  `*_bck*` row, assert that table is STILL absent after the catalog re-apply — regression test with
+  a fixture catalog CSV (proves `catalog.py:217-219` honors the exclusion).
+- **Clone-target parity (post-flush emitter 1):** with the flag on, assert an excluded
+  `CREATE TABLE …_BCK … CLONE` target gets NO `HAS_COLUMN(source='clone_inherited')` columns —
+  regression test (proves `indexer.py:1722-1747` honors the exclusion).
+- **Islands UNCHANGED** (deg-0 singletons, not lineage islands — confirmed: no SELECTS_FROM/
+  COLUMN_LINEAGE in or out, which is why a *file*-level ignore was a no-op): assert the small-island
   count does not move — this PR drains the *singleton sea*, it does not connect anything.
-- **Default OFF is a true no-op:** with the flag false (default), the before/after graph is
-  byte-for-byte identical to v1.30.1 (same node/edge counts) — a regression test asserts this.
+- **Default OFF is a true no-op:** with `enabled = false` (default), the before/after graph is
+  byte-for-byte identical to v1.30.1 (same node/edge counts) — a regression test asserts this
+  **with a `.sqlcg.toml` that DOES define patterns but has `enabled = false`**, proving the guard
+  (not mere absence of config) is what makes it a no-op.
 - **Legitimate tables provably untouched:** a fixture with a legit `_eenmalig` production table
   name (and a legit dated mart) asserts they are **NOT** excluded even with the flag on.
-- **Zero orphans:** post-exclusion, assert no COLUMN node / HAS_COLUMN / DEFINED_IN / SELECTS_FROM /
-  COLUMN_LINEAGE edge references an excluded table id.
+- **Zero orphans:** post-exclusion (and after BOTH post-flush emitters), assert no COLUMN node /
+  HAS_COLUMN / DEFINED_IN / SELECTS_FROM / COLUMN_LINEAGE edge references an excluded table id.
 - **Index-time and query-time exclusion are consistent:** the same name excluded at index time is
-  the same name `NoiseFilter` would hide at query time (shared predicate — assert parity).
+  the same name `NoiseFilter` would hide at query time (shared `core/` predicate — assert parity).
 - `gain --json` snapshot committed to [`plan/metrics/`](../metrics/) showing the singleton delta.
-- **Four perf-invariant suites pass UNMODIFIED** — the filter is a pre-flush list comprehension
-  over already-assembled rows (no new execute(), no per-row upsert); confirm it does not regress
-  the op-count scaling guard.
+- **Four perf-invariant suites pass UNMODIFIED** — the index-time filter is a guarded list
+  comprehension over already-assembled rows in `_flush_row_batch` (per-batch, no new execute(), no
+  per-row upsert); confirm it does not regress the op-count scaling guard.
 - `pyright` + `ruff` clean.
 
 ## Risk
 - **Over-broad exclusion drops real tables → silent lineage loss.** Mitigated by: reusing the
   conservative existing default pattern set (which already excludes bare `_eenmalig`), the
   default-OFF flag, and the legit-table negative fixture.
-- **Incomplete cascade → orphan columns/dangling edges.** Mitigated by the explicit zero-orphan
-  assertion and by the targets being deg-0 singletons (minimal cascade surface).
+- **Incomplete cascade → resurrected tables / orphan columns.** The two post-flush emitters
+  (clone inheritance `indexer.py:1722-1747`; catalog re-apply `catalog.py:217-219`) re-introduce
+  excluded tables/columns AFTER the pre-`:306` filter — this was the review's REWORK finding.
+  Mitigated by filtering BOTH emitters with the same predicate and the catalog-parity + clone-target
+  + zero-orphan regression assertions.
 - **Predicate drift between index-time and query-time** if the match logic is copy-pasted rather
-  than shared. Mitigated by factoring one shared module-private predicate.
+  than shared. Mitigated by one `core/`-resident shared predicate that `NoiseFilter` delegates to.
 
 ## Dependency / sequence
 - Independent of PR-6's code (PR-6 touches `ansi_parser.py`; this touches `indexer.py` Phase-C +
@@ -986,8 +1040,12 @@ Wire the **existing** table-name exclusion into the indexer's Phase-C flush, **b
   index slot — run after PR-6's live acceptance frees it.
 - Metric-moving → `gain --json` required.
 
-## Open question for the plan-reviewer
-- **Flag namespace:** reuse `[sqlcg.noise_filter]` with a new `exclude_at_index` key (keeps all
-  table-name exclusion config in one block) vs a separate `[sqlcg.index_filter]` block (keeps the
-  destructive index-time behavior visibly distinct from the non-destructive query-time filter).
-  Draft recommends `[sqlcg.noise_filter] exclude_at_index` for config locality; reviewer to confirm.
+## Resolved decisions (plan-reviewer, 2026-06-14)
+- **Flag namespace: SEPARATE block `[sqlcg.index_filter] enabled = false`** (default), reusing the
+  same pattern/name/regex readers as `[sqlcg.noise_filter]`. Rationale: the index-time behavior is
+  destructive/irreversible while `[sqlcg.noise_filter]` is non-destructive (reversible query-time
+  hide) — a distinct block signals the destructive semantics at the config surface. (Reviewer
+  overrode the draft's config-locality lean.)
+- **Shared predicate location: `core/`** (not `server/`) — see Proposed fix §1.
+- **Two post-flush re-introduction paths are in scope** (clone inheritance + catalog re-apply) —
+  see Proposed fix §3–§4. These were the REWORK gaps; folding them in cleared the gate.
