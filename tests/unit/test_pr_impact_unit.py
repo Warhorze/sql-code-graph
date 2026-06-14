@@ -413,3 +413,87 @@ def test_reindex_to_sha_returns_false_on_exception():
         result = _reindex_to_sha(mock_db, Path("/fake/root"), target_sha)
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# resync_changed fallback dispatch (OPEN-2 — index-at-SHA via detached worktree)
+#
+# Per decision (b): these assert ONLY the dispatch decision and the False-on-
+# failure contract. They do NOT fake the stamp (no set_indexed_sha side-effect).
+# The real-stamp proof is the integration test in tests/integration/test_resync.py.
+# ---------------------------------------------------------------------------
+
+
+def test_resync_fallback_dispatches_to_index_at_sha_when_backward():
+    """When the live tree is NOT at new_sha, the git-delta-None fallback
+    materializes new_sha via _index_repo_at_sha (not the bare index_repo)."""
+    from sqlcg.indexer.indexer import Indexer
+
+    old_sha = "1111111111111111111111111111111111111111"
+    new_sha = "2222222222222222222222222222222222222222"
+    head_sha = "3333333333333333333333333333333333333333"  # tree NOT at new_sha
+
+    indexer = Indexer()
+    mock_db = MagicMock()
+    with (
+        patch("sqlcg.indexer.git_delta.git_name_status_delta", return_value=None),
+        patch("sqlcg.indexer.git_delta._get_current_head", return_value=head_sha),
+        patch.object(Indexer, "_index_repo_at_sha") as spy_at_sha,
+        patch.object(Indexer, "index_repo") as spy_index_repo,
+    ):
+        summary = indexer.resync_changed(Path("/fake/root"), old_sha, new_sha, mock_db, None)
+
+    assert summary["fell_back_to_full"] is True
+    spy_at_sha.assert_called_once()
+    # The bare-root index_repo call must NOT fire on the backward path.
+    spy_index_repo.assert_not_called()
+    # Materialization targets new_sha.
+    assert spy_at_sha.call_args[0][1] == new_sha
+
+
+def test_resync_fallback_dispatches_to_index_repo_when_forward():
+    """When the live tree IS already at new_sha, the fallback uses the bare
+    index_repo(root, ...) — no worktree materialization."""
+    from sqlcg.indexer.indexer import Indexer
+
+    old_sha = "1111111111111111111111111111111111111111"
+    new_sha = "2222222222222222222222222222222222222222"
+
+    indexer = Indexer()
+    mock_db = MagicMock()
+    with (
+        patch("sqlcg.indexer.git_delta.git_name_status_delta", return_value=None),
+        patch("sqlcg.indexer.git_delta._get_current_head", return_value=new_sha),
+        patch.object(Indexer, "_index_repo_at_sha") as spy_at_sha,
+        patch.object(Indexer, "index_repo") as spy_index_repo,
+    ):
+        summary = indexer.resync_changed(Path("/fake/root"), old_sha, new_sha, mock_db, None)
+
+    assert summary["fell_back_to_full"] is True
+    spy_index_repo.assert_called_once()
+    spy_at_sha.assert_not_called()
+
+
+def test_reindex_to_sha_returns_false_when_index_at_sha_raises():
+    """_reindex_to_sha returns False (no propagation) when the worktree
+    materialization raises CalledProcessError (e.g. unknown SHA / shallow clone)."""
+    import subprocess
+
+    target_sha = "9999999999999999999999999999999999999999"
+    from_sha = "8888888888888888888888888888888888888888"
+
+    mock_db = MagicMock()
+    mock_db.get_indexed_sha.return_value = from_sha
+
+    with (
+        patch("sqlcg.indexer.git_delta.git_name_status_delta", return_value=None),
+        patch("sqlcg.indexer.git_delta._get_current_head", return_value=from_sha),
+        patch(
+            "sqlcg.indexer.indexer.Indexer._index_repo_at_sha",
+            side_effect=subprocess.CalledProcessError(1, ["git", "worktree", "add"]),
+        ),
+        patch("sqlcg.core.config.get_dialect", return_value=None),
+    ):
+        result = _reindex_to_sha(mock_db, Path("/fake/root"), target_sha)
+
+    assert result is False

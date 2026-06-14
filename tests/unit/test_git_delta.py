@@ -234,3 +234,26 @@ def test_scenario_c_git_delta_with_relative_root(git_repo: Path) -> None:
 
     assert delta is not None, "delta must not be None (git diff must succeed)"
     assert (git_repo / "new.sql").resolve() in delta.added
+
+
+# ---------------------------------------------------------------------------
+# _get_current_head (OPEN-2 — index-at-SHA helper)
+# ---------------------------------------------------------------------------
+
+
+def test_get_current_head_returns_sha_in_git_repo(git_repo):
+    """_get_current_head returns a 40-char hex SHA matching HEAD in a real repo."""
+    from sqlcg.indexer.git_delta import _get_current_head
+
+    head = _get_current_head(git_repo)
+    assert head is not None
+    assert len(head) == 40
+    assert all(c in "0123456789abcdef" for c in head)
+    assert head == _get_head(git_repo)
+
+
+def test_get_current_head_returns_none_in_non_git_dir(tmp_path):
+    """_get_current_head returns None (never raises) outside a git repo."""
+    from sqlcg.indexer.git_delta import _get_current_head
+
+    assert _get_current_head(tmp_path) is None

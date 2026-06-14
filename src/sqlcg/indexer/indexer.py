@@ -316,6 +316,77 @@ def _subprocess_parse_worker(parser_cls, dialect, path, sql, q):
 class Indexer:
     """Orchestrates SQL file parsing and graph persistence."""
 
+    def _index_repo_at_sha(
+        self,
+        root: Path,
+        target_sha: str,
+        db: GraphBackend,
+        dialect: str | None,
+        *,
+        batch_size: int = 50,
+        timeout_per_file: int = 10,
+    ) -> None:
+        """Full index of *target_sha*'s tree via a detached git worktree.
+
+        Materializes ``target_sha``'s committed tree in a detached worktree under
+        the system temp dir, then runs ``index_repo`` against it. The stamp is
+        written by ``index_repo``'s existing ``git rev-parse HEAD`` (cwd=worktree)
+        at ``indexer.py`` end-of-run, which returns ``target_sha`` for a detached
+        worktree — so no ``set_indexed_sha`` call is made here.
+
+        The user's working tree at *root* is never mutated. The worktree is always
+        removed (try/finally + ``shutil.rmtree`` backstop), even on failure.
+
+        Raises:
+            subprocess.CalledProcessError: if ``git worktree add`` fails (unknown
+                SHA, shallow clone, git missing). Propagated so the caller's
+                ``_reindex_to_sha`` returns False and the manual-reindex hint fires.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        tmp_dir = tempfile.mkdtemp(prefix="sqlcg_worktree_")
+        try:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", tmp_dir, target_sha],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                logger.error(
+                    "_index_repo_at_sha: git worktree add failed for %s at %s: %s",
+                    root,
+                    target_sha[:8],
+                    exc.stderr or exc,
+                )
+                raise
+            self.index_repo(
+                Path(tmp_dir),
+                dialect,
+                db,
+                batch_size=batch_size,
+                timeout_per_file=timeout_per_file,
+            )
+        finally:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", tmp_dir],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_index_repo_at_sha: git worktree remove failed for %s: %s",
+                    tmp_dir,
+                    exc,
+                )
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def index_repo(
         self,
         path: Path,
@@ -834,7 +905,7 @@ class Indexer:
             DEPENDENT_FILES_OF_TABLES_QUERY,
             GET_TABLES_DEFINED_IN_FILE_QUERY,
         )
-        from sqlcg.indexer.git_delta import git_name_status_delta
+        from sqlcg.indexer.git_delta import _get_current_head, git_name_status_delta
 
         summary: dict = {
             "added": 0,
@@ -855,9 +926,20 @@ class Indexer:
                 new_sha[:8],
             )
             summary["fell_back_to_full"] = True
-            self.index_repo(
-                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
-            )
+            _head = _get_current_head(root)
+            if _head is not None and new_sha != _head:
+                self._index_repo_at_sha(
+                    root,
+                    new_sha,
+                    db,
+                    dialect,
+                    batch_size=batch_size,
+                    timeout_per_file=timeout_per_file,
+                )
+            else:
+                self.index_repo(
+                    root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+                )
             return summary
 
         reparse_set: set[Path] = delta.added | delta.modified
@@ -964,9 +1046,20 @@ class Indexer:
 
         if fell_back:
             summary["fell_back_to_full"] = True
-            self.index_repo(
-                root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
-            )
+            _head = _get_current_head(root)
+            if _head is not None and new_sha != _head:
+                self._index_repo_at_sha(
+                    root,
+                    new_sha,
+                    db,
+                    dialect,
+                    batch_size=batch_size,
+                    timeout_per_file=timeout_per_file,
+                )
+            else:
+                self.index_repo(
+                    root, dialect, db, batch_size=batch_size, timeout_per_file=timeout_per_file
+                )
             return summary
 
         summary["closure_resolved"] = len(closure_files)

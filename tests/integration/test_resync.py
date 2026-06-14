@@ -397,3 +397,113 @@ def test_resync_fallback_when_closure_exceeds_max_depth(git_repo, db):
     assert _file_node_exists(db, str((git_repo / "e.sql").resolve())), (
         "Full index fallback must index all files including e.sql"
     )
+
+
+# ---------------------------------------------------------------------------
+# OPEN-2: large backward self-heal materializes base_sha via a detached worktree
+# (real DuckDB + real git worktree + real index_repo stamp — NOT a faked stamp).
+# ---------------------------------------------------------------------------
+
+
+def _sqltable_exists(db: DuckDBBackend, name: str) -> bool:
+    """True if a SqlTable node exists whose qualified name ends in *name*."""
+    rows = db.run_read(
+        'SELECT qualified FROM "SqlTable" WHERE qualified = ? OR qualified LIKE ?',
+        {"qualified": name, "like": f"%.{name}"},
+    )
+    return bool(rows)
+
+
+def _build_deep_chain_repo(git_repo: Path) -> tuple[str, str]:
+    """Two commits over a chain a->b->c->d->e deeper than max_closure_depth=3.
+
+    Commit 1 defines t_a from raw1; commit 2 modifies a.sql (t_a from raw2).
+    Healing commit_2 -> commit_1 re-modifies a.sql, whose closure must reach e
+    (4 hops > depth 3), tripping the closure-depth fallback. Returns
+    (commit_1_sha, commit_2_sha).
+    """
+    (git_repo / "a.sql").write_text("CREATE TABLE t_a AS SELECT x FROM raw1")
+    (git_repo / "b.sql").write_text("CREATE TABLE t_b AS SELECT x FROM t_a")
+    (git_repo / "c.sql").write_text("CREATE TABLE t_c AS SELECT x FROM t_b")
+    (git_repo / "d.sql").write_text("CREATE TABLE t_d AS SELECT x FROM t_c")
+    (git_repo / "e.sql").write_text("CREATE TABLE t_e AS SELECT x FROM t_d")
+    commit_1_sha = _commit_all(git_repo, "commit 1: chain on raw1")
+
+    (git_repo / "a.sql").write_text("CREATE TABLE t_a AS SELECT x FROM raw2")
+    commit_2_sha = _commit_all(git_repo, "commit 2: a from raw2")
+    return commit_1_sha, commit_2_sha
+
+
+def test_large_backward_heal_via_worktree_stamps_base_sha(git_repo, db):
+    """A large backward self-heal indexes base_sha's tree in a detached worktree
+    so the existing index_repo stamp writes base_sha (not HEAD).
+
+    Healing commit_2 -> commit_1 re-modifies the chain root a.sql; the closure
+    fans out past max_closure_depth=3, tripping the closure-depth fallback. The
+    live tree is at commit 2 != commit 1, so the fallback materializes commit 1
+    in a detached worktree and the real index_repo stamp writes commit_1_sha.
+    """
+    from sqlcg.indexer.git_delta import _get_current_head
+    from sqlcg.server.tools import _reindex_to_sha
+
+    commit_1_sha, commit_2_sha = _build_deep_chain_repo(git_repo)
+
+    # Index the graph at HEAD (commit 2).
+    indexer = Indexer()
+    indexer.index_repo(git_repo, dialect=None, db=db)
+    assert db.get_indexed_sha() == commit_2_sha
+
+    # Heal backward to commit 1.
+    healed = _reindex_to_sha(db, git_repo, commit_1_sha)
+
+    assert healed is True, "backward heal via worktree must return True"
+    assert db.get_indexed_sha() == commit_1_sha, (
+        "stamp must be commit_1_sha (written by the real index_repo run in the worktree)"
+    )
+    # Graph reflects commit 1: the whole chain is present, and t_a is sourced from
+    # raw1 (commit-1 state). raw1 is referenced ONLY at commit 1 — its presence in
+    # a SELECTS_FROM edge proves the worktree indexed the base-SHA tree (not HEAD,
+    # where a.sql reads raw2).
+    for present in ("t_a", "t_b", "t_c", "t_d", "t_e"):
+        assert _sqltable_exists(db, present), f"{present} must be present at commit 1"
+    raw1_edges = db.run_read(
+        'SELECT dst_key FROM "SELECTS_FROM" WHERE dst_key LIKE ?',
+        {"like": "%raw1%"},
+    )
+    assert raw1_edges, (
+        "a SELECTS_FROM edge to raw1 must exist (proves the worktree indexed the "
+        "base-SHA tree, where a.sql reads raw1 — not HEAD, where it reads raw2)"
+    )
+    # The user's working tree is untouched — still at commit 2.
+    assert _get_current_head(git_repo) == commit_2_sha, (
+        "the detached worktree must not move the user's working tree off HEAD"
+    )
+
+
+def test_large_backward_heal_worktree_cleaned_up_on_failure(git_repo, db, monkeypatch):
+    """When index_repo raises inside the worktree, the temp worktree is removed
+    and _reindex_to_sha returns False (cleanup gate)."""
+    import glob
+    import tempfile
+
+    from sqlcg.server.tools import _reindex_to_sha
+
+    commit_1_sha, _ = _build_deep_chain_repo(git_repo)
+    indexer = Indexer()
+    indexer.index_repo(git_repo, dialect=None, db=db)
+
+    pattern = str(Path(tempfile.gettempdir()) / "sqlcg_worktree_*")
+    before = set(glob.glob(pattern))
+
+    # The real index_repo runs once for the initial index above; patch it to fail
+    # only on the worktree call by raising on every call from here on.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(Indexer, "index_repo", _boom)
+
+    healed = _reindex_to_sha(db, git_repo, commit_1_sha)
+
+    assert healed is False, "an injected index_repo failure must yield a False heal"
+    after = set(glob.glob(pattern))
+    assert after == before, f"no sqlcg_worktree_* dir may leak; new dirs: {after - before}"
