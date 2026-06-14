@@ -896,6 +896,20 @@ class Indexer:
         if profile:
             _t_catalog_end = time.perf_counter()
 
+        # Bug #4 (PR-4): re-run the star expansion AFTER the catalog is applied.
+        # The first pass at the top of this block expands STAR_SOURCE rows whose
+        # leaf table already had HAS_COLUMN rows (parsed DDL). A temp built as
+        # `CREATE TEMP t AS SELECT * FROM src` where `src` is catalogued ONLY via
+        # information_schema has NO columns at the first pass — its HAS_COLUMN rows
+        # arrive with the catalog above — so the temp (and any promote out of it)
+        # produced zero edges. The star-expansion SQL is idempotent
+        # (INSERT OR REPLACE) and chains both levels (src -> temp -> persisted) in a
+        # single pass once the leaf columns exist, so one extra invocation here is
+        # the full fix. Only re-run when the catalog actually added columns; a repo
+        # with no configured catalog pays nothing.
+        if catalog_result.get("columns_loaded", 0) > 0:
+            star_edges_expanded = self._expand_star_sources(db)
+
         # Post-catalog: resolve JOIN_COL_RESOLVE markers against the full HAS_COLUMN
         # catalog (Bug #5, PR-5 option b). MUST run after the catalog is applied so
         # information_schema columns are present; the suppressed sqlglot mis-bind
