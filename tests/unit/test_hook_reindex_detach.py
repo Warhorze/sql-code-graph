@@ -479,3 +479,191 @@ class TestHookResyncLogPath:
         log_path = reindex_module._hook_resync_log_path()
 
         assert log_path == db_path.parent / "hook-resync.log"
+
+
+# ---------------------------------------------------------------------------
+# #1 — loud foreground preflight on schema/version skew before detaching
+# ---------------------------------------------------------------------------
+
+
+def _seed_db_with_schema_version(db_path: Path, version: str) -> None:
+    """Create a graph whose stored SchemaVersion row has the given version.
+
+    Writes the row directly so we can simulate a *stale-binary* graph whose
+    stored schema version differs from the current build's ``SCHEMA_VERSION``.
+    """
+    from sqlcg.core.duckdb_backend import DuckDBBackend
+
+    backend = DuckDBBackend(str(db_path))
+    backend.init_schema()
+    backend._conn.execute('DELETE FROM "SchemaVersion"')
+    backend._conn.execute(
+        'INSERT INTO "SchemaVersion" (version, indexed_sha, sqlcg_version) VALUES (?, ?, ?)',
+        [version, "deadbeef", "1.25.6"],
+    )
+    backend.close()
+
+
+class TestHookPreflightSchemaSkew:
+    """A stale-binary schema skew on the hook path fails LOUDLY, never silently (#1)."""
+
+    def test_schema_mismatch_exits_nonzero_with_message_and_no_detach(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Stored schema != current -> non-zero exit, visible message, NO detach spawn.
+
+        Inverts the #1 silent-exit-0 failure mode: before the fix the schema gate
+        ran in the detached child (log file only); now the foreground preflight
+        surfaces it. Guards the git-hook binary-resolution plan
+        ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+        """
+        repo = _git_repo(tmp_path)
+        sha_a = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        (repo / "added.sql").write_text("CREATE TABLE ADDED (id INT);\n")
+        sha_b = _commit_all(repo, "add table")
+
+        db_path = tmp_path / "stale.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+        _seed_db_with_schema_version(db_path, "8")  # stale: build needs "10"
+
+        mock_popen = _DetachPopenSpy()
+        monkeypatch.setattr(reindex_module.subprocess, "Popen", mock_popen)
+
+        result = runner.invoke(
+            app,
+            [
+                "reindex",
+                str(repo),
+                "--from",
+                sha_a,
+                "--to",
+                sha_b,
+                "--dialect",
+                "ansi",
+                "--quiet",
+                "--notify",
+            ],
+        )
+
+        assert result.exit_code != 0, result.output
+        assert "schema is v8" in result.output
+        assert "hook binary is stale" in result.output
+        assert "sqlcg git install-hooks" in result.output
+        # The whole point: it did NOT detach a doomed background resync.
+        mock_popen.assert_not_called()
+
+    def test_matching_schema_detaches_and_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Stored schema == current -> preflight is silent, detach proceeds, exit 0.
+
+        Regression guard that the preflight does not break the legitimate async
+        path. Guards the git-hook binary-resolution plan
+        ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+        """
+        from sqlcg.core.schema import SCHEMA_VERSION
+
+        repo = _git_repo(tmp_path)
+        sha_a = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        (repo / "added.sql").write_text("CREATE TABLE ADDED (id INT);\n")
+        sha_b = _commit_all(repo, "add table")
+
+        db_path = tmp_path / "current.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+        _seed_db_with_schema_version(db_path, SCHEMA_VERSION)
+
+        mock_popen = _DetachPopenSpy()
+        monkeypatch.setattr(reindex_module.subprocess, "Popen", mock_popen)
+
+        result = runner.invoke(
+            app,
+            [
+                "reindex",
+                str(repo),
+                "--from",
+                sha_a,
+                "--to",
+                sha_b,
+                "--dialect",
+                "ansi",
+                "--quiet",
+                "--notify",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "hook binary is stale" not in result.output
+        mock_popen.assert_called_once()
+
+    def test_locked_db_falls_through_to_detach_without_blocking_or_false_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """B1 hot-path safety: lock held -> single fast open, fall through to detach.
+
+        Simulates a concurrent resync holding the DuckDB exclusive lock: the
+        preflight's open raises IOException. It MUST NOT retry ~31 s (a #77-class
+        stall) and MUST NOT emit a false stale-schema error — it falls through to
+        the detach path unchanged. Proves we did not reintroduce #77. Guards the
+        git-hook binary-resolution plan
+        ([plan doc](plan/sprints/bugfix_githook_binary_resolution.md)).
+        """
+        repo = _git_repo(tmp_path)
+        sha_a = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        (repo / "added.sql").write_text("CREATE TABLE ADDED (id INT);\n")
+        sha_b = _commit_all(repo, "add table")
+
+        db_path = tmp_path / "locked.db"
+        monkeypatch.setenv("SQLCG_DB_PATH", str(db_path))
+
+        # Make the preflight's read-only open raise IOException (lock held), and
+        # count calls so we can assert it was a SINGLE attempt (no 31 s retry).
+        open_calls = {"n": 0}
+
+        def _always_locked(read_only: bool = False):
+            open_calls["n"] += 1
+            raise duckdb.IOException("Conflicting lock is held — another sqlcg process is running.")
+
+        import sqlcg.core.config as config_module
+
+        monkeypatch.setattr(config_module, "get_backend", _always_locked)
+        # If the preflight ever slept (retry), fail loudly — it must be a single
+        # bounded open, not the lock-retry path.
+        monkeypatch.setattr(
+            reindex_module.time,
+            "sleep",
+            lambda _s: (_ for _ in ()).throw(
+                AssertionError("preflight must not sleep/retry on a held lock")
+            ),
+        )
+
+        mock_popen = _DetachPopenSpy()
+        monkeypatch.setattr(reindex_module.subprocess, "Popen", mock_popen)
+
+        result = runner.invoke(
+            app,
+            [
+                "reindex",
+                str(repo),
+                "--from",
+                sha_a,
+                "--to",
+                sha_b,
+                "--dialect",
+                "ansi",
+                "--quiet",
+                "--notify",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        # Fell through to detach, no false stale-schema error.
+        assert "hook binary is stale" not in result.output
+        mock_popen.assert_called_once()
+        # Single bounded open — the preflight opened exactly once (not 5x retry).
+        assert open_calls["n"] == 1, f"preflight opened {open_calls['n']} times (must be 1)"
