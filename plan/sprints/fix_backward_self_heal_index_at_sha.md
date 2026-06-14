@@ -2,7 +2,7 @@
 
 **Plan date:** 2026-06-14
 **Author:** architect-planner
-**Status:** NEEDS-REVIEW
+**Status:** REVIEWED
 **Target version:** 1.28.4 (fix-only → **patch** per CLAUDE.md SemVer rule; master is at 1.28.3)
 
 GitHub issue: [#128](https://github.com/Warhorze/sql-code-graph/issues/128) — "pr-impact requires graph indexed at base-ref and is not self-healing"
@@ -178,17 +178,34 @@ working-tree edits are invisible to it. Correct: `pr-impact` analyses committed 
   `indexer.py` **already** imports `git_delta` at [`indexer.py:837`](../../src/sqlcg/indexer/indexer.py).
 - Both fallback branches in `resync_changed` get a backward-vs-forward dispatch.
 
-### Detecting backward vs. forward fallback
-Before each fallback `index_repo` call, resolve current HEAD via `_get_current_head(root)`:
-- If HEAD is known and `new_sha != HEAD` → **backward** → `_index_repo_at_sha(root, new_sha, …)`.
-- Else (forward, where the tree IS at `new_sha`; or HEAD unknown) → `index_repo(root, …)` unchanged.
+### Detecting backward vs. forward fallback (framing: "is materialization needed?", NOT "guess the direction")
+Before each fallback `index_repo` call, resolve the tree's actual checked-out commit via
+`_get_current_head(root)`. The predicate is **"is the live tree already at `new_sha`?"**:
+- If HEAD is known and `new_sha != HEAD` → the live tree is NOT at `new_sha`, so **materialize it** →
+  `_index_repo_at_sha(root, new_sha, …)`.
+- Else (the live tree IS at `new_sha` — the forward case; or HEAD unknown) → `index_repo(root, …)` unchanged.
 
-This keeps the **forward fallback path completely unaffected** (acceptance gate below).
+**Why this is always-correct — do NOT later "tighten" it to a backward-only heuristic (A1):**
+materializing `new_sha` in a detached worktree produces the correct index for `new_sha` *regardless
+of fallback direction*. The worktree path is therefore also correct (merely slower) for a forward
+resync that happens to be issued from a tree not at HEAD. Framing the predicate as "is
+materialization needed?" removes any misroute risk; a future maintainer must not narrow it.
+
+**Precondition for `git worktree add` (A2):** the worktree branch is taken only when
+`_head is not None`. `_get_current_head` returns non-None only inside a real git repo, so at the
+point we run `git worktree add ... (cwd=root)`, `root` is guaranteed to be a valid git repo —
+the `_indexed_root(db) or Path.cwd()` fallback ([`tools.py:2825`](../../src/sqlcg/server/tools.py))
+can never reach `git worktree add` in a non-repo dir.
+
+This keeps the **forward fallback path completely unaffected** when the tree is at `new_sha` (acceptance gate below).
 
 ### Cleanup safety
 `try/finally` around the worktree; `git worktree remove --force` (force needed for a detached
 worktree git treats as modified), then a belt-and-suspenders `shutil.rmtree(..., ignore_errors=True)`
-for git versions that exit 0 yet leave the dir. Temp dir created via `tempfile.mkdtemp(prefix="sqlcg_worktree_")`.
+for git versions that exit 0 yet leave the dir. Temp dir created via `tempfile.mkdtemp(prefix="sqlcg_worktree_")`
+in the system temp dir (`tempfile.gettempdir()`), **never inside `root` (A3)** — `git worktree add`
+refuses a path inside the working tree, and a later `walk_sql_files(root)` of an unrelated index
+must not be able to see it.
 
 ### Performance
 - Incremental path: **unchanged** — no new subprocess, no worktree.
@@ -292,7 +309,9 @@ This is the grep-confirmed call site for both `_index_repo_at_sha` and `_get_cur
 **Step 3.1** — `1.28.3` → `1.28.4`:
 - [`pyproject.toml`](../../pyproject.toml) line 7 `version = "1.28.4"`
 - [`src/sqlcg/__init__.py`](../../src/sqlcg/__init__.py) line 3 `__version__ = "1.28.4"`
-- `uv lock`
+- `uv lock` **then `uv sync` (A5)** — `test_version_parity` asserts `importlib.metadata.version(...)`,
+  which only refreshes after `uv sync` re-installs the editable package. CI runs `uv sync --all-extras`,
+  but a local `uv run pytest` after only `uv lock` would see stale metadata and red the parity test.
 - Acceptance: `test_version_parity.py` green.
 
 ---
@@ -355,7 +374,7 @@ This is the grep-confirmed call site for both `_index_repo_at_sha` and `_get_cur
 | Temp worktree leaked on crash | Low | `try/finally` + `shutil.rmtree(ignore_errors=True)` backstop. Cleanup gate asserts no leak on injected failure. |
 | `index_repo` stamps wrong SHA in worktree | Low | Detached-worktree HEAD is always the named commit; `_reindex_to_sha`'s post-check at [`tools.py:2752`](../../src/sqlcg/server/tools.py) is the final safety net (returns `False` on mismatch). |
 | Cross-device `tempfile.gettempdir()` vs repo (WSL2 `/tmp`) | Low | git worktrees do not require same-filesystem placement. If it ever fails, `CalledProcessError` is caught → safe `False`. |
-| Concurrent heals create two worktrees | Very low | Unique `mkdtemp` per call; DB writes already guarded by the server `backend_lock`; CLI is single-process. |
+| Concurrent heals create two worktrees | Very low | Unique `mkdtemp` per call; concurrent DB writes serialize on the single shared DuckDB handle and the CLI is single-process. (A4: do NOT cite a read-path `backend_lock` — PR-E #137 removed it; the write serialization is the shared-handle property, not a lock.) |
 
 ---
 
@@ -365,5 +384,21 @@ immediately, so no existing behaviour regresses — the heal simply now succeeds
 
 ---
 
+## Rollback
+Purely additive: one new private method (`_index_repo_at_sha`), one new helper (`_get_current_head`),
+and a dispatch wrapper at the two fallback branches. Reverting the commit restores the bare
+`self.index_repo(root, …)` calls — no schema, data, or API change to undo. The backward fallback
+returns to failing closed (`_reindex_to_sha` → `False` + manual-reindex hint), i.e. pre-fix behaviour.
+
 ## Review Trail
-*(To be filled in by plan-reviewer.)*
+**Plan-review (2026-06-14): APPROVE-WITH-AMENDMENTS.** Reviewer independently verified the keystone
+stamp (`indexer.py:684-693`, `cwd=path`), both fallback sites (`:858-860`, `:967-969`), the dispatch
+predicate against both real callers (backward heal `tools.py:2741`; forward resync `tools.py:2922` —
+no misroute), `new_sha`/`dialect`/`batch_size` in scope at both sites, the B4 real-backend integration
+pattern in `test_resync.py`, CI git availability, and `use_git=True`. Five amendments applied:
+- **A1** — reframed §"Detecting backward vs. forward fallback" as "is materialization needed?" (always-correct), with an explicit warning not to narrow it to a direction heuristic.
+- **A2** — stated the `_head is not None` precondition makes `cwd=root` for `git worktree add` always a valid repo (the `Path.cwd()` fallback can't reach it).
+- **A3** — pinned the temp worktree to system temp (`tempfile.gettempdir()`), never inside `root`.
+- **A4** — corrected the "Concurrent heals" mitigation: shared-handle write serialization, NOT a `backend_lock` (PR-E #137 removed the read-path lock).
+- **A5** — added `uv sync` after `uv lock` in Step 3.1 (editable-metadata refresh for `test_version_parity`).
+Shepherd also verified the keystone (`:684-693`) and both fallback sites directly. **Status: REVIEWED — cleared for implementation.**
